@@ -11,6 +11,38 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# Fail here rather than let libseat fail later. Its error for this case is
+# "Failed to open session: Function not implemented", which does not mention
+# ssh, seats, or what to do instead.
+TTY_NAME=$(tty)
+case "$TTY_NAME" in
+    /dev/tty[0-9]*) ;;
+    *)
+        cat >&2 <<MSG
+$0 must run on a virtual terminal. This is $TTY_NAME.
+
+A /dev/pts/N is a pseudo-terminal — an ssh login or a terminal emulator inside
+an existing desktop. logind grants DRM master only to the active session on a
+seat, and neither of those has one, so the udev backend cannot start.
+
+sudo does not help. The restriction is on the session, not on privileges.
+
+  At the machine:  Ctrl+Alt+F2, log in, run this again.
+  Over ssh:        use the nested backend instead, which needs no seat —
+                     WAYLAND_DISPLAY=wayland-1 cargo run -p huginn-comp
+MSG
+        exit 1
+        ;;
+esac
+
+# Running the whole session as root leaves root-owned sockets and caches in a
+# user session, and fs.protected_regular then stops root rewriting the log it
+# does not own — which looks like the script is broken rather than misused.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "do not run this as root: a seat session belongs to your user, not to root" >&2
+    exit 1
+fi
+
 LOG=${HUGINN_LOG:-/tmp/huginn-session.log}
 BIN=./target/debug/huginn
 PANEL=./target/debug/muninn
