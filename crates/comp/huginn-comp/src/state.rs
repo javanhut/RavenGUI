@@ -36,6 +36,7 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
+        dmabuf::{DmabufGlobal, DmabufState},
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
@@ -76,6 +77,11 @@ pub(crate) struct Huginn {
     pub xdg_shell_state: XdgShellState,
     pub layer_shell_state: WlrLayerShellState,
     pub raven_shell: crate::shell_protocol::RavenShellState,
+    pub dmabuf_state: DmabufState,
+    /// `None` until a backend calls `enable_dmabuf`; the winit and udev
+    /// backends discover their render node differently.
+    pub dmabuf_global: Option<DmabufGlobal>,
+    pub(crate) pending_dmabufs: crate::dmabuf::PendingImports,
     pub shm_state: ShmState,
     /// Held, not read: dropping this would withdraw the xdg-output global
     /// and clients would lose their output information mid-session.
@@ -109,6 +115,9 @@ impl Huginn {
             xdg_shell_state: XdgShellState::new::<Self>(dh),
             layer_shell_state: WlrLayerShellState::new::<Self>(dh),
             raven_shell: crate::shell_protocol::RavenShellState::new(dh),
+            dmabuf_state: DmabufState::new(),
+            dmabuf_global: None,
+            pending_dmabufs: crate::dmabuf::PendingImports::default(),
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             seat_state,

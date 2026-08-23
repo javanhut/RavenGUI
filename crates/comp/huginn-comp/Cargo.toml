@@ -19,6 +19,9 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 huginn-egl.workspace = true
+# For dev_t in the dmabuf main-device hint. No unsafe involved: the type is a
+# plain integer alias.
+libc = "0.2"
 raven-protocol = { workspace = true, features = ["server"] }
 smithay = { workspace = true, features = [
     "backend_drm",
