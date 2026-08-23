@@ -1,0 +1,109 @@
+# Huginn & Muninn
+
+The Wayland compositor and desktop shell for [RavenLinux](../RavenLinux),
+written in Rust on [Smithay](https://github.com/Smithay/smithay).
+
+Odin kept two ravens. **Huginn** — *thought* — flew out over the world each day
+and reported what he saw. **Muninn** — *memory* — is the half you actually look
+at.
+
+| Binary | What it is |
+|---|---|
+| `huginn` | the compositor |
+| `muninn` | the desktop shell — panel, launcher, notifications |
+| `muninn-lock` | the lock screen |
+
+## Architecture
+
+**The shell is a separate process.** `muninn` is an ordinary Wayland client that
+draws through `wlr-layer-shell` and talks to the compositor over the private
+`raven_shell_v1` protocol. GNOME takes the opposite approach — the shell lives
+inside Mutter, which buys synchronous access to window state at the price of a
+single failure domain, where a panel bug kills every open application. Here a
+crashed `muninn` costs you the panel and nothing else, and it can be rebuilt and
+restarted inside a live session.
+
+COSMIC is the reference design, and conveniently it is what the dev box runs, so
+a working example of this exact architecture is always a `ps` away.
+
+`muninn-lock` is a third binary for the same reason, more sharply:
+`ext-session-lock-v1` guarantees the compositor keeps the screen locked if the
+locking client dies, and that guarantee only means something if a shell bug
+cannot take the locker down with it.
+
+**`huginn-core` holds no I/O.** Layout, focus, and workspace behaviour live in a
+crate with no Wayland, DRM, or GPU dependency, so all of it is unit-tested in
+milliseconds on any host — including a Mac that cannot build the compositor at
+all. `huginn-comp` maps `WindowId` to a real `WlSurface` and turns
+`Space::arrange` output into `xdg_toplevel::configure` events.
+
+**One repository, split at protocol v1.** The custom protocol is co-designed by
+both halves, so a change to it touches the XML, the compositor, and the shell in
+one commit that either builds or doesn't. `raven-protocol` is kept standalone
+and additive-only so that the eventual `git subtree split` stays mechanical.
+
+Shared crates take the `raven-` prefix, since they belong to neither bird.
+
+```
+crates/
+├── raven-protocol/        raven_shell_v1 — shared, versioned, split-ready
+├── raven-config/          config schema — shared
+├── comp/
+│   ├── huginn-core/       ★ layout, focus, workspaces. Pure. Tests anywhere.
+│   ├── huginn-comp/       smithay glue, event loop, protocol handlers
+│   └── huginn-egl/        ★ the only crate permitted `unsafe`
+└── shell/
+    ├── muninn/            panel, launcher, notifications
+    └── muninn-lock/       session-lock client
+```
+
+## No unsafe
+
+`[workspace.lints.rust] unsafe_code = "forbid"` in the root manifest, inherited
+by every crate via `[lints] workspace = true`. `forbid` cannot be overridden by
+an `#[allow]` anywhere inside the crate — attempting it is `error[E0453]`.
+
+A compositor cannot reach zero: smithay exposes 28 `pub unsafe fn`, of which a
+DRM/GLES compositor must call about six, all in EGL/GLES bring-up. Those are
+quarantined in `huginn-egl`, the single crate that declares its own `[lints]`
+table. It also sets `clippy::undocumented_unsafe_blocks = "deny"`, so an
+`unsafe` block there without a `// SAFETY:` comment fails the build.
+
+The only way to smuggle unsafe into another crate is to drop the `[lints]`
+opt-in from its manifest, which is what `scripts/check-unsafe.sh` exists to
+catch. Run it in CI and from a pre-push hook.
+
+## Building
+
+**The compositor only builds on Linux.** Smithay needs `libudev`, `libdrm`,
+`libseat`, and `libinput` — Linux kernel-interface libraries with no macOS
+equivalent. On a Mac, `cargo check --workspace` still passes: the Linux-only
+dependencies sit behind `[target.'cfg(target_os = "linux")'.dependencies]`, and
+each Linux binary has a single top-level `cfg` gate.
+
+```sh
+# Anywhere, including macOS — this is where window-management work happens.
+cargo test -p huginn-core
+cargo check --workspace --all-targets
+
+# Edit here, build on the Linux box.
+./scripts/remote.sh test -p huginn-core
+./scripts/remote.sh run -p huginn-comp    # nested window in the host's session
+./scripts/check-unsafe.sh
+```
+
+`--backend` is autodetected: an inherited `WAYLAND_DISPLAY` means you are inside
+a session, which means development, which means the nested `winit` backend. It
+is the difference between a five-second edit loop and a reboot.
+
+**The udev/TTY backend cannot be driven over SSH.** logind grants DRM master
+only to the active session on a seat, and an ssh login has no seat at all — so
+`--backend udev` has to be run at the machine on a TTY, or in a VM with
+virtio-gpu.
+
+## Status
+
+Scaffolding. `huginn-core` and `raven-config` are real and tested; everything
+else is structure. Neither backend is implemented, and `huginn-egl` is
+deliberately empty — EGL initialisation gets written on the Linux host where it
+can be compiled and run, not guessed at from a machine that cannot link it.

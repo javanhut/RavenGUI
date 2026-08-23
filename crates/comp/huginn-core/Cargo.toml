@@ -1,0 +1,12 @@
+[package]
+name = "huginn-core"
+description = "Pure window-management model for the Huginn compositor: geometry, workspaces, focus, layout. No I/O, no Wayland, no GPU — builds and tests on any host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

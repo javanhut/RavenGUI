@@ -1,0 +1,28 @@
+[package]
+name = "huginn-egl"
+description = "Quarantine crate. The only crate in this workspace permitted to write `unsafe`, holding safe wrappers around smithay's EGL/GLES bring-up. Keep it small."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay = { workspace = true, features = ["backend_egl", "renderer_gl"] }
+
+[dependencies]
+thiserror.workspace = true
+
+# NOTE: this crate deliberately does NOT inherit `[lints] workspace = true`.
+# It is the single documented exception to the workspace-wide
+# `unsafe_code = "forbid"`. scripts/check-unsafe.sh asserts that no other crate
+# has quietly opted out the same way. Every `unsafe` block here needs a
+# `// SAFETY:` comment justifying it against the callee's documented contract —
+# `clippy::undocumented_unsafe_blocks` makes that a hard error, not a habit.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"

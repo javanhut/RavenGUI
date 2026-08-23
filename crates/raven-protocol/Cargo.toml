@@ -1,0 +1,26 @@
+[package]
+name = "raven-protocol"
+description = "The raven_shell_v1 Wayland protocol: the contract between the Huginn compositor and the Muninn shell. Kept standalone and versioned so it can be split into its own repo at v1."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# The compositor implements the server side; muninn implements the client side.
+# Neither needs the other's generated code, and keeping them apart means a
+# shell bug can never reach for a server-only type.
+server = ["dep:wayland-server"]
+client = ["dep:wayland-client"]
+
+[dependencies]
+wayland-backend.workspace = true
+wayland-server = { workspace = true, optional = true }
+wayland-client = { workspace = true, optional = true }
+
+[build-dependencies]
+wayland-scanner.workspace = true
+
+[lints]
+workspace = true
