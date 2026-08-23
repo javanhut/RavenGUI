@@ -108,6 +108,14 @@ wlr-layer-shell surfaces, and lays both out from `huginn-core`. Muninn draws a
 top panel with workspace pips, receives workspace state over `raven_shell_v1`,
 and switches workspaces when a pip is clicked.
 
+The udev/TTY backend drives real hardware: a libseat session, DRM/KMS scan-out
+through GBM, libinput, VT switching, and monitor hotplug. udev has no notion of
+a connector — plugging a monitor in shows up as a `Changed` event on the GPU's
+device node — so a hotplug re-probes the connector list and reconciles against
+it, and the initial scan at startup is that same code path. A connector that
+goes away loses its `wl_output` global and gives its CRTC back; a new one is
+placed to the right of the screens already up.
+
 ```sh
 ./scripts/remote.sh run -p huginn-comp                       # compositor
 WAYLAND_DISPLAY=huginn-1 cargo run -p muninn                 # panel
@@ -128,8 +136,15 @@ Not done yet, roughly in the order they matter:
 - **SIGTERM handling** — calloop's signal source needs its `signals` feature,
   which smithay does not enable. Ctrl-C is enough for the nested backend; a
   compositor killed on a TTY has to hand the session back.
-- **udev/TTY backend** — where `huginn-egl` finally gets written. Cannot be
-  driven over ssh.
+- **Per-output areas in `huginn-core`** — the core still models one usable
+  area, so with several monitors up the leftmost one defines it and windows
+  only ever tile there. Everything below it in the stack — hotplug, output
+  globals, per-CRTC scan-out — already handles the plural case.
+- **Multi-GPU** — only the primary GPU is driven. A second card is detected and
+  logged, but lighting up its connectors needs a `DrmOutputManager` per device
+  and a way to move buffers between them.
+- **Mode changes on a live connector** — a monitor that is already up keeps the
+  mode it came up with. Only connect and disconnect are reconciled.
 - **Privilege gating** — `raven_shell_v1` is advertised to every client, so any
   client can currently read workspace state and switch workspaces. Harmless on
   a single-user session, but it must be gated before anything untrusted runs.

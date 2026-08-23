@@ -124,7 +124,8 @@ pub(crate) fn run() -> Result<()> {
     };
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);
-    state.add_output(&output, &dh);
+    // One output for the life of the process; nothing ever withdraws it.
+    let _global = state.add_output(&output, &dh);
 
     // new_auto picks the first free name, so a second instance does not fail to
     // start just because the first one has huginn-1.
@@ -247,19 +248,8 @@ impl Nested {
                 .map_err(|e| anyhow::anyhow!("binding framebuffer: {e}"))?;
 
             // Validate queued dmabuf imports now that the EGL context is
-            // current. Every notifier must be answered one way or the other:
-            // a client that gets no reply waits forever for its buffer.
-            for (dmabuf, notifier) in self.state.take_pending_dmabufs() {
-                match renderer.import_dmabuf(&dmabuf, None) {
-                    Ok(_texture) => {
-                        let _ = notifier.successful::<Huginn>();
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "rejected a client dmabuf");
-                        notifier.failed();
-                    }
-                }
-            }
+            // current.
+            crate::dmabuf::import_pending(renderer, &mut self.state);
 
             // Geometry comes from huginn-core; stacking order and the cursor
             // come from render::elements, shared with the udev backend.

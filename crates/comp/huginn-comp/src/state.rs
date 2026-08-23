@@ -32,7 +32,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             Client, DisplayHandle,
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, GlobalId},
             protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
         },
     },
@@ -338,8 +338,12 @@ impl Huginn {
     }
 
     /// Attach an output so clients can discover scale, mode, and position.
-    pub(crate) fn add_output(&self, output: &Output, dh: &DisplayHandle) {
-        output.create_global::<Self>(dh);
+    ///
+    /// The returned [`GlobalId`] is what withdraws it again. A monitor can be
+    /// unplugged, and an output global left behind after that is one clients
+    /// still believe in and will happily place surfaces on.
+    pub(crate) fn add_output(&self, output: &Output, dh: &DisplayHandle) -> GlobalId {
+        output.create_global::<Self>(dh)
     }
 }
 

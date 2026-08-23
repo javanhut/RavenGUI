@@ -22,6 +22,7 @@
 
 use smithay::{
     backend::allocator::{Format, dmabuf::Dmabuf},
+    backend::renderer::ImportDma,
     delegate_dmabuf,
     reexports::wayland_server::DisplayHandle,
     wayland::dmabuf::{
@@ -75,6 +76,27 @@ impl Huginn {
     /// Take the queued imports so the backend can validate them.
     pub(crate) fn take_pending_dmabufs(&mut self) -> Vec<(Dmabuf, ImportNotifier)> {
         std::mem::take(&mut self.pending_dmabufs.0)
+    }
+}
+
+/// Answer every queued dmabuf import, importing it to find out.
+///
+/// Every backend must call this once per frame, with the renderer's context
+/// current. A notifier that is never answered leaves the client waiting for a
+/// buffer that is never acknowledged: the window maps, takes its configure, and
+/// then never paints. Only `wl_shm` clients — the panel — stay visible, which
+/// makes it look like a client bug rather than a missing call.
+pub(crate) fn import_pending<R: ImportDma>(renderer: &mut R, state: &mut Huginn) {
+    for (dmabuf, notifier) in state.take_pending_dmabufs() {
+        match renderer.import_dmabuf(&dmabuf, None) {
+            Ok(_texture) => {
+                let _ = notifier.successful::<Huginn>();
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "rejected a client dmabuf");
+                notifier.failed();
+            }
+        }
     }
 }
 
