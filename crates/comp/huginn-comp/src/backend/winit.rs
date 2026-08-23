@@ -3,9 +3,23 @@
 //! This is the development backend. It needs no seat, no DRM master and no TTY,
 //! so it can be driven entirely over ssh — which the udev backend cannot, since
 //! logind only grants DRM master to the active session on a seat.
+//!
+//! # Event loop
+//!
+//! Everything hangs off one calloop `EventLoop`: the listening socket, the
+//! Wayland display's poll fd, and winit's own event source. That structure is
+//! not needed for winit alone — a pump loop worked — but the udev backend has
+//! to multiplex DRM vblank, libinput and session signals, and retrofitting an
+//! event loop underneath a working DRM backend is far worse than putting one in
+//! first.
+//!
+//! Rendering is damage-driven: the loop wakes on a short timeout but only draws
+//! when something asked it to. An idle desktop does no GPU work. Animating
+//! clients keep themselves going, because every buffer they commit sets the
+//! flag that produces the next frame callback.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use smithay::{
@@ -13,27 +27,29 @@ use smithay::{
         egl::EGLDevice,
         input::{Event as _, InputEvent, KeyboardKeyEvent},
         renderer::{
-            Color32F, Frame, Renderer,
+            Color32F, Frame, ImportDma, Renderer,
             element::{
                 Kind,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
-            ImportDma,
             gles::GlesRenderer,
             utils::draw_render_elements,
         },
-        winit::{self, WinitEvent},
+        winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    input::keyboard::{FilterResult, keysyms},
+    input::keyboard::{FilterResult, KeyboardHandle, keysyms},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        wayland_server::{Display, ListeningSocket, protocol::wl_surface::WlSurface},
-        winit::platform::pump_events::PumpStatus,
+        calloop::{
+            EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic,
+        },
+        wayland_server::{Display, protocol::wl_surface::WlSurface},
     },
     utils::{Rectangle, SERIAL_COUNTER, Transform},
     wayland::{
         compositor::{SurfaceAttributes, TraversalAction, with_surface_tree_downward},
         shell::wlr_layer::Layer,
+        socket::ListeningSocketSource,
     },
 };
 
@@ -43,6 +59,13 @@ use crate::state::{ClientState, Huginn};
 
 /// Background colour of an empty workspace.
 const CLEAR: Color32F = Color32F::new(0.06, 0.06, 0.09, 1.0);
+
+/// How long the loop sleeps when nothing is happening.
+///
+/// Not a frame budget — the loop wakes this often but only renders when there
+/// is something to render. It exists so a missed redraw flag costs one frame of
+/// latency rather than freezing the display until the next client commit.
+const TICK: Duration = Duration::from_millis(16);
 
 /// A keybinding resolved to an intent.
 ///
@@ -61,11 +84,27 @@ enum Action {
     Quit,
 }
 
+/// Everything the event-loop callbacks touch.
+struct Nested {
+    state: Huginn,
+    display: Display<Huginn>,
+    backend: WinitGraphicsBackend<GlesRenderer>,
+    output: Output,
+    keyboard: KeyboardHandle<Huginn>,
+    socket: String,
+    start: Instant,
+    signal: LoopSignal,
+}
+
 pub(crate) fn run() -> Result<()> {
+    let mut event_loop: EventLoop<Nested> = EventLoop::try_new().context("creating event loop")?;
+    let handle = event_loop.handle();
+    let signal = event_loop.get_signal();
+
     let mut display: Display<Huginn> = Display::new().context("creating wayland display")?;
     let dh = display.handle();
 
-    let (mut backend, mut winit_loop) =
+    let (mut backend, winit_source) =
         winit::init::<GlesRenderer>().map_err(|e| anyhow::anyhow!("winit backend: {e}"))?;
 
     let size = backend.window_size();
@@ -104,110 +143,118 @@ pub(crate) fn run() -> Result<()> {
     output.set_preferred(mode);
     state.add_output(&output, &dh);
 
-    // bind_auto picks the first free name, so a second instance does not fail
-    // to start just because the first one has wayland-1.
-    let listener = ListeningSocket::bind_auto("huginn", 1..32)
-        .context("binding wayland socket")?;
-    let socket_name = listener
-        .socket_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // new_auto picks the first free name, so a second instance does not fail to
+    // start just because the first one has huginn-1.
+    let socket_source = ListeningSocketSource::new_auto().context("binding wayland socket")?;
+    let socket = socket_source.socket_name().to_string_lossy().into_owned();
 
+    handle
+        .insert_source(socket_source, |stream, _, data: &mut Nested| {
+            if let Err(e) = data
+                .display
+                .handle()
+                .insert_client(stream, Arc::new(ClientState::default()))
+            {
+                tracing::warn!(error = %e, "could not accept a client");
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("wayland socket source: {e}"))?;
+
+    // Level-triggered: if a dispatch leaves requests unread, the loop wakes
+    // again immediately rather than stalling until the next client writes.
+    let poll_fd = display
+        .backend()
+        .poll_fd()
+        .try_clone_to_owned()
+        .context("cloning the display poll fd")?;
+    handle
+        .insert_source(
+            Generic::new(poll_fd, Interest::READ, CalloopMode::Level),
+            |_, _, data: &mut Nested| {
+                data.display
+                    .dispatch_clients(&mut data.state)
+                    .map_err(std::io::Error::other)?;
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("wayland display source: {e}"))?;
+
+    handle
+        .insert_source(winit_source, |event, _, data: &mut Nested| {
+            data.on_winit(event);
+        })
+        .map_err(|e| anyhow::anyhow!("winit source: {e}"))?;
+
+    // Cloned rather than fetched per event: get_keyboard borrows the seat out
+    // of Huginn, which conflicts with passing Huginn itself to keyboard.input.
     let keyboard = state
         .seat
         .add_keyboard(Default::default(), 200, 25)
         .context("adding keyboard")?;
 
-    tracing::info!(socket = %socket_name, "huginn is up");
-    tracing::info!("clients: WAYLAND_DISPLAY={socket_name} <command>");
+    tracing::info!(socket = %socket, "huginn is up");
+    tracing::info!("clients: WAYLAND_DISPLAY={socket} <command>");
     tracing::info!(
         "keys: Super+J/K focus · Super+Return promote · Super+Q close · \
          Super+1-9 workspace · Super+Shift+1-9 move · Super+E spawn · Super+Esc quit"
     );
 
-    let start = Instant::now();
-    let mut clients = Vec::new();
+    let mut data = Nested {
+        state,
+        display,
+        backend,
+        output,
+        keyboard,
+        socket,
+        start: Instant::now(),
+        signal,
+    };
 
-    loop {
-        let mut actions: Vec<Action> = Vec::new();
-        let mut resized: Option<_> = None;
-
-        let status = winit_loop.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { size, .. } => resized = Some(size),
-            WinitEvent::CloseRequested => actions.push(Action::Quit),
-            WinitEvent::Input(InputEvent::Keyboard { event }) => {
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = event.time_msec();
-                let action = keyboard.input::<Action, _>(
-                    &mut state,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    time,
-                    |_state, modifiers, handle| {
-                        if !modifiers.logo {
-                            return FilterResult::Forward;
-                        }
-                        let sym = handle.modified_sym().raw();
-                        let action = match sym {
-                            keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
-                            keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
-                            keysyms::KEY_Return => Action::PromoteFocused,
-                            keysyms::KEY_q | keysyms::KEY_Q => Action::CloseFocused,
-                            keysyms::KEY_e | keysyms::KEY_E => Action::Spawn,
-                            keysyms::KEY_Escape => Action::Quit,
-                            // Shift+digit gives the punctuation keysyms, which
-                            // is how "move to workspace" is told apart from
-                            // "switch to workspace" without reading modifiers.
-                            keysyms::KEY_1..=keysyms::KEY_9 => {
-                                Action::Workspace((sym - keysyms::KEY_1) as usize)
-                            }
-                            keysyms::KEY_exclam => Action::SendToWorkspace(0),
-                            keysyms::KEY_at => Action::SendToWorkspace(1),
-                            keysyms::KEY_numbersign => Action::SendToWorkspace(2),
-                            keysyms::KEY_dollar => Action::SendToWorkspace(3),
-                            keysyms::KEY_percent => Action::SendToWorkspace(4),
-                            _ => return FilterResult::Forward,
-                        };
-                        FilterResult::Intercept(action)
-                    },
-                );
-                if let Some(action) = action {
-                    actions.push(action);
-                }
+    // NOTE: no SIGTERM handling. calloop's signal source needs its `signals`
+    // feature, which smithay does not enable. Fine for a nested dev backend
+    // where Ctrl-C reaches the process directly; the udev backend will need it,
+    // because a compositor killed on a TTY has to hand the session back.
+    event_loop
+        .run(TICK, &mut data, |data| {
+            if let Err(e) = data.dispatch_end_of_cycle() {
+                tracing::error!("{e:#}");
+                data.signal.stop();
             }
-            _ => {}
-        });
+        })
+        .context("running the event loop")?;
 
-        if let PumpStatus::Exit(_) = status {
-            return Ok(());
+    tracing::info!("huginn is down");
+    Ok(())
+}
+
+impl Nested {
+    /// Render if anything asked us to, then flush.
+    fn dispatch_end_of_cycle(&mut self) -> Result<()> {
+        if self.state.take_redraw() {
+            // render flushes internally, before submit blocks.
+            self.render()?;
+        } else {
+            // Flush even without a frame: a client waiting on a configure it
+            // never receives will sit there forever.
+            self.display.flush_clients().context("flushing clients")?;
         }
+        Ok(())
+    }
 
-        if let Some(size) = resized {
-            let mode = Mode { size, refresh: 60_000 };
-            output.change_current_state(Some(mode), None, None, None);
-            // Panels re-anchor and re-reserve first; the window area is
-            // whatever is left over.
-            state.set_output_area(Rect::from_xywh(0, 0, size.w, size.h));
-        }
-
-        for action in actions {
-            if apply(&mut state, action, &socket_name) {
-                return Ok(());
-            }
-        }
-
-        let size = backend.window_size();
+    fn render(&mut self) -> Result<()> {
+        let size = self.backend.window_size();
         let damage = Rectangle::from_size(size);
+
         {
-            let (renderer, mut framebuffer) = backend
+            let (renderer, mut framebuffer) = self
+                .backend
                 .bind()
                 .map_err(|e| anyhow::anyhow!("binding framebuffer: {e}"))?;
 
             // Validate queued dmabuf imports now that the EGL context is
             // current. Every notifier must be answered one way or the other:
             // a client that gets no reply waits forever for its buffer.
-            for (dmabuf, notifier) in state.take_pending_dmabufs() {
+            for (dmabuf, notifier) in self.state.take_pending_dmabufs() {
                 match renderer.import_dmabuf(&dmabuf, None) {
                     Ok(_texture) => {
                         let _ = notifier.successful::<Huginn>();
@@ -227,11 +274,11 @@ pub(crate) fn run() -> Result<()> {
             // covered, so the topmost surface must come first. Reversing this
             // does not just reorder the scene, it paints panels underneath the
             // windows they are supposed to sit above.
-            let overlay = state.layers_on(Layer::Overlay);
-            let top = state.layers_on(Layer::Top);
-            let windows = state.render_list();
-            let bottom = state.layers_on(Layer::Bottom);
-            let background = state.layers_on(Layer::Background);
+            let overlay = self.state.layers_on(Layer::Overlay);
+            let top = self.state.layers_on(Layer::Top);
+            let windows = self.state.render_list();
+            let bottom = self.state.layers_on(Layer::Bottom);
+            let background = self.state.layers_on(Layer::Background);
 
             let scene: Vec<(&WlSurface, Rect)> = overlay
                 .iter()
@@ -277,74 +324,131 @@ pub(crate) fn run() -> Result<()> {
 
             // Layer surfaces need frame callbacks too. A panel that never gets
             // one renders its first frame and then freezes forever.
-            let now = start.elapsed().as_millis() as u32;
+            let now = self.start.elapsed().as_millis() as u32;
             for (surface, _) in &scene {
                 send_frames(surface, now);
             }
-
-            if let Some(stream) = listener.accept().context("accepting client")? {
-                let client = display
-                    .handle()
-                    .insert_client(stream, Arc::new(ClientState::default()))
-                    .context("inserting client")?;
-                clients.push(client);
-            }
-
-            display.dispatch_clients(&mut state).context("dispatching")?;
-            display.flush_clients().context("flushing")?;
         }
 
-        // Must happen after clients are flushed: submit may block, and a client
-        // waiting on an unflushed event would stall behind it.
-        backend
+        // Must happen after the framebuffer borrow ends, and after clients are
+        // flushed: submit may block, and a client waiting on an unflushed event
+        // would stall behind it.
+        self.display.flush_clients().context("flushing clients")?;
+        self.backend
             .submit(Some(&[damage]))
             .map_err(|e| anyhow::anyhow!("submitting frame: {e}"))?;
+        Ok(())
     }
-}
 
-/// Apply a keybinding. Returns true if the compositor should exit.
-fn apply(state: &mut Huginn, action: Action, socket: &str) -> bool {
-    match action {
-        Action::Quit => return true,
-        Action::FocusNext => {
-            state.space.active_workspace_mut().cycle_focus(Direction::Forward);
-        }
-        Action::FocusPrev => {
-            state.space.active_workspace_mut().cycle_focus(Direction::Backward);
-        }
-        Action::PromoteFocused => {
-            state.space.active_workspace_mut().promote_focused();
-        }
-        Action::CloseFocused => {
-            if let Some(surface) = state.space.focused().and_then(|id| state.surface(id)) {
-                // Ask politely. The client unmaps itself, which arrives back as
-                // toplevel_destroyed; killing it here would lose unsaved work.
-                surface.send_close();
+    fn on_winit(&mut self, event: WinitEvent) {
+        match event {
+            WinitEvent::Resized { size, .. } => {
+                let mode = Mode {
+                    size,
+                    refresh: 60_000,
+                };
+                self.output.change_current_state(Some(mode), None, None, None);
+                // Panels re-anchor and re-reserve first; the window area is
+                // whatever is left over.
+                self.state
+                    .set_output_area(Rect::from_xywh(0, 0, size.w, size.h));
             }
-        }
-        Action::Workspace(i) => {
-            state.space.activate_workspace(i);
-        }
-        Action::SendToWorkspace(i) => {
-            state.space.send_focused_to_workspace(i);
-        }
-        Action::Spawn => {
-            let cmd = std::env::var("HUGINN_TERMINAL").unwrap_or_else(|_| "foot".to_owned());
-            // Child processes get the socket through the environment we hand
-            // them, not through std::env::set_var — which is unsafe in edition
-            // 2024 and so unavailable under forbid(unsafe_code).
-            match std::process::Command::new(&cmd)
-                .env("WAYLAND_DISPLAY", socket)
-                .spawn()
-            {
-                Ok(_) => tracing::info!(%cmd, "spawned"),
-                Err(e) => tracing::warn!(%cmd, error = %e, "spawn failed"),
+            WinitEvent::Redraw => self.state.queue_redraw(),
+            WinitEvent::CloseRequested => self.signal.stop(),
+            WinitEvent::Input(InputEvent::Keyboard { event }) => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = event.time_msec();
+                let action = self.keyboard.input::<Action, _>(
+                    &mut self.state,
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    time,
+                    |_state, modifiers, handle| {
+                        if !modifiers.logo {
+                            return FilterResult::Forward;
+                        }
+                        let sym = handle.modified_sym().raw();
+                        let action = match sym {
+                            keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
+                            keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
+                            keysyms::KEY_Return => Action::PromoteFocused,
+                            keysyms::KEY_q | keysyms::KEY_Q => Action::CloseFocused,
+                            keysyms::KEY_e | keysyms::KEY_E => Action::Spawn,
+                            keysyms::KEY_Escape => Action::Quit,
+                            // Shift+digit gives the punctuation keysyms, which
+                            // is how "move to workspace" is told apart from
+                            // "switch to workspace" without reading modifiers.
+                            keysyms::KEY_1..=keysyms::KEY_9 => {
+                                Action::Workspace((sym - keysyms::KEY_1) as usize)
+                            }
+                            keysyms::KEY_exclam => Action::SendToWorkspace(0),
+                            keysyms::KEY_at => Action::SendToWorkspace(1),
+                            keysyms::KEY_numbersign => Action::SendToWorkspace(2),
+                            keysyms::KEY_dollar => Action::SendToWorkspace(3),
+                            keysyms::KEY_percent => Action::SendToWorkspace(4),
+                            _ => return FilterResult::Forward,
+                        };
+                        FilterResult::Intercept(action)
+                    },
+                );
+                if let Some(action) = action {
+                    self.apply(action);
+                }
             }
+            _ => {}
         }
     }
-    state.arrange();
-    state.refresh_focus();
-    false
+
+    /// Apply a keybinding.
+    fn apply(&mut self, action: Action) {
+        let state = &mut self.state;
+        match action {
+            Action::Quit => {
+                self.signal.stop();
+                return;
+            }
+            Action::FocusNext => {
+                state.space.active_workspace_mut().cycle_focus(Direction::Forward);
+            }
+            Action::FocusPrev => {
+                state.space.active_workspace_mut().cycle_focus(Direction::Backward);
+            }
+            Action::PromoteFocused => {
+                state.space.active_workspace_mut().promote_focused();
+            }
+            Action::CloseFocused => {
+                if let Some(surface) = state.space.focused().and_then(|id| state.surface(id)) {
+                    // Ask politely. The client unmaps itself, which arrives back
+                    // as toplevel_destroyed; killing it here would lose unsaved
+                    // work.
+                    surface.send_close();
+                }
+            }
+            Action::Workspace(i) => {
+                state.space.activate_workspace(i);
+            }
+            Action::SendToWorkspace(i) => {
+                state.space.send_focused_to_workspace(i);
+            }
+            Action::Spawn => {
+                let cmd = std::env::var("HUGINN_TERMINAL").unwrap_or_else(|_| "foot".to_owned());
+                // Child processes get the socket through the environment we hand
+                // them, not through std::env::set_var — which is unsafe in
+                // edition 2024 and therefore unavailable under
+                // forbid(unsafe_code).
+                match std::process::Command::new(&cmd)
+                    .env("WAYLAND_DISPLAY", &self.socket)
+                    .spawn()
+                {
+                    Ok(_) => tracing::info!(%cmd, "spawned"),
+                    Err(e) => tracing::warn!(%cmd, error = %e, "spawn failed"),
+                }
+            }
+        }
+        self.state.arrange();
+        self.state.refresh_focus();
+    }
 }
 
 /// Release frame callbacks so clients know they may draw again.

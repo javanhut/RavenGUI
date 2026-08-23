@@ -82,6 +82,9 @@ pub(crate) struct Huginn {
     /// backends discover their render node differently.
     pub dmabuf_global: Option<DmabufGlobal>,
     pub(crate) pending_dmabufs: crate::dmabuf::PendingImports,
+    /// Set whenever something on screen changed. The backend renders only when
+    /// this is set, so an idle desktop does no GPU work.
+    needs_redraw: bool,
     pub shm_state: ShmState,
     /// Held, not read: dropping this would withdraw the xdg-output global
     /// and clients would lose their output information mid-session.
@@ -118,6 +121,9 @@ impl Huginn {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             pending_dmabufs: crate::dmabuf::PendingImports::default(),
+            // The first frame has to happen unprompted: nothing has committed
+            // yet, so nothing would otherwise ask for it.
+            needs_redraw: true,
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             seat_state,
@@ -192,6 +198,16 @@ impl Huginn {
             .collect()
     }
 
+    /// Ask the backend to draw a frame.
+    pub(crate) fn queue_redraw(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    /// Consume the redraw request, if there is one.
+    pub(crate) fn take_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.needs_redraw)
+    }
+
     /// The surface backing `id`, if it is still mapped.
     pub(crate) fn surface(&self, id: WindowId) -> Option<&ToplevelSurface> {
         self.toplevels.get(&id)
@@ -234,6 +250,7 @@ impl Huginn {
         // index runs through arrange, so this is the one place the shell needs
         // to be told. broadcast_workspaces suppresses no-op events itself.
         self.broadcast_workspaces();
+        self.queue_redraw();
     }
 
     /// Give keyboard focus to the core's focused window, and mark it activated
@@ -285,6 +302,7 @@ impl CompositorHandler for Huginn {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.queue_redraw();
 
         // A layer surface sends its anchor, size and exclusive zone before its
         // first commit and expects a configure in response. Doing this on every
