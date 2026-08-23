@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/raven-protocol",
+    "crates/raven-config",
+    "crates/comp/huginn-core",
+    "crates/comp/huginn-comp",
+    "crates/comp/huginn-egl",
+    "crates/shell/muninn",
+    "crates/shell/muninn-lock",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/javanhutchinson/RavenGUI"
+
+# Every crate inherits these via `[lints] workspace = true`.
+# `forbid` cannot be locally overridden by an #[allow] anywhere in the crate.
+# The single exception is `huginn-egl`, which declares its own [lints] table;
+# `scripts/check-unsafe.sh` proves no other crate has quietly done the same.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+todo = "warn"
+dbg_macro = "warn"
+
+[workspace.dependencies]
+raven-config = { path = "crates/raven-config" }
+huginn-core = { path = "crates/comp/huginn-core" }
+huginn-egl = { path = "crates/comp/huginn-egl" }
+raven-protocol = { path = "crates/raven-protocol" }
+
+smithay = { version = "0.7", default-features = false }
+smithay-client-toolkit = "0.21"
+wayland-scanner = "0.31"
+wayland-server = "0.31"
+wayland-client = "0.31"
+wayland-backend = "0.3"
+calloop = "0.14"
+iced = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+
+[profile.dev]
+opt-level = 1          # a compositor at opt-level 0 drops frames while you test
+
+[profile.dev.package."*"]
+opt-level = 3          # deps are rebuilt rarely; always optimize them
