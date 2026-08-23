@@ -14,6 +14,10 @@ mod backend;
 #[cfg(target_os = "linux")]
 mod dmabuf;
 #[cfg(target_os = "linux")]
+mod pointer;
+#[cfg(target_os = "linux")]
+mod render;
+#[cfg(target_os = "linux")]
 mod shell_protocol;
 #[cfg(target_os = "linux")]
 mod state;
@@ -34,14 +38,7 @@ fn main() {
 
         let result = match chosen {
             backend::Backend::Winit => backend::winit::run(),
-            backend::Backend::Udev => {
-                tracing::error!(
-                    "the udev backend is not implemented yet. It also cannot be driven \
-                     over ssh: logind grants DRM master only to the active session on a \
-                     seat, and an ssh login has no seat."
-                );
-                std::process::exit(1);
-            }
+            backend::Backend::Udev => backend::udev::run(),
         };
 
         if let Err(e) = result {

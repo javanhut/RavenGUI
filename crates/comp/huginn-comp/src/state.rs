@@ -19,9 +19,13 @@ use huginn_core::{
 };
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
+    utils::{Logical, Point},
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
-    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
+    input::{
+        Seat, SeatHandler, SeatState,
+        pointer::{CursorImageStatus, PointerHandle},
+    },
     output::Output,
     delegate_layer_shell,
     reexports::{
@@ -93,6 +97,10 @@ pub(crate) struct Huginn {
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub seat: Seat<Self>,
+    /// Pointer position in compositor-global logical coordinates.
+    pub pointer_location: Point<f64, Logical>,
+    /// What the focused client last asked the cursor to look like.
+    pub cursor_status: CursorImageStatus,
 
     /// Window-management policy. The only thing that decides geometry.
     pub space: Space,
@@ -111,7 +119,11 @@ pub(crate) struct Huginn {
 impl Huginn {
     pub(crate) fn new(dh: &DisplayHandle, area: Rect) -> Self {
         let mut seat_state = SeatState::new();
-        let seat = seat_state.new_wl_seat(dh, "huginn");
+        let mut seat = seat_state.new_wl_seat(dh, "huginn");
+        // Advertised for every backend. A seat with no pointer capability makes
+        // toolkits that expect a cursor misbehave, and silently breaks anything
+        // that relies on clicking — including Muninn's workspace pips.
+        seat.add_pointer();
 
         Self {
             compositor_state: CompositorState::new::<Self>(dh),
@@ -129,6 +141,9 @@ impl Huginn {
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
             seat,
+            pointer_location: (0.0, 0.0).into(),
+            // Default until a client sets its own on pointer enter.
+            cursor_status: CursorImageStatus::default_named(),
             space: Space::new(area),
             toplevels: HashMap::new(),
             layers: Vec::new(),
@@ -196,6 +211,46 @@ impl Huginn {
             .filter(|(surface, _)| layer_state(surface).is_some_and(|s| s.layer == layer))
             .map(|(surface, rect)| (surface, *rect))
             .collect()
+    }
+
+    /// The pointer handle. Always present: the seat is built with one.
+    pub(crate) fn pointer(&self) -> PointerHandle<Self> {
+        self.seat
+            .get_pointer()
+            .expect("the seat is constructed with a pointer")
+    }
+
+    /// The full output rectangle, before panels reserve any of it.
+    pub(crate) fn output_area(&self) -> Rect {
+        self.output_area
+    }
+
+    /// Every surface to paint, front to back.
+    ///
+    /// This is the single definition of stacking order, shared by rendering and
+    /// by pointer hit testing. Keeping them on one function is what guarantees
+    /// you can always click the thing you can see: if they were computed
+    /// separately they would eventually disagree, and the bug would look like
+    /// clicks landing on windows hidden behind a panel.
+    pub(crate) fn scene(&self) -> Vec<(&WlSurface, Rect)> {
+        let mut out = Vec::new();
+        for layer in [Layer::Overlay, Layer::Top] {
+            out.extend(self.layers_on(layer).into_iter().map(|(l, r)| (l.wl_surface(), r)));
+        }
+        out.extend(self.render_list().into_iter().map(|(w, r)| (w.wl_surface(), r)));
+        for layer in [Layer::Bottom, Layer::Background] {
+            out.extend(self.layers_on(layer).into_iter().map(|(l, r)| (l.wl_surface(), r)));
+        }
+        out
+    }
+
+    /// The terminal to launch for the spawn binding.
+    ///
+    /// Config decides; the environment variable exists so a single session can
+    /// be started with something else without editing the config file.
+    pub(crate) fn terminal_command(&self) -> String {
+        std::env::var("HUGINN_TERMINAL")
+            .unwrap_or_else(|_| raven_config::Config::default().commands.terminal)
     }
 
     /// Ask the backend to draw a frame.
@@ -390,7 +445,11 @@ impl SeatHandler for Huginn {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_status = image;
+        self.queue_redraw();
+    }
 }
 
 impl SelectionHandler for Huginn {

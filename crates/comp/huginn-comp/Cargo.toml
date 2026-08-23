@@ -26,6 +26,7 @@ raven-protocol = { workspace = true, features = ["server"] }
 smithay = { workspace = true, features = [
     "backend_drm",
     "backend_egl",
+    "backend_gbm",
     "backend_libinput",
     "backend_session_libseat",
     "backend_udev",
@@ -35,6 +36,8 @@ smithay = { workspace = true, features = [
     "wayland_frontend",
 ] }
 calloop.workspace = true
+# Already in the tree via winit; used to load the system cursor theme.
+xcursor = "0.3"
 
 [lints]
 workspace = true
