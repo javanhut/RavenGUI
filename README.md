@@ -103,7 +103,27 @@ virtio-gpu.
 
 ## Status
 
-Scaffolding. `huginn-core` and `raven-config` are real and tested; everything
-else is structure. Neither backend is implemented, and `huginn-egl` is
-deliberately empty — EGL initialisation gets written on the Linux host where it
-can be compiled and run, not guessed at from a machine that cannot link it.
+Working: Huginn runs nested via the winit backend, hosts xdg-shell clients and
+wlr-layer-shell surfaces, and lays both out from `huginn-core`. Muninn draws a
+top panel with workspace pips, receives workspace state over `raven_shell_v1`,
+and switches workspaces when a pip is clicked.
+
+```sh
+./scripts/remote.sh run -p huginn-comp                       # compositor
+WAYLAND_DISPLAY=huginn-1 cargo run -p muninn                 # panel
+WAYLAND_DISPLAY=huginn-1 cargo run -p muninn \
+    --example raven-shell-probe 3                            # protocol probe
+```
+
+Not done yet, roughly in the order they matter:
+
+- **dmabuf** (`zwp_linux_dmabuf_v1`) — clients still fall back to shm, copying
+  every frame through the CPU. Also a prerequisite for udev.
+- **calloop** — the winit loop is a manual pump; udev needs real event sources.
+- **udev/TTY backend** — where `huginn-egl` finally gets written. Cannot be
+  driven over ssh.
+- **Privilege gating** — `raven_shell_v1` is advertised to every client, so any
+  client can currently read workspace state and switch workspaces. Harmless on
+  a single-user session, but it must be gated before anything untrusted runs.
+- **iced** — the panel is software-rendered through `wl_shm`. Deliberate for
+  now; the protocol plumbing does not change when the renderer does.

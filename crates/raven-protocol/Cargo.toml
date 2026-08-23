@@ -16,11 +16,11 @@ client = ["dep:wayland-client"]
 
 [dependencies]
 wayland-backend.workspace = true
+wayland-scanner.workspace = true
 wayland-server = { workspace = true, optional = true }
 wayland-client = { workspace = true, optional = true }
 
-[build-dependencies]
-wayland-scanner.workspace = true
+
 
 [lints]
 workspace = true

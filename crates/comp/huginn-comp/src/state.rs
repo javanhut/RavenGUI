@@ -75,6 +75,7 @@ pub(crate) struct Huginn {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub layer_shell_state: WlrLayerShellState,
+    pub raven_shell: crate::shell_protocol::RavenShellState,
     pub shm_state: ShmState,
     /// Held, not read: dropping this would withdraw the xdg-output global
     /// and clients would lose their output information mid-session.
@@ -107,6 +108,7 @@ impl Huginn {
             compositor_state: CompositorState::new::<Self>(dh),
             xdg_shell_state: XdgShellState::new::<Self>(dh),
             layer_shell_state: WlrLayerShellState::new::<Self>(dh),
+            raven_shell: crate::shell_protocol::RavenShellState::new(dh),
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             seat_state,
@@ -218,6 +220,11 @@ impl Huginn {
             });
             surface.send_configure();
         }
+
+        // Every state change that can alter workspace occupancy or the active
+        // index runs through arrange, so this is the one place the shell needs
+        // to be told. broadcast_workspaces suppresses no-op events itself.
+        self.broadcast_workspaces();
     }
 
     /// Give keyboard focus to the core's focused window, and mark it activated

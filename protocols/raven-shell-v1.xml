@@ -6,14 +6,15 @@
   </copyright>
 
   <description summary="privileged shell protocol for the Huginn compositor">
-    The contract between the Huginn compositor and the muninn desktop shell.
+    The contract between the Huginn compositor and the Muninn desktop shell.
 
     This protocol covers only what no standard protocol provides. Panels, the
     dock and the wallpaper are wlr-layer-shell surfaces; the lock screen is
     ext-session-lock-v1. Do not duplicate those here.
 
-    The compositor only binds this global for clients it considers privileged.
-    An unprivileged client that binds it must be treated as a protocol error.
+    The compositor should only advertise this global to clients it considers
+    privileged. Huginn does not yet enforce that, which is tracked as a gap
+    rather than a design decision.
 
     Stability: additive changes only. Add requests and events and bump the
     interface version; never change or remove an existing one. Keeping to that
@@ -22,8 +23,8 @@
 
   <interface name="raven_shell_manager_v1" version="1">
     <description summary="entry point for the desktop shell">
-      Handed to the shell so it can observe compositor state it cannot see as
-      an ordinary client, such as which workspace is active.
+      Handed to the shell so it can observe compositor state it cannot see as an
+      ordinary Wayland client.
     </description>
 
     <request name="destroy" type="destructor">
@@ -35,17 +36,19 @@
 
     <request name="get_workspace_state">
       <description summary="observe workspace state">
-        Create an object that reports workspace count and which one is active,
-        so a panel can render workspace indicators.
+        Create an object reporting how many workspaces exist, which one is
+        active, and which hold windows, so a panel can render indicators.
+
+        The compositor sends one state event immediately on creation, so a
+        client never has to render a placeholder while it waits.
       </description>
       <arg name="id" type="new_id" interface="raven_workspace_state_v1"/>
     </request>
   </interface>
 
   <interface name="raven_workspace_state_v1" version="1">
-    <description summary="workspace count and active index">
-      On creation the compositor sends the current state, then an update
-      whenever it changes.
+    <description summary="workspace count, active index and occupancy">
+      Created through raven_shell_manager_v1.get_workspace_state.
     </description>
 
     <request name="destroy" type="destructor">
@@ -54,18 +57,24 @@
 
     <request name="activate">
       <description summary="switch to a workspace">
-        Out-of-range indices are ignored rather than clamped.
+        Ask the compositor to make workspace 'index' active.
+
+        An out-of-range index is ignored rather than clamped: clamping would
+        turn a shell bug into a silent jump to an unrelated workspace, which is
+        harder to notice than nothing happening.
       </description>
       <arg name="index" type="uint" summary="zero-based workspace index"/>
     </request>
 
     <event name="state">
       <description summary="workspace state changed">
-        Sent once on creation and again on every change.
+        Sent once when this object is created, and again whenever any field
+        changes. The compositor does not send this event if nothing changed.
       </description>
       <arg name="count" type="uint" summary="total number of workspaces"/>
       <arg name="active" type="uint" summary="zero-based index of the active workspace"/>
-      <arg name="occupied" type="array" summary="one uint32 per workspace: nonzero if it holds windows"/>
+      <arg name="occupied" type="uint"
+           summary="bitmask; bit N is set if workspace N holds at least one window. Caps at 32 workspaces, which is well beyond any sane count"/>
     </event>
   </interface>
 </protocol>
