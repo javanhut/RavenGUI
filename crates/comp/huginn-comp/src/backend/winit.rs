@@ -10,6 +10,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use smithay::{
     backend::{
+        egl::EGLDevice,
         input::{Event as _, InputEvent, KeyboardKeyEvent},
         renderer::{
             Color32F, Frame, Renderer,
@@ -17,6 +18,7 @@ use smithay::{
                 Kind,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
+            ImportDma,
             gles::GlesRenderer,
             utils::draw_render_elements,
         },
@@ -66,16 +68,22 @@ pub(crate) fn run() -> Result<()> {
     let (mut backend, mut winit_loop) =
         winit::init::<GlesRenderer>().map_err(|e| anyhow::anyhow!("winit backend: {e}"))?;
 
-    // NOTE: clients currently fall back to shared-memory buffers, copying every
-    // frame through the CPU, and log `libEGL warning: failed to get driver name`
-    // on startup. The fix is `zwp_linux_dmabuf_v1` (smithay's DmabufState), not
-    // `ImportEgl::bind_wl_display` — that is the legacy wl_drm path and is gated
-    // behind smithay's `use_system_lib`, which would swap the pure-Rust wayland
-    // backend for system libwayland. dmabuf is also what the udev backend needs,
-    // so it gets done once, properly, rather than twice.
-
     let size = backend.window_size();
     let mut state = Huginn::new(&dh, Rect::from_xywh(0, 0, size.w, size.h));
+
+    // Tell clients which GPU to allocate on and which formats we can import.
+    // Failing here is not fatal — clients simply stay on shm — so every branch
+    // warns and carries on rather than aborting startup.
+    match EGLDevice::device_for_display(backend.renderer().egl_context().display())
+        .and_then(|device| device.try_get_render_node())
+    {
+        Ok(Some(node)) => {
+            let formats: Vec<_> = backend.renderer().dmabuf_formats().into_iter().collect();
+            state.enable_dmabuf(&dh, node.dev_id(), formats);
+        }
+        Ok(None) => tracing::warn!("EGL display has no render node; clients stay on shm"),
+        Err(e) => tracing::warn!(error = %e, "could not identify the render node; clients stay on shm"),
+    }
 
     // A real wl_output makes toolkits behave: GTK and Qt both query scale and
     // mode before they will map a window at the right size.
@@ -195,6 +203,21 @@ pub(crate) fn run() -> Result<()> {
             let (renderer, mut framebuffer) = backend
                 .bind()
                 .map_err(|e| anyhow::anyhow!("binding framebuffer: {e}"))?;
+
+            // Validate queued dmabuf imports now that the EGL context is
+            // current. Every notifier must be answered one way or the other:
+            // a client that gets no reply waits forever for its buffer.
+            for (dmabuf, notifier) in state.take_pending_dmabufs() {
+                match renderer.import_dmabuf(&dmabuf, None) {
+                    Ok(_texture) => {
+                        let _ = notifier.successful::<Huginn>();
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "rejected a client dmabuf");
+                        notifier.failed();
+                    }
+                }
+            }
 
             // Geometry comes from huginn-core. Nothing in this loop decides
             // where anything goes.

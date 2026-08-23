@@ -12,6 +12,8 @@
 #[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
+mod dmabuf;
+#[cfg(target_os = "linux")]
 mod shell_protocol;
 #[cfg(target_os = "linux")]
 mod state;

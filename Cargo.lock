@@ -1298,6 +1298,7 @@ dependencies = [
  "calloop 0.14.4",
  "huginn-core",
  "huginn-egl",
+ "libc",
  "raven-config",
  "raven-protocol",
  "smithay",

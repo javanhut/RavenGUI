@@ -115,10 +115,12 @@ WAYLAND_DISPLAY=huginn-1 cargo run -p muninn \
     --example raven-shell-probe 3                            # protocol probe
 ```
 
+Clients get hardware buffers via `zwp_linux_dmabuf_v1`, with the render node
+advertised as the main device so they allocate on the GPU the compositor
+actually renders on.
+
 Not done yet, roughly in the order they matter:
 
-- **dmabuf** (`zwp_linux_dmabuf_v1`) — clients still fall back to shm, copying
-  every frame through the CPU. Also a prerequisite for udev.
 - **calloop** — the winit loop is a manual pump; udev needs real event sources.
 - **udev/TTY backend** — where `huginn-egl` finally gets written. Cannot be
   driven over ssh.
