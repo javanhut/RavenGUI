@@ -88,6 +88,8 @@ impl DmabufHandler for Huginn {
         // renderer is not reachable from here. The backend drains this next
         // frame and answers the notifier either way.
         self.pending_dmabufs.push(dmabuf, notifier);
+        // Only the render loop can answer the notifier, so make sure one runs.
+        self.queue_redraw();
     }
 }
 

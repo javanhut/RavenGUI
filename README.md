@@ -119,9 +119,15 @@ Clients get hardware buffers via `zwp_linux_dmabuf_v1`, with the render node
 advertised as the main device so they allocate on the GPU the compositor
 actually renders on.
 
+The compositor runs on a calloop event loop — listening socket, display poll
+fd, and winit all as event sources — and renders only on damage, so an idle
+session costs ~0.2% of one core.
+
 Not done yet, roughly in the order they matter:
 
-- **calloop** — the winit loop is a manual pump; udev needs real event sources.
+- **SIGTERM handling** — calloop's signal source needs its `signals` feature,
+  which smithay does not enable. Ctrl-C is enough for the nested backend; a
+  compositor killed on a TTY has to hand the session back.
 - **udev/TTY backend** — where `huginn-egl` finally gets written. Cannot be
   driven over ssh.
 - **Privilege gating** — `raven_shell_v1` is advertised to every client, so any
