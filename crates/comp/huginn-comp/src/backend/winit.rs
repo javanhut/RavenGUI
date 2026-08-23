@@ -25,12 +25,13 @@ use smithay::{
     input::keyboard::{FilterResult, keysyms},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        wayland_server::{Display, ListeningSocket},
+        wayland_server::{Display, ListeningSocket, protocol::wl_surface::WlSurface},
         winit::platform::pump_events::PumpStatus,
     },
     utils::{Rectangle, SERIAL_COUNTER, Transform},
-    wayland::compositor::{
-        SurfaceAttributes, TraversalAction, with_surface_tree_downward,
+    wayland::{
+        compositor::{SurfaceAttributes, TraversalAction, with_surface_tree_downward},
+        shell::wlr_layer::Layer,
     },
 };
 
@@ -177,8 +178,9 @@ pub(crate) fn run() -> Result<()> {
         if let Some(size) = resized {
             let mode = Mode { size, refresh: 60_000 };
             output.change_current_state(Some(mode), None, None, None);
-            state.space.set_area(Rect::from_xywh(0, 0, size.w, size.h));
-            state.arrange();
+            // Panels re-anchor and re-reserve first; the window area is
+            // whatever is left over.
+            state.set_output_area(Rect::from_xywh(0, 0, size.w, size.h));
         }
 
         for action in actions {
@@ -195,14 +197,38 @@ pub(crate) fn run() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("binding framebuffer: {e}"))?;
 
             // Geometry comes from huginn-core. Nothing in this loop decides
-            // where a window goes.
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
-                .render_list()
-                .into_iter()
+            // where anything goes.
+            //
+            // Order is front-to-back: draw_render_elements accumulates opaque
+            // regions as it walks the slice and skips whatever is already
+            // covered, so the topmost surface must come first. Reversing this
+            // does not just reorder the scene, it paints panels underneath the
+            // windows they are supposed to sit above.
+            let overlay = state.layers_on(Layer::Overlay);
+            let top = state.layers_on(Layer::Top);
+            let windows = state.render_list();
+            let bottom = state.layers_on(Layer::Bottom);
+            let background = state.layers_on(Layer::Background);
+
+            let scene: Vec<(&WlSurface, Rect)> = overlay
+                .iter()
+                .chain(top.iter())
+                .map(|(l, r)| (l.wl_surface(), *r))
+                .chain(windows.iter().map(|(w, r)| (w.wl_surface(), *r)))
+                .chain(
+                    bottom
+                        .iter()
+                        .chain(background.iter())
+                        .map(|(l, r)| (l.wl_surface(), *r)),
+                )
+                .collect();
+
+            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = scene
+                .iter()
                 .flat_map(|(surface, rect)| {
                     render_elements_from_surface_tree(
                         renderer,
-                        surface.wl_surface(),
+                        surface,
                         (rect.x(), rect.y()),
                         1.0,
                         1.0,
@@ -226,9 +252,11 @@ pub(crate) fn run() -> Result<()> {
                 .finish()
                 .map_err(|e| anyhow::anyhow!("finishing frame: {e}"))?;
 
+            // Layer surfaces need frame callbacks too. A panel that never gets
+            // one renders its first frame and then freezes forever.
             let now = start.elapsed().as_millis() as u32;
-            for (surface, _) in state.render_list() {
-                send_frames(surface.wl_surface(), now);
+            for (surface, _) in &scene {
+                send_frames(surface, now);
             }
 
             if let Some(stream) = listener.accept().context("accepting client")? {
@@ -297,7 +325,7 @@ fn apply(state: &mut Huginn, action: Action, socket: &str) -> bool {
 }
 
 /// Release frame callbacks so clients know they may draw again.
-fn send_frames(surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface, time: u32) {
+fn send_frames(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
         (),
