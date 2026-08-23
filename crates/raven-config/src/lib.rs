@@ -11,6 +11,26 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub layout: LayoutConfig,
+    pub commands: CommandsConfig,
+}
+
+/// Programs the desktop launches on the user's behalf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandsConfig {
+    /// Terminal spawned by the compositor's spawn binding.
+    pub terminal: String,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        Self {
+            // RavenLinux ships its own terminal, so that is what the desktop
+            // opens. Naming a third-party terminal here would make the default
+            // desktop depend on software the distro does not control.
+            terminal: "raven-terminal".to_owned(),
+        }
+    }
 }
 
 /// Tiling parameters. Mirrors the fields of `huginn_core::layout::Columns`;
@@ -63,6 +83,11 @@ mod tests {
         let cfg: Config = toml::from_str("[layout]\ngap = 20\n").expect("partial is valid");
         assert_eq!(cfg.layout.gap, 20);
         assert_eq!(cfg.layout.master_ratio, LayoutConfig::default().master_ratio);
+    }
+
+    #[test]
+    fn the_default_terminal_is_ravens_own() {
+        assert_eq!(Config::default().commands.terminal, "raven-terminal");
     }
 
     #[test]

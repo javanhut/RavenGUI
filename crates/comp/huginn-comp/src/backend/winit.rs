@@ -28,16 +28,12 @@ use smithay::{
         input::{Event as _, InputEvent, KeyboardKeyEvent},
         renderer::{
             Color32F, Frame, ImportDma, Renderer,
-            element::{
-                Kind,
-                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
-            },
             gles::GlesRenderer,
             utils::draw_render_elements,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    input::keyboard::{FilterResult, KeyboardHandle, keysyms},
+    input::keyboard::KeyboardHandle,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -48,13 +44,16 @@ use smithay::{
     utils::{Rectangle, SERIAL_COUNTER, Transform},
     wayland::{
         compositor::{SurfaceAttributes, TraversalAction, with_surface_tree_downward},
-        shell::wlr_layer::Layer,
         socket::ListeningSocketSource,
     },
 };
 
 use huginn_core::{geometry::Rect, workspace::Direction};
 
+use crate::backend::input;
+use crate::backend::keymap::{Action, HELP, resolve};
+use crate::pointer::Cursor;
+use crate::render;
 use crate::state::{ClientState, Huginn};
 
 /// Background colour of an empty workspace.
@@ -67,23 +66,6 @@ const CLEAR: Color32F = Color32F::new(0.06, 0.06, 0.09, 1.0);
 /// latency rather than freezing the display until the next client commit.
 const TICK: Duration = Duration::from_millis(16);
 
-/// A keybinding resolved to an intent.
-///
-/// The keyboard filter runs while the keyboard handle is borrowed, so it cannot
-/// touch compositor state that the follow-up work needs. Returning an intent
-/// and applying it afterwards keeps the borrow checker out of the keymap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
-    FocusNext,
-    FocusPrev,
-    PromoteFocused,
-    CloseFocused,
-    Workspace(usize),
-    SendToWorkspace(usize),
-    Spawn,
-    Quit,
-}
-
 /// Everything the event-loop callbacks touch.
 struct Nested {
     state: Huginn,
@@ -91,6 +73,7 @@ struct Nested {
     backend: WinitGraphicsBackend<GlesRenderer>,
     output: Output,
     keyboard: KeyboardHandle<Huginn>,
+    cursor: Option<Cursor>,
     socket: String,
     start: Instant,
     signal: LoopSignal,
@@ -187,6 +170,20 @@ pub(crate) fn run() -> Result<()> {
 
     // Cloned rather than fetched per event: get_keyboard borrows the seat out
     // of Huginn, which conflicts with passing Huginn itself to keyboard.input.
+    // Loaded once. XCURSOR_THEME/XCURSOR_SIZE are the conventional way users
+    // pick a cursor, so honour them rather than inventing our own setting.
+    let cursor = crate::pointer::Cursor::load(
+        &std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_owned()),
+        "default",
+        std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24),
+    );
+    if cursor.is_none() {
+        tracing::warn!("no cursor theme found; the pointer will be invisible over the background");
+    }
+
     let keyboard = state
         .seat
         .add_keyboard(Default::default(), 200, 25)
@@ -194,10 +191,7 @@ pub(crate) fn run() -> Result<()> {
 
     tracing::info!(socket = %socket, "huginn is up");
     tracing::info!("clients: WAYLAND_DISPLAY={socket} <command>");
-    tracing::info!(
-        "keys: Super+J/K focus · Super+Return promote · Super+Q close · \
-         Super+1-9 workspace · Super+Shift+1-9 move · Super+E spawn · Super+Esc quit"
-    );
+    tracing::info!("{HELP}");
 
     let mut data = Nested {
         state,
@@ -205,6 +199,7 @@ pub(crate) fn run() -> Result<()> {
         backend,
         output,
         keyboard,
+        cursor,
         socket,
         start: Instant::now(),
         signal,
@@ -266,46 +261,9 @@ impl Nested {
                 }
             }
 
-            // Geometry comes from huginn-core. Nothing in this loop decides
-            // where anything goes.
-            //
-            // Order is front-to-back: draw_render_elements accumulates opaque
-            // regions as it walks the slice and skips whatever is already
-            // covered, so the topmost surface must come first. Reversing this
-            // does not just reorder the scene, it paints panels underneath the
-            // windows they are supposed to sit above.
-            let overlay = self.state.layers_on(Layer::Overlay);
-            let top = self.state.layers_on(Layer::Top);
-            let windows = self.state.render_list();
-            let bottom = self.state.layers_on(Layer::Bottom);
-            let background = self.state.layers_on(Layer::Background);
-
-            let scene: Vec<(&WlSurface, Rect)> = overlay
-                .iter()
-                .chain(top.iter())
-                .map(|(l, r)| (l.wl_surface(), *r))
-                .chain(windows.iter().map(|(w, r)| (w.wl_surface(), *r)))
-                .chain(
-                    bottom
-                        .iter()
-                        .chain(background.iter())
-                        .map(|(l, r)| (l.wl_surface(), *r)),
-                )
-                .collect();
-
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = scene
-                .iter()
-                .flat_map(|(surface, rect)| {
-                    render_elements_from_surface_tree(
-                        renderer,
-                        surface,
-                        (rect.x(), rect.y()),
-                        1.0,
-                        1.0,
-                        Kind::Unspecified,
-                    )
-                })
-                .collect();
+            // Geometry comes from huginn-core; stacking order and the cursor
+            // come from render::elements, shared with the udev backend.
+            let elements = render::elements(renderer, &self.state, self.cursor.as_ref());
 
             let mut frame = renderer
                 .render(&mut framebuffer, size, Transform::Flipped180)
@@ -325,7 +283,7 @@ impl Nested {
             // Layer surfaces need frame callbacks too. A panel that never gets
             // one renders its first frame and then freezes forever.
             let now = self.start.elapsed().as_millis() as u32;
-            for (surface, _) in &scene {
+            for (surface, _) in self.state.scene() {
                 send_frames(surface, now);
             }
         }
@@ -364,38 +322,13 @@ impl Nested {
                     event.state(),
                     serial,
                     time,
-                    |_state, modifiers, handle| {
-                        if !modifiers.logo {
-                            return FilterResult::Forward;
-                        }
-                        let sym = handle.modified_sym().raw();
-                        let action = match sym {
-                            keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
-                            keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
-                            keysyms::KEY_Return => Action::PromoteFocused,
-                            keysyms::KEY_q | keysyms::KEY_Q => Action::CloseFocused,
-                            keysyms::KEY_e | keysyms::KEY_E => Action::Spawn,
-                            keysyms::KEY_Escape => Action::Quit,
-                            // Shift+digit gives the punctuation keysyms, which
-                            // is how "move to workspace" is told apart from
-                            // "switch to workspace" without reading modifiers.
-                            keysyms::KEY_1..=keysyms::KEY_9 => {
-                                Action::Workspace((sym - keysyms::KEY_1) as usize)
-                            }
-                            keysyms::KEY_exclam => Action::SendToWorkspace(0),
-                            keysyms::KEY_at => Action::SendToWorkspace(1),
-                            keysyms::KEY_numbersign => Action::SendToWorkspace(2),
-                            keysyms::KEY_dollar => Action::SendToWorkspace(3),
-                            keysyms::KEY_percent => Action::SendToWorkspace(4),
-                            _ => return FilterResult::Forward,
-                        };
-                        FilterResult::Intercept(action)
-                    },
+                    |_state, modifiers, handle| resolve(modifiers, handle.modified_sym().raw()),
                 );
                 if let Some(action) = action {
                     self.apply(action);
                 }
             }
+            WinitEvent::Input(event) => input::handle(&mut self.state, event),
             _ => {}
         }
     }
@@ -432,7 +365,7 @@ impl Nested {
                 state.space.send_focused_to_workspace(i);
             }
             Action::Spawn => {
-                let cmd = std::env::var("HUGINN_TERMINAL").unwrap_or_else(|_| "foot".to_owned());
+                let cmd = self.state.terminal_command();
                 // Child processes get the socket through the environment we hand
                 // them, not through std::env::set_var — which is unsafe in
                 // edition 2024 and therefore unavailable under
