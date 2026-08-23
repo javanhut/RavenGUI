@@ -27,6 +27,7 @@
 //! ```
 
 pub mod geometry;
+pub mod layer;
 pub mod layout;
 pub mod window;
 pub mod workspace;

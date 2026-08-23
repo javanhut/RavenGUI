@@ -11,25 +11,31 @@
 use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 
-use huginn_core::{Space, geometry::Rect, window::WindowId};
+use huginn_core::{
+    Space,
+    geometry::{Rect, Size},
+    layer::{Anchors, Exclusive, Margins, place, usable_area},
+    window::WindowId,
+};
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     output::Output,
+    delegate_layer_shell,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             Client, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
+            protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
         },
     },
     utils::Serial,
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
@@ -37,8 +43,12 @@ use smithay::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
             },
         },
-        shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        shell::{
+            wlr_layer::{
+                Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
+                WlrLayerShellState,
+            },
+            xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
         },
         shm::{ShmHandler, ShmState},
     },
@@ -64,6 +74,7 @@ impl ClientData for ClientState {
 pub(crate) struct Huginn {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
     /// Held, not read: dropping this would withdraw the xdg-output global
     /// and clients would lose their output information mid-session.
@@ -77,6 +88,14 @@ pub(crate) struct Huginn {
     pub space: Space,
     /// Wayland surface for each window the core knows about.
     toplevels: HashMap<WindowId, ToplevelSurface>,
+
+    /// Panels, docks, wallpapers and overlays, with the geometry last sent to
+    /// each. Storing what was sent is what keeps [`Huginn::refresh_layers`]
+    /// from configuring on every commit and driving clients into a redraw loop.
+    layers: Vec<(LayerSurface, Rect)>,
+    /// The whole output, before exclusive zones are subtracted. `space`'s area
+    /// is this minus whatever the panels have claimed.
+    output_area: Rect,
 }
 
 impl Huginn {
@@ -87,6 +106,7 @@ impl Huginn {
         Self {
             compositor_state: CompositorState::new::<Self>(dh),
             xdg_shell_state: XdgShellState::new::<Self>(dh),
+            layer_shell_state: WlrLayerShellState::new::<Self>(dh),
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             seat_state,
@@ -94,7 +114,71 @@ impl Huginn {
             seat,
             space: Space::new(area),
             toplevels: HashMap::new(),
+            layers: Vec::new(),
+            output_area: area,
         }
+    }
+
+    /// Set the full output rectangle and reflow everything beneath it.
+    pub(crate) fn set_output_area(&mut self, area: Rect) {
+        self.output_area = area;
+        self.refresh_layers();
+    }
+
+    /// Reposition every layer surface, recompute the area left for windows, and
+    /// configure whatever changed.
+    ///
+    /// Called on every commit, so it must be cheap and must not send a
+    /// configure unless geometry actually moved — a client that receives a
+    /// configure it did not need will redraw, commit, and land right back here.
+    pub(crate) fn refresh_layers(&mut self) {
+        let output = self.output_area;
+        let mut zones = Vec::new();
+        let mut updates = Vec::new();
+
+        for (index, (surface, last)) in self.layers.iter().enumerate() {
+            let Some(state) = layer_state(surface) else {
+                continue;
+            };
+            let rect = place(output, state.anchors, state.desired, state.margins);
+
+            // A negative exclusive zone means "ignore other panels and use the
+            // whole output"; only a positive one reserves space.
+            if state.exclusive > 0
+                && let Some(edge) = state.anchors.exclusive_edge()
+            {
+                zones.push(Exclusive { edge, size: state.exclusive });
+            }
+
+            if rect != *last {
+                updates.push((index, rect));
+            }
+        }
+
+        for (index, rect) in updates {
+            let (surface, last) = &mut self.layers[index];
+            *last = rect;
+            surface.with_pending_state(|pending| {
+                pending.size = Some((rect.w(), rect.h()).into());
+            });
+            surface.send_configure();
+        }
+
+        let usable = usable_area(output, &zones);
+        if usable != self.space.area() {
+            tracing::debug!(?usable, panels = zones.len(), "usable area changed");
+            self.space.set_area(usable);
+        }
+        self.arrange();
+    }
+
+    /// Layer surfaces on `layer`, with their geometry, for rendering.
+    pub(crate) fn layers_on(&self, layer: Layer) -> Vec<(&LayerSurface, Rect)> {
+        self.layers
+            .iter()
+            .filter(|(surface, _)| layer_state(surface).is_some_and(|s| s.layer == layer))
+            .map(|(surface, rect)| (surface, *rect))
+            .collect()
     }
 
     /// The surface backing `id`, if it is still mapped.
@@ -128,6 +212,7 @@ impl Huginn {
             let Some(surface) = self.toplevels.get(&id) else {
                 continue;
             };
+            tracing::debug!(window = id.raw(), ?rect, "configure");
             surface.with_pending_state(|state| {
                 state.size = Some((rect.w(), rect.h()).into());
             });
@@ -184,6 +269,18 @@ impl CompositorHandler for Huginn {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // A layer surface sends its anchor, size and exclusive zone before its
+        // first commit and expects a configure in response. Doing this on every
+        // commit covers both that first configure and any later change, without
+        // needing to track which is which.
+        if self
+            .layers
+            .iter()
+            .any(|(l, _)| l.wl_surface() == surface)
+        {
+            self.refresh_layers();
+        }
     }
 }
 
@@ -277,6 +374,37 @@ impl ServerDndGrabHandler for Huginn {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
 }
 
+impl WlrLayerShellHandler for Huginn {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        _output: Option<WlOutput>,
+        layer: Layer,
+        namespace: String,
+    ) {
+        tracing::debug!(%namespace, ?layer, "layer surface created");
+        // Only record it. Do NOT configure yet: the client sets its anchor,
+        // size and exclusive zone *after* creating the surface and before its
+        // first commit, so configuring here would compute geometry from empty
+        // state and send a bogus size the client has to correct. The commit
+        // hook sends the real initial configure a moment later.
+        //
+        // Rect::ZERO as the "last sent" geometry guarantees that first
+        // refresh_layers sees a change and does configure.
+        self.layers.push((surface, Rect::ZERO));
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.layers.retain(|(l, _)| l != &surface);
+        tracing::debug!(remaining = self.layers.len(), "layer surface destroyed");
+        self.refresh_layers();
+    }
+}
+
 impl OutputHandler for Huginn {}
 
 delegate_compositor!(Huginn);
@@ -285,3 +413,50 @@ delegate_shm!(Huginn);
 delegate_seat!(Huginn);
 delegate_data_device!(Huginn);
 delegate_output!(Huginn);
+delegate_layer_shell!(Huginn);
+
+/// What a layer surface has asked for, translated out of Wayland vocabulary and
+/// into the plain geometry types `huginn-core` works in.
+struct LayerRequest {
+    anchors: Anchors,
+    desired: Size,
+    margins: Margins,
+    exclusive: i32,
+    layer: Layer,
+}
+
+/// Read a layer surface's committed state.
+///
+/// Returns `None` before the client's first commit, when there is nothing to
+/// place yet.
+fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
+    use smithay::wayland::shell::wlr_layer::{Anchor, ExclusiveZone};
+
+    if !surface.alive() {
+        return None;
+    }
+    let state = with_states(surface.wl_surface(), |states| {
+        *states.cached_state.get::<LayerSurfaceCachedState>().current()
+    });
+
+    Some(LayerRequest {
+        anchors: Anchors {
+            top: state.anchor.contains(Anchor::TOP),
+            bottom: state.anchor.contains(Anchor::BOTTOM),
+            left: state.anchor.contains(Anchor::LEFT),
+            right: state.anchor.contains(Anchor::RIGHT),
+        },
+        desired: Size::new(state.size.w, state.size.h),
+        margins: Margins {
+            top: state.margin.top,
+            right: state.margin.right,
+            bottom: state.margin.bottom,
+            left: state.margin.left,
+        },
+        exclusive: match state.exclusive_zone {
+            ExclusiveZone::Exclusive(n) => n as i32,
+            ExclusiveZone::Neutral | ExclusiveZone::DontCare => 0,
+        },
+        layer: state.layer,
+    })
+}

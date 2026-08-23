@@ -14,6 +14,9 @@
 //! else, and it can be restarted — or rebuilt and swapped — without disturbing
 //! a running session.
 
+#[cfg(target_os = "linux")]
+mod panel;
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -24,9 +27,10 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     {
-        let config = raven_config::Config::default();
-        tracing::info!(?config, "muninn starting");
-        tracing::warn!("no surfaces implemented yet; exiting");
+        if let Err(e) = panel::run() {
+            tracing::error!("{e:#}");
+            std::process::exit(1);
+        }
     }
 
     #[cfg(not(target_os = "linux"))]

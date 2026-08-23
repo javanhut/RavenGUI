@@ -1862,6 +1862,7 @@ dependencies = [
 name = "muninn"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "iced",
  "raven-config",
  "raven-protocol",
