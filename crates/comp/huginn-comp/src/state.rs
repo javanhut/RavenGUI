@@ -53,7 +53,10 @@ use smithay::{
                 Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
                 WlrLayerShellState,
             },
-            xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
+            xdg::{
+                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+                XdgToplevelSurfaceData,
+            },
         },
         shm::{ShmHandler, ShmState},
     },
@@ -84,6 +87,24 @@ pub(crate) enum SceneItem<'a> {
     /// frame callback to.
     Ring(&'a SolidColorBuffer, Rect),
 }
+
+/// Applications that drive the `Super` layer themselves.
+///
+/// `Super`+`C` in RavenTerminal is already copy — `Super` is its leader, the
+/// way `Cmd` is on macOS. Translating for it would replace a working copy with
+/// `Ctrl`+`C`, which a terminal reads as SIGINT and delivers to whatever is
+/// running. Getting this wrong kills someone's job instead of copying a line,
+/// so an application that names itself and is not on this list gets the
+/// translation, and one that gives no name at all does not: a client with no
+/// `app_id` cannot be told apart from a terminal with no `app_id`.
+const SUPER_IS_THEIRS: &[&str] = &[
+    "raven-terminal",
+    "Alacritty",
+    "com.mitchellh.ghostty",
+    "foot",
+    "kitty",
+    "org.wezfurlong.wezterm",
+];
 
 /// Colour of the ring drawn around the focused window.
 ///
@@ -303,6 +324,36 @@ impl Huginn {
         self.scene().into_iter().filter_map(|item| match item {
             SceneItem::Surface(surface, rect) => Some((surface, rect)),
             SceneItem::Ring(..) => None,
+        })
+    }
+
+    /// Whether the focused client handles the `Super` layer itself.
+    ///
+    /// Decides who answers `Super`+`C`. An unnamed or absent focus counts as
+    /// theirs: the safe answer is to leave the keystroke alone, since the harm
+    /// of translating for a terminal is worse than the harm of not translating
+    /// for an application that would have liked it.
+    pub(crate) fn focus_owns_super(&self) -> bool {
+        let Some(app_id) = self.focused_app_id() else {
+            return true;
+        };
+        SUPER_IS_THEIRS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&app_id))
+    }
+
+    /// The `app_id` the focused window advertised, if it advertised one.
+    fn focused_app_id(&self) -> Option<String> {
+        let id = self.space.focused()?;
+        let toplevel = self.toplevels.get(&id)?;
+        with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()?
+                .lock()
+                .ok()?
+                .app_id
+                .clone()
         })
     }
 

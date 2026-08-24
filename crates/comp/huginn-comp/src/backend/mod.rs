@@ -1,5 +1,6 @@
 //! Backends: the two ways Huginn can reach a screen.
 
+pub(crate) mod chord;
 pub(crate) mod input;
 pub(crate) mod keymap;
 pub(crate) mod udev;
