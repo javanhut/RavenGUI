@@ -318,7 +318,9 @@ impl Blur {
             for element in elements {
                 let _ = RenderElement::draw(element, &mut frame, element.src(), element.geometry(1.0.into()), &[full], &[]);
             }
-            frame.finish().ok()?;
+            // The sync point is dropped: the next pass samples this texture
+            // through the same context, which orders them for us.
+            let _sync = frame.finish().ok()?;
         }
 
         // Pass 1: horizontal, `scene` into `horizontal`.
@@ -337,7 +339,7 @@ impl Blur {
                 sigma,
             );
             let _ = RenderElement::draw(&element, &mut frame, element.src(), element.geometry(1.0.into()), &[full], &[]);
-            frame.finish().ok()?;
+            let _sync = frame.finish().ok()?;
         }
 
         // Pass 2 is the caller's: the vertical pass is this element, drawn into
