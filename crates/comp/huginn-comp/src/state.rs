@@ -842,6 +842,7 @@ impl Huginn {
     ///
     /// Zero when no panel is open, which is what lets the renderer take the
     /// ordinary path unchanged for the overwhelming majority of frames.
+    #[allow(dead_code)]
     pub(crate) fn blur_radius(&self) -> f32 {
         crate::blur::radius_for(self.launcher.reveal(self.uptime()))
     }
