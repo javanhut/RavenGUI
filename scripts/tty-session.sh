@@ -106,7 +106,7 @@ if ! start_terminal "$TERMINAL"; then
     echo "  If it is raven-terminal, it is probably an X11-only build:"
     echo "    cd ~/Development/RavenTerminal && make build BACKEND=wayland"
     echo "  Falling back to kitty so this session is not empty."
-    start_terminal kitty || echo "  kitty unavailable too; Super+E still works if you install one."
+    start_terminal kitty || echo "  kitty unavailable too; Super+E/T still works if you install one."
 fi
 
 wait "$HUGINN"

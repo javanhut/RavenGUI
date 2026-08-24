@@ -147,6 +147,23 @@ impl Workspace {
         true
     }
 
+    /// Exchange the positions of two windows in the order.
+    ///
+    /// Focus is tracked by id, not by index, so whichever of the two held it
+    /// keeps it — the window travels and the focus goes with it, which is what
+    /// makes a directional move feel like dragging rather than like swapping
+    /// two things and being left behind.
+    pub fn swap(&mut self, a: WindowId, b: WindowId) -> bool {
+        let (Some(i), Some(j)) = (self.index_of(a), self.index_of(b)) else {
+            return false;
+        };
+        if i == j {
+            return false;
+        }
+        self.windows.swap(i, j);
+        true
+    }
+
     /// Promote the focused window to the master slot.
     pub fn promote_focused(&mut self) -> bool {
         let Some(current) = self.focus.and_then(|f| self.index_of(f)) else {
@@ -267,6 +284,23 @@ mod tests {
         assert!(w.shift_focused(Direction::Forward));
         assert_eq!(w.windows(), &[id(2), id(1), id(3)]);
         assert_eq!(w.focused(), Some(id(1)));
+    }
+
+    #[test]
+    fn swap_exchanges_positions_and_keeps_focus() {
+        let mut w = ws_with(3);
+        w.focus(id(1));
+        assert!(w.swap(id(1), id(3)));
+        assert_eq!(w.windows(), &[id(3), id(2), id(1)]);
+        assert_eq!(w.focused(), Some(id(1)), "focus followed the window");
+    }
+
+    #[test]
+    fn swapping_with_an_absent_or_identical_window_is_a_no_op() {
+        let mut w = ws_with(2);
+        assert!(!w.swap(id(1), id(99)));
+        assert!(!w.swap(id(1), id(1)));
+        assert_eq!(w.windows(), &[id(1), id(2)]);
     }
 
     #[test]

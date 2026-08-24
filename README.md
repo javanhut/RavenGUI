@@ -108,6 +108,12 @@ wlr-layer-shell surfaces, and lays both out from `huginn-core`. Muninn draws a
 top panel with workspace pips, receives workspace state over `raven_shell_v1`,
 and switches workspaces when a pip is clicked.
 
+The focused window wears a ring in the same accent the panel uses, and
+`Super`+arrows move it between tiles. Neighbours are found by position rather
+than by list order — with a master column beside a stack the two disagree — and
+a direction with nothing squarely that way does nothing rather than sending the
+window off diagonally.
+
 The udev/TTY backend drives real hardware: a libseat session, DRM/KMS scan-out
 through GBM, libinput, VT switching, and monitor hotplug. udev has no notion of
 a connector — plugging a monitor in shows up as a `Changed` event on the GPU's

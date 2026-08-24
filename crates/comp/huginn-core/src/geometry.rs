@@ -19,6 +19,60 @@ impl Point {
     }
 }
 
+/// A cardinal direction, for finding a tile by where it is rather than by
+/// where it sits in a list.
+///
+/// List order and screen position are not the same thing: in a master-and-stack
+/// layout the window to the right of the master is the second in the list, but
+/// the window below *that* one is the third — so "move right" and "move down"
+/// cannot both be list arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Dir {
+    /// True if `to` lies on this side of `from`, judged by their centres.
+    ///
+    /// Centres rather than edges, because tiles share edges: two windows in a
+    /// column touch, and an edge test would call each of them both above and
+    /// below the other.
+    pub const fn advances(self, from: Rect, to: Rect) -> bool {
+        self.distance(from, to) > 0
+    }
+
+    /// True if the two rects share any extent across the axis of travel.
+    ///
+    /// A neighbour must be aligned as well as [`advances`](Self::advances), or a
+    /// direction picks up diagonals: the top window of a stack sits higher than
+    /// a full-height master column beside it, so by centres alone it is "up"
+    /// from the master. Pressing up there and watching a window fly off to the
+    /// right is not what the key says it does. Requiring alignment means a
+    /// direction with nothing squarely that way does nothing at all.
+    pub const fn aligned(self, from: Rect, to: Rect) -> bool {
+        match self {
+            Self::Left | Self::Right => from.origin.y < to.bottom() && to.origin.y < from.bottom(),
+            Self::Up | Self::Down => from.origin.x < to.right() && to.origin.x < from.right(),
+        }
+    }
+
+    /// How far `to` lies along this direction, centre to centre. Only
+    /// meaningful for a rect that [`advances`](Self::advances).
+    pub const fn distance(self, from: Rect, to: Rect) -> i32 {
+        let a = from.center();
+        let b = to.center();
+        match self {
+            Self::Left => a.x - b.x,
+            Self::Right => b.x - a.x,
+            Self::Up => a.y - b.y,
+            Self::Down => b.y - a.y,
+        }
+    }
+}
+
 /// A width/height pair. Both dimensions are clamped to be non-negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Size {
@@ -116,6 +170,23 @@ impl Rect {
         )
     }
 
+    /// The four edges of a ring `width` thick drawn just outside this rect, in
+    /// the order top, bottom, left, right.
+    ///
+    /// Outside rather than inside: the pixels within the rect belong to the
+    /// client, and a ring painted over them hides content the client drew. That
+    /// puts the ring in the layout's gap, so a layout configured with no gap at
+    /// all lets it reach a pixel or two into the neighbour.
+    pub const fn ring(self, width: i32) -> [Self; 4] {
+        let span = self.size.w + width * 2;
+        [
+            Self::from_xywh(self.origin.x - width, self.origin.y - width, span, width),
+            Self::from_xywh(self.origin.x - width, self.bottom(), span, width),
+            Self::from_xywh(self.origin.x - width, self.origin.y, width, self.size.h),
+            Self::from_xywh(self.right(), self.origin.y, width, self.size.h),
+        ]
+    }
+
     /// Clamp this rect to lie inside `bounds`, preferring to move over resize.
     ///
     /// Used to keep a floating window on screen when an output is unplugged or
@@ -161,6 +232,65 @@ mod tests {
     #[test]
     fn inset_collapses_instead_of_inverting() {
         assert!(Rect::from_xywh(0, 0, 10, 10).inset(20).is_empty());
+    }
+
+    #[test]
+    fn a_ring_surrounds_without_covering() {
+        let r = Rect::from_xywh(100, 100, 40, 20);
+        let ring = r.ring(2);
+        for edge in ring {
+            assert!(!edge.overlaps(r), "{edge:?} covers client pixels");
+        }
+        // Corners included: the top and bottom bars run the full span, so the
+        // ring has no gaps where the sides meet them.
+        assert_eq!(ring[0], Rect::from_xywh(98, 98, 44, 2));
+        assert_eq!(ring[1], Rect::from_xywh(98, 120, 44, 2));
+        assert_eq!(ring[2], Rect::from_xywh(98, 100, 2, 20));
+        assert_eq!(ring[3], Rect::from_xywh(140, 100, 2, 20));
+    }
+
+    #[test]
+    fn a_zero_width_ring_is_four_empty_rects() {
+        assert!(Rect::from_xywh(0, 0, 10, 10).ring(0).iter().all(|e| e.is_empty()));
+    }
+
+    #[test]
+    fn direction_reads_centres_not_edges() {
+        let top = Rect::from_xywh(0, 0, 10, 10);
+        let bottom = Rect::from_xywh(0, 10, 10, 10);
+        // The two touch. Only one of the two answers may be true, both ways.
+        assert!(Dir::Down.advances(top, bottom));
+        assert!(!Dir::Up.advances(top, bottom));
+        assert!(Dir::Up.advances(bottom, top));
+        assert!(!Dir::Down.advances(bottom, top));
+    }
+
+    #[test]
+    fn a_window_is_not_its_own_neighbour() {
+        let r = Rect::from_xywh(0, 0, 10, 10);
+        for dir in [Dir::Left, Dir::Right, Dir::Up, Dir::Down] {
+            assert!(!dir.advances(r, r));
+        }
+    }
+
+    #[test]
+    fn alignment_rejects_the_diagonal() {
+        let master = Rect::from_xywh(0, 0, 100, 200);
+        let beside = Rect::from_xywh(110, 0, 100, 100);
+        // Squarely to the right, so right accepts it...
+        assert!(Dir::Right.advances(master, beside) && Dir::Right.aligned(master, beside));
+        // ...and its centre is higher, so up would too if centres were all
+        // that counted. They are not: nothing in that column is above.
+        assert!(Dir::Up.advances(master, beside));
+        assert!(!Dir::Up.aligned(master, beside));
+    }
+
+    #[test]
+    fn distance_grows_with_the_gap() {
+        let from = Rect::from_xywh(0, 0, 10, 10);
+        let near = Rect::from_xywh(20, 0, 10, 10);
+        let far = Rect::from_xywh(200, 0, 10, 10);
+        assert!(Dir::Right.distance(from, near) < Dir::Right.distance(from, far));
     }
 
     #[test]

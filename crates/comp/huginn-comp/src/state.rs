@@ -15,10 +15,10 @@ use huginn_core::{
     Space,
     geometry::{Rect, Size},
     layer::{Anchors, Exclusive, Margins, place, usable_area},
-    window::WindowId,
+    window::{WindowId, WindowMode},
 };
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::renderer::{element::solid::SolidColorBuffer, utils::on_commit_buffer_handler},
     utils::{Logical, Point},
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
@@ -75,6 +75,26 @@ impl ClientData for ClientState {
     }
 }
 
+/// One thing to paint, as [`Huginn::scene`] orders them.
+pub(crate) enum SceneItem<'a> {
+    /// A client surface: window, panel, wallpaper.
+    Surface(&'a WlSurface, Rect),
+    /// One edge of the ring around the focused window. Drawn by the compositor
+    /// itself, so unlike a surface there is no client to click on or to send a
+    /// frame callback to.
+    Ring(&'a SolidColorBuffer, Rect),
+}
+
+/// Colour of the ring drawn around the focused window.
+///
+/// The same accent muninn paints its active workspace pip with. Two different
+/// blues would read as two programs sharing a screen rather than one desktop.
+const FOCUS_RING_COLOR: [f32; 4] = [0.478, 0.635, 0.969, 1.0];
+
+/// Thickness of that ring, in logical pixels. Two is enough to see at a glance
+/// and thin enough to sit inside the layout's default gap.
+const FOCUS_RING_WIDTH: i32 = 2;
+
 /// The compositor.
 pub(crate) struct Huginn {
     pub compositor_state: CompositorState,
@@ -114,6 +134,17 @@ pub(crate) struct Huginn {
     /// The whole output, before exclusive zones are subtracted. `space`'s area
     /// is this minus whatever the panels have claimed.
     output_area: Rect,
+
+    /// The four edges of the focus ring, and where they were last put.
+    ///
+    /// The buffers are kept rather than rebuilt each frame because a buffer
+    /// carries the identity the damage tracker recognises it by. Fresh ones
+    /// every frame would look like four new elements appearing, so no frame
+    /// could ever be reported as unchanged and every redraw would cost a page
+    /// flip. `None` means nothing is ringed: no window is focused, or the
+    /// focused one is fullscreen.
+    focus_ring: [SolidColorBuffer; 4],
+    focus_ring_at: Option<[Rect; 4]>,
 }
 
 impl Huginn {
@@ -148,6 +179,10 @@ impl Huginn {
             toplevels: HashMap::new(),
             layers: Vec::new(),
             output_area: area,
+            focus_ring: std::array::from_fn(|_| {
+                SolidColorBuffer::new((0, 0), FOCUS_RING_COLOR)
+            }),
+            focus_ring_at: None,
         }
     }
 
@@ -225,23 +260,50 @@ impl Huginn {
         self.output_area
     }
 
-    /// Every surface to paint, front to back.
+    /// Everything to paint, front to back.
     ///
     /// This is the single definition of stacking order, shared by rendering and
     /// by pointer hit testing. Keeping them on one function is what guarantees
     /// you can always click the thing you can see: if they were computed
     /// separately they would eventually disagree, and the bug would look like
     /// clicks landing on windows hidden behind a panel.
-    pub(crate) fn scene(&self) -> Vec<(&WlSurface, Rect)> {
+    pub(crate) fn scene(&self) -> Vec<SceneItem<'_>> {
         let mut out = Vec::new();
         for layer in [Layer::Overlay, Layer::Top] {
-            out.extend(self.layers_on(layer).into_iter().map(|(l, r)| (l.wl_surface(), r)));
+            out.extend(
+                self.layers_on(layer)
+                    .into_iter()
+                    .map(|(l, r)| SceneItem::Surface(l.wl_surface(), r)),
+            );
         }
-        out.extend(self.render_list().into_iter().map(|(w, r)| (w.wl_surface(), r)));
+        // Directly above the windows: over its neighbours, whose pixels it
+        // reaches into when the layout leaves no gap, but under a panel or an
+        // overlay, which are entitled to cover the desktop.
+        out.extend(self.focus_ring().into_iter().map(|(b, r)| SceneItem::Ring(b, r)));
+        out.extend(
+            self.render_list()
+                .into_iter()
+                .map(|(w, r)| SceneItem::Surface(w.wl_surface(), r)),
+        );
         for layer in [Layer::Bottom, Layer::Background] {
-            out.extend(self.layers_on(layer).into_iter().map(|(l, r)| (l.wl_surface(), r)));
+            out.extend(
+                self.layers_on(layer)
+                    .into_iter()
+                    .map(|(l, r)| SceneItem::Surface(l.wl_surface(), r)),
+            );
         }
         out
+    }
+
+    /// The surfaces of [`Self::scene`], in the same order.
+    ///
+    /// Hit testing and frame callbacks both want a client on the other end, and
+    /// the focus ring has none.
+    pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (&WlSurface, Rect)> {
+        self.scene().into_iter().filter_map(|item| match item {
+            SceneItem::Surface(surface, rect) => Some((surface, rect)),
+            SceneItem::Ring(..) => None,
+        })
     }
 
     /// The terminal to launch for the spawn binding.
@@ -254,8 +316,49 @@ impl Huginn {
     }
 
     /// Ask the backend to draw a frame.
+    ///
+    /// The focus ring is recomputed here rather than at each of the places that
+    /// can move it. Anything that moves the ring — a focus change, a relayout,
+    /// a window going fullscreen — has to ask for a redraw or the change would
+    /// never reach the screen anyway, which makes this the one hook that cannot
+    /// be forgotten.
     pub(crate) fn queue_redraw(&mut self) {
         self.needs_redraw = true;
+        self.update_focus_ring();
+    }
+
+    /// Point the ring's four buffers at the focused window, or retire them.
+    fn update_focus_ring(&mut self) {
+        let rects = self.focus_ring_rects();
+        for (buffer, rect) in self.focus_ring.iter_mut().zip(rects.unwrap_or_default()) {
+            buffer.resize((rect.w(), rect.h()));
+        }
+        self.focus_ring_at = rects;
+    }
+
+    /// Where the focus ring goes, or `None` when there should not be one.
+    fn focus_ring_rects(&self) -> Option<[Rect; 4]> {
+        let id = self.space.focused()?;
+        // An unmapped window has geometry but nothing on screen; ringing it
+        // would draw a rectangle around empty space.
+        self.toplevels.get(&id)?;
+        let window = self.space.window(id)?;
+        // A fullscreen window covers its output edge to edge. There is nowhere
+        // outside it to put a ring, and the point of fullscreen is that nothing
+        // else is on screen to tell it apart from.
+        if window.mode == WindowMode::Fullscreen {
+            return None;
+        }
+        Some(window.geometry.ring(FOCUS_RING_WIDTH))
+    }
+
+    /// The focus ring's edges, each paired with the buffer that paints it.
+    /// Empty when nothing is ringed.
+    fn focus_ring(&self) -> Vec<(&SolidColorBuffer, Rect)> {
+        let Some(rects) = self.focus_ring_at else {
+            return Vec::new();
+        };
+        self.focus_ring.iter().zip(rects).collect()
     }
 
     /// Consume the redraw request, if there is one.
@@ -335,6 +438,11 @@ impl Huginn {
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, target, Serial::from(0));
         }
+
+        // The ring moved. Click-to-focus arrives here without going through
+        // arrange, so without this a click would move focus and leave the ring
+        // behind on the previous window until something else forced a frame.
+        self.queue_redraw();
     }
 
     /// Attach an output so clients can discover scale, mode, and position.
