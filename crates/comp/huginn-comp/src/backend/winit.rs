@@ -34,7 +34,7 @@ use smithay::{
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     input::keyboard::{KeyboardHandle, Keysym},
-    output::{Mode, Output, PhysicalProperties, Subpixel},
+    output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{
             EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic,
@@ -48,7 +48,11 @@ use smithay::{
     },
 };
 
-use huginn_core::{geometry::Rect, workspace::Direction};
+use huginn_core::{
+    geometry::{Rect, Size},
+    scale::OutputScale,
+    workspace::Direction,
+};
 
 use crate::backend::input;
 use crate::backend::chord;
@@ -75,7 +79,6 @@ struct Nested {
     output: Output,
     keyboard: KeyboardHandle<Huginn>,
     cursor: Option<Cursor>,
-    socket: String,
     start: Instant,
     signal: LoopSignal,
 }
@@ -123,8 +126,19 @@ pub(crate) fn run() -> Result<()> {
         size,
         refresh: 60_000,
     };
-    output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
+    // A nested window reports no physical size, so the scale policy falls back
+    // to 1x. That is correct here and not a limitation: the host compositor
+    // already applied its own scale to the window we were given, and applying
+    // a second one on top would double it.
+    let scale = OutputScale::integer_only(Size::new(size.w, size.h), Size::new(0, 0));
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Flipped180),
+        Some(Scale::Integer(scale.advertised as i32)),
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
+    state.set_output_scale(scale);
     // One output for the life of the process; nothing ever withdraws it.
     let _global = state.add_output(&output, &dh);
 
@@ -191,6 +205,7 @@ pub(crate) fn run() -> Result<()> {
         .add_keyboard(Default::default(), 200, 25)
         .context("adding keyboard")?;
 
+    state.set_socket(socket.clone());
     tracing::info!(socket = %socket, "huginn is up");
     tracing::info!("clients: WAYLAND_DISPLAY={socket} <command>");
     tracing::info!("{}", help_line());
@@ -202,7 +217,6 @@ pub(crate) fn run() -> Result<()> {
         output,
         keyboard,
         cursor,
-        socket,
         start: Instant::now(),
         signal,
     };
@@ -240,6 +254,9 @@ impl Nested {
     }
 
     fn render(&mut self) -> Result<()> {
+        // Advance animations before assembling the scene, so this frame shows
+        // where they are now rather than where they were last frame.
+        self.state.tick_animations();
         let size = self.backend.window_size();
         let damage = Rectangle::from_size(size);
 
@@ -275,7 +292,7 @@ impl Nested {
             // Layer surfaces need frame callbacks too. A panel that never gets
             // one renders its first frame and then freezes forever.
             let now = self.start.elapsed().as_millis() as u32;
-            for (surface, _) in self.state.scene_surfaces() {
+            for (surface, _) in self.state.frame_surfaces() {
                 send_frames(&surface, now);
             }
         }
@@ -313,6 +330,9 @@ impl Nested {
                 // state, but working out whose layer this is needs the focus as it
                 // stands now, not as the keystroke may leave it.
                 let owns_super = self.state.focus_owns_super();
+                // Read before the filter borrows the state.
+                let launcher_open = self.state.launcher.is_open();
+                let settings_open = self.state.settings.is_open();
                 let action = self
                     .keyboard
                     .input::<Option<Action>, _>(
@@ -322,7 +342,15 @@ impl Nested {
                         serial,
                         time,
                         |_state, modifiers, handle| {
-                            resolve(key_state, modifiers, handle.modified_sym().raw(), owns_super)
+                            {
+                                let sym = handle.modified_sym();
+                                // The character the layout produces, so the
+                                // launcher types what the user pressed rather
+                                // than what a US keyboard would have.
+                                let character = sym.key_char();
+                                let launcher = launcher_open.then_some(character);
+                                resolve(key_state, modifiers, sym.raw(), owns_super, launcher, settings_open)
+                            }
                         },
                     )
                     .flatten();
@@ -334,6 +362,7 @@ impl Nested {
             _ => {}
         }
     }
+
 
     /// Apply a keybinding.
     fn apply(&mut self, action: Action, time: u32) {
@@ -381,19 +410,23 @@ impl Nested {
             Action::SendToWorkspace(i) => {
                 state.space.send_focused_to_workspace(i);
             }
-            Action::Spawn => {
-                let cmd = self.state.terminal_command();
-                // Child processes get the socket through the environment we hand
-                // them, not through std::env::set_var — which is unsafe in
-                // edition 2024 and therefore unavailable under
-                // forbid(unsafe_code).
-                match std::process::Command::new(&cmd)
-                    .env("WAYLAND_DISPLAY", &self.socket)
-                    .spawn()
-                {
-                    Ok(_) => tracing::info!(%cmd, "spawned"),
-                    Err(e) => tracing::warn!(%cmd, error = %e, "spawn failed"),
+            Action::OpenSettings => {
+                let now = state.uptime();
+                state.settings.open(now);
+                state.refresh_settings();
+            }
+            Action::Settings(key) => {
+                let now = state.uptime();
+                match state.settings.press(key, now) {
+                    crate::settings::Outcome::Dismissed
+                    | crate::settings::Outcome::Redraw => state.refresh_settings(),
+                    crate::settings::Outcome::Unchanged => {}
                 }
+            }
+            Action::OpenLauncher => state.open_launcher(),
+            Action::Launcher(key) => state.launcher_key(key),
+            Action::Spawn => {
+                state.launch(None, &[state.terminal_command().to_owned()]);
             }
         }
         self.state.arrange();

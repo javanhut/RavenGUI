@@ -40,6 +40,9 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
 
 fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     state.pointer_location = location;
+    // The dock watches the bottom edge. Told before the event is forwarded, so
+    // a reveal and the client's own motion land in the same frame.
+    state.dock_pointer_moved();
     let under = state.surface_under(location);
     let pointer = state.pointer();
     pointer.motion(
@@ -73,6 +76,16 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     let on_popup = state
         .surface_under(state.pointer_location)
         .is_some_and(|(surface, _)| state.is_popup(&surface));
+    // The dock is compositor-drawn, so it is not under the pointer as far as
+    // any client is concerned. It has to be asked first, or a click on it
+    // falls through to whatever window is behind it.
+    if button_state == ButtonState::Pressed
+        && let Some(item) = state.dock_click()
+    {
+        state.activate_dock_item(&item);
+        return;
+    }
+
     if button_state == ButtonState::Pressed
         && !on_popup
         && !state.pointer().is_grabbed()

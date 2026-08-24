@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Start a full Huginn session on the current TTY: compositor, panel, terminal.
+# Start a full Huginn session on the current TTY: compositor and terminal.
+#
+# There is no panel process to start: the shell is drawn by the compositor.
 #
 # Must be run FROM A TTY (Ctrl+Alt+F2), not over ssh. logind grants DRM master
 # only to the active session on a seat, and an ssh login has no seat — the udev
@@ -45,8 +47,7 @@ fi
 
 LOG=${HUGINN_LOG:-/tmp/huginn-session.log}
 BIN=./target/debug/huginn
-PANEL=./target/debug/muninn
-TERMINAL=${HUGINN_TERMINAL:-raven-terminal}
+TERMINAL=raven-terminal
 
 [ -x "$BIN" ]   || { echo "build first: cargo build --workspace"; exit 1; }
 
@@ -82,10 +83,6 @@ fi
 echo "socket: $SOCK"
 export WAYLAND_DISPLAY="$SOCK"
 
-if [ -x "$PANEL" ]; then
-    "$PANEL" >>"$LOG" 2>&1 &
-    CHILDREN+=($!)
-fi
 # Start the configured terminal, but notice if it dies immediately. A terminal
 # built for X11 exits instantly on a Wayland-only compositor, and on a TTY that
 # is indistinguishable from "the compositor drew nothing".

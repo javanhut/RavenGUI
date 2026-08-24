@@ -172,7 +172,8 @@ impl Huginn {
                 grab.ungrab(PopupUngrabStrategy::All);
                 return;
             }
-            keyboard.set_focus(self, grab.current_grab(), serial);
+            // `current_grab` is an Option, so this can clear focus too.
+            self.set_keyboard_focus(grab.current_grab(), serial);
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
 

@@ -8,11 +8,12 @@
 //! where windows go and turns the answer into `xdg_toplevel::configure` events.
 //! Nothing else in this file makes a layout decision.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
 
 use huginn_core::{
     Space,
+    scale::OutputScale,
     geometry::{Rect, Size},
     layer::{Anchors, Exclusive, Margins, place, usable_area},
     window::{WindowId, WindowMode},
@@ -20,11 +21,12 @@ use huginn_core::{
 use smithay::{
     backend::renderer::{
         element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
-        utils::on_commit_buffer_handler,
+        utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     desktop::{PopupKind, PopupManager},
     utils::{Logical, Point},
-    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
+    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_output,
+    delegate_seat, delegate_shm, delegate_viewporter,
     delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
@@ -35,7 +37,7 @@ use smithay::{
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            Client, DisplayHandle,
+            Client, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
             protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
         },
@@ -45,11 +47,14 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
+        fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale},
+        viewporter::ViewporterState,
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+                set_data_device_focus,
             },
         },
         shell::{
@@ -99,7 +104,7 @@ pub(crate) enum SceneItem<'a> {
     /// invisible to hit testing — clicks fall through it to whatever is
     /// underneath, which is right for something that is a label rather than a
     /// window.
-    Overlay(&'a MemoryRenderBuffer, Rect),
+    Overlay(&'a MemoryRenderBuffer, Rect, f32),
 }
 
 /// Applications that drive the `Super` layer themselves.
@@ -120,15 +125,17 @@ const SUPER_IS_THEIRS: &[&str] = &[
     "org.wezfurlong.wezterm",
 ];
 
-/// Colour of the ring drawn around the focused window.
-///
-/// The same accent muninn paints its active workspace pip with. Two different
-/// blues would read as two programs sharing a screen rather than one desktop.
-const FOCUS_RING_COLOR: [f32; 4] = [0.478, 0.635, 0.969, 1.0];
 
-/// Thickness of that ring, in logical pixels. Two is enough to see at a glance
-/// and thin enough to sit inside the layout's default gap.
-const FOCUS_RING_WIDTH: i32 = 2;
+/// Whether `surface` currently holds a buffer.
+///
+/// The one question that decides whether a window is worth drawing. A surface
+/// exists, gets configured, and is laid out well before it has any content, and
+/// the interval is long — a Chromium-based application spends hundreds of
+/// milliseconds between its first commit and its first real frame. Anything
+/// drawn in that window is not the application.
+fn has_buffer(surface: &WlSurface) -> bool {
+    with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
+}
 
 /// The compositor.
 pub(crate) struct Huginn {
@@ -145,6 +152,20 @@ pub(crate) struct Huginn {
     /// this is set, so an idle desktop does no GPU work.
     needs_redraw: bool,
     pub shm_state: ShmState,
+    /// `wp_viewporter`. Held, not read: dropping it withdraws the global.
+    ///
+    /// Required by the integer-scale contract rather than optional polish. A
+    /// client told scale 2 on a panel whose logical size is not a clean half
+    /// needs a viewport to say "this 2x buffer covers exactly this logical
+    /// rectangle"; without one it can only describe whole buffer scales, and
+    /// the odd row at the edge has nowhere to go.
+    #[allow(dead_code)]
+    pub viewporter_state: ViewporterState,
+    /// `wp_fractional_scale_v1`, which this compositor answers with whole
+    /// numbers — see [`Huginn::new_fractional_scale`]. Held, not read:
+    /// dropping it withdraws the global and clients lose the answer.
+    #[allow(dead_code)]
+    pub fractional_scale_state: FractionalScaleManagerState,
     /// Held, not read: dropping this would withdraw the xdg-output global
     /// and clients would lose their output information mid-session.
     #[allow(dead_code)]
@@ -161,6 +182,19 @@ pub(crate) struct Huginn {
     pub space: Space,
     /// Wayland surface for each window the core knows about.
     toplevels: HashMap<WindowId, ToplevelSurface>,
+
+    /// Windows that have committed a buffer, and may therefore be drawn.
+    ///
+    /// A window is in the layout from the moment it is created — it has to be,
+    /// or the first `configure` could not carry the geometry it will actually
+    /// occupy — but it is not on screen until it has produced content. Between
+    /// those two moments its tile is reserved and empty.
+    ///
+    /// That gap is the whole point. Drawing a surface that has committed no
+    /// buffer, or one whose only buffer was painted at a size it has since been
+    /// told to change, is what shows a frame of white or garbage when a
+    /// Chromium-based application starts. See the design spec, §5.
+    mapped: HashSet<WindowId>,
 
     /// Menus, dropdowns and tooltips, and the modal grabs that dismiss them.
     ///
@@ -180,6 +214,55 @@ pub(crate) struct Huginn {
     /// The keybinding overlay, drawn once when it is summoned rather than on
     /// every frame. `None` when it is not on screen, which is almost always.
     help: Option<crate::overlay::Overlay>,
+
+    /// What this output renders at, and what clients are told.
+    ///
+    /// One output for now; this becomes per-output alongside `output_area`.
+    pub(crate) scale: OutputScale,
+
+    /// The Wayland socket children are told to connect to.
+    ///
+    /// Set by the backend once it has bound one — `Huginn` is built before the
+    /// socket exists, so this cannot be a constructor argument. Empty until
+    /// then, which only matters if something tries to spawn during startup.
+    socket: String,
+
+    /// The dock, and its rendered strip.
+    pub(crate) dock: crate::dock::Dock,
+    dock_panel: Option<crate::canvas::Panel>,
+    /// The items the strip currently holds, so a click can be resolved against
+    /// the same list that was drawn.
+    dock_items: Vec<crate::dock::Item>,
+
+    /// Quick settings, and its rendered panel.
+    pub(crate) settings: crate::settings::Settings,
+    settings_panel: Option<crate::canvas::Panel>,
+    /// When the compositor started, so animations have a monotonic origin.
+    started: std::time::Instant,
+
+    /// The application launcher, and the index it searches.
+    pub(crate) launcher: crate::launcher::Launcher,
+    /// The launcher's pixels, redrawn when its state changes rather than every
+    /// frame — a search field repainted at the refresh rate is how one ends up
+    /// feeling slower than the typing that drives it.
+    launcher_panel: Option<crate::canvas::Panel>,
+    /// Installed applications, scanned once at startup.
+    pub(crate) apps: Vec<raven_desktop::Entry>,
+    /// How often each application has been launched.
+    pub(crate) frecency: raven_desktop::Frecency,
+    /// The icon theme, indexed once at startup — walking every theme's
+    /// `index.theme` costs on the order of a hundred milliseconds.
+    icons: raven_desktop::Icons,
+    /// Icons already rasterized, kept between draws.
+    pixmaps: raven_desktop::Pixmaps,
+
+    /// The font stack. Built once at startup — loading fonts takes on the
+    /// order of a hundred milliseconds — and borrowed by anything that draws.
+    pub(crate) text: crate::text::Text,
+
+    /// Kept so focus changes can resolve a surface back to the client that
+    /// owns it, which is what the clipboard needs and nothing else does.
+    display: DisplayHandle,
 
     /// The four edges of the focus ring, and where they were last put.
     ///
@@ -214,6 +297,12 @@ impl Huginn {
             // yet, so nothing would otherwise ask for it.
             needs_redraw: true,
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
+            viewporter_state: ViewporterState::new::<Self>(dh),
+            fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
+            scale: OutputScale::for_output(
+                Size::new(area.w(), area.h()),
+                Size::new(0, 0),
+            ),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
@@ -221,16 +310,36 @@ impl Huginn {
             pointer_location: (0.0, 0.0).into(),
             // Default until a client sets its own on pointer enter.
             cursor_status: CursorImageStatus::default_named(),
-            space: Space::new(area),
+            space: {
+                let mut space = Space::new(area);
+                space.set_gap(crate::theme::GAP);
+                space
+            },
             toplevels: HashMap::new(),
+            mapped: HashSet::new(),
             popups: PopupManager::default(),
             layers: Vec::new(),
             output_area: area,
             focus_ring: std::array::from_fn(|_| {
-                SolidColorBuffer::new((0, 0), FOCUS_RING_COLOR)
+                SolidColorBuffer::new((0, 0), crate::theme::ACCENT.to_rgba_f32())
             }),
             focus_ring_at: None,
             help: None,
+            socket: String::new(),
+            dock: crate::dock::Dock::default(),
+            dock_panel: None,
+            dock_items: Vec::new(),
+            settings: crate::settings::Settings::default(),
+            settings_panel: None,
+            started: std::time::Instant::now(),
+            launcher: crate::launcher::Launcher::default(),
+            launcher_panel: None,
+            apps: crate::launcher::scan_applications(),
+            frecency: raven_desktop::Frecency::default(),
+            icons: raven_desktop::Icons::discover(crate::theme::ICON_THEME),
+            pixmaps: raven_desktop::Pixmaps::new(),
+            text: crate::text::Text::new(),
+            display: dh.clone(),
         }
     }
 
@@ -243,7 +352,10 @@ impl Huginn {
     pub(crate) fn toggle_help(&mut self) {
         self.help = match self.help {
             Some(_) => None,
-            None => Some(crate::overlay::Overlay::render(self.output_area)),
+            None => {
+                let area = self.output_area;
+                Some(crate::overlay::Overlay::render(area, &mut self.text))
+            }
         };
         tracing::debug!(visible = self.help.is_some(), "keybinding overlay");
         self.queue_redraw();
@@ -255,7 +367,7 @@ impl Huginn {
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
         if self.help.is_some() {
-            self.help = Some(crate::overlay::Overlay::render(area));
+            self.help = Some(crate::overlay::Overlay::render(area, &mut self.text));
         }
         self.refresh_layers();
     }
@@ -347,8 +459,39 @@ impl Huginn {
         // Above everything. It is summoned by someone who has lost track of
         // what is on screen, so letting a panel or a fullscreen window cover it
         // would defeat the one thing it is for.
+        // Above the windows and below the keybinding overlay: the overlay is
+        // summoned by someone who has lost track of what is on screen, and
+        // that includes having lost track of the launcher.
+        // Under the panels and over the windows: the dock is part of the
+        // desktop, the launcher and settings are things placed on top of it.
+        if let Some(panel) = &self.dock_panel
+            && let Some(rect) = self.dock_rect()
+        {
+            out.push(SceneItem::Overlay(panel.buffer(), rect, 1.0));
+        }
+        if let Some(panel) = &self.settings_panel {
+            out.push(SceneItem::Overlay(
+                panel.buffer(),
+                panel.centred_on(self.output_area),
+                self.settings.reveal(self.uptime()).clamp(0.0, 1.0),
+            ));
+        }
+        if let Some(panel) = &self.launcher_panel {
+            let clock = self.uptime();
+            let reveal = self.launcher.reveal(clock);
+            out.push(SceneItem::Overlay(
+                panel.buffer(),
+                crate::launcher::placement(
+                    self.output_area,
+                    panel.size(),
+                    self.launcher.origin(),
+                    reveal,
+                ),
+                reveal.clamp(0.0, 1.0),
+            ));
+        }
         if let Some(help) = &self.help {
-            out.push(SceneItem::Overlay(&help.buffer, help.placement(self.output_area)));
+            out.push(SceneItem::Overlay(help.buffer(), help.placement(self.output_area), 1.0));
         }
         // A panel's own menu belongs directly on top of the panel, not on top
         // of everything, so each layer surface carries its popups with it.
@@ -396,6 +539,31 @@ impl Huginn {
         })
     }
 
+    /// Every surface that should be told it may draw.
+    ///
+    /// Deliberately wider than [`Self::scene_surfaces`]: it includes windows
+    /// that have not committed a buffer yet. A frame callback is permission to
+    /// paint, and the surfaces most in need of that permission are exactly the
+    /// ones with nothing on screen. Withholding it from a client that waits on
+    /// a callback before its first paint deadlocks it against a compositor
+    /// waiting for the buffer that callback would have produced.
+    pub(crate) fn frame_surfaces(&self) -> Vec<(WlSurface, Rect)> {
+        let mut out: Vec<(WlSurface, Rect)> = self.scene_surfaces().collect();
+        out.extend(
+            self.space
+                .active_workspace()
+                .windows()
+                .iter()
+                .filter(|id| !self.mapped.contains(id))
+                .filter_map(|id| {
+                    let surface = self.toplevels.get(id)?.wl_surface().clone();
+                    let geometry = self.space.window(*id)?.geometry;
+                    Some((surface, geometry))
+                }),
+        );
+        out
+    }
+
     /// Whether the focused client handles the `Super` layer itself.
     ///
     /// Decides who answers `Super`+`C`. An unnamed or absent focus counts as
@@ -427,12 +595,323 @@ impl Huginn {
     }
 
     /// The terminal to launch for the spawn binding.
+    pub(crate) fn terminal_command(&self) -> &'static str {
+        crate::theme::TERMINAL
+    }
+
+    /// Adopt the scale a newly-configured output decided on.
     ///
-    /// Config decides; the environment variable exists so a single session can
-    /// be started with something else without editing the config file.
-    pub(crate) fn terminal_command(&self) -> String {
-        std::env::var("HUGINN_TERMINAL")
-            .unwrap_or_else(|_| raven_config::Config::default().commands.terminal)
+    /// The desktop is laid out in *logical* pixels, so this sets the window
+    /// area from `scale.logical` rather than from the panel's real resolution:
+    /// on a 4K 27" that is a 2560x1440 desktop over a 3840x2160 panel, which is
+    /// what makes windows come out a sensible size instead of tiny.
+    pub(crate) fn set_output_scale(&mut self, scale: OutputScale) {
+        self.scale = scale;
+        self.set_output_area(Rect::from_xywh(0, 0, scale.logical.w, scale.logical.h));
+        tracing::info!(
+            advertised = scale.advertised,
+            logical = %format!("{}x{}", scale.logical.w, scale.logical.h),
+            render = %format!("{}x{}", scale.render.w, scale.render.h),
+            physical = %format!("{}x{}", scale.physical.w, scale.physical.h),
+            resample = scale.needs_resample(),
+            "output scale"
+        );
+    }
+
+    /// Monotonic time since the compositor started.
+    ///
+    /// Monotonic rather than wall-clock: an NTP step mid-animation would
+    /// otherwise jump a panel to its end or run it backwards.
+    pub(crate) fn uptime(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// The pointer, in the core's coordinate type.
+    fn pointer_point(&self) -> huginn_core::geometry::Point {
+        huginn_core::geometry::Point::new(
+            self.pointer_location.x.round() as i32,
+            self.pointer_location.y.round() as i32,
+        )
+    }
+
+    /// The `app_id` of every open window on the active workspace.
+    pub(crate) fn running_app_ids(&self) -> Vec<String> {
+        self.space
+            .active_workspace()
+            .windows()
+            .iter()
+            .filter_map(|id| self.toplevels.get(id))
+            .filter_map(|toplevel| {
+                with_states(toplevel.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()?
+                        .lock()
+                        .ok()?
+                        .app_id
+                        .clone()
+                })
+            })
+            .collect()
+    }
+
+    /// Whether a window is covering the whole output.
+    ///
+    /// §4: the dock must never overlap a fullscreen window. Animating out over
+    /// one is still overlapping it, so this suppresses the dock outright
+    /// rather than asking it to leave.
+    fn has_fullscreen(&self) -> bool {
+        self.space
+            .active_workspace()
+            .windows()
+            .iter()
+            .filter_map(|id| self.space.window(*id))
+            .any(|w| w.mode == WindowMode::Fullscreen)
+    }
+
+    /// Where the dock is right now, if it is on screen at all.
+    pub(crate) fn dock_rect(&self) -> Option<Rect> {
+        let now = self.uptime();
+        if self.has_fullscreen() || !self.dock.is_visible(now) {
+            return None;
+        }
+        Some(crate::dock::placement(
+            self.output_area,
+            self.dock_items.len().max(1),
+            self.dock.reveal(now),
+        ))
+    }
+
+    /// Rebuild the dock strip from what is running.
+    pub(crate) fn refresh_dock(&mut self) {
+        if self.has_fullscreen() {
+            self.dock.hide_now();
+            self.dock_panel = None;
+            self.queue_redraw();
+            return;
+        }
+        let running = self.running_app_ids();
+        self.dock_items = crate::dock::items(&self.apps, &running);
+        self.dock_panel = self.dock.is_visible(self.uptime()).then(|| {
+            crate::dock::render(
+                &self.dock_items,
+                &self.apps,
+                &self.icons,
+                &mut self.pixmaps,
+                &mut self.text,
+                self.output_area,
+            )
+        });
+        self.queue_redraw();
+    }
+
+    /// Tell the dock where the pointer went.
+    pub(crate) fn dock_pointer_moved(&mut self) {
+        let now = self.uptime();
+        let over_dock = self
+            .dock_rect()
+            .is_some_and(|rect| rect.contains(self.pointer_point()));
+        let motion = self.settings.motion();
+        let y = self.pointer_location.y.round() as i32;
+        if self.dock.pointer_moved(y, self.output_area, over_dock, now, motion) {
+            self.refresh_dock();
+        }
+    }
+
+    /// A click landed. Returns the item hit, if any.
+    pub(crate) fn dock_click(&self) -> Option<crate::dock::Item> {
+        let rect = self.dock_rect()?;
+        let point = self.pointer_point();
+        if !rect.contains(point) {
+            return None;
+        }
+        let index = self.dock.item_at(point.x, rect, self.dock_items.len())?;
+        self.dock_items.get(index).cloned()
+    }
+
+    /// Tell the compositor which socket to hand to children.
+    pub(crate) fn set_socket(&mut self, socket: String) {
+        self.socket = socket;
+    }
+
+    /// Run an application, and remember that it was run.
+    ///
+    /// One place rather than three: the dock, the launcher, and the terminal
+    /// binding all start applications, and all three need the same environment
+    /// and the same frecency bookkeeping. Recorded before the spawn, because
+    /// what the user chose is worth remembering whether or not it starts.
+    pub(crate) fn launch(&mut self, entry_path: Option<std::path::PathBuf>, argv: &[String]) {
+        if let Some(path) = entry_path {
+            let now = self.now();
+            self.frecency.record(&path, now);
+        }
+        crate::backend::spawn(argv, &self.socket);
+    }
+
+    /// Open the launcher, growing it out of the dock's launcher icon.
+    ///
+    /// The origin is only taken when the dock is actually on screen — §4 asks
+    /// for the motion to start at the icon, and starting it off the bottom of
+    /// the screen because the dock happens to be hidden is motion the eye
+    /// cannot follow. Without one it grows in place from the centre.
+    pub(crate) fn open_launcher(&mut self) {
+        let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
+        let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
+        self.launcher.open(&self.apps, &self.frecency, now, origin, clock, motion);
+        self.refresh_launcher();
+    }
+
+    /// Apply a keystroke to the launcher, and act on what it asks for.
+    pub(crate) fn launcher_key(&mut self, key: crate::launcher::Key) {
+        let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
+        let outcome = self
+            .launcher
+            .press(key, &self.apps, &self.frecency, now, clock, motion);
+        match outcome {
+            crate::launcher::Outcome::Launch(argv) => {
+                let path = self
+                    .apps
+                    .iter()
+                    .find(|e| e.argv(&[]).as_deref() == Some(argv.as_slice()))
+                    .map(|e| e.path.clone());
+                self.launch(path, &argv);
+                self.refresh_launcher();
+            }
+            crate::launcher::Outcome::Dismissed | crate::launcher::Outcome::Redraw => {
+                self.refresh_launcher();
+            }
+            crate::launcher::Outcome::Unchanged => {}
+        }
+    }
+
+    /// Act on a dock item that was clicked.
+    ///
+    /// The launcher button opens the launcher — §4 makes it the leftmost item
+    /// for exactly this. A running application is focused; one that is not
+    /// running is left to the caller to spawn, since only the backend knows
+    /// the socket to hand it.
+    pub(crate) fn activate_dock_item(&mut self, item: &crate::dock::Item) {
+        if item.is_launcher() {
+            self.open_launcher();
+            return;
+        }
+        let Some(entry) = item.entry.and_then(|i| self.apps.get(i)) else {
+            return;
+        };
+        if !item.running {
+            // Not running: start it. The launcher opens applications rather
+            // than documents, so there are no targets to substitute.
+            let (path, argv) = (entry.path.clone(), entry.argv(&[]));
+            if let Some(argv) = argv {
+                self.launch(Some(path), &argv);
+            } else {
+                tracing::warn!(name = %entry.name, "dock entry has nothing runnable");
+            }
+            return;
+        }
+        // Focus the first window belonging to it.
+        let running: Vec<(huginn_core::window::WindowId, String)> = self
+            .space
+            .active_workspace()
+            .windows()
+            .iter()
+            .filter_map(|id| {
+                let toplevel = self.toplevels.get(id)?;
+                let app_id = with_states(toplevel.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()?
+                        .lock()
+                        .ok()?
+                        .app_id
+                        .clone()
+                })?;
+                Some((*id, app_id))
+            })
+            .collect();
+        if let Some((id, _)) = running
+            .iter()
+            .find(|(_, app_id)| crate::dock::matches(entry, app_id))
+        {
+            self.space.active_workspace_mut().focus(*id);
+            self.refresh_focus();
+        }
+    }
+
+    /// How blurred the desktop behind the panels should be, in pixels.
+    ///
+    /// Zero when no panel is open, which is what lets the renderer take the
+    /// ordinary path unchanged for the overwhelming majority of frames.
+    pub(crate) fn blur_radius(&self) -> f32 {
+        crate::blur::radius_for(self.launcher.reveal(self.uptime()))
+    }
+
+    /// Advance anything that is animating, and ask for another frame if it is
+    /// still moving.
+    ///
+    /// Called once per rendered frame. Without it a panel would compose at
+    /// whatever its reveal happened to be when a key was pressed and then hold
+    /// there, because nothing else asks for a redraw between keystrokes — the
+    /// animation would exist and never be seen.
+    ///
+    /// The converse matters as much: when nothing is animating this asks for
+    /// nothing, so an idle desktop still renders no frames.
+    pub(crate) fn tick_animations(&mut self) {
+        let now = self.uptime();
+        if self.settings.is_animating(now) {
+            self.refresh_settings();
+        }
+        if self.dock.is_animating(now) {
+            self.refresh_dock();
+        }
+        if self.launcher.is_animating(now) {
+            // Position and alpha come from the reveal at draw time, so the
+            // panel itself does not need recomposing — but a frame still has
+            // to be asked for, or the motion happens with nothing drawing it.
+            self.queue_redraw();
+        }
+    }
+
+    /// Redraw the quick settings panel, or drop it once it has closed.
+    ///
+    /// Kept while the close animation is still running: dropping the panel the
+    /// moment it is dismissed would make it vanish rather than leave.
+    pub(crate) fn refresh_settings(&mut self) {
+        let now = self.uptime();
+        self.settings_panel = self.settings.is_visible(now).then(|| {
+            crate::settings::render(&self.settings, &mut self.text, self.output_area, now)
+        });
+        self.queue_redraw();
+    }
+
+    /// Redraw the launcher's panel, or drop it when it is closed.
+    ///
+    /// Called whenever the launcher's state changes rather than on every
+    /// frame: composing it walks the result list and shapes a string per row,
+    /// which is cheap once per keystroke and wasteful sixty times a second.
+    pub(crate) fn refresh_launcher(&mut self) {
+        self.launcher_panel = self.launcher.is_visible(self.uptime()).then(|| {
+            crate::launcher::render(
+                &self.launcher,
+                &self.apps,
+                &mut self.text,
+                &self.icons,
+                &mut self.pixmaps,
+                self.output_area,
+            )
+        });
+        self.queue_redraw();
+    }
+
+    /// Seconds since the epoch, for frecency.
+    ///
+    /// A clock that cannot be read is not a reason to refuse to open the
+    /// launcher; zero simply means every application looks equally stale, and
+    /// the match quality still orders them.
+    pub(crate) fn now(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
     }
 
     /// Ask the backend to draw a frame.
@@ -460,8 +939,12 @@ impl Huginn {
     fn focus_ring_rects(&self) -> Option<[Rect; 4]> {
         let id = self.space.focused()?;
         // An unmapped window has geometry but nothing on screen; ringing it
-        // would draw a rectangle around empty space.
-        self.toplevels.get(&id)?;
+        // would draw a rectangle around empty space. Membership in `toplevels`
+        // is not the test — a window is in there from creation, hundreds of
+        // milliseconds before it has anything to show.
+        if !self.mapped.contains(&id) {
+            return None;
+        }
         let window = self.space.window(id)?;
         // A fullscreen window covers its output edge to edge. There is nowhere
         // outside it to put a ring, and the point of fullscreen is that nothing
@@ -469,7 +952,7 @@ impl Huginn {
         if window.mode == WindowMode::Fullscreen {
             return None;
         }
-        Some(window.geometry.ring(FOCUS_RING_WIDTH))
+        Some(window.geometry.ring(crate::theme::FOCUS_RING_WIDTH))
     }
 
     /// The focus ring's edges, each paired with the buffer that paints it.
@@ -504,17 +987,57 @@ impl Huginn {
 
     /// Windows on the active workspace with the geometry the core assigned,
     /// in the order they should be painted.
+    ///
+    /// Skips windows that have not yet committed a buffer. Their tile is
+    /// already reserved and their `configure` already sent; what they have not
+    /// got is anything worth showing, and showing it anyway is a frame of
+    /// whatever happened to be in the buffer.
     pub(crate) fn render_list(&self) -> Vec<(&ToplevelSurface, Rect)> {
         self.space
             .active_workspace()
             .windows()
             .iter()
+            .filter(|id| self.mapped.contains(id))
             .filter_map(|id| {
                 let surface = self.toplevels.get(id)?;
                 let geometry = self.space.window(*id)?.geometry;
                 Some((surface, geometry))
             })
             .collect()
+    }
+
+    /// Bring a window's mapped state into line with whether it has a buffer.
+    ///
+    /// Both directions. A client may unmap a window by attaching a null buffer
+    /// and later map it again by attaching a real one; xdg-shell says so
+    /// explicitly, and a compositor that only ever latches "mapped" leaves a
+    /// focus ring drawn around a window the client has taken away.
+    ///
+    /// Returns whether the state changed — the moment a window appears or
+    /// disappears, and where the open and close animations will hang once
+    /// there are any.
+    fn sync_mapped(&mut self, surface: &WlSurface) -> bool {
+        let Some(id) = self
+            .toplevels
+            .iter()
+            .find(|(_, s)| s.wl_surface() == surface)
+            .map(|(id, _)| *id)
+        else {
+            return false;
+        };
+        let changed = if has_buffer(surface) {
+            self.mapped.insert(id)
+        } else {
+            self.mapped.remove(&id)
+        };
+        if changed {
+            tracing::debug!(
+                window = id.raw(),
+                mapped = self.mapped.contains(&id),
+                "toplevel map state"
+            );
+        }
+        changed
     }
 
     /// Ask the core to lay out the active workspace and configure whatever
@@ -528,6 +1051,15 @@ impl Huginn {
             let Some(surface) = self.toplevels.get(&id) else {
                 continue;
             };
+            // A window that has not had its initial configure yet is mid-way
+            // through `new_toplevel`, which laid out first precisely so it
+            // could send one configure carrying the final geometry. Sending
+            // one here would make that two, and the first would be the stale
+            // one — reintroducing the resize-after-first-paint this ordering
+            // exists to remove.
+            if !surface.is_initial_configure_sent() {
+                continue;
+            }
             tracing::debug!(window = id.raw(), ?rect, "configure");
             surface.with_pending_state(|state| {
                 state.size = Some((rect.w(), rect.h()).into());
@@ -566,14 +1098,35 @@ impl Huginn {
         let target = focused
             .and_then(|id| self.toplevels.get(&id))
             .map(|s| s.wl_surface().clone());
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, target, Serial::from(0));
-        }
+        self.set_keyboard_focus(target, Serial::from(0));
 
         // The ring moved. Click-to-focus arrives here without going through
         // arrange, so without this a click would move focus and leave the ring
         // behind on the previous window until something else forced a frame.
         self.queue_redraw();
+    }
+
+    /// Give the keyboard — and with it the clipboard — to `target`.
+    ///
+    /// Always use this rather than `KeyboardHandle::set_focus` directly.
+    /// smithay calls [`SeatHandler::focus_changed`] only when focus moves *to*
+    /// a surface: the branch that clears it sends the old surface its `leave`
+    /// and returns, so nothing tells the data device that nobody holds the
+    /// keyboard any more. The clipboard would stay pointed at the window that
+    /// just closed, and that client would go on receiving selection offers
+    /// while unfocused — which is the same class of bug as never setting the
+    /// focus in the first place, just rarer and harder to see.
+    ///
+    /// The extra call is free when the hook did fire: smithay's
+    /// `set_clipboard_focus` compares against the focus it already has and
+    /// returns without sending anything if they agree.
+    pub(crate) fn set_keyboard_focus(&mut self, target: Option<WlSurface>, serial: Serial) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        keyboard.set_focus(self, target.clone(), serial);
+        let client = target.and_then(|surface| self.display.get_client(surface.id()).ok());
+        set_data_device_focus(&self.display, &self.seat, client);
     }
 
     /// Attach an output so clients can discover scale, mode, and position.
@@ -601,6 +1154,15 @@ impl CompositorHandler for Huginn {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         self.queue_redraw();
+
+        // A buffer arriving is what makes a window visible — not its creation,
+        // and not its configure. Until then the window holds a reserved and
+        // empty tile. See [`Huginn::sync_mapped`] and the design spec, §5.
+        if self.sync_mapped(surface) {
+            // Focus was given to this window when it was created, but the ring
+            // could not be drawn around something that was not on screen yet.
+            self.refresh_focus();
+        }
 
         // Moves a popup from unmapped to mapped once its parent is known, which
         // is what puts it in the tree the scene is built from.
@@ -642,17 +1204,38 @@ impl XdgShellHandler for Huginn {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let id = self.space.open_window();
         self.toplevels.insert(id, surface.clone());
-        tracing::debug!(window = id.raw(), "toplevel mapped");
+        tracing::debug!(window = id.raw(), "toplevel created");
 
-        // The first configure must go out before the client attaches a buffer;
-        // xdg-shell requires the client to ack a configure before its first
-        // commit, so a window that never gets one simply never appears.
+        // Lay out FIRST, so the geometry this window will actually occupy
+        // exists before its one and only initial configure goes out.
+        //
+        // The order matters more than it looks. Configuring first and arranging
+        // second sends the client a size of zero — "pick your own" — it paints
+        // at whatever it chose, and the configure that follows immediately
+        // resizes it into its tile. That pre-tile frame is visible, and it is
+        // one of the two things that makes a Chromium-based application flash
+        // when it starts. Arranging first means the first frame the client ever
+        // produces is already the right size. See the design spec, §5.
+        //
+        // `arrange` skips any window whose initial configure has not gone out,
+        // so it lays this one out without configuring it and the single
+        // configure below is the first the client ever sees.
+        self.arrange();
+
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
+            state.size = Some(
+                self.space
+                    .window(id)
+                    .map_or_else(|| (0, 0).into(), |w| {
+                        (w.geometry.w(), w.geometry.h()).into()
+                    }),
+            );
         });
+        // xdg-shell requires the client to ack a configure before its first
+        // commit, so a window that never gets one simply never appears.
         surface.send_configure();
 
-        self.arrange();
         self.refresh_focus();
     }
 
@@ -666,11 +1249,13 @@ impl XdgShellHandler for Huginn {
             return;
         };
         self.toplevels.remove(&id);
+        self.mapped.remove(&id);
         self.space.close_window(id);
-        tracing::debug!(window = id.raw(), "toplevel unmapped");
+        tracing::debug!(window = id.raw(), "toplevel destroyed");
 
         self.arrange();
         self.refresh_focus();
+        self.refresh_dock();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -736,7 +1321,21 @@ impl SeatHandler for Huginn {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    /// Hand the clipboard to whoever just took the keyboard.
+    ///
+    /// Without this the clipboard is inert in a way that looks like the clients
+    /// are at fault. `wl_data_device.selection` is only ever sent to the client
+    /// smithay believes holds the *data device* focus, which is a separate
+    /// thing from keyboard focus and is `None` until someone says otherwise —
+    /// and a `None` focus matches no client, so every device is skipped. The
+    /// compositor happily stores a `set_selection` from a client and then
+    /// offers it to nobody, including back to the client that set it. A
+    /// terminal asking to paste gets no offer, reads an empty clipboard, and
+    /// silently does nothing.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let client = focused.and_then(|surface| self.display.get_client(surface.id()).ok());
+        set_data_device_focus(&self.display, seat, client);
+    }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
@@ -792,12 +1391,36 @@ impl WlrLayerShellHandler for Huginn {
 
 impl OutputHandler for Huginn {}
 
+impl FractionalScaleHandler for Huginn {
+    /// Answer a client's fractional-scale request with a whole number.
+    ///
+    /// The protocol's name is about the wire format — it carries scale in
+    /// 120ths so a compositor *can* say 1.5 — not an obligation to send one.
+    /// This compositor never does. A client that asks is told 1 or 2, the same
+    /// as `wl_output` says, so the two can never disagree and no client has a
+    /// reason to render at a fraction. See `huginn_core::scale`.
+    ///
+    /// Answered on creation rather than waiting for a commit: a client that
+    /// binds this and gets no scale back has to guess, and guessing is the
+    /// thing this exists to remove.
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = f64::from(self.scale.advertised);
+        with_states(&surface, |states| {
+            with_fractional_scale(states, |fractional| {
+                fractional.set_preferred_scale(scale);
+            });
+        });
+    }
+}
+
 delegate_compositor!(Huginn);
 delegate_xdg_shell!(Huginn);
 delegate_shm!(Huginn);
 delegate_seat!(Huginn);
 delegate_data_device!(Huginn);
 delegate_output!(Huginn);
+delegate_viewporter!(Huginn);
+delegate_fractional_scale!(Huginn);
 delegate_layer_shell!(Huginn);
 
 /// What a layer surface has asked for, translated out of Wayland vocabulary and
@@ -845,3 +1468,4 @@ fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
         layer: state.layer,
     })
 }
+

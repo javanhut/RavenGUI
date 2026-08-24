@@ -1,0 +1,14 @@
+[package]
+name = "raven-desktop"
+description = "XDG desktop entries and icon theme lookup for the Raven launcher and dock. Host-agnostic: builds and tests anywhere."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+resvg.workspace = true
+
+[lints]
+workspace = true
