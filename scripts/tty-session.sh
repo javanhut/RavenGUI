@@ -5,7 +5,7 @@
 # only to the active session on a seat, and an ssh login has no seat — the udev
 # backend will refuse to start and tell you so.
 #
-# To leave: Super+Escape quits the compositor. If something goes wrong and the
+# To leave: Super+Shift+Escape quits the compositor. If something goes wrong and the
 # screen is unusable, Ctrl+Alt+F1 switches back to your normal session; Huginn
 # releases DRM master when it loses the VT.
 set -u
@@ -106,7 +106,7 @@ if ! start_terminal "$TERMINAL"; then
     echo "  If it is raven-terminal, it is probably an X11-only build:"
     echo "    cd ~/Development/RavenTerminal && make build BACKEND=wayland"
     echo "  Falling back to kitty so this session is not empty."
-    start_terminal kitty || echo "  kitty unavailable too; Super+E/T still works if you install one."
+    start_terminal kitty || echo "  kitty unavailable too; Super+Shift+E/T still works if you install one."
 fi
 
 wait "$HUGINN"

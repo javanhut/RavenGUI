@@ -50,7 +50,7 @@ use smithay::{
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
-    input::keyboard::KeyboardHandle,
+    input::keyboard::{KeyboardHandle, Keysym},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -73,6 +73,7 @@ use smithay::{
 use huginn_core::{geometry::Rect, workspace::Direction};
 
 use crate::backend::input;
+use crate::backend::chord;
 use crate::backend::keymap::{Action, HELP, resolve};
 use crate::pointer::Cursor;
 use crate::render;
@@ -716,6 +717,10 @@ impl Udev {
         let serial = SERIAL_COUNTER.next_serial();
         let time = event.time_msec();
         let key_state = event.state();
+        // Read before the filter runs: the closure is handed the compositor
+        // state, but working out whose layer this is needs the focus as it
+        // stands now, not as the keystroke may leave it.
+        let owns_super = self.state.focus_owns_super();
         let action = self
             .keyboard
             .input::<Option<Action>, _>(
@@ -725,16 +730,16 @@ impl Udev {
                 serial,
                 time,
                 |_state, modifiers, handle| {
-                    resolve(key_state, modifiers, handle.modified_sym().raw())
+                    resolve(key_state, modifiers, handle.modified_sym().raw(), owns_super)
                 },
             )
             .flatten();
         if let Some(action) = action {
-            self.apply(action);
+            self.apply(action, time);
         }
     }
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, action: Action, time: u32) {
         let state = &mut self.state;
         match action {
             Action::Quit => {
@@ -752,6 +757,14 @@ impl Udev {
             }
             Action::Move(dir) => {
                 state.space.move_focused(dir);
+            }
+            Action::Copy => {
+                chord::send_ctrl(&self.keyboard, state, Keysym::c, time);
+                return;
+            }
+            Action::Paste => {
+                chord::send_ctrl(&self.keyboard, state, Keysym::v, time);
+                return;
             }
             Action::CloseFocused => {
                 if let Some(surface) = state.space.focused().and_then(|id| state.surface(id)) {

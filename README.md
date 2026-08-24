@@ -109,10 +109,21 @@ top panel with workspace pips, receives workspace state over `raven_shell_v1`,
 and switches workspaces when a pip is clicked.
 
 The focused window wears a ring in the same accent the panel uses, and
-`Super`+arrows move it between tiles. Neighbours are found by position rather
-than by list order — with a master column beside a stack the two disagree — and
-a direction with nothing squarely that way does nothing rather than sending the
-window off diagonally.
+`Super`+`Shift`+arrows move it between tiles. Neighbours are found by position
+rather than by list order — with a master column beside a stack the two disagree
+— and a direction with nothing squarely that way does nothing rather than
+sending the window off diagonally.
+
+Window management lives on the `Super`+`Shift` layer. Plain `Super` belongs to
+applications: RavenTerminal uses it as its own leader, and a chord the
+compositor intercepts never reaches a client at all. The exception is
+`Super`+`C` and `Super`+`V`, which the compositor translates rather than
+performs — it cannot copy, having no idea what a client has selected, so it
+synthesises the `Ctrl`+`C` that toolkits listen for. Clients that drive the
+`Super` layer themselves are exempt by `app_id`, because a terminal reads
+`Ctrl`+`C` as SIGINT and would kill the job instead of copying. A client that
+advertises no `app_id` is treated as one of them: it cannot be told apart from
+a terminal that advertises none either.
 
 The udev/TTY backend drives real hardware: a libseat session, DRM/KMS scan-out
 through GBM, libinput, VT switching, and monitor hotplug. udev has no notion of
