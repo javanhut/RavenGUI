@@ -11,6 +11,7 @@ use smithay::{
         ImportAll, ImportMem, Renderer,
         element::{
             Kind, memory::MemoryRenderBufferRenderElement, render_elements,
+            solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
     },
@@ -20,7 +21,7 @@ use smithay::{
 };
 
 use crate::pointer::Cursor;
-use crate::state::Huginn;
+use crate::state::{Huginn, SceneItem};
 
 render_elements! {
     /// Everything Huginn can draw.
@@ -29,6 +30,8 @@ render_elements! {
     Surface = WaylandSurfaceRenderElement<R>,
     /// The cursor, when no client has supplied its own.
     Cursor = MemoryRenderBufferRenderElement<R>,
+    /// One edge of the ring around the focused window.
+    Ring = SolidColorRenderElement,
 }
 
 /// Build the full scene, cursor included, front to back.
@@ -99,19 +102,30 @@ where
         CursorImageStatus::Hidden => {}
     }
 
-    for (surface, rect) in state.scene() {
-        out.extend(
-            render_elements_from_surface_tree(
-                renderer,
-                surface,
-                (rect.x(), rect.y()),
-                1.0,
-                1.0,
-                Kind::Unspecified,
-            )
-            .into_iter()
-            .map(HuginnElement::Surface),
-        );
+    for item in state.scene() {
+        match item {
+            SceneItem::Surface(surface, rect) => out.extend(
+                render_elements_from_surface_tree(
+                    renderer,
+                    surface,
+                    (rect.x(), rect.y()),
+                    1.0,
+                    1.0,
+                    Kind::Unspecified,
+                )
+                .into_iter()
+                .map(HuginnElement::Surface),
+            ),
+            SceneItem::Ring(buffer, rect) => {
+                out.push(HuginnElement::Ring(SolidColorRenderElement::from_buffer(
+                    buffer,
+                    (rect.x(), rect.y()),
+                    1.0,
+                    1.0,
+                    Kind::Unspecified,
+                )));
+            }
+        }
     }
 
     out

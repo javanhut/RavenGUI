@@ -34,7 +34,7 @@ pub mod workspace;
 
 use std::collections::BTreeMap;
 
-use geometry::Rect;
+use geometry::{Dir, Rect};
 use window::{Window, WindowId, WindowMode};
 use workspace::{Workspace, WorkspaceId};
 
@@ -162,6 +162,47 @@ impl Space {
         true
     }
 
+    /// Swap the focused window with its nearest neighbour in `dir`.
+    ///
+    /// Neighbours are found by geometry rather than by list order, because the
+    /// two disagree the moment a layout is anything but a single row: with a
+    /// master column beside a stack, "right" has to mean the window drawn to
+    /// the right, whatever index it holds.
+    ///
+    /// Only tiled windows take part. A floating window has no slot in the order
+    /// to swap, and a fullscreen one has no neighbours on screen to swap with.
+    /// Returns whether anything moved; call [`Self::arrange`] afterwards to turn
+    /// the new order into geometry.
+    pub fn move_focused(&mut self, dir: Dir) -> bool {
+        let Some(id) = self.focused() else {
+            return false;
+        };
+        if !self.windows.get(&id).is_some_and(Window::is_tiled) {
+            return false;
+        }
+        let Some(target) = self.neighbour(id, dir) else {
+            return false;
+        };
+        self.workspaces[self.active].swap(id, target)
+    }
+
+    /// The tiled window nearest `from` in `dir` on the active workspace.
+    fn neighbour(&self, from: WindowId, dir: Dir) -> Option<WindowId> {
+        let origin = self.windows.get(&from)?.geometry;
+        self.workspaces[self.active]
+            .windows()
+            .iter()
+            .filter(|id| **id != from)
+            .filter_map(|id| self.windows.get(id))
+            .filter(|win| win.is_tiled())
+            .filter(|win| dir.advances(origin, win.geometry) && dir.aligned(origin, win.geometry))
+            // min_by_key keeps the first of equal keys, so a tie — every window
+            // of a stack is equally far right of a full-height master — falls to
+            // the one earliest in workspace order.
+            .min_by_key(|win| dir.distance(origin, win.geometry))
+            .map(Window::id)
+    }
+
     /// Recompute geometry for every window on the active workspace.
     ///
     /// Returns only the windows whose geometry actually changed. The compositor
@@ -218,7 +259,7 @@ impl Space {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Point;
+    use crate::geometry::{Dir, Point};
     use crate::window::SizeHints;
     use geometry::Size;
 
@@ -353,6 +394,89 @@ mod tests {
 
         s.activate_workspace(2);
         assert_eq!(s.focused(), Some(b), "and the window arrived focused");
+    }
+
+    /// Three windows in the default Columns layout: `a` is the master column,
+    /// `b` and `c` are the stack, top to bottom.
+    fn master_and_stack() -> (Space, WindowId, WindowId, WindowId) {
+        let mut s = space();
+        let a = s.open_window();
+        let b = s.open_window();
+        let c = s.open_window();
+        s.arrange();
+        (s, a, b, c)
+    }
+
+    #[test]
+    fn moving_right_out_of_the_master_takes_the_top_of_the_stack() {
+        let (mut s, a, b, c) = master_and_stack();
+        s.active_workspace_mut().focus(a);
+        assert!(s.move_focused(Dir::Right));
+        assert_eq!(s.active_workspace().windows(), &[b, a, c]);
+        assert_eq!(s.focused(), Some(a), "the window moved, not the focus");
+    }
+
+    #[test]
+    fn moving_within_the_stack_walks_it_one_window_at_a_time() {
+        let (mut s, a, b, c) = master_and_stack();
+        s.active_workspace_mut().focus(b);
+        assert!(s.move_focused(Dir::Down));
+        assert_eq!(s.active_workspace().windows(), &[a, c, b]);
+
+        // And back, which must land exactly where it started.
+        s.arrange();
+        assert!(s.move_focused(Dir::Up));
+        assert_eq!(s.active_workspace().windows(), &[a, b, c]);
+    }
+
+    #[test]
+    fn moving_into_the_wall_does_nothing() {
+        let (mut s, a, _b, _c) = master_and_stack();
+        s.active_workspace_mut().focus(a);
+        // The master column is full height at the left edge: nothing is above,
+        // below, or left of it.
+        for dir in [Dir::Left, Dir::Up, Dir::Down] {
+            assert!(!s.move_focused(dir), "{dir:?} found a neighbour that is not there");
+        }
+        assert_eq!(s.active_workspace().windows()[0], a);
+    }
+
+    #[test]
+    fn a_lone_window_has_nowhere_to_move() {
+        let mut s = space();
+        s.open_window();
+        s.arrange();
+        assert!(!s.move_focused(Dir::Right));
+    }
+
+    #[test]
+    fn moving_with_nothing_focused_is_a_no_op() {
+        let mut s = space();
+        assert!(!s.move_focused(Dir::Left));
+    }
+
+    #[test]
+    fn floating_windows_do_not_join_the_tiling_order() {
+        let (mut s, a, b, _c) = master_and_stack();
+        s.window_mut(b).expect("open").mode = WindowMode::Floating;
+        s.arrange();
+        s.active_workspace_mut().focus(b);
+        assert!(!s.move_focused(Dir::Left), "a floating window has no slot to swap");
+
+        // And it is not a target either: from the master, right must skip it.
+        s.active_workspace_mut().focus(a);
+        assert!(s.move_focused(Dir::Right));
+        assert_ne!(s.active_workspace().windows()[0], b);
+    }
+
+    #[test]
+    fn a_move_is_its_own_inverse() {
+        let (mut s, a, b, c) = master_and_stack();
+        s.active_workspace_mut().focus(c);
+        assert!(s.move_focused(Dir::Up));
+        s.arrange();
+        assert!(s.move_focused(Dir::Down));
+        assert_eq!(s.active_workspace().windows(), &[a, b, c]);
     }
 
     #[test]

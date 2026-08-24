@@ -82,8 +82,7 @@ impl Huginn {
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
-        let candidates = self.scene();
-        for (surface, rect) in candidates {
+        for (surface, rect) in self.scene_surfaces() {
             let origin: Point<i32, Logical> = (rect.x(), rect.y()).into();
             let relative = point - origin.to_f64();
             if let Some(found) =

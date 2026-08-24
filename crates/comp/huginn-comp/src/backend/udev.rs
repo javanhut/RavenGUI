@@ -685,7 +685,7 @@ impl Udev {
         // callback, and withholding it because we found nothing to repaint
         // stalls that client forever.
         let now = self.start.elapsed().as_millis() as u32;
-        for (surface, _) in self.state.scene() {
+        for (surface, _) in self.state.scene_surfaces() {
             send_frames(surface, now);
         }
     }
@@ -715,14 +715,20 @@ impl Udev {
         };
         let serial = SERIAL_COUNTER.next_serial();
         let time = event.time_msec();
-        let action = self.keyboard.input::<Action, _>(
-            &mut self.state,
-            event.key_code(),
-            event.state(),
-            serial,
-            time,
-            |_state, modifiers, handle| resolve(modifiers, handle.modified_sym().raw()),
-        );
+        let key_state = event.state();
+        let action = self
+            .keyboard
+            .input::<Option<Action>, _>(
+                &mut self.state,
+                event.key_code(),
+                key_state,
+                serial,
+                time,
+                |_state, modifiers, handle| {
+                    resolve(key_state, modifiers, handle.modified_sym().raw())
+                },
+            )
+            .flatten();
         if let Some(action) = action {
             self.apply(action);
         }
@@ -743,6 +749,9 @@ impl Udev {
             }
             Action::PromoteFocused => {
                 state.space.active_workspace_mut().promote_focused();
+            }
+            Action::Move(dir) => {
+                state.space.move_focused(dir);
             }
             Action::CloseFocused => {
                 if let Some(surface) = state.space.focused().and_then(|id| state.surface(id)) {
