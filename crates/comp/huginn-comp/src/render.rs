@@ -3,6 +3,14 @@
 //! Both backends paint the same thing; only the surface they paint onto
 //! differs. Keeping assembly here means a stacking-order fix cannot land in one
 //! backend and not the other.
+//!
+//! # Scale
+//!
+//! Every position here is logical and every buffer is physical, and the scale
+//! that converts between them is the output's *advertised* integer scale — the
+//! same whole number clients were told, so a 2x client buffer lands on 2x worth
+//! of pixels and nothing is resampled on the way. See `huginn_core::scale` for
+//! why it is never a fraction.
 
 use std::sync::Mutex;
 
@@ -44,6 +52,11 @@ where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Clone + Send + 'static,
 {
+    // The output's advertised integer scale, as an f64 for the element APIs.
+    // Whole numbers only, so this conversion is exact and no position can land
+    // between pixels on the way from logical to physical.
+    let scale = f64::from(state.scale.advertised);
+
     let mut out: Vec<HuginnElement<R>> = Vec::new();
 
     // The cursor goes first because the scene is painted front to back, and
@@ -65,11 +78,8 @@ where
                 render_elements_from_surface_tree(
                     renderer,
                     surface,
-                    // Scale is 1.0 throughout for now, so logical and physical
-                    // coordinates coincide; this becomes a real conversion when
-                    // fractional scaling lands.
-                    position.to_physical(1),
-                    1.0,
+                    position.to_physical(scale as i32),
+                    scale,
                     1.0,
                     Kind::Cursor,
                 )
@@ -108,23 +118,29 @@ where
                 render_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    (rect.x(), rect.y()),
-                    1.0,
+                    Point::<i32, Logical>::from((rect.x(), rect.y())).to_physical(scale as i32),
+                    scale,
                     1.0,
                     Kind::Unspecified,
                 )
                 .into_iter()
                 .map(HuginnElement::Surface),
             ),
-            SceneItem::Overlay(buffer, rect) => {
+            SceneItem::Overlay(buffer, rect, alpha) => {
+                // `size` scales the buffer and `alpha` fades it, both per
+                // frame and both free — which is what lets the launcher grow
+                // out of the dock icon without being composed again at every
+                // intermediate size. Re-shaping its text sixty times a second
+                // would cost more than the animation is worth, and the glyphs
+                // would shimmer as they re-hinted at each one.
                 if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
                     Point::<f64, Logical>::from((f64::from(rect.x()), f64::from(rect.y())))
-                        .to_physical(1.0),
+                        .to_physical(scale),
                     buffer,
+                    Some(alpha),
                     None,
-                    None,
-                    None,
+                    Some((rect.w(), rect.h()).into()),
                     Kind::Unspecified,
                 ) {
                     out.push(HuginnElement::Cursor(element));
@@ -133,8 +149,8 @@ where
             SceneItem::Ring(buffer, rect) => {
                 out.push(HuginnElement::Ring(SolidColorRenderElement::from_buffer(
                     buffer,
-                    (rect.x(), rect.y()),
-                    1.0,
+                    Point::<i32, Logical>::from((rect.x(), rect.y())).to_physical(scale as i32),
+                    scale,
                     1.0,
                     Kind::Unspecified,
                 )));

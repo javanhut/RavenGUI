@@ -2,11 +2,10 @@
 resolver = "3"
 members = [
     "crates/raven-protocol",
-    "crates/raven-config",
+    "crates/raven-desktop",
     "crates/comp/huginn-core",
     "crates/comp/huginn-comp",
     "crates/comp/huginn-egl",
-    "crates/shell/muninn",
     "crates/shell/muninn-lock",
 ]
 
@@ -32,7 +31,7 @@ todo = "warn"
 dbg_macro = "warn"
 
 [workspace.dependencies]
-raven-config = { path = "crates/raven-config" }
+raven-desktop = { path = "crates/raven-desktop" }
 huginn-core = { path = "crates/comp/huginn-core" }
 huginn-egl = { path = "crates/comp/huginn-egl" }
 raven-protocol = { path = "crates/raven-protocol" }
@@ -44,12 +43,21 @@ wayland-server = "0.31"
 wayland-client = "0.31"
 wayland-backend = "0.3"
 calloop = "0.14"
-iced = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+# Text shaping, layout and rasterization for the compositor-drawn shell.
+# `default-features = false` drops fontconfig, which would put a C library on
+# the critical path of a distro that ships almost no GUI dependencies; fontdb
+# finds fonts by scanning the standard directories without it.
+# SVG rasterization for application icons. `text` and `system-fonts` are off:
+# an icon that relies on glyphs is vanishingly rare, and enabling them drags
+# fontdb and a font database scan into the icon path for nothing. `svgz` stays
+# because real icon themes ship compressed SVGs.
+resvg = { version = "0.48", default-features = false, features = ["svgz"] }
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
 
 [profile.dev]
 opt-level = 1          # a compositor at opt-level 0 drops frames while you test

@@ -48,6 +48,18 @@ pub(crate) enum Action {
     Paste,
     /// Show or hide the keybinding overlay.
     ToggleHelp,
+    /// Open the application launcher.
+    OpenLauncher,
+    /// Open the quick settings panel.
+    OpenSettings,
+    /// A key while quick settings is open.
+    Settings(crate::settings::Key),
+    /// A key while the launcher is open. Every key goes to it.
+    ///
+    /// The launcher is drawn by the compositor rather than by a client, so
+    /// there is no surface to focus and nothing to forward to. While it is
+    /// open the keymap stops resolving chords entirely.
+    Launcher(crate::launcher::Key),
 }
 
 /// One row of the keybinding overlay, and one clause of the startup log line.
@@ -102,7 +114,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         action: Action::PromoteFocused,
         chord: "Super+Shift+Return",
-        description: "promote the focused window to master",
+        description: "swap the focused window into the first tile",
     },
     Binding {
         action: Action::Workspace(0),
@@ -123,6 +135,16 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::Paste,
         chord: "Super+V",
         description: "paste in the focused client",
+    },
+    Binding {
+        action: Action::OpenLauncher,
+        chord: "Super+Shift+Space",
+        description: "open the application launcher",
+    },
+    Binding {
+        action: Action::OpenSettings,
+        chord: "Super+Shift+S",
+        description: "open quick settings",
     },
     Binding {
         action: Action::ToggleHelp,
@@ -164,7 +186,26 @@ pub(crate) fn resolve(
     modifiers: &ModifiersState,
     sym: u32,
     focus_owns_super: bool,
+    launcher: Option<Option<char>>,
+    settings_open: bool,
 ) -> FilterResult<Option<Action>> {
+    // Quick settings takes everything, for the same reason the launcher does:
+    // it is compositor-drawn, so there is no surface to focus and nothing to
+    // forward to. Checked first because a panel that is open owns the keyboard.
+    if settings_open {
+        let key = crate::settings::Key::from_keysym(sym);
+        return FilterResult::Intercept(pressed(key_state, Action::Settings(key)));
+    }
+
+    // The launcher takes everything, chords included, and forwards nothing.
+    // A key reaching the focused client while a search field is open would let
+    // a window act on what the user was typing at the launcher — and `Escape`
+    // is the only way out, so it must never be shadowed by a binding.
+    if let Some(character) = launcher {
+        let key = crate::launcher::Key::from_keysym(sym, modifiers.ctrl, character);
+        return FilterResult::Intercept(pressed(key_state, Action::Launcher(key)));
+    }
+
     if !modifiers.logo {
         return FilterResult::Forward;
     }
@@ -184,6 +225,8 @@ pub(crate) fn resolve(
     }
 
     let action = match sym {
+        keysyms::KEY_space => Action::OpenLauncher,
+        keysyms::KEY_s | keysyms::KEY_S => Action::OpenSettings,
         keysyms::KEY_h | keysyms::KEY_H => Action::ToggleHelp,
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
         keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
@@ -239,7 +282,7 @@ mod tests {
 
     /// The action a press produces, if any.
     fn intercepted(mods: ModifiersState, sym: u32) -> Option<Action> {
-        match resolve(KeyState::Pressed, &mods, sym, false) {
+        match resolve(KeyState::Pressed, &mods, sym, false, None, false) {
             FilterResult::Intercept(action) => action,
             FilterResult::Forward => None,
         }
@@ -248,7 +291,7 @@ mod tests {
     /// Whether the key reaches the focused client instead.
     fn forwarded(key_state: KeyState, mods: ModifiersState, sym: u32) -> bool {
         matches!(
-            resolve(key_state, &mods, sym, false),
+            resolve(key_state, &mods, sym, false, None, false),
             FilterResult::Forward
         )
     }
@@ -275,6 +318,83 @@ mod tests {
             ctrl: true,
             ..Default::default()
         }
+    }
+
+    /// The action a press produces with the launcher open.
+    fn to_launcher(mods: ModifiersState, sym: u32, ch: Option<char>) -> FilterResult<Option<Action>> {
+        resolve(KeyState::Pressed, &mods, sym, false, Some(ch), false)
+    }
+
+    #[test]
+    fn an_open_launcher_takes_every_key_including_plain_letters() {
+        // Nothing may reach the focused client while a search field is open,
+        // or a window acts on what the user was typing at the launcher.
+        for (mods, sym, ch) in [
+            (ModifiersState::default(), keysyms::KEY_a, Some('a')),
+            (ModifiersState::default(), keysyms::KEY_1, Some('1')),
+            (super_held(), keysyms::KEY_c, Some('c')),
+            (super_shift(), keysyms::KEY_q, Some('q')),
+        ] {
+            assert!(
+                matches!(to_launcher(mods, sym, ch), FilterResult::Intercept(_)),
+                "{sym:#x} escaped to the client"
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_launcher_shadows_every_compositor_binding() {
+        // Including the ones that would otherwise close a window or quit the
+        // session out from under the launcher.
+        for sym in [keysyms::KEY_q, keysyms::KEY_T, keysyms::KEY_Escape, keysyms::KEY_H] {
+            let FilterResult::Intercept(Some(action)) = to_launcher(super_shift(), sym, None) else {
+                panic!("{sym:#x} was not intercepted for the launcher");
+            };
+            assert!(
+                matches!(action, Action::Launcher(_)),
+                "{sym:#x} resolved to {action:?} instead of going to the launcher"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_always_reaches_the_launcher_as_dismiss() {
+        // The only way out. If a binding ever shadowed this the launcher would
+        // have the keyboard and no exit.
+        for mods in [ModifiersState::default(), super_held(), super_shift()] {
+            assert!(
+                matches!(
+                    to_launcher(mods, keysyms::KEY_Escape, None),
+                    FilterResult::Intercept(Some(Action::Launcher(crate::launcher::Key::Dismiss)))
+                ),
+                "Escape did not reach the launcher with {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_while_the_launcher_is_open_is_swallowed_but_does_nothing() {
+        // Same rule as every other binding: both halves are intercepted so the
+        // client never sees an orphaned release, but only the press acts.
+        assert!(matches!(
+            resolve(
+                KeyState::Released,
+                &ModifiersState::default(),
+                keysyms::KEY_a,
+                false,
+                Some(Some('a')),
+                false
+            ),
+            FilterResult::Intercept(None)
+        ));
+    }
+
+    #[test]
+    fn the_launcher_binding_is_reachable_when_it_is_closed() {
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_space),
+            Some(Action::OpenLauncher)
+        );
     }
 
     #[test]
@@ -342,7 +462,7 @@ mod tests {
         // which it reads as SIGINT and sends to whatever is running.
         for sym in [keysyms::KEY_c, keysyms::KEY_v] {
             assert!(matches!(
-                resolve(KeyState::Pressed, &super_held(), sym, true),
+                resolve(KeyState::Pressed, &super_held(), sym, true, None, false),
                 FilterResult::Forward
             ));
         }
@@ -354,7 +474,7 @@ mod tests {
         // runs every binding twice, which is two terminals per keystroke.
         assert_eq!(intercepted(super_shift(), keysyms::KEY_T), Some(Action::Spawn));
         assert!(matches!(
-            resolve(KeyState::Released, &super_shift(), keysyms::KEY_T, false),
+            resolve(KeyState::Released, &super_shift(), keysyms::KEY_T, false, None, false),
             FilterResult::Intercept(None)
         ));
     }

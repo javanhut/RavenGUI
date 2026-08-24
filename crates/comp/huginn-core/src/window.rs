@@ -25,7 +25,7 @@ impl WindowId {
 /// How a window participates in layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowMode {
-    /// Managed by the workspace's [`Layout`](crate::layout::Layout).
+    /// Placed by the workspace's tile tree. See [`crate::tiles`].
     #[default]
     Tiled,
     /// Keeps its own geometry; floats above tiled windows.
@@ -91,6 +91,18 @@ impl Window {
     /// True if this window's geometry comes from the layout engine.
     pub const fn is_tiled(&self) -> bool {
         matches!(self.mode, WindowMode::Tiled)
+    }
+
+    /// Whether this window keeps its own geometry instead of a tile.
+    ///
+    /// The distinction that matters to the tile tree is floating versus not,
+    /// which is *not* the same as tiled versus not: a fullscreen window is not
+    /// tiled, but it still owns the tile it will return to. Evicting it would
+    /// mean un-fullscreening dropped it into whatever slot happened to be free,
+    /// and the spec is explicit that fullscreen is a state inside the pane
+    /// rather than a departure from it.
+    pub const fn is_floating(&self) -> bool {
+        matches!(self.mode, WindowMode::Floating)
     }
 
     /// Enter fullscreen over `area`, remembering where to return to.

@@ -10,9 +10,19 @@
 //! handlers, and rendering.
 
 #[cfg(target_os = "linux")]
+mod anim;
+#[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
+mod blur;
+#[cfg(target_os = "linux")]
+mod canvas;
+#[cfg(target_os = "linux")]
 mod dmabuf;
+#[cfg(target_os = "linux")]
+mod dock;
+#[cfg(target_os = "linux")]
+mod launcher;
 #[cfg(target_os = "linux")]
 mod overlay;
 #[cfg(target_os = "linux")]
@@ -22,9 +32,15 @@ mod popup;
 #[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]
+mod settings;
+#[cfg(target_os = "linux")]
 mod shell_protocol;
 #[cfg(target_os = "linux")]
 mod state;
+#[cfg(target_os = "linux")]
+mod text;
+#[cfg(target_os = "linux")]
+mod theme;
 
 fn main() {
     tracing_subscriber::fmt()

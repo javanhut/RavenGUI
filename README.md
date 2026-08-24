@@ -9,33 +9,24 @@ at.
 
 | Binary | What it is |
 |---|---|
-| `huginn` | the compositor |
-| `muninn` | the desktop shell — panel, launcher, notifications |
+| `huginn` | the compositor, and the shell it draws — dock, launcher, notifications |
 | `muninn-lock` | the lock screen |
 
 ## Architecture
-
-**The shell is a separate process.** `muninn` is an ordinary Wayland client that
-draws through `wlr-layer-shell` and talks to the compositor over the private
-`raven_shell_v1` protocol. GNOME takes the opposite approach — the shell lives
-inside Mutter, which buys synchronous access to window state at the price of a
-single failure domain, where a panel bug kills every open application. Here a
-crashed `muninn` costs you the panel and nothing else, and it can be rebuilt and
-restarted inside a live session.
-
-COSMIC is the reference design, and conveniently it is what the dev box runs, so
-a working example of this exact architecture is always a `ps` away.
-
-`muninn-lock` is a third binary for the same reason, more sharply:
-`ext-session-lock-v1` guarantees the compositor keeps the screen locked if the
-locking client dies, and that guarantee only means something if a shell bug
-cannot take the locker down with it.
 
 **`huginn-core` holds no I/O.** Layout, focus, and workspace behaviour live in a
 crate with no Wayland, DRM, or GPU dependency, so all of it is unit-tested in
 milliseconds on any host — including a Mac that cannot build the compositor at
 all. `huginn-comp` maps `WindowId` to a real `WlSurface` and turns
 `Space::arrange` output into `xdg_toplevel::configure` events.
+
+**The shell is not a client.** The dock, launcher, overview and notifications
+are drawn by the compositor itself, inside the render loop. Anything that must
+feel instant and must never fail does not get to be a separate process that can
+miss a frame or die. `muninn-lock` is the one exception, and it has an
+independent reason: `ext-session-lock-v1` keeps the screen locked if the locking
+client dies, which is only worth anything if that client shares no address space
+with the rest of the shell.
 
 **One repository, split at protocol v1.** The custom protocol is co-designed by
 both halves, so a change to it touches the XML, the compositor, and the shell in
@@ -47,13 +38,13 @@ Shared crates take the `raven-` prefix, since they belong to neither bird.
 ```
 crates/
 ├── raven-protocol/        raven_shell_v1 — shared, versioned, split-ready
-├── raven-config/          config schema — shared
+├── raven-desktop/         ★ .desktop entries + icon lookup. Pure.
 ├── comp/
 │   ├── huginn-core/       ★ layout, focus, workspaces. Pure. Tests anywhere.
-│   ├── huginn-comp/       smithay glue, event loop, protocol handlers
+│   ├── huginn-comp/       smithay glue, event loop, protocol handlers,
+│   │                        and the shell — dock, launcher, notifications
 │   └── huginn-egl/        ★ the only crate permitted `unsafe`
 └── shell/
-    ├── muninn/            panel, launcher, notifications
     └── muninn-lock/       session-lock client
 ```
 
@@ -72,6 +63,105 @@ table. It also sets `clippy::undocumented_unsafe_blocks = "deny"`, so an
 The only way to smuggle unsafe into another crate is to drop the `[lints]`
 opt-in from its manifest, which is what `scripts/check-unsafe.sh` exists to
 catch. Run it in CI and from a pre-push hook.
+
+## Window mapping
+
+A window is in the layout from the moment it is created and on screen only once
+it has committed a buffer. Between those two moments its tile is reserved and
+empty.
+
+Two orderings do the work, and both are load-bearing:
+
+- **Lay out, then configure.** `new_toplevel` arranges before it sends the
+  initial `configure`, so that configure carries the geometry the window will
+  actually occupy. The other way round sends a size of zero, the client paints
+  at whatever it picked, and the next configure resizes it into its tile — and
+  that pre-tile frame is visible. `arrange` skips any window whose initial
+  configure has not gone out, so exactly one is ever sent.
+- **Buffer, then draw.** `render_list` skips unmapped windows. A surface exists,
+  is configured, and is laid out well before it has content; a Chromium-based
+  application spends hundreds of milliseconds getting there, and anything drawn
+  in that interval is not the application.
+
+Frame callbacks deliberately go to a *wider* set than rendering does
+(`frame_surfaces`), including windows with no buffer. A frame callback is
+permission to paint, and the surfaces most needing it are the ones with nothing
+on screen; withholding it deadlocks a client against a compositor waiting for
+the buffer that callback would have produced.
+
+Mapping tracks both directions, since a client may unmap by attaching a null
+buffer and map again later.
+
+**Not yet implemented:** §5's animation clauses. There are no open or close
+animations, so there is nothing yet to hold until the first buffer or to run out
+from the last one. `sync_mapped` is where both will hang.
+
+## Tiling
+
+Opening a window splits the focused tile in two; closing one gives its space
+back to whatever it was split from. The split follows the tile's longer edge and
+is then **kept**, so tiles tend toward square instead of degenerating into
+slivers, and a resize or an output change never rearranges a pane behind your
+back.
+
+`huginn_core::tiles` is the tree. `Workspace` holds it alongside a plain
+membership list, because the two answer different questions — who lives on this
+workspace, versus how the tiled ones divide the screen. A floating window is in
+the first and not the second. A **fullscreen window is in both**: it keeps its
+tile so that leaving fullscreen puts it back exactly where it was, which is what
+§2's "fullscreen is a layout state inside the current pane" requires.
+
+The tree is a cache, never an authority. `Space::arrange` reconciles it against
+the membership list and each window's mode before reading it, so a missed update
+costs a frame of staleness rather than a window tiled into a slot it no longer
+occupies.
+
+There is one tiling model and no way to choose another.
+
+## Scaling
+
+**No client is ever handed a fractional scale.** `wl_output` advertises 1 or 2,
+and `wp_fractional_scale_v1` — whose name is about the wire format, not an
+obligation — answers with the same whole number. A client told 1.5× either
+renders at 1× and is upscaled or renders at 2× and is downscaled by a toolkit
+that does not know what the panel is; either way the glyphs pass through a
+resample the text rasterizer did not know about, which is why the same terminal
+looks sharp on macOS and mushy elsewhere.
+
+`huginn_core::scale` decides, from the panel's resolution and its reported
+millimetres. The DPI ratio snaps **down** to a quarter step, so a step is a
+threshold to be reached: an ordinary ~110 DPI monitor (27" 1440p, 34"
+ultrawide) stays at 1× rather than being promoted to a 2× desktop and
+downsampled every frame.
+
+| panel | dpi | advertised | logical desktop |
+|---|---|---|---|
+| 1920×1080 24" | 92 | 1 | 1920×1080 |
+| 2560×1440 27" | 109 | 1 | 2560×1440 |
+| 3840×2160 27" | 163 | 2 | 1920×1080 |
+| 2880×1800 15.4" | 221 | 2 | 1440×900 |
+
+**Not yet implemented:** the offscreen render-at-2×-and-downsample pass for
+panels whose ideal scale is fractional. `DrmCompositor::render_frame` draws
+straight into the scanout buffer, so there is nowhere for a larger render target
+to live. Until then the backends call `OutputScale::integer_only`, which divides
+by the advertised integer instead — a 4K 27" gets a crisp 1920×1080-at-2×
+desktop rather than the 2560×1440-at-1.5× it would prefer.
+
+## No configuration
+
+There is no config file. The desktop ships one look and one set of behaviours,
+compiled in — see `huginn-comp/src/theme.rs`, which is the whole visual
+language, and `backend/keymap.rs`, which is the whole keymap.
+
+This is a deliberate constraint rather than an unfinished feature. A format a
+user can write is a format that must not change between releases, and a config
+schema drifting under someone is the commonest way a compositor breaks a
+desktop that was working. A constant cannot drift, because nothing outside the
+binary ever names it.
+
+There is no `HUGINN_TERMINAL` override either: an environment variable is a
+user-facing configuration surface with extra steps.
 
 ## Building
 
@@ -110,7 +200,7 @@ and switches workspaces when a pip is clicked.
 
 The focused window wears a ring in the same accent the panel uses, and
 `Super`+`Shift`+arrows move it between tiles. Neighbours are found by position
-rather than by list order — with a master column beside a stack the two disagree
+rather than by tile order — with one window beside a split stack the two disagree
 — and a direction with nothing squarely that way does nothing rather than
 sending the window off diagonally.
 
@@ -143,9 +233,7 @@ placed to the right of the screens already up.
 
 ```sh
 ./scripts/remote.sh run -p huginn-comp                       # compositor
-WAYLAND_DISPLAY=huginn-1 cargo run -p muninn                 # panel
-WAYLAND_DISPLAY=huginn-1 cargo run -p muninn \
-    --example raven-shell-probe 3                            # protocol probe
+cargo run -p raven-desktop --example inventory                # app/icon index
 ```
 
 Clients get hardware buffers via `zwp_linux_dmabuf_v1`, with the render node

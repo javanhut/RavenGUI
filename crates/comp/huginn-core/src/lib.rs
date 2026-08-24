@@ -28,7 +28,8 @@
 
 pub mod geometry;
 pub mod layer;
-pub mod layout;
+pub mod scale;
+pub mod tiles;
 pub mod window;
 pub mod workspace;
 
@@ -44,6 +45,9 @@ use workspace::{Workspace, WorkspaceId};
 /// stable row of indicators, which is the behaviour `muninn` is built around.
 const DEFAULT_WORKSPACES: u64 = 9;
 
+/// Gutter used until the compositor supplies its own. See [`Space::set_gap`].
+const DEFAULT_GAP: i32 = 8;
+
 /// The complete window-management state of one seat.
 #[derive(Debug)]
 pub struct Space {
@@ -54,6 +58,12 @@ pub struct Space {
     /// subtracted. Single-output for now; multi-output arrives with the udev
     /// backend, at which point this becomes a per-output field.
     area: Rect,
+    /// Space between tiled windows and around the edge of the pane.
+    ///
+    /// Held here rather than read from a constant so `huginn-core` keeps
+    /// knowing nothing about the desktop's appearance; the compositor sets it
+    /// once from its theme.
+    gap: i32,
     next_window: u64,
 }
 
@@ -67,8 +77,14 @@ impl Space {
                 .collect(),
             active: 0,
             area,
+            gap: DEFAULT_GAP,
             next_window: 1,
         }
+    }
+
+    /// Set the gutter between tiled windows. Call [`Self::arrange`] after.
+    pub fn set_gap(&mut self, gap: i32) {
+        self.gap = gap.max(0);
     }
 
     /// The area available to windows.
@@ -213,25 +229,39 @@ impl Space {
         let area = self.area;
         let ws = &self.workspaces[self.active];
 
+        // Everything that owns a tile — which is everything except floating
+        // windows. A fullscreen window stays in the tree so that leaving
+        // fullscreen puts it back exactly where it was.
         let tiled: Vec<WindowId> = ws
             .windows()
             .iter()
             .copied()
-            .filter(|id| self.windows.get(id).is_some_and(Window::is_tiled))
+            .filter(|id| self.windows.get(id).is_some_and(|w| !w.is_floating()))
             .collect();
 
-        let rects = ws.layout().arrange(area, tiled.len());
-        debug_assert_eq!(rects.len(), tiled.len(), "layout returned the wrong count");
+        // The tree is a cache over `tiled`, not a second source of truth, so
+        // it is brought into line before it is read rather than trusted to
+        // have been kept up to date by whoever last changed a window's mode.
+        let gap = self.gap;
+        let ws = &mut self.workspaces[self.active];
+        ws.reconcile_tiles(&tiled, area, gap);
+        let laid = ws.tiles().arrange(area, gap);
+        debug_assert_eq!(laid.len(), tiled.len(), "the tree and the tiled set disagree");
 
         let mut changed = Vec::new();
-        for (id, rect) in tiled.iter().zip(rects) {
-            let Some(win) = self.windows.get_mut(id) else {
+        for (id, rect) in laid {
+            let Some(win) = self.windows.get_mut(&id) else {
                 continue;
             };
+            // Holds a tile but is not currently in it; the fullscreen pass
+            // below gives it the whole area.
+            if !win.is_tiled() {
+                continue;
+            }
             let sized = Rect::new(rect.origin, win.hints.clamp(rect.size));
             if win.geometry != sized {
                 win.geometry = sized;
-                changed.push((*id, sized));
+                changed.push((id, sized));
             }
         }
 
@@ -261,6 +291,7 @@ mod tests {
     use super::*;
     use crate::geometry::{Dir, Point};
     use crate::window::SizeHints;
+
     use geometry::Size;
 
     const SCREEN: Rect = Rect::from_xywh(0, 0, 1920, 1080);
@@ -396,8 +427,10 @@ mod tests {
         assert_eq!(s.focused(), Some(b), "and the window arrived focused");
     }
 
-    /// Three windows in the default Columns layout: `a` is the master column,
-    /// `b` and `c` are the stack, top to bottom.
+    /// Three windows: `a` takes the left half, `b` and `c` split the right,
+    /// top to bottom. Each new window splits the tile of the one before it,
+    /// and the split follows the longer edge — so a wide pane divides in two
+    /// vertically first, then the tall right-hand tile divides horizontally.
     fn master_and_stack() -> (Space, WindowId, WindowId, WindowId) {
         let mut s = space();
         let a = s.open_window();
@@ -412,7 +445,9 @@ mod tests {
         let (mut s, a, b, c) = master_and_stack();
         s.active_workspace_mut().focus(a);
         assert!(s.move_focused(Dir::Right));
-        assert_eq!(s.active_workspace().windows(), &[b, a, c]);
+        // Tile order, not membership order: membership records who lives here,
+        // the tree records where they sit, and only the latter moves.
+        assert_eq!(s.active_workspace().tiles().windows(), [b, a, c]);
         assert_eq!(s.focused(), Some(a), "the window moved, not the focus");
     }
 
@@ -421,12 +456,12 @@ mod tests {
         let (mut s, a, b, c) = master_and_stack();
         s.active_workspace_mut().focus(b);
         assert!(s.move_focused(Dir::Down));
-        assert_eq!(s.active_workspace().windows(), &[a, c, b]);
+        assert_eq!(s.active_workspace().tiles().windows(), [a, c, b]);
 
         // And back, which must land exactly where it started.
         s.arrange();
         assert!(s.move_focused(Dir::Up));
-        assert_eq!(s.active_workspace().windows(), &[a, b, c]);
+        assert_eq!(s.active_workspace().tiles().windows(), [a, b, c]);
     }
 
     #[test]

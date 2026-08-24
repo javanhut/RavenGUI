@@ -34,3 +34,26 @@ impl Backend {
         }
     }
 }
+
+/// Run `argv` as a desktop application on `socket`.
+///
+/// A free function rather than a method so it borrows nothing but its
+/// arguments: both backends call it while holding a mutable borrow of the
+/// compositor state, which a method on `&self` would conflict with.
+///
+/// The argv comes from `Entry::argv`, which has already split it and stripped
+/// field codes — it never goes near a shell. Children inherit the environment
+/// and are additionally told which display to connect to.
+pub(crate) fn spawn(argv: &[String], socket: &str) {
+    let Some((program, args)) = argv.split_first() else {
+        return;
+    };
+    match std::process::Command::new(program)
+        .args(args)
+        .env("WAYLAND_DISPLAY", socket)
+        .spawn()
+    {
+        Ok(_) => tracing::info!(?argv, "spawned"),
+        Err(e) => tracing::warn!(?argv, error = %e, "spawn failed"),
+    }
+}
