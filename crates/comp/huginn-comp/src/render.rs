@@ -107,7 +107,7 @@ where
             SceneItem::Surface(surface, rect) => out.extend(
                 render_elements_from_surface_tree(
                     renderer,
-                    surface,
+                    &surface,
                     (rect.x(), rect.y()),
                     1.0,
                     1.0,
@@ -116,6 +116,20 @@ where
                 .into_iter()
                 .map(HuginnElement::Surface),
             ),
+            SceneItem::Overlay(buffer, rect) => {
+                if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    Point::<f64, Logical>::from((f64::from(rect.x()), f64::from(rect.y())))
+                        .to_physical(1.0),
+                    buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ) {
+                    out.push(HuginnElement::Cursor(element));
+                }
+            }
             SceneItem::Ring(buffer, rect) => {
                 out.push(HuginnElement::Ring(SolidColorRenderElement::from_buffer(
                     buffer,

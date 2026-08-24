@@ -46,13 +46,108 @@ pub(crate) enum Action {
     Copy,
     /// Paste in the focused client. As [`Action::Copy`], with `Ctrl`+`V`.
     Paste,
+    /// Show or hide the keybinding overlay.
+    ToggleHelp,
 }
 
-/// One line of help, kept next to the bindings so the two cannot drift.
-pub(crate) const HELP: &str = "keys: Super+Shift+J/K focus · Super+Shift+arrows move window · \
-     Super+Shift+Return promote · Super+Shift+Q/X close · Super+Shift+E/T terminal · \
-     Super+Shift+1-9 workspace · Super+Ctrl+Shift+1-9 send there · Super+Shift+Esc quit · \
-     Super+C/V copy and paste. Plain Super belongs to the focused application.";
+/// One row of the keybinding overlay, and one clause of the startup log line.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Binding {
+    /// The action this row stands for. Present so a test can prove that every
+    /// action [`resolve`] can return has a row here — the whole point of the
+    /// table being the only place bindings are written down. Nothing outside
+    /// that test reads it, and it earns its keep anyway: it is the only thing
+    /// making the link between a binding and its description checkable.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub action: Action,
+    /// The chord as a user reads it, not as xkb spells it.
+    pub chord: &'static str,
+    /// What it does, in the imperative and lowercase, so the column reads as a
+    /// list rather than as a series of headings.
+    pub description: &'static str,
+}
+
+/// Every binding the compositor answers, in the order they are worth learning.
+///
+/// This is the single source of truth. The overlay renders it, the startup log
+/// line is built from it, and `bindings_cover_every_action` fails the build if
+/// [`resolve`] grows an action that never made it into this table. A binding
+/// that exists but is written down nowhere is a binding nobody will find.
+pub(crate) const BINDINGS: &[Binding] = &[
+    Binding {
+        action: Action::Spawn,
+        chord: "Super+Shift+E / T",
+        description: "open a terminal",
+    },
+    Binding {
+        action: Action::CloseFocused,
+        chord: "Super+Shift+Q / X",
+        description: "close the focused window",
+    },
+    Binding {
+        action: Action::FocusNext,
+        chord: "Super+Shift+J",
+        description: "focus the next window",
+    },
+    Binding {
+        action: Action::FocusPrev,
+        chord: "Super+Shift+K",
+        description: "focus the previous window",
+    },
+    Binding {
+        action: Action::Move(Dir::Left),
+        chord: "Super+Shift+arrows",
+        description: "move the focused window between tiles",
+    },
+    Binding {
+        action: Action::PromoteFocused,
+        chord: "Super+Shift+Return",
+        description: "promote the focused window to master",
+    },
+    Binding {
+        action: Action::Workspace(0),
+        chord: "Super+Shift+1..9",
+        description: "go to a workspace",
+    },
+    Binding {
+        action: Action::SendToWorkspace(0),
+        chord: "Super+Ctrl+Shift+1..9",
+        description: "send the focused window to a workspace",
+    },
+    Binding {
+        action: Action::Copy,
+        chord: "Super+C",
+        description: "copy in the focused client",
+    },
+    Binding {
+        action: Action::Paste,
+        chord: "Super+V",
+        description: "paste in the focused client",
+    },
+    Binding {
+        action: Action::ToggleHelp,
+        chord: "Super+Shift+H",
+        description: "show or hide this list",
+    },
+    Binding {
+        action: Action::Quit,
+        chord: "Super+Shift+Esc",
+        description: "quit the compositor",
+    },
+];
+
+/// The startup log line, built from [`BINDINGS`] rather than written out again.
+///
+/// Someone reading a session log is usually not looking at the screen, which is
+/// exactly when an overlay is no use — so the same table has to reach both.
+pub(crate) fn help_line() -> String {
+    let keys = BINDINGS
+        .iter()
+        .map(|b| format!("{} {}", b.chord, b.description))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("keys: {keys}. Plain Super belongs to the focused application.")
+}
 
 /// Map a key event to an action, or forward it to the focused client.
 ///
@@ -89,6 +184,7 @@ pub(crate) fn resolve(
     }
 
     let action = match sym {
+        keysyms::KEY_h | keysyms::KEY_H => Action::ToggleHelp,
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
         keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
         keysyms::KEY_Return => Action::PromoteFocused,
@@ -272,5 +368,56 @@ mod tests {
     #[test]
     fn unbound_keys_reach_the_client() {
         assert_eq!(intercepted(super_shift(), keysyms::KEY_z), None);
+    }
+
+    /// Every action the keymap can produce is written down in `BINDINGS`, and
+    /// nothing in `BINDINGS` is written down for an action the keymap cannot
+    /// produce.
+    ///
+    /// This is what makes the table a source of truth rather than a comment
+    /// that happens to be code. Sweeping the keysym space is cheap and needs no
+    /// maintenance — a new binding added to `resolve` shows up here on its own,
+    /// which a hand-written list of actions would not.
+    #[test]
+    fn bindings_cover_every_action() {
+        use std::collections::HashSet;
+        use std::mem::discriminant;
+
+        let mut reachable = HashSet::new();
+        for mods in [super_held(), super_shift(), super_ctrl_shift()] {
+            for sym in 0..=u32::from(u16::MAX) {
+                if let Some(action) = intercepted(mods, sym) {
+                    reachable.insert(discriminant(&action));
+                }
+            }
+        }
+
+        let documented: HashSet<_> = BINDINGS.iter().map(|b| discriminant(&b.action)).collect();
+
+        let orphan = BINDINGS
+            .iter()
+            .find(|b| !reachable.contains(&discriminant(&b.action)));
+        assert!(orphan.is_none(), "BINDINGS lists {:?}, which no key produces", orphan);
+
+        assert_eq!(
+            reachable.len(),
+            documented.len(),
+            "an action is reachable by a key but missing from BINDINGS, so the \
+             overlay and the log line will not mention it"
+        );
+    }
+
+    /// The overlay draws with an ASCII bitmap font, so a chord or description
+    /// that strays outside it comes out as blanks.
+    #[test]
+    fn binding_text_is_ascii() {
+        for binding in BINDINGS {
+            for text in [binding.chord, binding.description] {
+                assert!(
+                    text.chars().all(|c| (' '..='~').contains(&c)),
+                    "{text:?} is not renderable by the overlay font"
+                );
+            }
+        }
     }
 }

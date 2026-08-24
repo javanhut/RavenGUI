@@ -18,7 +18,11 @@ use huginn_core::{
     window::{WindowId, WindowMode},
 };
 use smithay::{
-    backend::renderer::{element::solid::SolidColorBuffer, utils::on_commit_buffer_handler},
+    backend::renderer::{
+        element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
+        utils::on_commit_buffer_handler,
+    },
+    desktop::{PopupKind, PopupManager},
     utils::{Logical, Point},
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
@@ -80,12 +84,22 @@ impl ClientData for ClientState {
 
 /// One thing to paint, as [`Huginn::scene`] orders them.
 pub(crate) enum SceneItem<'a> {
-    /// A client surface: window, panel, wallpaper.
-    Surface(&'a WlSurface, Rect),
+    /// A client surface: window, panel, wallpaper, popup.
+    ///
+    /// Owned rather than borrowed because a popup is reached through the
+    /// compositor's popup tree, which hands back values rather than references
+    /// into anything the compositor holds. A `WlSurface` is a handle, so the
+    /// clone costs a refcount.
+    Surface(WlSurface, Rect),
     /// One edge of the ring around the focused window. Drawn by the compositor
     /// itself, so unlike a surface there is no client to click on or to send a
     /// frame callback to.
     Ring(&'a SolidColorBuffer, Rect),
+    /// The keybinding overlay. Compositor-drawn like the ring, so it too is
+    /// invisible to hit testing — clicks fall through it to whatever is
+    /// underneath, which is right for something that is a label rather than a
+    /// window.
+    Overlay(&'a MemoryRenderBuffer, Rect),
 }
 
 /// Applications that drive the `Super` layer themselves.
@@ -148,6 +162,13 @@ pub(crate) struct Huginn {
     /// Wayland surface for each window the core knows about.
     toplevels: HashMap<WindowId, ToplevelSurface>,
 
+    /// Menus, dropdowns and tooltips, and the modal grabs that dismiss them.
+    ///
+    /// Deliberately outside `space`: a popup is not a window, has no place in
+    /// a workspace, and is positioned by the client's own rules rather than by
+    /// any layout the core runs.
+    pub popups: PopupManager,
+
     /// Panels, docks, wallpapers and overlays, with the geometry last sent to
     /// each. Storing what was sent is what keeps [`Huginn::refresh_layers`]
     /// from configuring on every commit and driving clients into a redraw loop.
@@ -155,6 +176,10 @@ pub(crate) struct Huginn {
     /// The whole output, before exclusive zones are subtracted. `space`'s area
     /// is this minus whatever the panels have claimed.
     output_area: Rect,
+
+    /// The keybinding overlay, drawn once when it is summoned rather than on
+    /// every frame. `None` when it is not on screen, which is almost always.
+    help: Option<crate::overlay::Overlay>,
 
     /// The four edges of the focus ring, and where they were last put.
     ///
@@ -198,18 +223,40 @@ impl Huginn {
             cursor_status: CursorImageStatus::default_named(),
             space: Space::new(area),
             toplevels: HashMap::new(),
+            popups: PopupManager::default(),
             layers: Vec::new(),
             output_area: area,
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), FOCUS_RING_COLOR)
             }),
             focus_ring_at: None,
+            help: None,
         }
+    }
+
+    /// Show or hide the keybinding overlay.
+    ///
+    /// Rendered on the way in rather than kept around: it is a few hundred
+    /// kilobytes that spend the whole session unlooked at, and the table it is
+    /// drawn from cannot change while the compositor runs, so there is nothing
+    /// to gain by holding it.
+    pub(crate) fn toggle_help(&mut self) {
+        self.help = match self.help {
+            Some(_) => None,
+            None => Some(crate::overlay::Overlay::render(self.output_area)),
+        };
+        tracing::debug!(visible = self.help.is_some(), "keybinding overlay");
+        self.queue_redraw();
     }
 
     /// Set the full output rectangle and reflow everything beneath it.
     pub(crate) fn set_output_area(&mut self, area: Rect) {
         self.output_area = area;
+        // The overlay picks its scale from the output height, so a resize with
+        // it open has to redraw it rather than just re-centre it.
+        if self.help.is_some() {
+            self.help = Some(crate::overlay::Overlay::render(area));
+        }
         self.refresh_layers();
     }
 
@@ -260,6 +307,13 @@ impl Huginn {
         self.arrange();
     }
 
+    /// Every layer surface with the geometry last sent to it, in no particular
+    /// order. Used to find a popup's root, which cares which surface it is
+    /// rather than which layer it sits on.
+    pub(crate) fn all_layers(&self) -> Vec<(&LayerSurface, Rect)> {
+        self.layers.iter().map(|(surface, rect)| (surface, *rect)).collect()
+    }
+
     /// Layer surfaces on `layer`, with their geometry, for rendering.
     pub(crate) fn layers_on(&self, layer: Layer) -> Vec<(&LayerSurface, Rect)> {
         self.layers
@@ -290,12 +344,28 @@ impl Huginn {
     /// clicks landing on windows hidden behind a panel.
     pub(crate) fn scene(&self) -> Vec<SceneItem<'_>> {
         let mut out = Vec::new();
+        // Above everything. It is summoned by someone who has lost track of
+        // what is on screen, so letting a panel or a fullscreen window cover it
+        // would defeat the one thing it is for.
+        if let Some(help) = &self.help {
+            out.push(SceneItem::Overlay(&help.buffer, help.placement(self.output_area)));
+        }
+        // A panel's own menu belongs directly on top of the panel, not on top
+        // of everything, so each layer surface carries its popups with it.
         for layer in [Layer::Overlay, Layer::Top] {
-            out.extend(
-                self.layers_on(layer)
-                    .into_iter()
-                    .map(|(l, r)| SceneItem::Surface(l.wl_surface(), r)),
-            );
+            for (surface, rect) in self.layers_on(layer) {
+                out.extend(self.popups_of(surface.wl_surface(), rect));
+                out.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
+            }
+        }
+        // Window popups go above every window and above the ring. A menu is
+        // routinely taller than the button that opened it and reaches over the
+        // neighbouring tile; drawing it under that tile, or letting the ring
+        // draw a line across it, is worse than the alternative of a menu
+        // covering a window it does not belong to — which is what a menu is
+        // supposed to do.
+        for (window, rect) in self.render_list() {
+            out.extend(self.popups_of(window.wl_surface(), rect));
         }
         // Directly above the windows: over its neighbours, whose pixels it
         // reaches into when the layout leaves no gap, but under a panel or an
@@ -304,14 +374,13 @@ impl Huginn {
         out.extend(
             self.render_list()
                 .into_iter()
-                .map(|(w, r)| SceneItem::Surface(w.wl_surface(), r)),
+                .map(|(w, r)| SceneItem::Surface(w.wl_surface().clone(), r)),
         );
         for layer in [Layer::Bottom, Layer::Background] {
-            out.extend(
-                self.layers_on(layer)
-                    .into_iter()
-                    .map(|(l, r)| SceneItem::Surface(l.wl_surface(), r)),
-            );
+            for (surface, rect) in self.layers_on(layer) {
+                out.extend(self.popups_of(surface.wl_surface(), rect));
+                out.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
+            }
         }
         out
     }
@@ -320,10 +389,10 @@ impl Huginn {
     ///
     /// Hit testing and frame callbacks both want a client on the other end, and
     /// the focus ring has none.
-    pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (&WlSurface, Rect)> {
+    pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (WlSurface, Rect)> {
         self.scene().into_iter().filter_map(|item| match item {
             SceneItem::Surface(surface, rect) => Some((surface, rect)),
-            SceneItem::Ring(..) => None,
+            SceneItem::Ring(..) | SceneItem::Overlay(..) => None,
         })
     }
 
@@ -415,6 +484,17 @@ impl Huginn {
     /// Consume the redraw request, if there is one.
     pub(crate) fn take_redraw(&mut self) -> bool {
         std::mem::take(&mut self.needs_redraw)
+    }
+
+    /// End-of-cycle housekeeping, run by both backends.
+    ///
+    /// A dismissed popup leaves a dead entry in the popup tree, and a dead
+    /// entry still appears in the scene: the client destroyed the surface, so
+    /// there is nothing to paint, but the tree is only pruned when asked. Doing
+    /// it once per cycle rather than at each destroy point keeps a nested
+    /// menu's teardown — several surfaces going at once — to a single sweep.
+    pub(crate) fn refresh(&mut self) {
+        self.popups.cleanup();
     }
 
     /// The surface backing `id`, if it is still mapped.
@@ -522,6 +602,24 @@ impl CompositorHandler for Huginn {
         on_commit_buffer_handler::<Self>(surface);
         self.queue_redraw();
 
+        // Moves a popup from unmapped to mapped once its parent is known, which
+        // is what puts it in the tree the scene is built from.
+        self.popups.commit(surface);
+
+        // Same rule as a toplevel: the client may not attach a buffer until it
+        // has acked a configure, so a popup that never gets one never appears.
+        // It cannot be sent from new_popup, because the client sets its
+        // positioner between creating the popup and committing it, and
+        // configuring early would answer with geometry computed from nothing.
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
+            && !popup.is_initial_configure_sent()
+        {
+            self.unconstrain_popup(&popup);
+            if let Err(err) = popup.send_configure() {
+                tracing::warn!(%err, "initial popup configure refused");
+            }
+        }
+
         // A layer surface sends its anchor, size and exclusive zone before its
         // first commit and expects a configure in response. Doing this on every
         // commit covers both that first configure and any later change, without
@@ -575,16 +673,47 @@ impl XdgShellHandler for Huginn {
         self.refresh_focus();
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        // No configure here: see the popup branch of `commit`. Tracking is all
+        // that is owed at this point, and a popup whose parent is not set yet
+        // is parked as unmapped until it is.
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!(%err, "popup died before it could be tracked");
+        }
+    }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        self.take_popup_grab(surface, &seat, serial);
+    }
+
+    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        // The tree is pruned once per cycle by `refresh`; all that is needed
+        // here is a frame without the popup in it.
+        self.queue_redraw();
+    }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        // Reposition is the client saying "same popup, new anchor" — a submenu
+        // following the item the pointer moved to. The new positioner has to
+        // be stored before unconstraining, since unconstraining is defined in
+        // terms of it.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        self.unconstrain_popup(&surface);
+        // The token pairs the client's request with the configure that answers
+        // it, so it must go out first.
+        surface.send_repositioned(token);
+        if let Err(err) = surface.send_configure() {
+            tracing::warn!(%err, "reposition configure refused");
+        }
+        self.queue_redraw();
     }
 }
 

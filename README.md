@@ -114,6 +114,14 @@ rather than by list order — with a master column beside a stack the two disagr
 — and a direction with nothing squarely that way does nothing rather than
 sending the window off diagonally.
 
+`Super`+`Shift`+`H` draws the keybinding list over everything, and pressing it
+again takes it away. The compositor renders it itself, with a bitmap font it
+carries in the binary — the shell is a separate process precisely so it can
+crash, and a help screen that vanishes along with the panel would be missing
+exactly when it is wanted. Both the overlay and the line the compositor logs at
+startup are built from one table next to the keymap, and a test walks the
+keysym space to prove no binding has been added without a row in it.
+
 Window management lives on the `Super`+`Shift` layer. Plain `Super` belongs to
 applications: RavenTerminal uses it as its own leader, and a chord the
 compositor intercepts never reaches a client at all. The exception is

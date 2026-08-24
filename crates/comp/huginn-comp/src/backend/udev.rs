@@ -74,7 +74,7 @@ use huginn_core::{geometry::Rect, workspace::Direction};
 
 use crate::backend::input;
 use crate::backend::chord;
-use crate::backend::keymap::{Action, HELP, resolve};
+use crate::backend::keymap::{Action, help_line, resolve};
 use crate::pointer::Cursor;
 use crate::render;
 use crate::state::{ClientState, Huginn};
@@ -340,7 +340,7 @@ pub(crate) fn run() -> Result<()> {
 
     tracing::info!(socket = %data.socket, screens = data.screens.len(), "huginn is up on DRM");
     tracing::info!("clients: WAYLAND_DISPLAY={} <command>", data.socket);
-    tracing::info!("{HELP}");
+    tracing::info!("{}", help_line());
 
     // Draw once before entering the loop. calloop only runs the post-dispatch
     // callback after an event, so with nothing connected yet the first frame
@@ -363,6 +363,7 @@ pub(crate) fn run() -> Result<()> {
                     screen.dirty = true;
                 }
             }
+            data.state.refresh();
             data.render_dirty();
             if let Err(e) = data.display.flush_clients() {
                 tracing::warn!(error = %e, "flushing clients");
@@ -687,7 +688,7 @@ impl Udev {
         // stalls that client forever.
         let now = self.start.elapsed().as_millis() as u32;
         for (surface, _) in self.state.scene_surfaces() {
-            send_frames(surface, now);
+            send_frames(&surface, now);
         }
     }
 
@@ -764,6 +765,10 @@ impl Udev {
             }
             Action::Paste => {
                 chord::send_ctrl(&self.keyboard, state, Keysym::v, time);
+                return;
+            }
+            Action::ToggleHelp => {
+                state.toggle_help();
                 return;
             }
             Action::CloseFocused => {
