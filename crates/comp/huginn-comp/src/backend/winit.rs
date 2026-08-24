@@ -52,7 +52,7 @@ use huginn_core::{geometry::Rect, workspace::Direction};
 
 use crate::backend::input;
 use crate::backend::chord;
-use crate::backend::keymap::{Action, HELP, resolve};
+use crate::backend::keymap::{Action, help_line, resolve};
 use crate::pointer::Cursor;
 use crate::render;
 use crate::state::{ClientState, Huginn};
@@ -193,7 +193,7 @@ pub(crate) fn run() -> Result<()> {
 
     tracing::info!(socket = %socket, "huginn is up");
     tracing::info!("clients: WAYLAND_DISPLAY={socket} <command>");
-    tracing::info!("{HELP}");
+    tracing::info!("{}", help_line());
 
     let mut data = Nested {
         state,
@@ -227,6 +227,7 @@ pub(crate) fn run() -> Result<()> {
 impl Nested {
     /// Render if anything asked us to, then flush.
     fn dispatch_end_of_cycle(&mut self) -> Result<()> {
+        self.state.refresh();
         if self.state.take_redraw() {
             // render flushes internally, before submit blocks.
             self.render()?;
@@ -275,7 +276,7 @@ impl Nested {
             // one renders its first frame and then freezes forever.
             let now = self.start.elapsed().as_millis() as u32;
             for (surface, _) in self.state.scene_surfaces() {
-                send_frames(surface, now);
+                send_frames(&surface, now);
             }
         }
 
@@ -360,6 +361,10 @@ impl Nested {
             }
             Action::Paste => {
                 chord::send_ctrl(&self.keyboard, state, Keysym::v, time);
+                return;
+            }
+            Action::ToggleHelp => {
+                state.toggle_help();
                 return;
             }
             Action::CloseFocused => {

@@ -14,7 +14,11 @@ mod backend;
 #[cfg(target_os = "linux")]
 mod dmabuf;
 #[cfg(target_os = "linux")]
+mod overlay;
+#[cfg(target_os = "linux")]
 mod pointer;
+#[cfg(target_os = "linux")]
+mod popup;
 #[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]

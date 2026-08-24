@@ -78,15 +78,21 @@ impl Huginn {
     /// what you click is always what you can see. Descends into subsurfaces and
     /// honours input regions, which is why a client can have a transparent
     /// border that clicks fall straight through.
+    ///
+    /// `point` and the surface origin both go in as global coordinates:
+    /// `under_from_surface_tree` subtracts the one from the other itself, and
+    /// relativising the point first subtracts the origin twice. That reads as
+    /// clicks landing a window's own position away from the pointer — harmless
+    /// for a surface at the screen origin like the panel, and enough to miss
+    /// the surface entirely for one tiled off to the right.
     pub(crate) fn surface_under(
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
         for (surface, rect) in self.scene_surfaces() {
             let origin: Point<i32, Logical> = (rect.x(), rect.y()).into();
-            let relative = point - origin.to_f64();
             if let Some(found) =
-                under_from_surface_tree(surface, relative, origin, WindowSurfaceType::ALL)
+                under_from_surface_tree(&surface, point, origin, WindowSurfaceType::ALL)
             {
                 return Some(found);
             }

@@ -63,7 +63,19 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
 
     // Click to focus. Done on press rather than release so that a click-drag
     // starting in an unfocused window focuses it before the drag begins.
+    //
+    // Two things are exempt. A click on a popup belongs to the window that
+    // opened the popup, and a menu routinely hangs over the tile next door —
+    // focusing whatever lies under it would dismiss the menu and focus the
+    // wrong window in the same gesture. And while any grab is active the grab
+    // decides where input goes, so moving focus underneath it would leave the
+    // grab holding a seat that is pointing somewhere else.
+    let on_popup = state
+        .surface_under(state.pointer_location)
+        .is_some_and(|(surface, _)| state.is_popup(&surface));
     if button_state == ButtonState::Pressed
+        && !on_popup
+        && !state.pointer().is_grabbed()
         && let Some(window) = state.window_under(state.pointer_location)
     {
         state.space.active_workspace_mut().focus(window);
