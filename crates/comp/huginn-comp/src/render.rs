@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use smithay::{
     backend::renderer::{
-        ImportAll, ImportMem, Renderer,
+        gles::{GlesRenderer, element::TextureShaderElement},
         element::{
             Kind, memory::MemoryRenderBufferRenderElement, render_elements,
             solid::SolidColorRenderElement,
@@ -33,31 +33,54 @@ use crate::state::{Huginn, SceneItem};
 
 render_elements! {
     /// Everything Huginn can draw.
-    pub(crate) HuginnElement<R> where R: ImportAll + ImportMem;
+    ///
+    /// Concrete over `GlesRenderer` rather than generic. Both backends use it —
+    /// winit through `WinitGraphicsBackend<GlesRenderer>` and udev directly —
+    /// so the generic bought nothing, and it cost the ability to hold a
+    /// [`TextureShaderElement`], which exists only for GLES.
+    pub(crate) HuginnElement<=GlesRenderer>;
     /// A client surface: window, panel, wallpaper.
-    Surface = WaylandSurfaceRenderElement<R>,
+    Surface = WaylandSurfaceRenderElement<GlesRenderer>,
     /// The cursor, when no client has supplied its own.
-    Cursor = MemoryRenderBufferRenderElement<R>,
+    Cursor = MemoryRenderBufferRenderElement<GlesRenderer>,
     /// One edge of the ring around the focused window.
     Ring = SolidColorRenderElement,
+    /// The desktop, already drawn and blurred into a texture.
+    Blur = TextureShaderElement,
+}
+
+/// The scene split at the blur boundary: what goes over a blurred desktop,
+/// and what gets blurred.
+///
+/// The cursor is always in the first group — blurring the pointer would be
+/// blurring the one thing the user is aiming with.
+pub(crate) fn elements_split(
+    renderer: &mut GlesRenderer,
+    state: &Huginn,
+    fallback_cursor: Option<&Cursor>,
+) -> (Vec<HuginnElement>, Vec<HuginnElement>) {
+    let all = elements(renderer, state, fallback_cursor);
+    // `elements` puts the cursor in front of everything `scene` produced, so
+    // the boundary is that plus the panels above it.
+    let cursor = all.len() - state.scene().len();
+    let above = cursor + state.blur_boundary();
+    let mut front = all;
+    let back = front.split_off(above.min(front.len()));
+    (front, back)
 }
 
 /// Build the full scene, cursor included, front to back.
-pub(crate) fn elements<R>(
-    renderer: &mut R,
+pub(crate) fn elements(
+    renderer: &mut GlesRenderer,
     state: &Huginn,
     fallback_cursor: Option<&Cursor>,
-) -> Vec<HuginnElement<R>>
-where
-    R: Renderer + ImportAll + ImportMem,
-    R::TextureId: Clone + Send + 'static,
-{
+) -> Vec<HuginnElement> {
     // The output's advertised integer scale, as an f64 for the element APIs.
     // Whole numbers only, so this conversion is exact and no position can land
     // between pixels on the way from logical to physical.
     let scale = f64::from(state.scale.advertised);
 
-    let mut out: Vec<HuginnElement<R>> = Vec::new();
+    let mut out: Vec<HuginnElement> = Vec::new();
 
     // The cursor goes first because the scene is painted front to back, and
     // nothing is ever meant to occlude the pointer.

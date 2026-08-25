@@ -121,6 +121,8 @@ struct Udev {
     device_id: libc::dev_t,
     manager: Manager,
     renderer: GlesRenderer,
+    /// The blur, if its shader compiled. `None` means panels do not blur.
+    blur: Option<crate::blur::Blur>,
     screens: HashMap<crtc::Handle, Screen>,
     keyboard: KeyboardHandle<Huginn>,
     cursor: Option<Cursor>,
@@ -316,7 +318,10 @@ pub(crate) fn run() -> Result<()> {
         .add_keyboard(Default::default(), 200, 25)
         .context("adding keyboard")?;
 
+    let mut renderer = renderer;
+    let blur = crate::blur::Blur::compile(&mut renderer);
     let mut data = Udev {
+        blur,
         state,
         display,
         dh,
@@ -681,7 +686,37 @@ impl Udev {
             return;
         }
 
-        let elements = render::elements(&mut self.renderer, &self.state, self.cursor.as_ref());
+        // The blur's offscreen passes bind their own framebuffers, so they run
+        // before `render_frame` takes the renderer. `None` — no panel open, no
+        // shader, no buffer — falls through to the path this backend has always
+        // taken, so an ordinary frame costs exactly what it did before.
+        let radius = self.state.blur_radius();
+        let blurred = if radius > 0.0 {
+            let size = self
+                .screens
+                .get(&crtc)
+                .and_then(|screen| screen.output.current_mode())
+                .map(|mode| mode.size)
+                .unwrap_or_default();
+            let (_, behind) =
+                render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref());
+            self.blur
+                .as_mut()
+                .and_then(|blur| blur.pass(&mut self.renderer, &behind, size, radius))
+        } else {
+            None
+        };
+
+        let mut elements = match &blurred {
+            Some(_) => {
+                render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref()).0
+            }
+            None => render::elements(&mut self.renderer, &self.state, self.cursor.as_ref()),
+        };
+        // Front to back, so the blurred desktop goes on the end.
+        if let Some(element) = blurred {
+            elements.push(crate::render::HuginnElement::Blur(element));
+        }
 
         let Some(screen) = self.screens.get_mut(&crtc) else {
             return;
@@ -752,6 +787,7 @@ impl Udev {
         // Read before the filter borrows the state.
         let launcher_open = self.state.launcher.is_open();
         let settings_open = self.state.settings.is_open();
+                let resizing = self.state.resizing;
         let action = self
             .keyboard
             .input::<Option<Action>, _>(
@@ -768,11 +804,17 @@ impl Udev {
                                 // than what a US keyboard would have.
                                 let character = sym.key_char();
                                 let launcher = launcher_open.then_some(character);
-                                resolve(key_state, modifiers, sym.raw(), owns_super, launcher, settings_open)
+                                resolve(key_state, modifiers, sym.raw(), owns_super, launcher, settings_open, resizing)
                             }
                 },
             )
             .flatten();
+        if resizing
+            && key_state == smithay::backend::input::KeyState::Pressed
+            && !matches!(action, Some(Action::Resize(_)))
+        {
+            self.state.resizing = false;
+        }
         if let Some(action) = action {
             self.apply(action, time);
         }
@@ -820,6 +862,12 @@ impl Udev {
             Action::SendToWorkspace(i) => {
                 state.space.send_focused_to_workspace(i);
             }
+            Action::EnterResize => {
+                state.resizing = true;
+                tracing::debug!("resize mode: arrows resize, Escape or Return leaves");
+            }
+            Action::Resize(dir) => state.resize_focused(dir),
+            Action::LeaveResize => state.resizing = false,
             Action::OpenSettings => {
                 let now = state.uptime();
                 state.settings.open(now);

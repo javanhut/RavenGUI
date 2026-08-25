@@ -15,13 +15,12 @@
 //! radius that is 98 samples against 2401, which is the difference between a
 //! blur that fits in a frame and one that does not.
 //!
-//! # Not wired up yet
+//! # Never verified on a screen
 //!
-//! Everything here is built and tested, and nothing calls [`Blur::pass`]. The
-//! two offscreen passes have to happen *before* the backend binds its output
-//! framebuffer, which means restructuring both render loops — and that is the
-//! one path where a mistake is a blank screen rather than a wrong pixel. It is
-//! left for a session where the result can actually be looked at.
+//! This compiles and its kernel is tested, but no part of the GPU path has
+//! been run: shader compilation errors surface only at runtime, on real
+//! hardware. The fallbacks below are what make that acceptable to ship
+//! untested — the worst case they allow is a panel that does not blur.
 //!
 //! # If it fails
 //!
@@ -36,7 +35,6 @@
 /// The shader samples a fixed number of taps regardless, so this only sets how
 /// far apart they are; past about this the taps separate enough that the blur
 /// starts to band instead of smoothing.
-#[allow(dead_code)]
 pub(crate) const MAX_RADIUS: f32 = 18.0;
 
 /// Taps per pass, each side of centre.
@@ -44,7 +42,6 @@ pub(crate) const MAX_RADIUS: f32 = 18.0;
 /// Nine, so a pass samples 19 texels and the pair costs 38. Enough that the
 /// Gaussian is not visibly truncated at [`MAX_RADIUS`], few enough to stay
 /// within the uniform array a GLES 2 shader can rely on.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const TAPS: usize = 9;
 
 /// Gaussian weights for [`TAPS`] offsets each side of centre, normalized.
@@ -81,7 +78,6 @@ pub(crate) fn weights(sigma: f32) -> [f32; TAPS + 1] {
 /// Animated with the reveal so the desktop softens as the panel arrives, which
 /// is what §4 asks for — a blur that snapped to full strength would read as a
 /// separate event from the panel appearing.
-#[allow(dead_code)]
 pub(crate) fn radius_for(reveal: f32) -> f32 {
     MAX_RADIUS * reveal.clamp(0.0, 1.0)
 }
@@ -102,7 +98,6 @@ pub(crate) fn radius_for(reveal: f32) -> f32 {
 /// Rust: it is the executable specification this mirrors, and what the tests
 /// pin. Normalizing by the running total also makes "the weights sum to one"
 /// true by construction here rather than by arithmetic that could drift.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SHADER: &str = r#"
 precision mediump float;
 //_DEFINES
@@ -229,7 +224,7 @@ mod tests {
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
-use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement};
+use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::gles::element::TextureShaderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture, Uniform};
 use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer};
@@ -242,7 +237,6 @@ use crate::render::HuginnElement;
 /// Held across frames: compiling a shader and allocating two full-screen
 /// textures per frame would cost more than the blur itself.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct Blur {
     program: GlesTexProgram,
     /// The scene, and the horizontal pass. Reallocated only when the output
@@ -250,7 +244,6 @@ pub(crate) struct Blur {
     scene: Option<(GlesTexture, GlesTexture, Size<i32, Physical>)>,
 }
 
-#[allow(dead_code)]
 impl Blur {
     /// Compile the shader, or give up.
     ///
@@ -293,7 +286,7 @@ impl Blur {
     pub(crate) fn pass(
         &mut self,
         renderer: &mut GlesRenderer,
-        elements: &[HuginnElement<GlesRenderer>],
+        elements: &[HuginnElement],
         size: Size<i32, Physical>,
         radius: f32,
     ) -> Option<TextureShaderElement> {
@@ -315,9 +308,12 @@ impl Blur {
                 .render(&mut fb, size, Transform::Normal)
                 .ok()?;
             frame.clear(Color32F::from([0.0, 0.0, 0.0, 1.0]), &[full]).ok()?;
-            for element in elements {
-                let _ = RenderElement::draw(element, &mut frame, element.src(), element.geometry(1.0.into()), &[full], &[]);
-            }
+            let _ = smithay::backend::renderer::utils::draw_render_elements::<GlesRenderer, _, _>(
+                &mut frame,
+                1.0,
+                elements,
+                &[full],
+            );
             // The sync point is dropped: the next pass samples this texture
             // through the same context, which orders them for us.
             let _sync = frame.finish().ok()?;
@@ -338,7 +334,12 @@ impl Blur {
                 [1.0 / size.w as f32, 0.0],
                 sigma,
             );
-            let _ = RenderElement::draw(&element, &mut frame, element.src(), element.geometry(1.0.into()), &[full], &[]);
+            let _ = smithay::backend::renderer::utils::draw_render_elements::<GlesRenderer, _, _>(
+                &mut frame,
+                1.0,
+                std::slice::from_ref(&element),
+                &[full],
+            );
             let _sync = frame.finish().ok()?;
         }
 
@@ -373,7 +374,6 @@ impl Blur {
 }
 
 /// One blur pass as a drawable element.
-#[allow(dead_code)]
 fn shader_element(
     context: smithay::backend::renderer::ContextId<GlesTexture>,
     texture: &GlesTexture,

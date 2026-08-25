@@ -50,6 +50,12 @@ pub(crate) enum Action {
     ToggleHelp,
     /// Open the application launcher.
     OpenLauncher,
+    /// Enter resize mode: arrows then resize the focused window.
+    EnterResize,
+    /// Resize the focused window while in resize mode.
+    Resize(Dir),
+    /// Leave resize mode.
+    LeaveResize,
     /// Open the quick settings panel.
     OpenSettings,
     /// A key while quick settings is open.
@@ -115,6 +121,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::PromoteFocused,
         chord: "Super+Shift+Return",
         description: "swap the focused window into the first tile",
+    },
+    Binding {
+        action: Action::EnterResize,
+        chord: "Super+Shift+R",
+        description: "resize the focused window with the arrows",
     },
     Binding {
         action: Action::Workspace(0),
@@ -188,10 +199,29 @@ pub(crate) fn resolve(
     focus_owns_super: bool,
     launcher: Option<Option<char>>,
     settings_open: bool,
+    resizing: bool,
 ) -> FilterResult<Option<Action>> {
     // Quick settings takes everything, for the same reason the launcher does:
     // it is compositor-drawn, so there is no surface to focus and nothing to
     // forward to. Checked first because a panel that is open owns the keyboard.
+    // Resize mode owns the arrows and nothing else, so every other key both
+    // leaves the mode and does what it would have done. A mode that swallowed
+    // everything until it was dismissed would be a mode you get stuck in.
+    if resizing {
+        let action = match sym {
+            keysyms::KEY_Left => Some(Action::Resize(Dir::Left)),
+            keysyms::KEY_Right => Some(Action::Resize(Dir::Right)),
+            keysyms::KEY_Up => Some(Action::Resize(Dir::Up)),
+            keysyms::KEY_Down => Some(Action::Resize(Dir::Down)),
+            keysyms::KEY_Escape | keysyms::KEY_Return => Some(Action::LeaveResize),
+            _ => None,
+        };
+        if let Some(action) = action {
+            return FilterResult::Intercept(pressed(key_state, action));
+        }
+        // Not a resize key: fall through, and the caller leaves the mode.
+    }
+
     if settings_open {
         let key = crate::settings::Key::from_keysym(sym);
         return FilterResult::Intercept(pressed(key_state, Action::Settings(key)));
@@ -227,6 +257,7 @@ pub(crate) fn resolve(
     let action = match sym {
         keysyms::KEY_space => Action::OpenLauncher,
         keysyms::KEY_s | keysyms::KEY_S => Action::OpenSettings,
+        keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
         keysyms::KEY_h | keysyms::KEY_H => Action::ToggleHelp,
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
         keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
@@ -282,7 +313,7 @@ mod tests {
 
     /// The action a press produces, if any.
     fn intercepted(mods: ModifiersState, sym: u32) -> Option<Action> {
-        match resolve(KeyState::Pressed, &mods, sym, false, None, false) {
+        match resolve(KeyState::Pressed, &mods, sym, false, None, false, false) {
             FilterResult::Intercept(action) => action,
             FilterResult::Forward => None,
         }
@@ -291,7 +322,7 @@ mod tests {
     /// Whether the key reaches the focused client instead.
     fn forwarded(key_state: KeyState, mods: ModifiersState, sym: u32) -> bool {
         matches!(
-            resolve(key_state, &mods, sym, false, None, false),
+            resolve(key_state, &mods, sym, false, None, false, false),
             FilterResult::Forward
         )
     }
@@ -322,7 +353,60 @@ mod tests {
 
     /// The action a press produces with the launcher open.
     fn to_launcher(mods: ModifiersState, sym: u32, ch: Option<char>) -> FilterResult<Option<Action>> {
-        resolve(KeyState::Pressed, &mods, sym, false, Some(ch), false)
+        resolve(KeyState::Pressed, &mods, sym, false, Some(ch), false, false)
+    }
+
+    /// Resolve with resize mode active.
+    fn while_resizing(sym: u32) -> FilterResult<Option<Action>> {
+        resolve(KeyState::Pressed, &ModifiersState::default(), sym, false, None, false, true)
+    }
+
+    #[test]
+    fn resize_mode_takes_the_bare_arrows() {
+        // Bare, not Super+Shift+arrows — that chord already moves a window
+        // between tiles, and overloading it would make the two
+        // indistinguishable.
+        for (sym, dir) in [
+            (keysyms::KEY_Left, Dir::Left),
+            (keysyms::KEY_Right, Dir::Right),
+            (keysyms::KEY_Up, Dir::Up),
+            (keysyms::KEY_Down, Dir::Down),
+        ] {
+            assert!(
+                matches!(while_resizing(sym), FilterResult::Intercept(Some(Action::Resize(d))) if d == dir),
+                "{sym:#x} did not resize"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_and_return_both_leave_resize_mode() {
+        for sym in [keysyms::KEY_Escape, keysyms::KEY_Return] {
+            assert!(matches!(
+                while_resizing(sym),
+                FilterResult::Intercept(Some(Action::LeaveResize))
+            ));
+        }
+    }
+
+    #[test]
+    fn resize_mode_does_not_swallow_everything_else() {
+        // A mode that held every key until dismissed is a mode you get stuck
+        // in. Anything that is not an arrow falls through to what it would
+        // have done, and the caller leaves the mode.
+        assert!(matches!(while_resizing(keysyms::KEY_a), FilterResult::Forward));
+        assert!(matches!(while_resizing(keysyms::KEY_space), FilterResult::Forward));
+    }
+
+    #[test]
+    fn the_arrows_are_untouched_when_not_resizing() {
+        // Or a text editor could never move its cursor.
+        assert!(forwarded(KeyState::Pressed, ModifiersState::default(), keysyms::KEY_Left));
+    }
+
+    #[test]
+    fn the_resize_binding_is_reachable() {
+        assert_eq!(intercepted(super_shift(), keysyms::KEY_R), Some(Action::EnterResize));
     }
 
     #[test]
@@ -383,6 +467,7 @@ mod tests {
                 keysyms::KEY_a,
                 false,
                 Some(Some('a')),
+                false,
                 false
             ),
             FilterResult::Intercept(None)
@@ -462,7 +547,7 @@ mod tests {
         // which it reads as SIGINT and sends to whatever is running.
         for sym in [keysyms::KEY_c, keysyms::KEY_v] {
             assert!(matches!(
-                resolve(KeyState::Pressed, &super_held(), sym, true, None, false),
+                resolve(KeyState::Pressed, &super_held(), sym, true, None, false, false),
                 FilterResult::Forward
             ));
         }
@@ -474,7 +559,7 @@ mod tests {
         // runs every binding twice, which is two terminals per keystroke.
         assert_eq!(intercepted(super_shift(), keysyms::KEY_T), Some(Action::Spawn));
         assert!(matches!(
-            resolve(KeyState::Released, &super_shift(), keysyms::KEY_T, false, None, false),
+            resolve(KeyState::Released, &super_shift(), keysyms::KEY_T, false, None, false, false),
             FilterResult::Intercept(None)
         ));
     }
