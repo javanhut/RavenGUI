@@ -31,6 +31,7 @@ use smithay::{
     delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
+        keyboard::LedState,
         pointer::{CursorImageStatus, PointerHandle},
     },
     output::Output,
@@ -178,6 +179,24 @@ pub(crate) struct Huginn {
     pub pointer_location: Point<f64, Logical>,
     /// What the focused client last asked the cursor to look like.
     pub cursor_status: CursorImageStatus,
+    /// Keyboards whose LEDs the compositor drives, and what they should show.
+    ///
+    /// In a session the kernel stops driving caps lock — the VT is in raw
+    /// mode, key events go to evdev, and the LED follows the compositor's xkb
+    /// state or nobody's. Only the udev backend ever adds devices here: nested
+    /// under another compositor the host owns the LEDs, exactly as it owns the
+    /// keymap.
+    ///
+    /// This is also the one piece of the input stack observable with a dead
+    /// display. A caps lock LED that toggles proves keyboard → libinput →
+    /// compositor end to end from the far side of a black screen, which is
+    /// worth having on a distribution whose graphics bring-up is younger than
+    /// its input stack.
+    pub(crate) keyboard_led_devices: Vec<smithay::reexports::input::Device>,
+    /// The state those LEDs were last told to show. Kept so a keyboard that
+    /// appears mid-session — or reappears after a VT switch — is set to the
+    /// session's state rather than left showing whatever the console left on.
+    pub(crate) keyboard_led_state: LedState,
 
     /// Window-management policy. The only thing that decides geometry.
     pub space: Space,
@@ -319,6 +338,8 @@ impl Huginn {
             pointer_location: (0.0, 0.0).into(),
             // Default until a client sets its own on pointer enter.
             cursor_status: CursorImageStatus::default_named(),
+            keyboard_led_devices: Vec::new(),
+            keyboard_led_state: LedState::default(),
             space: {
                 let mut space = Space::new(area);
                 space.set_gap(crate::theme::GAP);
@@ -1374,6 +1395,17 @@ impl SeatHandler for Huginn {
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
+    }
+
+    /// Mirror the xkb lock state onto the physical keyboards.
+    ///
+    /// smithay recomputes the LED state on every key and calls this only when
+    /// it changed, so this is per-caps-lock-press, not per-keystroke.
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
+        self.keyboard_led_state = led_state;
+        for device in &mut self.keyboard_led_devices {
+            device.led_update(led_state.into());
+        }
     }
 
     /// Hand the clipboard to whoever just took the keyboard.
