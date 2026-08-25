@@ -57,7 +57,7 @@ use smithay::{
             EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic,
         },
         drm::control::{Device as _, ResourceHandles, connector, crtc},
-        input::Libinput,
+        input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
         wayland_server::{
             Display, DisplayHandle, backend::GlobalId, protocol::wl_surface::WlSurface,
@@ -771,6 +771,24 @@ impl Udev {
     }
 
     fn on_input(&mut self, event: InputEvent<LibinputInputBackend>) {
+        // Keyboards are tracked as they come and go so their lock LEDs can
+        // follow the xkb state — see `Huginn::keyboard_led_devices`. A device
+        // arriving mid-session is set to the session's current state, not
+        // trusted to already show it.
+        match event {
+            InputEvent::DeviceAdded { mut device } => {
+                if device.has_capability(DeviceCapability::Keyboard) {
+                    device.led_update(self.state.keyboard_led_state.into());
+                    self.state.keyboard_led_devices.push(device);
+                }
+                return;
+            }
+            InputEvent::DeviceRemoved { device } => {
+                self.state.keyboard_led_devices.retain(|d| d != &device);
+                return;
+            }
+            _ => {}
+        }
         let InputEvent::Keyboard { event } = event else {
             // Motion, buttons and scroll all go to the shared handler, so the
             // udev and winit backends cannot drift apart.
