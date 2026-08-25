@@ -76,6 +76,9 @@ struct Nested {
     state: Huginn,
     display: Display<Huginn>,
     backend: WinitGraphicsBackend<GlesRenderer>,
+    /// The blur, if its shader compiled. `None` means panels do not blur and
+    /// everything else works exactly as before.
+    blur: Option<crate::blur::Blur>,
     output: Output,
     keyboard: KeyboardHandle<Huginn>,
     cursor: Option<Cursor>,
@@ -210,7 +213,9 @@ pub(crate) fn run() -> Result<()> {
     tracing::info!("clients: WAYLAND_DISPLAY={socket} <command>");
     tracing::info!("{}", help_line());
 
+    let blur = crate::blur::Blur::compile(backend.renderer());
     let mut data = Nested {
+        blur,
         state,
         display,
         backend,
@@ -259,6 +264,25 @@ impl Nested {
         self.state.tick_animations();
         let size = self.backend.window_size();
         let damage = Rectangle::from_size(size);
+        let radius = self.state.blur_radius();
+
+        // The blur's offscreen passes have to happen before the output
+        // framebuffer is bound — they bind their own — so they run here, on
+        // the renderer alone, and hand back one element to draw the result.
+        //
+        // `None` covers every case that is not "a panel is open and the shader
+        // works", and every one of them falls through to the path below
+        // unchanged. That is deliberate: the overwhelming majority of frames
+        // take exactly the code they took before the blur existed.
+        let blurred = if radius > 0.0 {
+            let renderer = self.backend.renderer();
+            let (_, behind) = render::elements_split(renderer, &self.state, self.cursor.as_ref());
+            self.blur
+                .as_mut()
+                .and_then(|blur| blur.pass(renderer, &behind, size, radius))
+        } else {
+            None
+        };
 
         {
             let (renderer, mut framebuffer) = self
@@ -272,7 +296,12 @@ impl Nested {
 
             // Geometry comes from huginn-core; stacking order and the cursor
             // come from render::elements, shared with the udev backend.
-            let elements = render::elements(renderer, &self.state, self.cursor.as_ref());
+            let elements = match &blurred {
+                // The desktop is already drawn, blurred, in one texture; only
+                // what sits above the blur is still to draw.
+                Some(_) => render::elements_split(renderer, &self.state, self.cursor.as_ref()).0,
+                None => render::elements(renderer, &self.state, self.cursor.as_ref()),
+            };
 
             let mut frame = renderer
                 .render(&mut framebuffer, size, Transform::Flipped180)
@@ -280,7 +309,12 @@ impl Nested {
             frame
                 .clear(CLEAR, &[damage])
                 .map_err(|e| anyhow::anyhow!("clearing frame: {e}"))?;
-            draw_render_elements(&mut frame, 1.0, &elements, &[damage])
+            // The blurred desktop goes down first, then everything above it.
+            if let Some(element) = &blurred {
+                draw_render_elements::<GlesRenderer, _, _>(&mut frame, 1.0, std::slice::from_ref(element), &[damage])
+                    .map_err(|e| anyhow::anyhow!("drawing the blurred desktop: {e}"))?;
+            }
+            draw_render_elements::<GlesRenderer, _, _>(&mut frame, 1.0, &elements, &[damage])
                 .map_err(|e| anyhow::anyhow!("drawing: {e}"))?;
             // The returned SyncPoint is discarded deliberately: the host
             // compositor we are nested inside does the synchronisation for us.
@@ -333,6 +367,7 @@ impl Nested {
                 // Read before the filter borrows the state.
                 let launcher_open = self.state.launcher.is_open();
                 let settings_open = self.state.settings.is_open();
+                let resizing = self.state.resizing;
                 let action = self
                     .keyboard
                     .input::<Option<Action>, _>(
@@ -349,11 +384,22 @@ impl Nested {
                                 // than what a US keyboard would have.
                                 let character = sym.key_char();
                                 let launcher = launcher_open.then_some(character);
-                                resolve(key_state, modifiers, sym.raw(), owns_super, launcher, settings_open)
+                                resolve(key_state, modifiers, sym.raw(), owns_super, launcher, settings_open, resizing)
                             }
                         },
                     )
                     .flatten();
+                // Any press that is not an arrow leaves resize mode — the
+                // keymap forwarded it, so this is the only place that knows it
+                // happened. Presses only: an arrow's *release* also resolves to
+                // no action, and clearing on that would end the mode after a
+                // single nudge.
+                if resizing
+                    && key_state == smithay::backend::input::KeyState::Pressed
+                    && !matches!(action, Some(Action::Resize(_)))
+                {
+                    self.state.resizing = false;
+                }
                 if let Some(action) = action {
                     self.apply(action, time);
                 }
@@ -410,6 +456,12 @@ impl Nested {
             Action::SendToWorkspace(i) => {
                 state.space.send_focused_to_workspace(i);
             }
+            Action::EnterResize => {
+                state.resizing = true;
+                tracing::debug!("resize mode: arrows resize, Escape or Return leaves");
+            }
+            Action::Resize(dir) => state.resize_focused(dir),
+            Action::LeaveResize => state.resizing = false,
             Action::OpenSettings => {
                 let now = state.uptime();
                 state.settings.open(now);

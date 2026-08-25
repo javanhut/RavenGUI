@@ -82,6 +82,13 @@ impl Workspace {
         &self.tiles
     }
 
+    /// The split tree, mutably. For resizing, which changes a split's ratio
+    /// rather than the set of windows — the one edit that does not go through
+    /// [`Self::reconcile_tiles`].
+    pub fn tiles_mut(&mut self) -> &mut Tiles {
+        &mut self.tiles
+    }
+
     /// Bring the tree into line with `tiled`, the windows that belong in it.
     ///
     /// Anything in the tree but not in `tiled` is dropped and its space

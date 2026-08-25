@@ -14,7 +14,8 @@ use std::os::unix::io::OwnedFd;
 use huginn_core::{
     Space,
     scale::OutputScale,
-    geometry::{Rect, Size},
+    tiles::Axis,
+    geometry::{Dir, Rect, Size},
     layer::{Anchors, Exclusive, Margins, place, usable_area},
     window::{WindowId, WindowMode},
 };
@@ -220,6 +221,14 @@ pub(crate) struct Huginn {
     /// One output for now; this becomes per-output alongside `output_area`.
     pub(crate) scale: OutputScale,
 
+    /// Whether the arrows are currently resizing the focused window.
+    ///
+    /// A mode rather than a chord because resizing is done by feel: you press
+    /// an arrow several times and watch. `Super`+`Shift`+arrows is already
+    /// taken by moving a window between tiles, and overloading it would make
+    /// the two indistinguishable.
+    pub(crate) resizing: bool,
+
     /// The Wayland socket children are told to connect to.
     ///
     /// Set by the backend once it has bound one — `Huginn` is built before the
@@ -325,6 +334,7 @@ impl Huginn {
             }),
             focus_ring_at: None,
             help: None,
+            resizing: false,
             socket: String::new(),
             dock: crate::dock::Dock::default(),
             dock_panel: None,
@@ -456,25 +466,21 @@ impl Huginn {
     /// clicks landing on windows hidden behind a panel.
     pub(crate) fn scene(&self) -> Vec<SceneItem<'_>> {
         let mut out = Vec::new();
-        // Above everything. It is summoned by someone who has lost track of
-        // what is on screen, so letting a panel or a fullscreen window cover it
-        // would defeat the one thing it is for.
-        // Above the windows and below the keybinding overlay: the overlay is
-        // summoned by someone who has lost track of what is on screen, and
-        // that includes having lost track of the launcher.
-        // Under the panels and over the windows: the dock is part of the
-        // desktop, the launcher and settings are things placed on top of it.
-        if let Some(panel) = &self.dock_panel
-            && let Some(rect) = self.dock_rect()
-        {
-            out.push(SceneItem::Overlay(panel.buffer(), rect, 1.0));
-        }
-        if let Some(panel) = &self.settings_panel {
-            out.push(SceneItem::Overlay(
-                panel.buffer(),
-                panel.centred_on(self.output_area),
-                self.settings.reveal(self.uptime()).clamp(0.0, 1.0),
-            ));
+        // Front to back, and the order is the whole point:
+        //
+        //   help overlay   - summoned by someone who has lost track of what is
+        //                    on screen, which includes the panels
+        //   launcher       - over the dock it grew out of
+        //   settings       - likewise
+        //   ---- blur boundary ----
+        //   dock           - part of the desktop, so it blurs with it
+        //   layer surfaces
+        //   windows
+        //
+        // Everything below the boundary is what a panel blurs. See
+        // [`Huginn::blur_boundary`], which counts the items above it.
+        if let Some(help) = &self.help {
+            out.push(SceneItem::Overlay(help.buffer(), help.placement(self.output_area), 1.0));
         }
         if let Some(panel) = &self.launcher_panel {
             let clock = self.uptime();
@@ -490,8 +496,18 @@ impl Huginn {
                 reveal.clamp(0.0, 1.0),
             ));
         }
-        if let Some(help) = &self.help {
-            out.push(SceneItem::Overlay(help.buffer(), help.placement(self.output_area), 1.0));
+        if let Some(panel) = &self.settings_panel {
+            out.push(SceneItem::Overlay(
+                panel.buffer(),
+                panel.centred_on(self.output_area),
+                self.settings.reveal(self.uptime()).clamp(0.0, 1.0),
+            ));
+        }
+        // --- blur boundary: everything below here is what a panel blurs ---
+        if let Some(panel) = &self.dock_panel
+            && let Some(rect) = self.dock_rect()
+        {
+            out.push(SceneItem::Overlay(panel.buffer(), rect, 1.0));
         }
         // A panel's own menu belongs directly on top of the panel, not on top
         // of everything, so each layer surface carries its popups with it.
@@ -748,6 +764,34 @@ impl Huginn {
         crate::backend::spawn(argv, &self.socket);
     }
 
+    /// Resize the focused window one step in `dir`.
+    ///
+    /// A step rather than a continuous drag: this is a keyboard, and the unit
+    /// of a keyboard is a press.
+    pub(crate) fn resize_focused(&mut self, dir: Dir) {
+        /// How much of a tile one press moves. Small enough to aim with, large
+        /// enough that a deliberate resize does not take twenty presses.
+        const STEP: f32 = 0.03;
+
+        let Some(window) = self.space.focused() else {
+            return;
+        };
+        let (axis, delta) = match dir {
+            Dir::Left => (Axis::Horizontal, -STEP),
+            Dir::Right => (Axis::Horizontal, STEP),
+            Dir::Up => (Axis::Vertical, -STEP),
+            Dir::Down => (Axis::Vertical, STEP),
+        };
+        if self
+            .space
+            .active_workspace_mut()
+            .tiles_mut()
+            .resize(window, axis, delta)
+        {
+            self.arrange();
+        }
+    }
+
     /// Open the launcher, growing it out of the dock's launcher icon.
     ///
     /// The origin is only taken when the dock is actually on screen — §4 asks
@@ -838,11 +882,21 @@ impl Huginn {
         }
     }
 
+    /// How many leading scene items sit *above* the blur.
+    ///
+    /// The help overlay, the launcher and quick settings, in that order — each
+    /// present only when it is. Counted rather than hardcoded so the boundary
+    /// cannot drift from the order [`Huginn::scene`] actually pushes in.
+    pub(crate) fn blur_boundary(&self) -> usize {
+        usize::from(self.help.is_some())
+            + usize::from(self.launcher_panel.is_some())
+            + usize::from(self.settings_panel.is_some())
+    }
+
     /// How blurred the desktop behind the panels should be, in pixels.
     ///
     /// Zero when no panel is open, which is what lets the renderer take the
     /// ordinary path unchanged for the overwhelming majority of frames.
-    #[allow(dead_code)]
     pub(crate) fn blur_radius(&self) -> f32 {
         crate::blur::radius_for(self.launcher.reveal(self.uptime()))
     }

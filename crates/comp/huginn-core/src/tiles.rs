@@ -129,6 +129,56 @@ impl Node {
         }
     }
 
+    /// Adjust the nearest ancestor split on `axis` that contains `target`.
+    ///
+    /// Returns `Found` once the window is located, so each ancestor on the way
+    /// back up gets the chance to be the one that moves — and the first one on
+    /// the right axis takes it.
+    fn resize(&mut self, target: WindowId, axis: Axis, delta: f32) -> bool {
+        let Self::Split {
+            axis: split_axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        // Which side the window is on decides the sign: growing a window in
+        // the second half means *shrinking* the first half's ratio.
+        let in_first = first.contains(target);
+        let in_second = !in_first && second.contains(target);
+        if !in_first && !in_second {
+            return false;
+        }
+        // Deeper first, so the innermost split on the right axis wins — that
+        // is the one whose edge is actually beside the focused window.
+        let child = if in_first { first } else { second };
+        if child.resize(target, axis, delta) {
+            return true;
+        }
+        if *split_axis != axis {
+            return false;
+        }
+        let wanted = if in_first { *ratio + delta } else { *ratio - delta };
+        let clamped = wanted.clamp(MIN_RATIO, MAX_RATIO);
+        if (clamped - *ratio).abs() < f32::EPSILON {
+            return false;
+        }
+        *ratio = clamped;
+        true
+    }
+
+    /// Whether `target` is somewhere under this node.
+    fn contains(&self, target: WindowId) -> bool {
+        match self {
+            Self::Leaf(id) => *id == target,
+            Self::Split { first, second, .. } => {
+                first.contains(target) || second.contains(target)
+            }
+        }
+    }
+
     /// Remove `target`, collapsing the split it was half of.
     ///
     /// Returns `Some(replacement)` when this node must be replaced by its
@@ -176,8 +226,15 @@ enum Removal {
 /// proportion describes the space the windows actually get rather than the
 /// space before the gutter was taken out of it. Getting that backwards makes
 /// a 50/50 split visibly uneven at large gaps.
+/// How lopsided a split is allowed to get.
+///
+/// A tile at zero would be a window with no area, which reaches a client as a
+/// protocol error rather than as a small window.
+const MIN_RATIO: f32 = 0.1;
+const MAX_RATIO: f32 = 0.9;
+
 fn divide(rect: Rect, axis: Axis, ratio: f32, gap: i32) -> (Rect, Rect) {
-    let ratio = ratio.clamp(0.1, 0.9);
+    let ratio = ratio.clamp(MIN_RATIO, MAX_RATIO);
     match axis {
         Axis::Horizontal => {
             let usable = (rect.w() - gap).max(0);
@@ -295,6 +352,23 @@ impl Tiles {
             root.rename(a, b);
         }
         true
+    }
+
+    /// Nudge the split that governs `window` along `axis`.
+    ///
+    /// `delta` is a fraction of the tile: positive grows the window, negative
+    /// shrinks it. Returns whether anything moved.
+    ///
+    /// Walks up from the leaf to the *nearest ancestor splitting on that axis*,
+    /// which is what makes a resize mean the same thing wherever the focus is.
+    /// Adjusting only the immediate parent would do nothing at all whenever the
+    /// parent happened to split the other way — the window would simply refuse
+    /// to widen, with no indication why.
+    pub fn resize(&mut self, window: WindowId, axis: Axis, delta: f32) -> bool {
+        let Some(root) = self.root.as_mut() else {
+            return false;
+        };
+        root.resize(window, axis, delta)
     }
 
     /// Drop every window for which `keep` is false, collapsing as it goes.
@@ -587,6 +661,99 @@ mod tests {
         kept.retain(|_| true);
         assert_eq!(kept.windows(), tiles.windows());
         assert_eq!(kept.arrange(SCREEN, GAP), tiles.arrange(SCREEN, GAP));
+    }
+
+    #[test]
+    fn resizing_widens_the_window_and_narrows_its_neighbour() {
+        let mut tiles = chain(2);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.resize(id(1), Axis::Horizontal, 0.1));
+        let after = tiles.arrange(SCREEN, GAP);
+        assert!(after[0].1.w() > before[0].1.w(), "the focused window did not grow");
+        assert!(after[1].1.w() < before[1].1.w(), "its neighbour did not give way");
+        // And the pane is still fully covered — no gap opened between them.
+        assert_eq!(
+            after[0].1.w() + after[1].1.w() + GAP,
+            before[0].1.w() + before[1].1.w() + GAP
+        );
+    }
+
+    #[test]
+    fn resizing_the_second_window_grows_it_too() {
+        // The sign has to flip: growing the window on the right means
+        // shrinking the split's ratio, not raising it.
+        let mut tiles = chain(2);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.resize(id(2), Axis::Horizontal, 0.1));
+        let after = tiles.arrange(SCREEN, GAP);
+        assert!(after[1].1.w() > before[1].1.w(), "the right window shrank instead");
+    }
+
+    #[test]
+    fn resizing_along_an_axis_nothing_splits_on_does_nothing() {
+        // Two windows side by side cannot be made taller relative to one
+        // another. Reporting that honestly is what lets the caller leave the
+        // resize mode's feedback alone rather than showing a change.
+        let mut tiles = chain(2);
+        assert!(!tiles.resize(id(1), Axis::Vertical, 0.1));
+    }
+
+    #[test]
+    fn a_resize_finds_the_nearest_split_on_that_axis() {
+        // Three windows: 1 on the left, 2 and 3 splitting the right half
+        // vertically. Resizing 2 vertically must move the split between 2 and
+        // 3 — the innermost one on that axis — not the outer horizontal one.
+        let mut tiles = chain(3);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.resize(id(2), Axis::Vertical, 0.1));
+        let after = tiles.arrange(SCREEN, GAP);
+        assert_eq!(after[0].1, before[0].1, "the unrelated left window moved");
+        assert!(after[1].1.h() > before[1].1.h());
+        assert!(after[2].1.h() < before[2].1.h());
+    }
+
+    #[test]
+    fn an_outer_split_is_still_reachable_from_a_nested_window() {
+        // Resizing window 2 horizontally has no split beside it on that axis
+        // until the outer one, which is the whole point of walking up.
+        let mut tiles = chain(3);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.resize(id(2), Axis::Horizontal, 0.1));
+        let after = tiles.arrange(SCREEN, GAP);
+        assert!(after[0].1.w() < before[0].1.w(), "the outer split did not move");
+    }
+
+    #[test]
+    fn a_window_can_never_be_resized_out_of_existence() {
+        // A zero-width tile reaches a client as a protocol error rather than
+        // as a very small window.
+        let mut tiles = chain(2);
+        for _ in 0..50 {
+            tiles.resize(id(1), Axis::Horizontal, -0.5);
+        }
+        for (_, rect) in tiles.arrange(SCREEN, GAP) {
+            assert!(rect.w() > 0 && rect.h() > 0, "resized to nothing: {rect:?}");
+        }
+    }
+
+    #[test]
+    fn resizing_stops_reporting_change_once_it_is_clamped() {
+        // So a key held down at the limit does not keep asking for redraws.
+        let mut tiles = chain(2);
+        while tiles.resize(id(1), Axis::Horizontal, 0.1) {}
+        assert!(!tiles.resize(id(1), Axis::Horizontal, 0.1));
+    }
+
+    #[test]
+    fn resizing_a_window_that_is_not_here_does_nothing() {
+        let mut tiles = chain(2);
+        assert!(!tiles.resize(id(99), Axis::Horizontal, 0.1));
+    }
+
+    #[test]
+    fn a_lone_window_has_nothing_to_resize_against() {
+        let mut tiles = chain(1);
+        assert!(!tiles.resize(id(1), Axis::Horizontal, 0.1));
     }
 
     #[test]
