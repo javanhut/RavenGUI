@@ -43,15 +43,21 @@ impl Backend {
 ///
 /// The argv comes from `Entry::argv`, which has already split it and stripped
 /// field codes — it never goes near a shell. Children inherit the environment
-/// and are additionally told which display to connect to.
-pub(crate) fn spawn(argv: &[String], socket: &str) {
+/// and are additionally told which display(s) to connect to.
+pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) {
     let Some((program, args)) = argv.split_first() else {
         return;
     };
-    match std::process::Command::new(program)
-        .args(args)
-        .env("WAYLAND_DISPLAY", socket)
-        .spawn()
+    let mut command = std::process::Command::new(program);
+    command.args(args).env("WAYLAND_DISPLAY", socket);
+    // Toolkits pick Wayland when both are set, so this only decides where the
+    // X11-only ones connect. Absent until XWayland signals ready, which is
+    // deliberate: a child that inherits a DISPLAY pointing at an unmanaged X
+    // server maps windows nobody will ever lay out.
+    if let Some(display) = x11_display {
+        command.env("DISPLAY", format!(":{display}"));
+    }
+    match command.spawn()
     {
         Ok(_) => tracing::info!(?argv, "spawned"),
         Err(e) => tracing::warn!(?argv, error = %e, "spawn failed"),

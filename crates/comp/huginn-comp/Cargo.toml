@@ -35,6 +35,10 @@ smithay = { workspace = true, features = [
     "desktop",
     "renderer_gl",
     "wayland_frontend",
+    # XWayland: pulls in x11rb (composite/xfixes/randr) and the X11 window
+    # manager smithay expects the compositor to implement. Without this the
+    # `xwayland` module does not exist and X11 clients have nothing to talk to.
+    "xwayland",
 ] }
 calloop.workspace = true
 # Already in the tree via winit; used to load the system cursor theme.

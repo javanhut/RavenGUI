@@ -11,6 +11,12 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
 
+use crate::window::WindowSurface;
+use smithay::{
+    delegate_xwayland_shell,
+    wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
+    xwayland::{X11Surface, X11Wm},
+};
 use huginn_core::{
     Space,
     scale::OutputScale,
@@ -66,7 +72,6 @@ use smithay::{
             },
             xdg::{
                 PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-                XdgToplevelSurfaceData,
             },
         },
         shm::{ShmHandler, ShmState},
@@ -200,8 +205,36 @@ pub(crate) struct Huginn {
 
     /// Window-management policy. The only thing that decides geometry.
     pub space: Space,
-    /// Wayland surface for each window the core knows about.
-    toplevels: HashMap<WindowId, ToplevelSurface>,
+    /// The surface behind each window the core knows about — an `xdg_toplevel`
+    /// for a Wayland client, an `X11Surface` for one arriving through XWayland.
+    /// The layout core deals only in [`WindowId`] and never learns the
+    /// difference; see [`crate::window::WindowSurface`] for where the two
+    /// protocols actually diverge.
+    windows: HashMap<WindowId, WindowSurface>,
+
+    /// The X11 window manager, once XWayland has signalled ready. `None` when
+    /// XWayland is not installed, has not come up yet, or failed — all three of
+    /// which are states the compositor runs in perfectly well, just without
+    /// X11 clients.
+    pub(crate) xwm: Option<X11Wm>,
+    /// `xwayland_shell_v1`, the protocol XWayland uses to associate an X11
+    /// window with the Wayland surface it created for it. Held, not read:
+    /// dropping it withdraws the global and XWayland can no longer associate
+    /// anything, which presents as X11 windows that map and never draw.
+    pub(crate) xwayland_shell_state: XWaylandShellState,
+    /// Override-redirect X11 windows: menus, tooltips, drag icons.
+    ///
+    /// Outside the layout by definition — override-redirect *means* the window
+    /// manager must not position them. Kept in creation order, which is the
+    /// order they stack.
+    pub(crate) x11_unmanaged: Vec<X11Surface>,
+    /// The display number XWayland came up on, once it has.
+    ///
+    /// Recorded rather than exported to the environment: it is only ever needed
+    /// by children, and it reaches them the same way `WAYLAND_DISPLAY` does —
+    /// injected in `backend::spawn`. `std::env::set_var` would be a
+    /// process-global write, and unsafe in edition 2024.
+    pub(crate) x11_display: Option<u32>,
 
     /// Windows that have committed a buffer, and may therefore be drawn.
     ///
@@ -345,7 +378,11 @@ impl Huginn {
                 space.set_gap(crate::theme::GAP);
                 space
             },
-            toplevels: HashMap::new(),
+            windows: HashMap::new(),
+            xwm: None,
+            xwayland_shell_state: XWaylandShellState::new::<Self>(dh),
+            x11_unmanaged: Vec::new(),
+            x11_display: None,
             mapped: HashSet::new(),
             popups: PopupManager::default(),
             layers: Vec::new(),
@@ -538,14 +575,31 @@ impl Huginn {
                 out.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
             }
         }
+        // Override-redirect X11 windows: menus, tooltips, drag icons. They sit
+        // with the Wayland popups rather than with the windows, because that is
+        // what they are — the X11 spelling of the same thing. Drawn at the
+        // coordinates the client chose, since override-redirect means exactly
+        // that the window manager does not get to place them.
+        //
+        // Skips any whose surface XWayland has not associated yet, on the same
+        // reasoning as an unmapped window: it exists but has nothing to show.
+        for window in &self.x11_unmanaged {
+            let Some(surface) = window.wl_surface() else {
+                continue;
+            };
+            let geo = window.geometry();
+            let rect = Rect::from_xywh(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
+            out.extend(self.popups_of(&surface, rect));
+            out.push(SceneItem::Surface(surface, rect));
+        }
         // Window popups go above every window and above the ring. A menu is
         // routinely taller than the button that opened it and reaches over the
         // neighbouring tile; drawing it under that tile, or letting the ring
         // draw a line across it, is worse than the alternative of a menu
         // covering a window it does not belong to — which is what a menu is
         // supposed to do.
-        for (window, rect) in self.render_list() {
-            out.extend(self.popups_of(window.wl_surface(), rect));
+        for (surface, rect) in self.render_list() {
+            out.extend(self.popups_of(&surface, rect));
         }
         // Directly above the windows: over its neighbours, whose pixels it
         // reaches into when the layout leaves no gap, but under a panel or an
@@ -554,7 +608,7 @@ impl Huginn {
         out.extend(
             self.render_list()
                 .into_iter()
-                .map(|(w, r)| SceneItem::Surface(w.wl_surface().clone(), r)),
+                .map(|(surface, r)| SceneItem::Surface(surface, r)),
         );
         for layer in [Layer::Bottom, Layer::Background] {
             for (surface, rect) in self.layers_on(layer) {
@@ -593,7 +647,7 @@ impl Huginn {
                 .iter()
                 .filter(|id| !self.mapped.contains(id))
                 .filter_map(|id| {
-                    let surface = self.toplevels.get(id)?.wl_surface().clone();
+                    let surface = self.windows.get(id)?.wl_surface()?;
                     let geometry = self.space.window(*id)?.geometry;
                     Some((surface, geometry))
                 }),
@@ -619,16 +673,7 @@ impl Huginn {
     /// The `app_id` the focused window advertised, if it advertised one.
     fn focused_app_id(&self) -> Option<String> {
         let id = self.space.focused()?;
-        let toplevel = self.toplevels.get(&id)?;
-        with_states(toplevel.wl_surface(), |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()?
-                .lock()
-                .ok()?
-                .app_id
-                .clone()
-        })
+        self.windows.get(&id)?.app_id()
     }
 
     /// The terminal to launch for the spawn binding.
@@ -677,18 +722,7 @@ impl Huginn {
             .active_workspace()
             .windows()
             .iter()
-            .filter_map(|id| self.toplevels.get(id))
-            .filter_map(|toplevel| {
-                with_states(toplevel.wl_surface(), |states| {
-                    states
-                        .data_map
-                        .get::<XdgToplevelSurfaceData>()?
-                        .lock()
-                        .ok()?
-                        .app_id
-                        .clone()
-                })
-            })
+            .filter_map(|id| self.windows.get(id)?.app_id())
             .collect()
     }
 
@@ -782,7 +816,7 @@ impl Huginn {
             let now = self.now();
             self.frecency.record(&path, now);
         }
-        crate::backend::spawn(argv, &self.socket);
+        crate::backend::spawn(argv, &self.socket, self.x11_display);
     }
 
     /// Resize the focused window one step in `dir`.
@@ -880,19 +914,7 @@ impl Huginn {
             .active_workspace()
             .windows()
             .iter()
-            .filter_map(|id| {
-                let toplevel = self.toplevels.get(id)?;
-                let app_id = with_states(toplevel.wl_surface(), |states| {
-                    states
-                        .data_map
-                        .get::<XdgToplevelSurfaceData>()?
-                        .lock()
-                        .ok()?
-                        .app_id
-                        .clone()
-                })?;
-                Some((*id, app_id))
-            })
+            .filter_map(|id| Some((*id, self.windows.get(id)?.app_id()?)))
             .collect();
         if let Some((id, _)) = running
             .iter()
@@ -1015,7 +1037,7 @@ impl Huginn {
     fn focus_ring_rects(&self) -> Option<[Rect; 4]> {
         let id = self.space.focused()?;
         // An unmapped window has geometry but nothing on screen; ringing it
-        // would draw a rectangle around empty space. Membership in `toplevels`
+        // would draw a rectangle around empty space. Membership in `windows`
         // is not the test — a window is in there from creation, hundreds of
         // milliseconds before it has anything to show.
         if !self.mapped.contains(&id) {
@@ -1056,9 +1078,38 @@ impl Huginn {
         self.popups.cleanup();
     }
 
+    /// Take a tile for a newly mapped X11 window.
+    ///
+    /// Separate from `new_toplevel` only because the XDG path is a protocol
+    /// handler and this is not; both take a `WindowId` from the core and record
+    /// the surface against it.
+    pub(crate) fn open_x11_window(&mut self, window: WindowSurface) -> WindowId {
+        let id = self.space.open_window();
+        self.windows.insert(id, window);
+        id
+    }
+
+    /// Drop an X11 window out of the layout and re-run the passes that depend
+    /// on it. Mirrors the tail of `toplevel_destroyed`.
+    pub(crate) fn close_x11_window(&mut self, id: WindowId) {
+        self.windows.remove(&id);
+        self.mapped.remove(&id);
+        self.space.close_window(id);
+        self.arrange();
+        self.refresh_focus();
+    }
+
+    /// The layout's id for an X11 window, if it is managed.
+    pub(crate) fn x11_window_id(&self, window: &X11Surface) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find(|(_, w)| w.as_x11() == Some(window))
+            .map(|(id, _)| *id)
+    }
+
     /// The surface backing `id`, if it is still mapped.
-    pub(crate) fn surface(&self, id: WindowId) -> Option<&ToplevelSurface> {
-        self.toplevels.get(&id)
+    pub(crate) fn surface(&self, id: WindowId) -> Option<&WindowSurface> {
+        self.windows.get(&id)
     }
 
     /// Windows on the active workspace with the geometry the core assigned,
@@ -1068,14 +1119,19 @@ impl Huginn {
     /// already reserved and their `configure` already sent; what they have not
     /// got is anything worth showing, and showing it anyway is a frame of
     /// whatever happened to be in the buffer.
-    pub(crate) fn render_list(&self) -> Vec<(&ToplevelSurface, Rect)> {
+    /// Yields the Wayland surface rather than the window, because every caller
+    /// wants exactly that and an X11 window's surface is an `Option` — resolving
+    /// it here means the render path, the popup root lookup and the scene
+    /// builder do not each have to decide what an X11 window with no surface yet
+    /// should mean. It means the same thing as an unmapped window: skip it.
+    pub(crate) fn render_list(&self) -> Vec<(WlSurface, Rect)> {
         self.space
             .active_workspace()
             .windows()
             .iter()
             .filter(|id| self.mapped.contains(id))
             .filter_map(|id| {
-                let surface = self.toplevels.get(id)?;
+                let surface = self.windows.get(id)?.wl_surface()?;
                 let geometry = self.space.window(*id)?.geometry;
                 Some((surface, geometry))
             })
@@ -1094,9 +1150,9 @@ impl Huginn {
     /// there are any.
     fn sync_mapped(&mut self, surface: &WlSurface) -> bool {
         let Some(id) = self
-            .toplevels
+            .windows
             .iter()
-            .find(|(_, s)| s.wl_surface() == surface)
+            .find(|(_, w)| w.wl_surface().as_ref() == Some(surface))
             .map(|(id, _)| *id)
         else {
             return false;
@@ -1124,7 +1180,7 @@ impl Huginn {
     /// call would make clients re-render continuously.
     pub(crate) fn arrange(&mut self) {
         for (id, rect) in self.space.arrange() {
-            let Some(surface) = self.toplevels.get(&id) else {
+            let Some(window) = self.windows.get(&id) else {
                 continue;
             };
             // A window that has not had its initial configure yet is mid-way
@@ -1133,14 +1189,16 @@ impl Huginn {
             // one here would make that two, and the first would be the stale
             // one — reintroducing the resize-after-first-paint this ordering
             // exists to remove.
-            if !surface.is_initial_configure_sent() {
+            // XDG only: an X11 window has no initial-configure handshake, so
+            // there is no first configure for a second one to duplicate. The
+            // check would skip every X11 window forever.
+            if let Some(toplevel) = window.as_xdg()
+                && !toplevel.is_initial_configure_sent()
+            {
                 continue;
             }
             tracing::debug!(window = id.raw(), ?rect, "configure");
-            surface.with_pending_state(|state| {
-                state.size = Some((rect.w(), rect.h()).into());
-            });
-            surface.send_configure();
+            window.configure(rect);
         }
 
         // Every state change that can alter workspace occupancy or the active
@@ -1155,25 +1213,20 @@ impl Huginn {
     pub(crate) fn refresh_focus(&mut self) {
         let focused = self.space.focused();
 
-        for (id, surface) in &self.toplevels {
+        for (id, window) in &self.windows {
             let is_focused = Some(*id) == focused;
-            let changed = surface.with_pending_state(|state| {
-                let was = state.states.contains(xdg_toplevel::State::Activated);
-                if is_focused {
-                    state.states.set(xdg_toplevel::State::Activated);
-                } else {
-                    state.states.unset(xdg_toplevel::State::Activated);
-                }
-                was != is_focused
-            });
-            if changed {
-                surface.send_configure();
+            // set_activated reports whether it actually changed anything, and
+            // the configure is conditional on that. refresh_focus runs whenever
+            // focus *might* have moved, so configuring unconditionally here
+            // drives every client on the workspace into a redraw loop.
+            if window.set_activated(is_focused) {
+                window.send_configure();
             }
         }
 
         let target = focused
-            .and_then(|id| self.toplevels.get(&id))
-            .map(|s| s.wl_surface().clone());
+            .and_then(|id| self.windows.get(&id))
+            .and_then(|w| w.wl_surface());
         self.set_keyboard_focus(target, Serial::from(0));
 
         // The ring moved. Click-to-focus arrives here without going through
@@ -1279,7 +1332,7 @@ impl XdgShellHandler for Huginn {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let id = self.space.open_window();
-        self.toplevels.insert(id, surface.clone());
+        self.windows.insert(id, WindowSurface::Xdg(surface.clone()));
         tracing::debug!(window = id.raw(), "toplevel created");
 
         // Lay out FIRST, so the geometry this window will actually occupy
@@ -1317,14 +1370,14 @@ impl XdgShellHandler for Huginn {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let Some(id) = self
-            .toplevels
+            .windows
             .iter()
-            .find(|(_, s)| *s == &surface)
+            .find(|(_, w)| w.as_xdg() == Some(&surface))
             .map(|(id, _)| *id)
         else {
             return;
         };
-        self.toplevels.remove(&id);
+        self.windows.remove(&id);
         self.mapped.remove(&id);
         self.space.close_window(id);
         tracing::debug!(window = id.raw(), "toplevel destroyed");
@@ -1509,6 +1562,19 @@ delegate_output!(Huginn);
 delegate_viewporter!(Huginn);
 delegate_fractional_scale!(Huginn);
 delegate_layer_shell!(Huginn);
+
+/// XWayland associating an X11 window with a Wayland surface.
+///
+/// The dispatch side lives on `Huginn` because `Display<Huginn>` is what
+/// clients are dispatched against. The *handler* side is also needed on each
+/// backend's loop data type, which `impl_xwm_handler!` generates -- see
+/// `crate::xwayland` for why those are two different types.
+impl XWaylandShellHandler for Huginn {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+}
+delegate_xwayland_shell!(Huginn);
 
 /// What a layer surface has asked for, translated out of Wayland vocabulary and
 /// into the plain geometry types `huginn-core` works in.
