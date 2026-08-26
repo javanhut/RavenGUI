@@ -93,7 +93,17 @@ pub(crate) const GAP: i32 = 8;
 /// `network-wired` resolve to nothing against bare hicolor. Measured on the
 /// development machine, 10 of 36 installed applications had no icon under
 /// `hicolor` and 1 under `breeze-dark`. Whatever RavenLinux ships belongs here.
-pub(crate) const ICON_THEME: &str = "hicolor";
+///
+/// RavenLinux ships `breeze-icons`, so this names `breeze-dark`: the light
+/// variant is drawn for dark panels, which is what [`BACKGROUND`] is. Naming
+/// `hicolor` here was not a smaller choice but an empty one — the image
+/// carried three files under that theme, all of them installed by CMake, so
+/// every icon in the dock and the launcher resolved to nothing and drew blank.
+///
+/// `Icons::find` walks this theme, then everything it inherits, then hicolor
+/// regardless, so a name this theme happens to lack still resolves the way it
+/// did before. Nothing is lost by preferring a theme that has icons in it.
+pub(crate) const ICON_THEME: &str = "breeze-dark";
 
 /// The terminal the spawn binding launches.
 ///
