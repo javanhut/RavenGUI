@@ -94,7 +94,7 @@ impl Huginn {
     fn root_rect(&self, root: &WlSurface) -> Option<Rect> {
         self.render_list()
             .into_iter()
-            .find(|(toplevel, _)| toplevel.wl_surface() == root)
+            .find(|(surface, _)| surface == root)
             .map(|(_, rect)| rect)
             .or_else(|| {
                 self.all_layers()

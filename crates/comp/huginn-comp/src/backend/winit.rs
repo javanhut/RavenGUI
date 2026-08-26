@@ -100,6 +100,13 @@ pub(crate) fn run() -> Result<()> {
     let size = backend.window_size();
     let mut state = Huginn::new(&dh, Rect::from_xywh(0, 0, size.w, size.h));
 
+    // XWayland. Started here rather than after the backend is up because it is
+    // asynchronous either way: this only spawns the server and registers the
+    // event source, and the window manager is created later, when XWayland
+    // reports ready. Fail-soft -- if the `Xwayland` binary is not installed the
+    // compositor runs exactly as before, without X11 clients.
+    crate::xwayland::start::<Nested>(&dh, &handle);
+
     // Tell clients which GPU to allocate on and which formats we can import.
     // Failing here is not fatal — clients simply stay on shm — so every branch
     // warns and carries on rather than aborting startup.
@@ -447,7 +454,7 @@ impl Nested {
                     // Ask politely. The client unmaps itself, which arrives back
                     // as toplevel_destroyed; killing it here would lose unsaved
                     // work.
-                    surface.send_close();
+                    surface.close();
                 }
             }
             Action::Workspace(i) => {
@@ -506,3 +513,5 @@ fn send_frames(surface: &WlSurface, time: u32) {
         |_, _, &()| true,
     );
 }
+
+crate::impl_xwm_handler!(Nested);

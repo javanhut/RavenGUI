@@ -190,6 +190,13 @@ pub(crate) fn run() -> Result<()> {
 
     let mut state = Huginn::new(&dh, Rect::from_xywh(0, 0, 0, 0));
 
+    // XWayland. Started here rather than after the backend is up because it is
+    // asynchronous either way: this only spawns the server and registers the
+    // event source, and the window manager is created later, when XWayland
+    // reports ready. Fail-soft -- if the `Xwayland` binary is not installed the
+    // compositor runs exactly as before, without X11 clients.
+    crate::xwayland::start::<Udev>(&dh, &handle);
+
     match EGLDevice::device_for_display(renderer.egl_context().display())
         .and_then(|device| device.try_get_render_node())
     {
@@ -871,7 +878,7 @@ impl Udev {
             }
             Action::CloseFocused => {
                 if let Some(surface) = state.space.focused().and_then(|id| state.surface(id)) {
-                    surface.send_close();
+                    surface.close();
                 }
             }
             Action::Workspace(i) => {
@@ -930,3 +937,5 @@ fn send_frames(surface: &WlSurface, time: u32) {
         |_, _, &()| true,
     );
 }
+
+crate::impl_xwm_handler!(Udev);
