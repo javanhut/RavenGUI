@@ -163,6 +163,31 @@ binary ever names it.
 There is no `HUGINN_TERMINAL` override either: an environment variable is a
 user-facing configuration surface with extra steps.
 
+## What the system has to provide
+
+Compiling the look in means the distribution underneath has to supply things by
+name, and every one of these fails silently — the compositor starts, and part of
+the desktop is simply not there. RavenLinux's `stage-gui.sh` installs all four
+and its stage summary reports on each.
+
+| Named in | Expects | Missing means |
+|---|---|---|
+| `theme::TERMINAL`, `dock::PINNED` | `raven-terminal` on `$PATH` | `Super`+`Shift`+`T` does nothing and the dock's one pinned item is dead — the desktop can launch no process at all |
+| `launcher::scan_applications` | `.desktop` files in `$XDG_DATA_DIRS/applications` | the launcher opens and enumerates nothing |
+| `pointer::Cursor::load` | an xcursor theme at `$XCURSOR_THEME`, default `default` | no pointer is drawn over the dock, launcher or background — clients that set their own still show one, so it reads as a rendering bug |
+| `theme::ICON_THEME` | the `breeze-dark` icon theme | every dock and launcher icon draws blank |
+
+Two of them have no in-band failure at all: a missing cursor theme and a missing
+icon theme both take the `None` branch by design, because refusing to start over
+a cosmetic asset would be worse. That makes them the distribution's problem to
+check for, not the compositor's to report.
+
+`Entry::terminal` is parsed from `Terminal=true` and currently read by nothing —
+`Huginn::launch` hands `Entry::argv` to `Command::spawn` either way, so an entry
+carrying that key execs a bare TUI with no controlling terminal and silently
+does nothing. Until that is honoured, an entry for a terminal program has to
+name a terminal in its own `Exec=`.
+
 ## Building
 
 **The compositor only builds on Linux.** Smithay needs `libudev`, `libdrm`,
