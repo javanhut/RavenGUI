@@ -354,12 +354,21 @@ const TITLE: &str = "Quick settings";
 /// Marks a control that is not wired to anything yet.
 const STUB: &str = "not connected";
 
-pub(crate) fn render(settings: &Settings, text: &mut Text, output: Rect, now: Duration) -> Panel {
-    Panel::from_canvas(&compose(settings, text, output, now))
+/// Draw the panel for `output` at `density` pixels per logical one.
+pub(crate) fn render(
+    settings: &Settings,
+    text: &mut Text,
+    output: Rect,
+    now: Duration,
+    density: u32,
+) -> Panel {
+    Panel::from_canvas(&compose(settings, text, output, now, density), density)
 }
 
-fn compose(settings: &Settings, text: &mut Text, output: Rect, now: Duration) -> Canvas {
-    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
+fn compose(settings: &Settings, text: &mut Text, output: Rect, now: Duration, density: u32) -> Canvas {
+    // In the canvas's own pixels, `density` times the logical ones. See
+    // `Panel::from_canvas`.
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density.max(1) as f32;
     let size = BASE_SIZE * scale;
     let pad = PAD * scale;
     let width = (WIDTH * scale) as usize;
@@ -579,7 +588,7 @@ mod tests {
         }
         let settings = opened();
         // Composing at full reveal so the alpha pass does not hide anything.
-        let canvas = compose(&settings, &mut text, Rect::from_xywh(0, 0, 1920, 1080), ms(500));
+        let canvas = compose(&settings, &mut text, Rect::from_xywh(0, 0, 1920, 1080), ms(500), 1);
         assert!(canvas.height > 0);
         // The rows that are stubs draw a longer value string than the real one,
         // so the panel must be wide enough for it rather than clipping.
@@ -605,8 +614,8 @@ mod tests {
         }
         let settings = opened();
         let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let opaque = compose(&settings, &mut text, output, ms(500));
-        let faded = compose(&settings, &mut text, output, ms(20));
+        let opaque = compose(&settings, &mut text, output, ms(500), 1);
+        let faded = compose(&settings, &mut text, output, ms(20), 1);
         let alpha = |c: &Canvas| c.pixels.chunks_exact(4).map(|p| u32::from(p[3])).sum::<u32>();
         assert!(alpha(&faded) < alpha(&opaque), "the reveal did not fade the panel");
     }
@@ -635,7 +644,7 @@ mod dump {
         let at = Duration::from_millis(
             std::env::var("SETTINGS_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(500),
         );
-        let canvas = compose(&settings, &mut text, Rect::from_xywh(0, 0, 1920, 1080), at);
+        let canvas = compose(&settings, &mut text, Rect::from_xywh(0, 0, 1920, 1080), at, 1);
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
         for pixel in canvas.pixels.chunks_exact(4) {
             ppm.extend_from_slice(&pixel[..3]);

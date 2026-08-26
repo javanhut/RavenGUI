@@ -709,7 +709,7 @@ pub(crate) fn placement(output: Rect, panel: (i32, i32), origin: Option<Rect>, r
     Rect::from_xywh(cx - sw / 2, cy - sh / 2, sw, sh)
 }
 
-/// Draw the launcher for `output`.
+/// Draw the launcher for `output` at `density` pixels per logical one.
 pub(crate) fn render(
     launcher: &Launcher,
     apps: &[Entry],
@@ -717,8 +717,9 @@ pub(crate) fn render(
     icons: &Icons,
     pixmaps: &mut Pixmaps,
     output: Rect,
+    density: u32,
 ) -> Panel {
-    Panel::from_canvas(&compose(launcher, apps, text, icons, pixmaps, output))
+    Panel::from_canvas(&compose(launcher, apps, text, icons, pixmaps, output, density), density)
 }
 
 /// Lay the launcher out and paint it. Split from [`render`] so a test can get
@@ -730,8 +731,13 @@ fn compose(
     icons: &Icons,
     pixmaps: &mut Pixmaps,
     output: Rect,
+    density: u32,
 ) -> Canvas {
-    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
+    // Everything here is in the canvas's own pixels, which `density` makes
+    // more numerous than the logical ones the panel is placed in. See
+    // `Panel::from_canvas`.
+    let density = density.max(1);
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
     let size = BASE_SIZE * scale;
     let pad = PAD * scale;
     let width = (WIDTH * scale) as usize;
@@ -817,7 +823,7 @@ fn compose(
         if let Some(pixmap) = entry
             .icon
             .as_deref()
-            .and_then(|name| icons.find(name, icon_size, 1))
+            .and_then(|name| icons.find(name, icon_size / density, density))
             .and_then(|path| pixmaps.get(&path, icon_size))
         {
             canvas.blit(
@@ -866,6 +872,7 @@ mod render_tests {
             &icons,
             &mut pixmaps,
             Rect::from_xywh(0, 0, 1920, 1080),
+            1,
         );
         (canvas, apps)
     }
@@ -1046,7 +1053,7 @@ mod render_tests {
             &std::env::var("RAVEN_ICON_THEME").unwrap_or_else(|_| crate::theme::ICON_THEME.into()),
         );
         let mut pixmaps = Pixmaps::new();
-        let canvas = compose(&launcher, &apps, &mut text, &icons, &mut pixmaps, output);
+        let canvas = compose(&launcher, &apps, &mut text, &icons, &mut pixmaps, output, 1);
 
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
         for pixel in canvas.pixels.chunks_exact(4) {

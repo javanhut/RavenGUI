@@ -34,7 +34,7 @@ use smithay::{
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     input::keyboard::{KeyboardHandle, Keysym},
-    output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
+    output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
             EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic,
@@ -54,6 +54,7 @@ use huginn_core::{
     workspace::Direction,
 };
 
+use crate::backend::advertise;
 use crate::backend::input;
 use crate::backend::chord;
 use crate::backend::keymap::{Action, help_line, resolve};
@@ -140,11 +141,11 @@ pub(crate) fn run() -> Result<()> {
     // to 1x. That is correct here and not a limitation: the host compositor
     // already applied its own scale to the window we were given, and applying
     // a second one on top would double it.
-    let scale = OutputScale::integer_only(Size::new(size.w, size.h), Size::new(0, 0));
+    let scale = OutputScale::for_output(Size::new(size.w, size.h), Size::new(0, 0));
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
-        Some(Scale::Integer(scale.advertised as i32)),
+        Some(advertise(scale)),
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
@@ -196,19 +197,8 @@ pub(crate) fn run() -> Result<()> {
 
     // Cloned rather than fetched per event: get_keyboard borrows the seat out
     // of Huginn, which conflicts with passing Huginn itself to keyboard.input.
-    // Loaded once. XCURSOR_THEME/XCURSOR_SIZE are the conventional way users
-    // pick a cursor, so honour them rather than inventing our own setting.
-    let cursor = crate::pointer::Cursor::load(
-        &std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_owned()),
-        "default",
-        std::env::var("XCURSOR_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24),
-    );
-    if cursor.is_none() {
-        tracing::warn!("no cursor theme found; the pointer will be invisible over the background");
-    }
+    // Loaded once: the nested window is 1× for the life of the process.
+    let cursor = crate::pointer::Cursor::from_env(state.scale.advertised);
 
     let keyboard = state
         .seat
@@ -272,6 +262,9 @@ impl Nested {
         let size = self.backend.window_size();
         let damage = Rectangle::from_size(size);
         let radius = self.state.blur_radius();
+        // Always 1 here — see the output setup — but the elements were built
+        // against it, so it is the only correct value to draw them with.
+        let scale = self.state.scale.fractional();
 
         // The blur's offscreen passes have to happen before the output
         // framebuffer is bound — they bind their own — so they run here, on
@@ -286,7 +279,7 @@ impl Nested {
             let (_, behind) = render::elements_split(renderer, &self.state, self.cursor.as_ref());
             self.blur
                 .as_mut()
-                .and_then(|blur| blur.pass(renderer, &behind, size, radius))
+                .and_then(|blur| blur.pass(renderer, &behind, size, scale, radius))
         } else {
             None
         };
@@ -318,10 +311,10 @@ impl Nested {
                 .map_err(|e| anyhow::anyhow!("clearing frame: {e}"))?;
             // The blurred desktop goes down first, then everything above it.
             if let Some(element) = &blurred {
-                draw_render_elements::<GlesRenderer, _, _>(&mut frame, 1.0, std::slice::from_ref(element), &[damage])
+                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, std::slice::from_ref(element), &[damage])
                     .map_err(|e| anyhow::anyhow!("drawing the blurred desktop: {e}"))?;
             }
-            draw_render_elements::<GlesRenderer, _, _>(&mut frame, 1.0, &elements, &[damage])
+            draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &[damage])
                 .map_err(|e| anyhow::anyhow!("drawing: {e}"))?;
             // The returned SyncPoint is discarded deliberately: the host
             // compositor we are nested inside does the synchronisation for us.

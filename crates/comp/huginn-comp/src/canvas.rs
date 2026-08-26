@@ -17,7 +17,10 @@ use crate::theme::Color;
 /// An RGBA canvas the overlay is composed into before it becomes a buffer.
 ///
 /// Composed at final size rather than drawn small and scaled up, so the
-/// renderer never sees anything to interpolate.
+/// renderer never sees anything to interpolate. "Final size" includes the
+/// output's density: on a 2× output a panel is composed with twice the pixels
+/// in each direction and [`Panel::from_canvas`] marks the buffer as 2×, so it
+/// lands on the panel pixel for pixel, the same as a 2× client's window.
 pub(crate) struct Canvas {
     pub(crate) pixels: Vec<u8>,
     /// Width in pixels; the stride in bytes is this times four.
@@ -207,7 +210,7 @@ impl crate::text::Surface for Canvas {
     }
 }
 
-/// A finished panel: its pixels, and the size they were drawn at.
+/// A finished panel: its pixels, and the logical size it occupies.
 #[derive(Debug)]
 pub(crate) struct Panel {
     pub buffer: MemoryRenderBuffer,
@@ -217,8 +220,17 @@ pub(crate) struct Panel {
 
 impl Panel {
     /// Turn a composed canvas into something the renderer can draw.
-    pub(crate) fn from_canvas(canvas: &Canvas) -> Self {
-        let (width, height) = (canvas.stride as i32, canvas.height as i32);
+    ///
+    /// `density` is the integer scale the canvas was composed at — the
+    /// output's advertised scale — and becomes the buffer's scale, so the
+    /// panel's logical size is the canvas divided by it. Rounded up: a canvas
+    /// an odd pixel wide at 2× would otherwise lose half a pixel off its edge.
+    pub(crate) fn from_canvas(canvas: &Canvas, density: u32) -> Self {
+        let density = density.max(1) as usize;
+        let (width, height) = (
+            canvas.stride.div_ceil(density) as i32,
+            canvas.height.div_ceil(density) as i32,
+        );
         Self {
             // Not quite opaque — the background carries a little alpha so the
             // desktop shows faintly through — so no opaque region is claimed.
@@ -230,8 +242,8 @@ impl Panel {
                 // a little-endian machine. Reading this as Argb8888 tints the
                 // whole panel blue and puts the alpha in the wrong place.
                 Fourcc::Abgr8888,
-                (width, height),
-                1,
+                (canvas.stride as i32, canvas.height as i32),
+                density as i32,
                 Transform::Normal,
                 None,
             ),
@@ -244,7 +256,7 @@ impl Panel {
         &self.buffer
     }
 
-    /// The panel's size in pixels.
+    /// The panel's size in logical pixels.
     pub(crate) fn size(&self) -> (i32, i32) {
         (self.width, self.height)
     }

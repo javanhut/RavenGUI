@@ -44,10 +44,11 @@ pub(crate) struct Overlay {
 }
 
 impl Overlay {
-    /// Draw the overlay, sized to sit comfortably on `output`.
-    pub(crate) fn render(output: Rect, text: &mut Text) -> Self {
+    /// Draw the overlay, sized to sit comfortably on `output`, at `density`
+    /// pixels per logical one.
+    pub(crate) fn render(output: Rect, text: &mut Text, density: u32) -> Self {
         Self {
-            panel: Panel::from_canvas(&compose(output, text)),
+            panel: Panel::from_canvas(&compose(output, text, density), density),
         }
     }
 
@@ -63,12 +64,19 @@ impl Overlay {
 
 /// Lay the panel out and paint it. Split from [`Overlay::render`] so a test can
 /// get at the pixels without going through a renderer.
-fn compose(output: Rect, text: &mut Text) -> Canvas {
+fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
     // Text grows with the output rather than the panel being scaled after the
     // fact: rasterizing at the final size is the whole reason for a real font
     // stack, and scaling a bitmap afterwards would throw that away.
-    let size = (BASE_SIZE * (output.h() as f32 / 1080.0)).clamp(BASE_SIZE, BASE_SIZE * 2.5);
+    //
+    // Everything below is in the canvas's own pixels, of which a 2× output has
+    // twice as many per logical pixel as a 1× one. `px` is that factor; it
+    // goes into every dimension here and `Panel::from_canvas` divides it back
+    // out, so the panel is placed at the same logical size either way.
+    let px = density.max(1) as f32;
+    let size = (BASE_SIZE * (output.h() as f32 / 1080.0)).clamp(BASE_SIZE, BASE_SIZE * 2.5) * px;
     let line = size * 1.35;
+    let (pad, column_gap, line_gap, rule) = (PAD * px, COLUMN_GAP * px, LINE_GAP * px, px);
 
     let chord_w = BINDINGS
         .iter()
@@ -78,20 +86,20 @@ fn compose(output: Rect, text: &mut Text) -> Canvas {
     // the chained title and footer measurements need it too.
     let widest_row = BINDINGS
         .iter()
-        .map(|b| chord_w + COLUMN_GAP + text.measure(b.description, size).0)
+        .map(|b| chord_w + column_gap + text.measure(b.description, size).0)
         .fold(0.0_f32, f32::max);
     let body_w = widest_row
         .max(text.measure(TITLE, size).0)
         .max(text.measure(FOOTER, size).0);
 
-    let w = (body_w + PAD * 2.0).ceil() as usize;
+    let w = (body_w + pad * 2.0).ceil() as usize;
     // Title, a rule under it, every binding, then the footer.
     let rows = BINDINGS.len() as f32;
-    let h = (PAD * 2.0
-        + line + LINE_GAP          // title
-        + 1.0 + LINE_GAP           // rule
-        + rows * (line + LINE_GAP) // bindings
-        + LINE_GAP
+    let h = (pad * 2.0
+        + line + line_gap          // title
+        + rule + line_gap          // rule
+        + rows * (line + line_gap) // bindings
+        + line_gap
         + line)                    // footer
         .ceil() as usize;
 
@@ -99,26 +107,26 @@ fn compose(output: Rect, text: &mut Text) -> Canvas {
     canvas.fill(0, 0, w, h, BG);
     canvas.frame(BORDER);
 
-    let mut y = PAD;
-    text.draw(&mut canvas, TITLE, size, PAD as i32, y as i32, crate::theme::ACCENT);
-    y += line + LINE_GAP;
-    canvas.fill(PAD as usize, y as usize, body_w as usize, 1, BORDER);
-    y += 1.0 + LINE_GAP;
+    let mut y = pad;
+    text.draw(&mut canvas, TITLE, size, pad as i32, y as i32, crate::theme::ACCENT);
+    y += line + line_gap;
+    canvas.fill(pad as usize, y as usize, body_w as usize, rule as usize, BORDER);
+    y += rule + line_gap;
 
     for binding in BINDINGS {
-        text.draw(&mut canvas, binding.chord, size, PAD as i32, y as i32, crate::theme::ACCENT);
+        text.draw(&mut canvas, binding.chord, size, pad as i32, y as i32, crate::theme::ACCENT);
         text.draw(
             &mut canvas,
             binding.description,
             size,
-            (PAD + chord_w + COLUMN_GAP) as i32,
+            (pad + chord_w + column_gap) as i32,
             y as i32,
             crate::theme::TEXT,
         );
-        y += line + LINE_GAP;
+        y += line + line_gap;
     }
-    y += LINE_GAP;
-    text.draw(&mut canvas, FOOTER, size, PAD as i32, y as i32, crate::theme::TEXT_DIM);
+    y += line_gap;
+    text.draw(&mut canvas, FOOTER, size, pad as i32, y as i32, crate::theme::TEXT_DIM);
 
     canvas
 }
@@ -130,7 +138,7 @@ mod tests {
     #[test]
     fn it_is_centred_on_the_output() {
         let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let overlay = Overlay::render(output, &mut Text::new());
+        let overlay = Overlay::render(output, &mut Text::new(), 1);
         let at = overlay.placement(output);
         // Integer division leaves an odd screen a pixel wider on one side.
         assert!((output.w() - (at.x() * 2 + at.w())).abs() <= 1, "not horizontally centred");
@@ -145,7 +153,7 @@ mod tests {
         // also has height to spare and none to waste on width, which is what
         // catches a scale picked from one axis.
         let output = Rect::from_xywh(1920, 0, 1280, 1024);
-        let overlay = Overlay::render(output, &mut Text::new());
+        let overlay = Overlay::render(output, &mut Text::new(), 1);
         let at = overlay.placement(output);
         assert!(at.x() >= output.x() && at.right() <= output.right());
     }
@@ -155,7 +163,7 @@ mod tests {
         // Better a clipped list anchored at the corner than one centred so far
         // negative that the beginning of every line is off screen.
         let output = Rect::from_xywh(0, 0, 320, 200);
-        let overlay = Overlay::render(output, &mut Text::new());
+        let overlay = Overlay::render(output, &mut Text::new(), 1);
         let at = overlay.placement(output);
         assert!(at.x() >= output.x() && at.y() >= output.y());
     }
@@ -182,7 +190,7 @@ mod tests {
             return;
         }
         let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let canvas = compose(output, &mut text);
+        let canvas = compose(output, &mut text, 1);
         let size = BASE_SIZE;
         let footer = text.measure(FOOTER, size).0;
         assert!(
@@ -200,7 +208,7 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text);
+        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let clear = canvas.pixels.chunks_exact(4).filter(|p| p[3] == 0).count();
         assert_eq!(clear, 0, "{clear} fully transparent pixels inside the panel");
     }
@@ -214,7 +222,7 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text);
+        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let accent = crate::theme::ACCENT.to_rgba_bytes();
         let partial = canvas
             .pixels
@@ -235,9 +243,32 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let small = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text);
-        let large = compose(Rect::from_xywh(0, 0, 3840, 2160), &mut text);
+        let small = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
+        let large = compose(Rect::from_xywh(0, 0, 3840, 2160), &mut text, 1);
         assert!(large.height > small.height, "panel did not grow with the output");
+    }
+
+    #[test]
+    fn a_denser_output_gets_more_pixels_but_the_same_panel() {
+        // The point of density: a 2× panel has twice the pixels each way and
+        // is told so, so it occupies the same logical rectangle as the 1× one
+        // and lands on a 2× screen pixel for pixel instead of being stretched.
+        let mut text = Text::new();
+        if !text.is_usable() {
+            return;
+        }
+        let output = Rect::from_xywh(0, 0, 1920, 1080);
+        let one = compose(output, &mut text, 1);
+        let two = compose(output, &mut text, 2);
+        // Shaped text does not scale to the pixel, so allow it a little slack.
+        let close = |a: usize, b: usize| (a as f32 - b as f32).abs() <= (b as f32 * 0.02).max(2.0);
+        assert!(close(two.stride, one.stride * 2), "{} vs {}", two.stride, one.stride);
+        assert!(close(two.height, one.height * 2), "{} vs {}", two.height, one.height);
+
+        let at_one = Overlay::render(output, &mut text, 1).placement(output);
+        let at_two = Overlay::render(output, &mut text, 2).placement(output);
+        assert!(close(at_two.w() as usize, at_one.w() as usize));
+        assert!(close(at_two.h() as usize, at_one.h() as usize));
     }
 
     #[test]
@@ -246,12 +277,12 @@ mod tests {
             return;
         };
         let mut text = Text::new();
-        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text);
+        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let (w, h) = (canvas.stride, canvas.height);
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         // The canvas is RGBA and PPM is RGB, so the alpha is dropped. Every
         // pixel the overlay draws is opaque enough for that to be honest.
-        for pixel in compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text).pixels.chunks_exact(4)
+        for pixel in compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1).pixels.chunks_exact(4)
         {
             ppm.extend_from_slice(&pixel[..3]);
         }

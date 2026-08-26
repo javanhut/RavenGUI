@@ -2,8 +2,8 @@
 //!
 //! The rule, from the design spec §3: **a client is never handed a fractional
 //! scale.** Every surface renders at a whole-number scale, and any fraction the
-//! panel needs is applied exactly once, by the compositor, to the finished
-//! frame.
+//! panel needs is applied exactly once, by the compositor, as the surface is
+//! composed onto the panel.
 //!
 //! # Why
 //!
@@ -17,11 +17,22 @@
 //!
 //! # The consequence
 //!
-//! The scene is always rendered at **at least** the panel's physical
-//! resolution, never less — so the final step is always a downsample, never an
-//! upscale. A downsample loses no detail the panel could have shown; an upscale
-//! invents detail that was never rendered. That asymmetry is the crispness
-//! guarantee, and [`OutputScale::render_size`] is where it is enforced.
+//! Every surface is rendered at **at least** the panel's density, never less —
+//! so composing it onto the panel is always a downsample, never an upscale. A
+//! downsample loses no detail the panel could have shown; an upscale invents
+//! detail that was never rendered. That asymmetry is the crispness guarantee,
+//! and [`OutputScale::render`] is where it is enforced.
+//!
+//! # How the fraction is applied
+//!
+//! The output carries two scales: the whole number clients are told
+//! ([`OutputScale::advertised`]) and the real one the compositor lays out and
+//! composes at ([`OutputScale::fractional`]). A 4K 27" is a 2560×1440 desktop
+//! composed at 1.5×; its clients render at 2× and each buffer is sampled down
+//! by 0.75 as it is drawn. That is one resample per surface, done by the
+//! compositor, with the client none the wiser — the same as macOS's "looks
+//! like 2560×1440", short of doing it to the composed frame rather than to
+//! each surface.
 
 use crate::geometry::Size;
 
@@ -52,23 +63,41 @@ pub struct OutputScale {
     /// windows out in. Divided down from the panel by the *effective* scale,
     /// so a denser panel shows the same amount of desktop at a larger size.
     pub logical: Size,
-    /// The size of the buffer the whole scene is composed into, in real pixels.
+    /// The scene's size at the advertised scale, in real pixels: what the
+    /// surfaces add up to before the fraction is applied.
     ///
     /// Always `logical * advertised`, and always at least [`Self::physical`] —
-    /// so the final blit is a downsample and never an upscale.
+    /// so composing onto the panel is a downsample and never an upscale.
     pub render: Size,
     /// The panel's real resolution. What actually gets scanned out.
     pub physical: Size,
 }
 
 impl OutputScale {
-    /// Whether the composed frame must be resampled before scanout.
+    /// Whether surfaces are resampled on their way to the panel.
     ///
     /// False on the common cases — a 1× desktop, and a clean 2× panel — where
-    /// the render buffer already is the panel resolution and the extra pass
-    /// would be a copy that changes nothing.
+    /// [`Self::fractional`] is the advertised integer and every buffer lands
+    /// pixel for pixel.
     pub fn needs_resample(self) -> bool {
         self.render != self.physical
+    }
+
+    /// The scale the desktop is actually composed at: physical pixels per
+    /// logical one.
+    ///
+    /// This is what the renderer converts positions with, and what the output
+    /// reports through the protocols that can carry a fraction (`xdg_output`'s
+    /// logical size). Clients are still told [`Self::advertised`]. Equal to it
+    /// whenever [`Self::needs_resample`] is false.
+    ///
+    /// Recovered from the sizes rather than stored, so it is exactly the ratio
+    /// the rest of the struct was built from and the two cannot disagree.
+    pub fn fractional(self) -> f64 {
+        if self.logical.w <= 0 {
+            return f64::from(self.advertised);
+        }
+        f64::from(self.physical.w) / f64::from(self.logical.w)
     }
 
     /// Decide the scale for a panel of `physical` pixels and `physical_mm`.
@@ -112,38 +141,6 @@ impl OutputScale {
             advertised,
             logical,
             render,
-            physical,
-        }
-    }
-}
-
-impl OutputScale {
-    /// The decision restricted to scales that need no resample pass.
-    ///
-    /// Same advertised integer as [`Self::for_output`], but the logical desktop
-    /// is divided by that integer rather than by the fractional effective
-    /// scale, so `render` always equals `physical` and
-    /// [`Self::needs_resample`] is always false.
-    ///
-    /// **This exists because the compositor cannot resample yet.** The DRM path
-    /// renders straight into the scanout buffer, so a `render` larger than
-    /// `physical` would draw a desktop bigger than the screen rather than a
-    /// crisper one. Until the offscreen-plus-downsample pass lands, a 4K 27"
-    /// gets a clean 1920x1080-at-2x desktop instead of the 2560x1440-at-1.5x it
-    /// would prefer — larger UI than ideal, but correct and sharp, and exactly
-    /// what macOS offers as "looks like 1920x1080" on the same panel.
-    ///
-    /// Delete this and its callers when the resample pass exists.
-    pub fn integer_only(physical: Size, physical_mm: Size) -> Self {
-        let full = Self::for_output(physical, physical_mm);
-        let advertised = full.advertised as i32;
-        Self {
-            advertised: full.advertised,
-            logical: Size::new(
-                divide_ceil(physical.w, f64::from(advertised)),
-                divide_ceil(physical.h, f64::from(advertised)),
-            ),
-            render: physical,
             physical,
         }
     }
@@ -341,37 +338,42 @@ mod tests {
     }
 
     #[test]
-    fn integer_only_never_asks_for_a_resample() {
-        // The property the renderer currently depends on: it draws into the
-        // scanout buffer, so a render larger than the panel is a desktop
-        // bigger than the screen.
+    fn the_fraction_is_the_advertised_integer_unless_a_resample_is_needed() {
+        // 1x and clean 2x panels compose at exactly the scale clients render
+        // at, so nothing is resampled. The 4K 27" is the one that is not.
+        let (px, mm) = panel(1920, 1080, 24.0);
+        assert_eq!(OutputScale::for_output(px, mm).fractional(), 1.0);
+        let (px, mm) = panel(2880, 1800, 15.4);
+        assert_eq!(OutputScale::for_output(px, mm).fractional(), 2.0);
+        let (px, mm) = panel(3840, 2160, 27.0);
+        let scale = OutputScale::for_output(px, mm);
+        assert_eq!(scale.fractional(), 1.5);
+        assert!(scale.needs_resample());
+    }
+
+    #[test]
+    fn the_fraction_maps_the_logical_desktop_back_onto_the_panel() {
+        // Whatever the rounding in `logical`, the composed desktop must cover
+        // the panel: logical times the fraction is the panel width exactly,
+        // and the height lands within the pixel the ceil put there.
         for (w, h, inches) in [
             (1366, 768, 14.0),
-            (1920, 1080, 24.0),
             (1920, 1080, 13.3),
             (2256, 1504, 13.5),
-            (2560, 1440, 27.0),
-            (2880, 1800, 15.4),
             (3440, 1440, 34.0),
             (3840, 2160, 27.0),
         ] {
             let (px, mm) = panel(w, h, inches);
-            let scale = OutputScale::integer_only(px, mm);
-            assert_eq!(scale.render, px, "{w}x{h} @{inches}\" wants a resample");
-            assert!(!scale.needs_resample());
-            assert!(scale.advertised == 1 || scale.advertised == 2);
+            let scale = OutputScale::for_output(px, mm);
+            let f = scale.fractional();
+            assert_eq!((f64::from(scale.logical.w) * f).round() as i32, px.w, "{w}x{h}");
+            let composed_h = f64::from(scale.logical.h) * f;
+            assert!(
+                composed_h >= f64::from(px.h) && composed_h < f64::from(px.h) + f,
+                "{w}x{h} @{inches}\": composed {composed_h} for a {}-high panel",
+                px.h
+            );
         }
-    }
-
-    #[test]
-    fn integer_only_gives_a_four_k_twenty_seven_a_clean_two_times_desktop() {
-        // The documented trade: 1920x1080 at 2x rather than 2560x1440 at 1.5x.
-        // Bigger UI than ideal, but crisp, and it fits the screen.
-        let (px, mm) = panel(3840, 2160, 27.0);
-        let scale = OutputScale::integer_only(px, mm);
-        assert_eq!(scale.advertised, 2);
-        assert_eq!(scale.logical, Size::new(1920, 1080));
-        assert_eq!(scale.render, px);
     }
 
     #[test]

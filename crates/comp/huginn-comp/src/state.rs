@@ -422,7 +422,7 @@ impl Huginn {
             Some(_) => None,
             None => {
                 let area = self.output_area;
-                Some(crate::overlay::Overlay::render(area, &mut self.text))
+                Some(crate::overlay::Overlay::render(area, &mut self.text, self.scale.advertised))
             }
         };
         tracing::debug!(visible = self.help.is_some(), "keybinding overlay");
@@ -435,7 +435,7 @@ impl Huginn {
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
         if self.help.is_some() {
-            self.help = Some(crate::overlay::Overlay::render(area, &mut self.text));
+            self.help = Some(crate::overlay::Overlay::render(area, &mut self.text, self.scale.advertised));
         }
         self.refresh_layers();
     }
@@ -771,6 +771,7 @@ impl Huginn {
                 &mut self.pixmaps,
                 &mut self.text,
                 self.output_area,
+                self.scale.advertised,
             )
         });
         self.queue_redraw();
@@ -977,7 +978,13 @@ impl Huginn {
     pub(crate) fn refresh_settings(&mut self) {
         let now = self.uptime();
         self.settings_panel = self.settings.is_visible(now).then(|| {
-            crate::settings::render(&self.settings, &mut self.text, self.output_area, now)
+            crate::settings::render(
+                &self.settings,
+                &mut self.text,
+                self.output_area,
+                now,
+                self.scale.advertised,
+            )
         });
         self.queue_redraw();
     }
@@ -996,6 +1003,7 @@ impl Huginn {
                 &self.icons,
                 &mut self.pixmaps,
                 self.output_area,
+                self.scale.advertised,
             )
         });
         self.queue_redraw();

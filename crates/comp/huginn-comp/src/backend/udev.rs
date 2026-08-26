@@ -20,7 +20,17 @@
 //! node — udev has no notion of a connector, so the only way to learn what
 //! actually changed is to re-read the connector list. [`Udev::sync_connectors`]
 //! does that and reconciles: connectors that went away lose their screen and
-//! their `wl_output` global, new ones get a CRTC and light up.
+//! their `wl_output` global, new ones get a CRTC and light up, and ones that
+//! stayed are re-read in case the panel behind them changed —
+//! [`Udev::refresh_screen`] follows a new preferred mode or density without
+//! taking the output down.
+//!
+//! # Coordinates
+//!
+//! The core lays the desktop out in *logical* pixels and the renderer scales
+//! them back up by the output's advertised integer scale. Everything this
+//! backend tells the core — the output area, the position of each screen — is
+//! therefore in logical units, never in the panel's native resolution.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -56,14 +66,13 @@ use smithay::{
         calloop::{
             EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic,
         },
-        drm::control::{Device as _, ResourceHandles, connector, crtc},
+        drm::control::{Device as _, Mode as DrmMode, ResourceHandles, connector, crtc},
         input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
         wayland_server::{
             Display, DisplayHandle, backend::GlobalId, protocol::wl_surface::WlSurface,
         },
     },
-    output::Scale,
     utils::{DeviceFd, SERIAL_COUNTER, Transform},
     wayland::{
         compositor::{SurfaceAttributes, TraversalAction, with_surface_tree_downward},
@@ -77,6 +86,7 @@ use huginn_core::{
     workspace::Direction,
 };
 
+use crate::backend::advertise;
 use crate::backend::input;
 use crate::backend::chord;
 use crate::backend::keymap::{Action, help_line, resolve};
@@ -104,6 +114,13 @@ struct Screen {
     /// rescan reports connectors, so both directions have to be answerable.
     connector: connector::Handle,
     name: String,
+    /// The mode the CRTC is driving. Compared against the connector's preferred
+    /// mode on every rescan; a difference means the panel behind the connector
+    /// is not the one this screen was brought up for.
+    mode: DrmMode,
+    /// The scale policy for this panel. `logical` is what the screen measures
+    /// in the desktop's coordinates, which is the unit `relayout` works in.
+    scale: OutputScale,
     /// A frame is queued and we are waiting for its page flip. Queueing another
     /// before the flip completes returns EBUSY.
     awaiting_flip: bool,
@@ -306,19 +323,9 @@ pub(crate) fn run() -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("session source: {e}"))?;
 
-    // Loaded once. XCURSOR_THEME/XCURSOR_SIZE are the conventional way users
-    // pick a cursor, so honour them rather than inventing our own setting.
-    let cursor = crate::pointer::Cursor::load(
-        &std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_owned()),
-        "default",
-        std::env::var("XCURSOR_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24),
-    );
-    if cursor.is_none() {
-        tracing::warn!("no cursor theme found; the pointer will be invisible over the background");
-    }
+    // For the density the state starts with; `relayout` loads it again when
+    // the first screen — or a different one — says otherwise.
+    let cursor = crate::pointer::Cursor::from_env(state.scale.advertised);
 
     let keyboard = state
         .seat
@@ -410,6 +417,27 @@ fn preferred_mode(
         .copied()
 }
 
+/// What a connector driven at `mode` looks like to clients: the `wl_output`
+/// mode, and the scale policy for the panel's density.
+///
+/// Shared by bring-up and rescan so the two cannot disagree about a panel.
+fn describe(connector: &connector::Info, mode: &DrmMode) -> (Mode, OutputScale) {
+    let (w, h) = mode.size();
+    let wl_mode = Mode {
+        size: (i32::from(w), i32::from(h)).into(),
+        refresh: refresh_mhz(mode),
+    };
+    // Physical size is in millimetres and comes back as u32.
+    let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
+    // The integer-scale contract: whatever the panel's density works out to,
+    // a client is only ever told a whole number. See `huginn_core::scale`.
+    let scale = OutputScale::for_output(
+        Size::new(i32::from(w), i32::from(h)),
+        Size::new(phys_w as i32, phys_h as i32),
+    );
+    (wl_mode, scale)
+}
+
 /// Refresh rate in mHz, the unit `wl_output` reports.
 ///
 /// Computed rather than read from `Mode::vrefresh`, which is a legacy field and
@@ -474,7 +502,10 @@ impl Udev {
     /// GPU. It has to be a full reconciliation rather than an add or a remove:
     /// the event says only that *something* about the device changed, and a
     /// single change can be both — a KVM switch flipping inputs disconnects one
-    /// connector and connects another before we get a chance to look.
+    /// connector and connects another before we get a chance to look. It can
+    /// also be neither: the same connector, still connected, with a different
+    /// monitor on the end of it, which is why connectors we already drive are
+    /// re-read rather than skipped.
     fn sync_connectors(&mut self) {
         let resources = match self.manager.device().resource_handles() {
             Ok(resources) => resources,
@@ -511,11 +542,12 @@ impl Udev {
             false
         });
 
-        // --- new ---
+        // --- new, or still here but different ---
         let known: HashSet<connector::Handle> =
             self.screens.values().map(|screen| screen.connector).collect();
         for connector in &connected {
             if known.contains(&connector.handle()) {
+                changed |= self.refresh_screen(connector);
                 continue;
             }
             match self.add_screen(&resources, connector) {
@@ -545,12 +577,7 @@ impl Udev {
             anyhow::bail!("no free CRTC for {name}");
         };
 
-        let (w, h) = mode.size();
-        let refresh = refresh_mhz(&mode);
-        let wl_mode = Mode {
-            size: (i32::from(w), i32::from(h)).into(),
-            refresh,
-        };
+        let (wl_mode, scale) = describe(connector, &mode);
         let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
         let output = Output::new(
             name.clone(),
@@ -563,26 +590,15 @@ impl Udev {
             },
         );
         // Position is left at the origin here; `relayout` places every screen
-        // once the whole set is known.
-        // The integer-scale contract: whatever the panel's density works out
-        // to, a client is only ever told a whole number. See
-        // `huginn_core::scale`.
-        //
-        // `integer_only` rather than `for_output` because `render_frame` draws
-        // into the scanout buffer, so there is nowhere for a larger render
-        // target to live yet. Switch to `for_output` with the resample pass.
-        let scale = OutputScale::integer_only(
-            Size::new(i32::from(w), i32::from(h)),
-            Size::new(phys_w as i32, phys_h as i32),
-        );
+        // once the whole set is known, and it is also what hands the core its
+        // scale and area — this screen may not be the one that defines them.
         output.change_current_state(
             Some(wl_mode),
             Some(Transform::Normal),
-            Some(Scale::Integer(scale.advertised as i32)),
+            Some(advertise(scale)),
             None,
         );
         output.set_preferred(wl_mode);
-        self.state.set_output_scale(scale);
         let global = self.state.add_output(&output, &self.dh);
 
         let dh = self.dh.clone();
@@ -604,7 +620,14 @@ impl Udev {
                 anyhow::anyhow!("initialising {name}: {e}")
             })?;
 
-        tracing::info!(%name, ?crtc, width = w, height = h, refresh_mhz = refresh, "output up");
+        tracing::info!(
+            %name,
+            ?crtc,
+            width = wl_mode.size.w,
+            height = wl_mode.size.h,
+            refresh_mhz = wl_mode.refresh,
+            "output up"
+        );
 
         self.screens.insert(
             crtc,
@@ -614,11 +637,87 @@ impl Udev {
                 global,
                 connector: connector.handle(),
                 name,
+                mode,
+                scale,
                 awaiting_flip: false,
                 dirty: true,
             },
         );
         Ok(())
+    }
+
+    /// Follow a change to the panel behind a connector we already drive.
+    ///
+    /// A KVM switch, or a monitor swapped while the cable stays in, keeps the
+    /// connector handle and changes everything else: the preferred mode, the
+    /// physical size, and with it the scale. The rescan force-probed the
+    /// connector, so what it reports now is the new panel and not the kernel's
+    /// memory of the old one. Returns whether anything changed.
+    ///
+    /// The mode is switched in place rather than by tearing the screen down:
+    /// clients keep the `wl_output` they know and see a mode event on it, the
+    /// same as they would from any compositor with a display settings page.
+    /// [`DrmOutput::use_mode`] only stages the mode for the next commit, so
+    /// marking the screen dirty is what actually performs the modeset.
+    fn refresh_screen(&mut self, connector: &connector::Info) -> bool {
+        let Some((&crtc, _)) = self
+            .screens
+            .iter()
+            .find(|(_, screen)| screen.connector == connector.handle())
+        else {
+            return false;
+        };
+        let Some(mode) = preferred_mode(connector) else {
+            // A connected panel with no modes is one mid-way through a swap.
+            // Keep driving what we have; the next event will say more.
+            tracing::warn!(connector = ?connector.handle(), "connector reports no modes; keeping its current mode");
+            return false;
+        };
+        let (wl_mode, scale) = describe(connector, &mode);
+
+        let screen = self
+            .screens
+            .get_mut(&crtc)
+            .expect("looked up by connector just above");
+        if mode == screen.mode && scale == screen.scale {
+            return false;
+        }
+
+        if mode != screen.mode {
+            if let Err(e) = screen.drm.use_mode(
+                mode,
+                &mut self.renderer,
+                &DrmOutputRenderElements::<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>::default(),
+            ) {
+                tracing::warn!(name = %screen.name, error = %e, "switching mode; keeping the old one");
+                return false;
+            }
+            tracing::info!(
+                name = %screen.name,
+                width = wl_mode.size.w,
+                height = wl_mode.size.h,
+                refresh_mhz = wl_mode.refresh,
+                "output mode changed"
+            );
+        }
+        if scale != screen.scale {
+            tracing::info!(name = %screen.name, advertised = scale.advertised, "output scale changed");
+        }
+
+        screen.mode = mode;
+        screen.scale = scale;
+        // The physical size on the `wl_output` global is fixed at creation and
+        // stays as the old panel reported it; nothing downstream reads it, the
+        // scale policy having already been applied here.
+        screen.output.change_current_state(
+            Some(wl_mode),
+            None,
+            Some(advertise(scale)),
+            None,
+        );
+        screen.output.set_preferred(wl_mode);
+        screen.dirty = true;
+        true
     }
 
     /// A CRTC this connector can drive that no screen has already taken.
@@ -637,6 +736,12 @@ impl Udev {
 
     /// Lay the screens out left to right and tell the core how much room it has.
     ///
+    /// In logical pixels throughout: a 4K panel at 2× is 1920 wide here, which
+    /// is the unit the desktop is laid out in and the renderer scales back up
+    /// from. Using the panel's native size instead would hand the core a
+    /// desktop twice as large as the screen, of which clients — told 2× —
+    /// would then show a quarter.
+    ///
     /// Ordered by connector name rather than by CRTC or discovery order, so
     /// that unplugging the middle of three monitors and plugging it back in
     /// puts it back where it was instead of shuffling the other two.
@@ -648,27 +753,35 @@ impl Udev {
         let mut leftmost = None;
         for crtc in order {
             let screen = &self.screens[&crtc];
-            let Some(mode) = screen.output.current_mode() else {
-                continue;
-            };
             screen
                 .output
                 .change_current_state(None, None, None, Some((x, 0).into()));
-            leftmost.get_or_insert(Rect::from_xywh(0, 0, mode.size.w, mode.size.h));
-            x += mode.size.w;
+            leftmost.get_or_insert(screen.scale);
+            x += screen.scale.logical.w;
         }
 
-        // Single-output for now: huginn-core still models one usable area, so
-        // the leftmost screen defines it. Multi-output needs a per-output area
-        // in the core before it means anything here. With nothing connected the
-        // last known area is kept — resizing every client to zero and back is
-        // a configure storm that buys nothing while no one can see the screen.
-        if let Some(area) = leftmost
-            && area != self.state.output_area()
+        // Single-output for now: huginn-core still models one scale and one
+        // usable area, so the leftmost screen defines both. Multi-output needs
+        // a per-output area in the core before it means anything here. With
+        // nothing connected the last known scale is kept — resizing every
+        // client to zero and back is a configure storm that buys nothing while
+        // no one can see the screen.
+        if let Some(scale) = leftmost
+            && scale != self.state.scale
         {
-            // `set_output_area` reflows the layer surfaces and arranges the
-            // windows underneath them, so there is nothing more to do here.
-            self.state.set_output_area(area);
+            // `set_output_scale` derives the area from the logical size and
+            // reflows the layer surfaces and the windows underneath them.
+            // The panels the shell draws are composed for the new density the
+            // next time each is refreshed; the cursor bitmap is the one thing
+            // loaded once, so it is loaded again here.
+            self.state.set_output_scale(scale);
+            if self
+                .cursor
+                .as_ref()
+                .is_none_or(|cursor| cursor.density != scale.advertised)
+            {
+                self.cursor = Cursor::from_env(scale.advertised);
+            }
         }
     }
 
@@ -709,7 +822,9 @@ impl Udev {
                 render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref());
             self.blur
                 .as_mut()
-                .and_then(|blur| blur.pass(&mut self.renderer, &behind, size, radius))
+                .and_then(|blur| {
+                    blur.pass(&mut self.renderer, &behind, size, self.state.scale.fractional(), radius)
+                })
         } else {
             None
         };

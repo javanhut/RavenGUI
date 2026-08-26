@@ -15,6 +15,14 @@
 //! radius that is 98 samples against 2401, which is the difference between a
 //! blur that fits in a frame and one that does not.
 //!
+//! The scene pass draws the elements with the output's scale, the same one the
+//! backend would have drawn them with — an element's size comes from the scale
+//! it is drawn at, so anything else draws the desktop the wrong size into the
+//! texture. The two blur passes are texture-to-texture and work in physical
+//! pixels at 1:1; only the last element, the one handed back to the backend,
+//! is sized in logical pixels so that the backend's scale maps it back onto
+//! the panel exactly.
+//!
 //! # Never verified on a screen
 //!
 //! This compiles and its kernel is tested, but no part of the GPU path has
@@ -228,7 +236,7 @@ use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::gles::element::TextureShaderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture, Uniform};
 use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer};
-use smithay::utils::{Physical, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Rectangle, Scale, Size, Transform};
 
 use crate::render::HuginnElement;
 
@@ -281,6 +289,9 @@ impl Blur {
 
     /// Render `elements` into a texture, blur it, and return it as an element.
     ///
+    /// `size` is the output in physical pixels and `scale` is what the caller
+    /// will draw the returned element — and would have drawn `elements` — with.
+    ///
     /// `None` if anything fails, in which case the caller draws `elements`
     /// itself exactly as it would have without a blur.
     pub(crate) fn pass(
@@ -288,9 +299,10 @@ impl Blur {
         renderer: &mut GlesRenderer,
         elements: &[HuginnElement],
         size: Size<i32, Physical>,
+        scale: f64,
         radius: f32,
     ) -> Option<TextureShaderElement> {
-        if radius <= 0.05 || size.w <= 0 || size.h <= 0 {
+        if radius <= 0.05 || size.w <= 0 || size.h <= 0 || scale <= 0.0 {
             return None;
         }
         self.ensure_textures(renderer, size)?;
@@ -310,7 +322,7 @@ impl Blur {
             frame.clear(Color32F::from([0.0, 0.0, 0.0, 1.0]), &[full]).ok()?;
             let _ = smithay::backend::renderer::utils::draw_render_elements::<GlesRenderer, _, _>(
                 &mut frame,
-                1.0,
+                Scale::from(scale),
                 elements,
                 &[full],
             );
@@ -330,7 +342,8 @@ impl Blur {
                 context.clone(),
                 &source,
                 &self.program,
-                size,
+                // Drawn at 1:1 below, so physical pixels are the logical ones.
+                Size::from((size.w, size.h)),
                 [1.0 / size.w as f32, 0.0],
                 sigma,
             );
@@ -344,13 +357,15 @@ impl Blur {
         }
 
         // Pass 2 is the caller's: the vertical pass is this element, drawn into
-        // whatever framebuffer the frame is going to.
+        // whatever framebuffer the frame is going to — at the caller's scale,
+        // so it is sized in logical pixels to come out as the whole panel.
+        let logical: Size<i32, Logical> = size.to_f64().to_logical(scale).to_i32_round();
         let (_, horizontal, _) = self.scene.as_ref()?;
         Some(shader_element(
             context,
             horizontal,
             &self.program,
-            size,
+            logical,
             [0.0, 1.0 / size.h as f32],
             sigma,
         ))
@@ -373,12 +388,13 @@ impl Blur {
     }
 }
 
-/// One blur pass as a drawable element.
+/// One blur pass as a drawable element, `size` being what it will cover in
+/// the coordinates of whoever draws it.
 fn shader_element(
     context: smithay::backend::renderer::ContextId<GlesTexture>,
     texture: &GlesTexture,
     program: &GlesTexProgram,
-    size: Size<i32, Physical>,
+    size: Size<i32, Logical>,
     direction: [f32; 2],
     sigma: f32,
 ) -> TextureShaderElement {
