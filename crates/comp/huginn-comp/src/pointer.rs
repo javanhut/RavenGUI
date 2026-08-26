@@ -23,20 +23,51 @@ use crate::state::Huginn;
 #[derive(Debug)]
 pub(crate) struct Cursor {
     pub buffer: MemoryRenderBuffer,
-    /// Offset from the pointer position to the top-left of the bitmap. The
-    /// hotspot is the pixel that actually points at things — drawing the image
-    /// at the pointer position without subtracting it puts the arrow's tip one
-    /// icon down and to the right of where the user is aiming.
+    /// Offset from the pointer position to the top-left of the bitmap, in
+    /// logical pixels. The hotspot is the pixel that actually points at
+    /// things — drawing the image at the pointer position without subtracting
+    /// it puts the arrow's tip one icon down and to the right of where the
+    /// user is aiming.
     pub hotspot: Point<i32, Logical>,
+    /// The output density the bitmap was picked for. A backend compares this
+    /// against the output's advertised scale to know when to load again.
+    pub density: u32,
 }
 
 impl Cursor {
-    /// Load `name` at roughly `size` pixels from `theme`.
+    /// The user's cursor for an output of `density`.
+    ///
+    /// `XCURSOR_THEME` and `XCURSOR_SIZE` are the conventional way users pick
+    /// a cursor, so they are honoured rather than a setting invented. Logs
+    /// when there is none: the pointer will be invisible over the background,
+    /// which is worth a line in the log and not worth refusing to start.
+    pub(crate) fn from_env(density: u32) -> Option<Self> {
+        let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_owned());
+        let size = std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        let cursor = Self::load(&theme, "default", size, density);
+        if cursor.is_none() {
+            tracing::warn!("no cursor theme found; the pointer will be invisible over the background");
+        }
+        cursor
+    }
+
+    /// Load `name` at roughly `size` logical pixels from `theme`, for an
+    /// output of `density` pixels per logical one.
+    ///
+    /// The bitmap asked for is `size × density` pixels and the buffer is
+    /// marked at that scale, so on a 2× output the 48-pixel image is drawn
+    /// into 24 logical pixels: the same size on screen as at 1×, and sharp.
+    /// A theme that ships no size that large gives a smaller cursor rather
+    /// than a blurry one, which is the better of the two failures.
     ///
     /// Returns `None` rather than failing the compositor: a missing cursor
     /// theme is a cosmetic problem, and refusing to start over it would be a
     /// far worse one.
-    pub(crate) fn load(theme: &str, name: &str, size: u32) -> Option<Self> {
+    pub(crate) fn load(theme: &str, name: &str, size: u32, density: u32) -> Option<Self> {
+        let density = density.max(1);
         let path = xcursor::CursorTheme::load(theme).load_icon(name)?;
         let mut bytes = Vec::new();
         std::fs::File::open(&path).ok()?.read_to_end(&mut bytes).ok()?;
@@ -46,7 +77,7 @@ impl Cursor {
         // rather than assuming the first is sensible.
         let image = images
             .iter()
-            .min_by_key(|i| i.size.abs_diff(size))
+            .min_by_key(|i| i.size.abs_diff(size * density))
             .filter(|i| i.width > 0 && i.height > 0)?;
 
         // pixels_rgba is R,G,B,A in byte order, which is DRM's ABGR8888 —
@@ -56,7 +87,7 @@ impl Cursor {
             &image.pixels_rgba,
             Fourcc::Abgr8888,
             (image.width as i32, image.height as i32),
-            1,
+            density as i32,
             Transform::Normal,
             // No opaque regions: cursors are antialiased, so every pixel may
             // carry alpha. Claiming opacity would let the damage tracker skip
@@ -66,7 +97,8 @@ impl Cursor {
 
         Some(Self {
             buffer,
-            hotspot: (image.xhot as i32, image.yhot as i32).into(),
+            hotspot: ((image.xhot / density) as i32, (image.yhot / density) as i32).into(),
+            density,
         })
     }
 }

@@ -35,6 +35,20 @@ impl Backend {
     }
 }
 
+/// What to tell the protocols about an output's scale.
+///
+/// Two numbers, on purpose. `advertised_integer` is what `wl_output` says, and
+/// every client renders at it. `fractional` is what the compositor lays the
+/// desktop out at and what `DrmCompositor` composes surfaces with, and it also
+/// reaches `xdg_output`, whose logical size has to agree with the desktop the
+/// core actually laid out. See `huginn_core::scale`.
+pub(crate) fn advertise(scale: huginn_core::scale::OutputScale) -> smithay::output::Scale {
+    smithay::output::Scale::Custom {
+        advertised_integer: scale.advertised as i32,
+        fractional: scale.fractional(),
+    }
+}
+
 /// Run `argv` as a desktop application on `socket`.
 ///
 /// A free function rather than a method so it borrows nothing but its

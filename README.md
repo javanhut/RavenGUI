@@ -141,12 +141,14 @@ downsampled every frame.
 | 3840×2160 27" | 163 | 2 | 1920×1080 |
 | 2880×1800 15.4" | 221 | 2 | 1440×900 |
 
-**Not yet implemented:** the offscreen render-at-2×-and-downsample pass for
-panels whose ideal scale is fractional. `DrmCompositor::render_frame` draws
-straight into the scanout buffer, so there is nowhere for a larger render target
-to live. Until then the backends call `OutputScale::integer_only`, which divides
-by the advertised integer instead — a 4K 27" gets a crisp 1920×1080-at-2×
-desktop rather than the 2560×1440-at-1.5× it would prefer.
+The fraction itself is applied by the compositor. The output carries two scales
+(`smithay::output::Scale::Custom`): the integer for `wl_output`, and
+`OutputScale::fractional` — 1.5 on that 4K 27" — for laying the desktop out,
+for `xdg_output`'s logical size, and for composing. Each 2× client buffer is
+sampled down by 0.75 as it is drawn, once, by the compositor; the client never
+knows. That is macOS's "looks like 2560×1440" done per surface rather than to
+the finished frame, which costs nothing in code because `DrmCompositor` already
+composes at whatever fraction the output reports.
 
 ## No configuration
 

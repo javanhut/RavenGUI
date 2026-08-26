@@ -7,10 +7,18 @@
 //! # Scale
 //!
 //! Every position here is logical and every buffer is physical, and the scale
-//! that converts between them is the output's *advertised* integer scale — the
-//! same whole number clients were told, so a 2x client buffer lands on 2x worth
-//! of pixels and nothing is resampled on the way. See `huginn_core::scale` for
-//! why it is never a fraction.
+//! that converts between them is the output's *fractional* scale — what the
+//! desktop is composed at, which is the advertised integer on a 1× or clean 2×
+//! panel and something like 1.5 on a 4K 27". Clients only ever hear the
+//! integer; the fraction is applied here, once per surface, as it is drawn.
+//! Each element is snapped to whole physical pixels (`precise_round`), and
+//! neighbours round the same coordinate the same way, so tiles meet without
+//! seams. See `huginn_core::scale`.
+//!
+//! Both backends draw these elements with the same scale — udev through the
+//! `Output` the `DrmCompositor` reads, winit by passing it explicitly — and
+//! the blur pass has to as well. An element's size is worked out from the
+//! scale it is *drawn* with, so a mismatch does not shift it, it resizes it.
 
 use std::sync::Mutex;
 
@@ -75,10 +83,8 @@ pub(crate) fn elements(
     state: &Huginn,
     fallback_cursor: Option<&Cursor>,
 ) -> Vec<HuginnElement> {
-    // The output's advertised integer scale, as an f64 for the element APIs.
-    // Whole numbers only, so this conversion is exact and no position can land
-    // between pixels on the way from logical to physical.
-    let scale = f64::from(state.scale.advertised);
+    // The scale the desktop is composed at. See the module docs.
+    let scale = state.scale.fractional();
 
     let mut out: Vec<HuginnElement> = Vec::new();
 
@@ -101,7 +107,7 @@ pub(crate) fn elements(
                 render_elements_from_surface_tree(
                     renderer,
                     surface,
-                    position.to_physical(scale as i32),
+                    position.to_physical_precise_round::<f64, i32>(scale),
                     scale,
                     1.0,
                     Kind::Cursor,
@@ -120,7 +126,7 @@ pub(crate) fn elements(
                     .into();
                 if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
-                    position.to_physical(1.0),
+                    position.to_physical(scale),
                     &cursor.buffer,
                     None,
                     None,
@@ -141,7 +147,8 @@ pub(crate) fn elements(
                 render_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    Point::<i32, Logical>::from((rect.x(), rect.y())).to_physical(scale as i32),
+                    Point::<i32, Logical>::from((rect.x(), rect.y()))
+                        .to_physical_precise_round::<f64, i32>(scale),
                     scale,
                     1.0,
                     Kind::Unspecified,
@@ -172,7 +179,8 @@ pub(crate) fn elements(
             SceneItem::Ring(buffer, rect) => {
                 out.push(HuginnElement::Ring(SolidColorRenderElement::from_buffer(
                     buffer,
-                    Point::<i32, Logical>::from((rect.x(), rect.y())).to_physical(scale as i32),
+                    Point::<i32, Logical>::from((rect.x(), rect.y()))
+                        .to_physical_precise_round::<f64, i32>(scale),
                     scale,
                     1.0,
                     Kind::Unspecified,

@@ -316,6 +316,10 @@ pub(crate) fn item_rect(dock: Rect, index: usize) -> Rect {
     )
 }
 
+/// Paint the dock for `output` at `density` pixels per logical one.
+///
+/// The rectangle it is drawn into comes from [`placement`], in logical pixels;
+/// this composes the same shape with `density` times the pixels each way.
 pub(crate) fn render(
     items: &[Item],
     apps: &[Entry],
@@ -323,8 +327,10 @@ pub(crate) fn render(
     pixmaps: &mut Pixmaps,
     _text: &mut Text,
     output: Rect,
+    density: u32,
 ) -> Panel {
-    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
+    let density = density.max(1);
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
     let (icon, gap) = (ICON * scale, GAP * scale);
     let h = (icon + gap * 2.0) as usize;
     let w = ((icon + gap) * items.len() as f32 + gap) as usize;
@@ -349,7 +355,10 @@ pub(crate) fn render(
             .entry
             .and_then(|i| apps.get(i))
             .and_then(|e| e.icon.as_deref())
-            .and_then(|name| icons.find(name, icon as u32, 1))
+            // Looked up at its logical size for the output's density, which
+            // is how icon themes file their 2× artwork; rasterized at the
+            // real pixel size either way.
+            .and_then(|name| icons.find(name, icon as u32 / density, density))
             .and_then(|path| pixmaps.get(&path, icon as u32))
         {
             canvas.blit(x as usize, gap as usize, pixmap);
@@ -369,7 +378,7 @@ pub(crate) fn render(
             );
         }
     }
-    Panel::from_canvas(&canvas)
+    Panel::from_canvas(&canvas, density)
 }
 
 /// A grid of squares, for the launcher button.
@@ -674,6 +683,7 @@ mod dump {
             &mut pixmaps,
             &mut text,
             Rect::from_xywh(0, 0, 1920, 1080),
+            1,
         );
         let _ = panel;
 
