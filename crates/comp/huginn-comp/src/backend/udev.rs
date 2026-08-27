@@ -214,6 +214,12 @@ pub(crate) fn run() -> Result<()> {
     // compositor runs exactly as before, without X11 clients.
     crate::xwayland::start::<Udev>(&dh, &handle);
 
+    // Watch the application directories, so an application installed during
+    // the session reaches the launcher and the dock without a logout. Started
+    // here for the same reason XWayland is: it only registers an event source,
+    // and everything it does happens later, from the loop.
+    crate::appwatch::start::<Udev>(&handle);
+
     match EGLDevice::device_for_display(renderer.egl_context().display())
         .and_then(|device| device.try_get_render_node())
     {
@@ -1008,6 +1014,10 @@ impl Udev {
             }
             Action::Resize(dir) => state.resize_focused(dir),
             Action::LeaveResize => state.resizing = false,
+            Action::ToggleCarousel => {
+                let layout = state.space.toggle_layout();
+                tracing::debug!(?layout, "workspace layout switched");
+            }
             Action::OpenSettings => {
                 let now = state.uptime();
                 state.settings.open(now);

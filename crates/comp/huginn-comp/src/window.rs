@@ -149,7 +149,19 @@ impl WindowSurface {
                 t.with_pending_state(|state| {
                     state.size = Some((rect.w(), rect.h()).into());
                 });
-                t.send_configure();
+                // Only when something actually changed. An `xdg_toplevel`
+                // configure carries a size and never a position — where a window
+                // sits is the compositor's business — so a window that moved
+                // without resizing has nothing to be told, and `send_configure`
+                // would tell it anyway and wait for an ack.
+                //
+                // Tiling rarely moves a window without also resizing it, which
+                // is why this went unnoticed. The carousel does nothing else:
+                // scrolling the strip slides every pane at a constant width, so
+                // with `send_configure` here a single focus change would
+                // configure every window on the workspace and have each redraw
+                // to arrive at the size it already had.
+                t.send_pending_configure();
             }
             Self::X11(x) => {
                 let geo = Rectangle::<i32, Logical>::new(

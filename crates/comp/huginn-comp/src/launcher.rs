@@ -19,9 +19,16 @@ use raven_desktop::{Entry, Frecency, Icons, Pixmaps, entry, search};
 
 /// Read every installed application.
 ///
-/// Scanned once at startup. §4 wants a freshly installed application to appear
-/// without a restart, which needs an inotify watch on these directories; until
-/// that exists this is a snapshot taken when the session began.
+/// Called at startup and again whenever [`crate::appwatch`] sees one of these
+/// directories change, which is what lets a freshly installed application
+/// appear without a restart. §4.
+///
+/// Directories are visited in precedence order and entries shadow by file
+/// name, so a user's copy of an application replaces the system's rather than
+/// joining it. Both halves come from [`entry`], which is also what
+/// [`crate::appwatch`] watches — the scan and the watch reading the same list
+/// from the same place is what stops them disagreeing about where an
+/// application may come from.
 pub(crate) fn scan_applications() -> Vec<Entry> {
     let current: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
@@ -29,18 +36,24 @@ pub(crate) fn scan_applications() -> Vec<Entry> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
-    let dirs = std::env::var_os("XDG_DATA_DIRS")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
 
     let mut apps = Vec::new();
-    for base in std::env::split_paths(&dirs) {
-        let Ok(files) = std::fs::read_dir(base.join("applications")) else {
+    let mut seen = std::collections::HashSet::new();
+
+    for dir in entry::directories() {
+        let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
         };
         for file in files.flatten() {
             let path = file.path();
             if path.extension().is_none_or(|e| e != "desktop") {
+                continue;
+            }
+            // Before reading the file, not after: a shadowing entry that
+            // `parse` rejects — `Hidden=true`, the spec's way to remove an
+            // application — must still suppress the copy it shadows.
+            if entry::shadows(&mut seen, &path) {
+                tracing::debug!(path = %path.display(), "shadowed by a higher-precedence entry");
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -51,6 +64,12 @@ pub(crate) fn scan_applications() -> Vec<Entry> {
             }
         }
     }
+
+    // `read_dir` yields whatever order the filesystem feels like, which makes
+    // the dock's trailing run of applications reshuffle between logins and
+    // makes two scans of an unchanged system compare unequal. Sorting by path
+    // costs nothing at this size and removes both.
+    apps.sort_by(|a, b| a.path.cmp(&b.path));
     tracing::info!(count = apps.len(), "applications indexed");
     apps
 }
@@ -319,6 +338,16 @@ impl Launcher {
         self.selected = 0;
         self.refresh(entries, frecency, now);
         Outcome::Redraw
+    }
+
+    /// Re-rank against a changed application list, keeping the query.
+    ///
+    /// Results are indices into that list, so a list that changed underneath
+    /// an open launcher leaves the highlight pointing at whatever now sits at
+    /// that index — the wrong application, and it would be the one Enter
+    /// launches. Re-ranking is what keeps the indices meaning what they say.
+    pub(crate) fn reindex(&mut self, entries: &[Entry], frecency: &Frecency, now: u64) {
+        self.refresh(entries, frecency, now);
     }
 
     fn refresh(&mut self, entries: &[Entry], frecency: &Frecency, now: u64) {
@@ -638,6 +667,53 @@ mod tests {
         // client while the launcher is open lets a window act on a chord the
         // user was typing at the launcher.
         assert_eq!(Key::from_keysym(keysyms::KEY_Shift_L, false, None), Key::Ignored);
+    }
+
+    #[test]
+    fn reindexing_keeps_the_highlight_on_the_application_it_was_on() {
+        // Results are indices into the application list. An install shifts
+        // every index after it, so a launcher left un-reindexed highlights one
+        // application and launches the one that took its place.
+        let (mut launcher, apps) = typed("fi");
+        let chosen = apps[launcher.selection().expect("a selection")].name.clone();
+
+        let mut grown = apps.clone();
+        grown.insert(0, entry("Aardvark", "/bin/aardvark"));
+
+        launcher.reindex(&grown, &Frecency::new(), NOW);
+        assert_eq!(
+            grown[launcher.selection().expect("still a selection")].name,
+            chosen,
+        );
+    }
+
+    #[test]
+    fn reindexing_keeps_the_query() {
+        // Re-ranking is not reopening: whatever the user has typed survives an
+        // install that happens while they are typing it.
+        let (mut launcher, apps) = typed("fi");
+        let before = launcher.results.len();
+
+        launcher.reindex(&apps, &Frecency::new(), NOW);
+        assert_eq!(launcher.results.len(), before);
+        assert!(
+            launcher.results.iter().all(|i| apps[*i].name.starts_with("Fi")
+                || apps[*i].name.contains("fi")
+                || apps[*i].name.starts_with("Fr")),
+            "the query was lost and everything matched",
+        );
+    }
+
+    #[test]
+    fn reindexing_after_a_removal_leaves_no_selection_past_the_end() {
+        let (mut launcher, apps) = typed("");
+        launcher.press(Key::Down, &apps, &Frecency::new(), NOW, CLOCK, STILL);
+        launcher.press(Key::Down, &apps, &Frecency::new(), NOW, CLOCK, STILL);
+
+        // Everything the user could have highlighted is uninstalled at once.
+        let empty: Vec<Entry> = Vec::new();
+        launcher.reindex(&empty, &Frecency::new(), NOW);
+        assert_eq!(launcher.selection(), None);
     }
 }
 

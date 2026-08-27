@@ -161,6 +161,15 @@ impl Animated {
 /// How long the launcher takes to appear. §4: "~150ms, ease-out".
 pub(crate) const LAUNCHER_OPEN: Duration = Duration::from_millis(150);
 
+/// How long the carousel takes to slide one focus step.
+///
+/// Short, because it runs on every focus change rather than on a deliberate
+/// open: a slide long enough to admire is one you wait through each time you
+/// move between panes. It exists to show *which way* the strip went — a jump
+/// leaves you to work out whether the pane you wanted arrived from the left or
+/// the right — not to be watched.
+pub(crate) const CAROUSEL_SLIDE: Duration = Duration::from_millis(170);
+
 /// How long a panel takes to slide away. Shorter than opening: dismissing is
 /// an instruction that has already been given, and waiting for it to finish is
 /// waiting for nothing.

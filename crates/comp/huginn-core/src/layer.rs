@@ -218,6 +218,19 @@ pub struct Focusable<K> {
     pub mapped: u64,
 }
 
+impl<K> Focusable<K> {
+    /// Whether this surface takes the keyboard outright, rather than on a click.
+    ///
+    /// Both halves matter and neither is redundant: the surface has to have
+    /// asked for [`Interactivity::Exclusive`], and its layer has to be one that
+    /// [`Level::allows_exclusive`]. Defined here so that the resolver and the
+    /// compositor — which needs to know whether the ring should retire — cannot
+    /// drift apart on what an exclusive claim is.
+    pub const fn holds_exclusive(&self) -> bool {
+        matches!(self.interactivity, Interactivity::Exclusive) && self.level.allows_exclusive()
+    }
+}
+
 /// Who should hold the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardFocus<K, W> {
@@ -257,7 +270,7 @@ where
 {
     let exclusive = layers
         .iter()
-        .filter(|l| l.interactivity == Interactivity::Exclusive && l.level.allows_exclusive())
+        .filter(|l| l.holds_exclusive())
         .max_by_key(|l| (l.level, l.mapped));
     if let Some(claimant) = exclusive {
         return KeyboardFocus::Layer(claimant.key);
@@ -523,6 +536,17 @@ mod focus {
             keyboard_focus(&layers, Some(1), Some(7)),
             KeyboardFocus::Window(7)
         );
+    }
+
+    #[test]
+    fn holds_exclusive_needs_both_the_request_and_an_eligible_layer() {
+        assert!(claimant(1, Level::Overlay, Interactivity::Exclusive).holds_exclusive());
+        assert!(claimant(1, Level::Top, Interactivity::Exclusive).holds_exclusive());
+        // Asked for it, but not somewhere it can be granted.
+        assert!(!claimant(1, Level::Bottom, Interactivity::Exclusive).holds_exclusive());
+        // Eligible layer, but never asked.
+        assert!(!claimant(1, Level::Overlay, Interactivity::OnDemand).holds_exclusive());
+        assert!(!claimant(1, Level::Overlay, Interactivity::None).holds_exclusive());
     }
 
     #[test]

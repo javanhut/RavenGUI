@@ -43,6 +43,9 @@ wayland-server = "0.31"
 wayland-client = "0.31"
 wayland-backend = "0.3"
 calloop = "0.14"
+# Watching the application directories for installs. The safe wrapper rather
+# than raw `inotify_add_watch`, because this workspace forbids unsafe code.
+inotify = { version = "0.11", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

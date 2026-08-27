@@ -82,6 +82,15 @@ outright would hold it against every window on the desktop for as long as it
 stayed mapped, which from the user's side is indistinguishable from a hung
 session. You can still click into such a surface.
 
+Holding `exclusive` **retires the focus ring**. Every keystroke is going to your
+surface, and a ring still drawn around the window behind you would be claiming
+otherwise. The window keeps its `activated` state — it is still where the
+keyboard returns when you go away — so a toolkit that styles itself on activation
+will still look focused; only the compositor's own ring goes. An `on_demand`
+surface does *not* retire the ring, because it hands the keyboard back on the
+next click elsewhere and blinking the ring off for that would make clicking a bar
+flicker the desktop.
+
 Two things this does not change. The compositor's own keybindings are tested
 before anything is forwarded, so an `exclusive` surface cannot swallow the chord
 that closes it. And a focused layer surface never counts as owning the `Super`
@@ -148,6 +157,7 @@ client cannot receive or override them:
 | `Super+Shift+J` / `K` | focus the next / previous window |
 | `Super+Shift+arrows` | move the focused window between tiles |
 | `Super+Shift+Return` | swap the focused window into the first tile |
+| `Super+Shift+C` | switch the workspace between tiling and the carousel |
 | `Super+Shift+R` | resize the focused window with the arrows |
 | `Super+Shift+1..9` | go to a workspace |
 | `Super+Ctrl+Shift+1..9` | send the focused window to a workspace |
