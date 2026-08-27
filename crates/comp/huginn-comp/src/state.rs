@@ -269,6 +269,12 @@ pub(crate) struct Huginn {
     /// strip belongs and has no clock to move it with, so the sliding lives
     /// here and the offset is handed back down each frame.
     carousel_scroll: crate::anim::Animated,
+    /// Which workspace [`Self::carousel_scroll`] is currently sliding for.
+    ///
+    /// Scroll position belongs to the workspace, so a change here means the
+    /// animation has nothing to continue from and should snap rather than
+    /// slide. `None` while no carousel is active.
+    carousel_on: Option<huginn_core::workspace::WorkspaceId>,
     /// The layer surface the pointer last clicked into, if it wanted the
     /// keyboard at all.
     ///
@@ -408,6 +414,7 @@ impl Huginn {
             popups: PopupManager::default(),
             layers: Vec::new(),
             carousel_scroll: crate::anim::Animated::settled(0.0),
+            carousel_on: None,
             focused_layer: None,
             keyboard_on: KeyboardOn::default(),
             output_area: area,
@@ -1361,20 +1368,29 @@ impl Huginn {
     /// step with this one.
     fn settle_carousel(&mut self) {
         let now = self.uptime();
-        let Some(target) = self.space.carousel_target_offset() else {
+        let Some(target) = self.space.update_carousel_target() else {
             // Not a carousel workspace. Hand the offset back to the layout so a
             // stale slide cannot hold a tiled workspace off its own geometry.
             self.space.set_carousel_offset(None);
+            self.carousel_on = None;
             return;
         };
 
-        // Only retarget when the destination actually moved. `Animated::animate_to`
-        // restarts its clock for a target it has already reached, and this runs
-        // on every arrange — including the arranges the animation itself asks
-        // for — so calling it unconditionally would keep the strip permanently
-        // one frame from settling and the compositor permanently redrawing.
-        #[allow(clippy::float_cmp)]
-        if (self.carousel_scroll.target() - target as f32).abs() >= 1.0 {
+        // Arriving on a different workspace is not a slide. Each one keeps its
+        // own scroll position, so there is nothing continuous between where the
+        // last strip sat and where this one does — animating across would move
+        // this workspace's panes a distance that belongs to the other one.
+        let workspace = self.space.active_workspace().id();
+        if self.carousel_on != Some(workspace) {
+            self.carousel_on = Some(workspace);
+            self.carousel_scroll.jump_to(target as f32);
+        } else if (self.carousel_scroll.target() - target as f32).abs() >= 1.0 {
+            // Only retarget when the destination actually moved.
+            // `Animated::animate_to` restarts its clock for a target it has
+            // already reached, and this runs on every arrange — including the
+            // arranges the animation itself asks for — so calling it
+            // unconditionally would keep the strip permanently one frame from
+            // settling and the compositor permanently redrawing.
             self.carousel_scroll.animate_to(
                 target as f32,
                 now,
