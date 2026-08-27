@@ -66,12 +66,13 @@ pub fn target_offset(
     area: Rect,
     gap: i32,
     columns: u32,
+    current: i32,
 ) -> i32 {
     if windows.is_empty() {
         return 0;
     }
     let m = metrics(area, gap, columns, windows.len());
-    scroll_offset(windows, focus, m.inner.w(), m.col_w, m.stride)
+    scroll_offset(windows, focus, m.inner.w(), m.col_w, m.stride, current)
 }
 
 /// Lay `windows` out left to right, scrolled by `offset` pixels.
@@ -118,8 +119,9 @@ pub fn arrange(
     area: Rect,
     gap: i32,
     columns: u32,
+    current: i32,
 ) -> Vec<(WindowId, Rect)> {
-    let offset = target_offset(windows, focus, area, gap, columns);
+    let offset = target_offset(windows, focus, area, gap, columns, current);
     arrange_at(windows, area, gap, columns, offset)
 }
 
@@ -136,25 +138,41 @@ fn scroll_offset(
     viewport: i32,
     col_w: i32,
     stride: i32,
+    current: i32,
 ) -> i32 {
     // The strip is as wide as its panes and the gaps between them; the last
     // pane contributes a column rather than a stride, since nothing follows it.
     let span = (windows.len() as i32 - 1) * stride + col_w;
     let furthest = (span - viewport).max(0);
 
+    // Where the strip is now, made safe to reason from: a held offset can be
+    // stale after windows closed and the strip got shorter.
+    let settled = current.clamp(0, furthest);
+
     let Some(index) = focus.and_then(|id| windows.iter().position(|w| *w == id)) else {
-        return 0;
+        // Nothing to reveal, so stay put rather than snapping home. A strip
+        // that jumped back to the start whenever focus was briefly lost would
+        // move under a user who did nothing.
+        return settled;
     };
 
     let left = index as i32 * stride;
     let right = left + col_w;
 
+    // Start from where the strip already is. A pane that is fully on screen
+    // satisfies neither test below and the offset comes back unchanged, which
+    // is what makes this a nudge rather than a recentre — and it is the whole
+    // reason the current position has to be an argument. Derived from the
+    // focused index alone this could only ever pin the pane to one edge, so
+    // every step back towards the start scrolled the strip a full column even
+    // though the pane was already in view.
+    //
     // Two clamps in sequence, and the order is deliberate. Revealing the right
     // edge can push the offset past the left edge of the same pane when a pane
     // is wider than the viewport; applying the left rule second means such a
     // pane is shown from its start, which is where its content is.
-    let mut offset = 0;
-    if right > viewport {
+    let mut offset = settled;
+    if right > offset + viewport {
         offset = right - viewport;
     }
     if left < offset {
@@ -185,12 +203,12 @@ mod tests {
 
     #[test]
     fn an_empty_strip_arranges_to_nothing() {
-        assert!(arrange(&[], None, SCREEN, GAP, 2).is_empty());
+        assert!(arrange(&[], None, SCREEN, GAP, 2, 0).is_empty());
     }
 
     #[test]
     fn a_lone_pane_fills_the_area_rather_than_taking_one_column() {
-        let laid = arrange(&ids(1), Some(id(1)), SCREEN, GAP, 2);
+        let laid = arrange(&ids(1), Some(id(1)), SCREEN, GAP, 2, 0);
         assert_eq!(laid.len(), 1);
         // The area inset by the gutter, and no narrower: `columns` is capped at
         // the number of windows so one pane is not left beside a hole.
@@ -199,7 +217,7 @@ mod tests {
 
     #[test]
     fn two_panes_split_the_area_with_a_gap_between_them() {
-        let laid = arrange(&ids(2), Some(id(1)), SCREEN, GAP, 2);
+        let laid = arrange(&ids(2), Some(id(1)), SCREEN, GAP, 2, 0);
         let (w, gap_between) = (laid[0].1.w(), laid[1].1.x() - laid[0].1.right());
         assert_eq!(w, 485, "980 minus one gap, halved");
         assert_eq!(laid[1].1.w(), 485, "both columns are the same width");
@@ -212,7 +230,7 @@ mod tests {
         // The count is the contract: `Space::arrange` asserts that the layout
         // returns exactly as many rects as there are tiled windows, and a pane
         // with no frame callback deadlocks its client.
-        let laid = arrange(&ids(6), Some(id(1)), SCREEN, GAP, 2);
+        let laid = arrange(&ids(6), Some(id(1)), SCREEN, GAP, 2, 0);
         assert_eq!(laid.len(), 6);
         assert!(
             laid.iter().any(|(_, r)| r.x() > SCREEN.right()),
@@ -222,15 +240,15 @@ mod tests {
 
     #[test]
     fn the_strip_starts_unscrolled_when_the_first_pane_has_focus() {
-        let laid = arrange(&ids(6), Some(id(1)), SCREEN, GAP, 2);
+        let laid = arrange(&ids(6), Some(id(1)), SCREEN, GAP, 2, 0);
         assert_eq!(xs(&laid)[0], 10, "the first pane sits at the left gutter");
     }
 
     #[test]
     fn focusing_a_pane_to_the_right_scrolls_it_into_view() {
         let windows = ids(6);
-        let at_first = arrange(&windows, Some(id(1)), SCREEN, GAP, 2);
-        let at_third = arrange(&windows, Some(id(3)), SCREEN, GAP, 2);
+        let at_first = arrange(&windows, Some(id(1)), SCREEN, GAP, 2, 0);
+        let at_third = arrange(&windows, Some(id(3)), SCREEN, GAP, 2, 0);
 
         let third = at_third.iter().find(|(w, _)| *w == id(3)).unwrap().1;
         assert!(third.x() >= 0 && third.right() <= SCREEN.right(), "fully visible");
@@ -239,12 +257,56 @@ mod tests {
 
     #[test]
     fn a_pane_already_in_view_does_not_move_the_strip() {
-        // Nudge, not centre. Panes 1 and 2 are both on screen at rest, so
-        // moving focus between them must not shift anything.
+        // Nudge, not centre. This has to walk: focus out to pane 3, which
+        // scrolls, then back to pane 2, which is still fully on screen.
+        //
+        // Comparing panes 1 and 2 from rest — which is what this test used to
+        // do — proves nothing, because the offset is zero either way. The rule
+        // only has teeth once the strip has actually moved.
         let windows = ids(6);
-        let on_first = arrange(&windows, Some(id(1)), SCREEN, GAP, 2);
-        let on_second = arrange(&windows, Some(id(2)), SCREEN, GAP, 2);
-        assert_eq!(xs(&on_first), xs(&on_second));
+        let out = target_offset(&windows, Some(id(3)), SCREEN, GAP, 2, 0);
+        assert!(out > 0, "focusing pane 3 from rest scrolls the strip");
+
+        let laid = arrange_at(&windows, SCREEN, GAP, 2, out);
+        let two = laid.iter().find(|(w, _)| *w == id(2)).expect("pane 2").1;
+        assert!(two.x() >= 10 && two.right() <= 990, "pane 2 is fully on screen");
+
+        let back = target_offset(&windows, Some(id(2)), SCREEN, GAP, 2, out);
+        assert_eq!(back, out, "a pane already in view must not move the strip");
+    }
+
+    #[test]
+    fn focusing_a_pane_off_to_the_left_scrolls_back_to_it() {
+        // The other half: not moving for a visible pane must not turn into
+        // never moving backwards at all.
+        let windows = ids(6);
+        let out = target_offset(&windows, Some(id(5)), SCREEN, GAP, 2, 0);
+        let back = target_offset(&windows, Some(id(1)), SCREEN, GAP, 2, out);
+        assert!(back < out, "the strip scrolls back for a pane off to the left");
+        let laid = arrange_at(&windows, SCREEN, GAP, 2, back);
+        assert_eq!(laid[0].1.x(), 10, "pane 1 ends up at the left gutter");
+    }
+
+    #[test]
+    fn walking_focus_out_and_back_returns_the_strip_to_where_it_started() {
+        // The property the nudge rule buys: moving focus along the strip and
+        // back leaves it where it was, instead of ratcheting a column each way.
+        let windows = ids(6);
+        let start = 0;
+        let out = target_offset(&windows, Some(id(3)), SCREEN, GAP, 2, start);
+        let back_two = target_offset(&windows, Some(id(2)), SCREEN, GAP, 2, out);
+        let back_one = target_offset(&windows, Some(id(1)), SCREEN, GAP, 2, back_two);
+        assert_eq!(back_one, start, "back at the start, not a column short of it");
+    }
+
+    #[test]
+    fn an_offset_left_stale_by_a_shorter_strip_is_pulled_back() {
+        // Windows closing shortens the strip under a held offset. The layout
+        // must not keep honouring a position the strip no longer reaches.
+        let windows = ids(3);
+        let target = target_offset(&windows, Some(id(1)), SCREEN, GAP, 2, 99_999);
+        let laid = arrange_at(&windows, SCREEN, GAP, 2, target);
+        assert_eq!(laid[0].1.x(), 10, "pane 1 is reachable again");
     }
 
     #[test]
@@ -252,7 +314,7 @@ mod tests {
         // Focusing the last pane must not scroll past it and leave a gap on the
         // right where nothing is.
         let windows = ids(6);
-        let laid = arrange(&windows, Some(id(6)), SCREEN, GAP, 2);
+        let laid = arrange(&windows, Some(id(6)), SCREEN, GAP, 2, 0);
         let last = laid.last().unwrap().1;
         assert_eq!(last.right(), 990, "the final pane ends at the far gutter");
         // Two columns, so the pane before it is the other visible one and sits
@@ -267,9 +329,9 @@ mod tests {
         // size and never a position, so if widths hold, scrolling tells clients
         // nothing and costs no round-trips.
         let windows = ids(6);
-        let first = arrange(&windows, Some(id(1)), SCREEN, GAP, 2);
+        let first = arrange(&windows, Some(id(1)), SCREEN, GAP, 2, 0);
         for focus in 1..=6 {
-            let laid = arrange(&windows, Some(id(focus)), SCREEN, GAP, 2);
+            let laid = arrange(&windows, Some(id(focus)), SCREEN, GAP, 2, 0);
             for (a, b) in first.iter().zip(laid.iter()) {
                 assert_eq!(a.1.w(), b.1.w(), "width changed when focus moved");
                 assert_eq!(a.1.h(), b.1.h(), "height changed when focus moved");
@@ -278,21 +340,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unfocused_strip_shows_its_start() {
-        let laid = arrange(&ids(6), None, SCREEN, GAP, 2);
-        assert_eq!(xs(&laid)[0], 10);
+    fn an_unfocused_strip_stays_where_it_is() {
+        let at_rest = arrange(&ids(6), None, SCREEN, GAP, 2, 0);
+        assert_eq!(xs(&at_rest)[0], 10, "at rest it shows its start");
+        // And scrolled, it stays scrolled: losing focus is not a reason to move.
+        let scrolled = arrange(&ids(6), None, SCREEN, GAP, 2, 495);
+        assert_eq!(xs(&scrolled)[0], 10 - 495);
     }
 
     #[test]
     fn a_focus_that_is_not_in_the_strip_is_ignored() {
-        let laid = arrange(&ids(3), Some(id(99)), SCREEN, GAP, 2);
+        let laid = arrange(&ids(3), Some(id(99)), SCREEN, GAP, 2, 0);
         assert_eq!(laid.len(), 3);
         assert_eq!(xs(&laid)[0], 10, "no scroll, rather than a panic or an empty layout");
     }
 
     #[test]
     fn one_column_gives_a_pane_the_whole_area() {
-        let laid = arrange(&ids(4), Some(id(2)), SCREEN, GAP, 1);
+        let laid = arrange(&ids(4), Some(id(2)), SCREEN, GAP, 1, 0);
         assert_eq!(laid[0].1.w(), 980);
         let second = laid[1].1;
         assert_eq!(second.x(), 10, "the focused pane fills the viewport");
@@ -300,7 +365,7 @@ mod tests {
 
     #[test]
     fn zero_columns_is_treated_as_one_rather_than_dividing_by_it() {
-        let laid = arrange(&ids(3), Some(id(1)), SCREEN, GAP, 0);
+        let laid = arrange(&ids(3), Some(id(1)), SCREEN, GAP, 0, 0);
         assert_eq!(laid.len(), 3);
         assert_eq!(laid[0].1.w(), 980);
     }
@@ -312,9 +377,9 @@ mod tests {
         // between offsets must pass through exactly the same geometry.
         let windows = ids(6);
         for focus in 1..=6 {
-            let target = target_offset(&windows, Some(id(focus)), SCREEN, GAP, 2);
+            let target = target_offset(&windows, Some(id(focus)), SCREEN, GAP, 2, 0);
             assert_eq!(
-                arrange(&windows, Some(id(focus)), SCREEN, GAP, 2),
+                arrange(&windows, Some(id(focus)), SCREEN, GAP, 2, 0),
                 arrange_at(&windows, SCREEN, GAP, 2, target),
             );
         }
@@ -336,7 +401,7 @@ mod tests {
     #[test]
     fn a_degenerate_area_produces_no_negative_sizes() {
         let tiny = Rect::from_xywh(0, 0, 4, 4);
-        let laid = arrange(&ids(3), Some(id(2)), tiny, GAP, 2);
+        let laid = arrange(&ids(3), Some(id(2)), tiny, GAP, 2, 0);
         assert!(laid.iter().all(|(_, r)| r.w() >= 1 && r.h() >= 0));
     }
 }

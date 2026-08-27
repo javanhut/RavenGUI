@@ -68,6 +68,17 @@ pub struct Workspace {
     focus: Option<WindowId>,
     /// The split tree over the *tiled* subset of `windows`.
     tiles: Tiles,
+    /// Where this workspace's strip is settled, in pixels from its start.
+    ///
+    /// Beside [`Self::layout`] and for the same reason: a scroll position is a
+    /// property of the space you are in, not of the desktop. Held globally, a
+    /// workspace switch would carry the last workspace's position into this one
+    /// and the compositor would slide across a distance belonging to neither.
+    ///
+    /// Meaningless while the layout is [`Layout::Tiled`], and left alone rather
+    /// than cleared, so toggling out to tiling and back returns the strip to
+    /// where it was instead of to its start.
+    scroll: i32,
 }
 
 impl Workspace {
@@ -78,6 +89,7 @@ impl Workspace {
             windows: Vec::new(),
             focus: None,
             tiles: Tiles::new(),
+            scroll: 0,
         }
     }
 
@@ -98,6 +110,18 @@ impl Workspace {
     /// row of equal columns.
     pub fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
+    }
+
+    /// Where this workspace's strip is settled, in pixels from its start.
+    pub const fn scroll(&self) -> i32 {
+        self.scroll
+    }
+
+    /// Record where the strip has settled. The layout clamps it, so a value
+    /// left stale by a strip that got shorter is corrected on the next arrange
+    /// rather than having to be noticed here.
+    pub fn set_scroll(&mut self, scroll: i32) {
+        self.scroll = scroll;
     }
 
     /// Flip between the two layouts, and report the one now in force.

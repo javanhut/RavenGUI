@@ -127,22 +127,26 @@ impl Space {
             .collect()
     }
 
-    /// Where the carousel wants to be scrolled to, or `None` when the active
-    /// workspace is not a carousel.
+    /// Work out where the active workspace's strip should now be settled,
+    /// record it, and return it. `None` when that workspace is not a carousel.
     ///
     /// The compositor animates towards this. Nothing here moves on its own.
-    pub fn carousel_target_offset(&self) -> Option<i32> {
-        let ws = &self.workspaces[self.active];
+    ///
+    /// This commits rather than merely reporting, because the answer depends on
+    /// where the strip already is: a pane that is on screen leaves the offset
+    /// alone, so the previous position has to be the one that is read next time.
+    /// Reporting without committing would compute every step from the same
+    /// stale origin and undo the nudge.
+    pub fn update_carousel_target(&mut self) -> Option<i32> {
+        let tiled = self.tiled_windows();
+        let (area, gap, columns) = (self.area, self.gap, self.carousel_columns);
+        let ws = &mut self.workspaces[self.active];
         if ws.layout() != Layout::Carousel {
             return None;
         }
-        Some(strip::target_offset(
-            &self.tiled_windows(),
-            ws.focused(),
-            self.area,
-            self.gap,
-            self.carousel_columns,
-        ))
+        let settled = strip::target_offset(&tiled, ws.focused(), area, gap, columns, ws.scroll());
+        ws.set_scroll(settled);
+        Some(settled)
     }
 
     /// Hold the carousel at `offset` while it is sliding, or hand it back to
@@ -320,10 +324,25 @@ impl Space {
             // Every window in gets a rect out, including the ones scrolled off
             // screen, which is what keeps the assertion below true for both.
             Layout::Carousel => {
-                let focus = ws.focused();
-                let offset = held.unwrap_or_else(|| {
-                    strip::target_offset(&tiled, focus, area, gap, columns)
-                });
+                // A held offset is the compositor part way through a slide. With
+                // nothing held, settle the strip here so that arranging on its
+                // own — which is what the tests and any non-animating caller
+                // do — still lands where focus asks for.
+                let offset = match held {
+                    Some(offset) => offset,
+                    None => {
+                        let settled = strip::target_offset(
+                            &tiled,
+                            ws.focused(),
+                            area,
+                            gap,
+                            columns,
+                            ws.scroll(),
+                        );
+                        ws.set_scroll(settled);
+                        settled
+                    }
+                };
                 strip::arrange_at(&tiled, area, gap, columns, offset)
             }
         };
@@ -654,7 +673,58 @@ mod tests {
     fn a_tiled_workspace_has_no_carousel_offset_to_animate() {
         let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
         s.open_window();
-        assert_eq!(s.carousel_target_offset(), None);
+        assert_eq!(s.update_carousel_target(), None);
+    }
+
+    #[test]
+    fn each_workspace_keeps_its_own_scroll_position() {
+        // Scroll is per workspace, like the layout it belongs to. Held globally,
+        // arriving on a carousel would inherit wherever the last one happened to
+        // be sitting.
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let mut first = Vec::new();
+        for _ in 0..6 {
+            first.push(s.open_window());
+        }
+        s.toggle_layout();
+        s.active_workspace_mut().focus(first[5]);
+        let scrolled = s.update_carousel_target().expect("a carousel has a target");
+        assert!(scrolled > 0, "the first workspace is scrolled along its strip");
+
+        // A second carousel workspace, with its own short strip.
+        assert!(s.activate_workspace(1));
+        s.toggle_layout();
+        s.open_window();
+        assert_eq!(
+            s.update_carousel_target(),
+            Some(0),
+            "a fresh workspace starts at its own beginning, not the last one's"
+        );
+
+        // And going back finds the first one where it was left.
+        assert!(s.activate_workspace(0));
+        assert_eq!(s.update_carousel_target(), Some(scrolled));
+    }
+
+    #[test]
+    fn toggling_out_to_tiling_and_back_keeps_the_scroll() {
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let mut opened = Vec::new();
+        for _ in 0..6 {
+            opened.push(s.open_window());
+        }
+        s.toggle_layout();
+        s.active_workspace_mut().focus(opened[5]);
+        let scrolled = s.update_carousel_target().expect("a carousel has a target");
+
+        s.toggle_layout();
+        assert_eq!(s.update_carousel_target(), None, "tiling has no strip");
+        s.toggle_layout();
+        assert_eq!(
+            s.update_carousel_target(),
+            Some(scrolled),
+            "the strip is where it was, not back at its start"
+        );
     }
 
     #[test]
@@ -670,7 +740,7 @@ mod tests {
         s.toggle_layout();
         s.active_workspace_mut().focus(opened[5]);
 
-        let target = s.carousel_target_offset().expect("a carousel has a target");
+        let target = s.update_carousel_target().expect("a carousel has a target");
         assert!(target > 0, "focus on the last pane must scroll the strip");
 
         s.set_carousel_offset(Some(target / 2));
@@ -678,7 +748,7 @@ mod tests {
         let midway = s.window(opened[0]).unwrap().geometry.x();
 
         assert_eq!(
-            s.carousel_target_offset(),
+            s.update_carousel_target(),
             Some(target),
             "holding the strip part way must not move where it is going"
         );
