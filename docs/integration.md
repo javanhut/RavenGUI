@@ -42,6 +42,13 @@ space taken out of the tiling area — Huginn shrinks the space windows are laid
 out in and rearranges. Zones stack, so a panel and a dock on the same edge each
 get their share.
 
+Space is reserved only while you have something on screen. A layer surface
+declares its zone before its first commit and may unmap and stay alive later; in
+both cases it reserves nothing, so the desktop never tiles around a gap with no
+panel in it. Your `configure` still arrives before you have a buffer — you need
+it to know what size to draw — so the sequence is: declare the zone, receive a
+configure, attach a buffer, and the desktop makes room at that point.
+
 The protocol only gives an exclusive zone a meaning when the surface is anchored
 to exactly one edge, or to one edge plus the two edges perpendicular to it.
 Anchored to a corner or to all four edges there is no unambiguous edge to
