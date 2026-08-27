@@ -17,7 +17,7 @@ use smithay::{
 
 use huginn_core::geometry::Rect;
 
-use crate::state::{Huginn, layer_state, level_of};
+use crate::state::{Huginn, has_buffer, layer_state, level_of};
 
 /// The default cursor bitmap, loaded from the system xcursor theme.
 #[derive(Debug)]
@@ -170,6 +170,13 @@ impl Huginn {
             .into_iter()
             .enumerate()
             .filter_map(|(index, (surface, rect))| {
+                // Unmapped surfaces are not clickable. One still holds its place
+                // in the layout while it has nothing on screen, and letting a
+                // click reach it would take focus away from the window the user
+                // can actually see under it.
+                if !has_buffer(surface.wl_surface()) {
+                    return None;
+                }
                 let state = layer_state(surface)?;
                 (state.interactivity != huginn_core::layer::Interactivity::None
                     && rect.contains(p))
