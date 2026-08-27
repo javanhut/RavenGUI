@@ -65,7 +65,19 @@ impl Item {
 ///
 /// Compiled in, like everything else — there is no configuration. Whatever
 /// RavenLinux ships as its defaults belongs here.
-const PINNED: &[&str] = &["raven-terminal"];
+///
+/// By *stem*, which is why the file manager appears here under a reverse-DNS
+/// name and the terminal does not: `scan_applications` keys entries by their
+/// file name, and RavenLinux installs
+/// `/usr/share/applications/com.ravenfilemanager.Raven.desktop` — the name GTK
+/// requires of an application's entry, since it must match the application id.
+/// Writing `ravenfilemanager` here, the binary's name, matches nothing.
+///
+/// A name that resolves to no entry is skipped rather than drawn dead: the
+/// loop below only pushes an item when `position` finds one, so an image built
+/// with `FILEMANAGER_SKIP=1` gets a dock with one icon instead of a dock with
+/// an icon that launches nothing.
+const PINNED: &[&str] = &["raven-terminal", "com.ravenfilemanager.Raven"];
 
 /// Whether `entry` is the application that owns a window with `app_id`.
 ///
