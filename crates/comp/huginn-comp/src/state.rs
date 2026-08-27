@@ -490,7 +490,16 @@ impl Huginn {
 
             // A negative exclusive zone means "ignore other panels and use the
             // whole output"; only a positive one reserves space.
+            //
+            // And only a surface with something on screen reserves it. A layer
+            // surface declares its zone *before* its first commit, and may unmap
+            // and stay alive afterwards; honouring either would carve a strip
+            // out of the desktop that nothing is drawn in — windows tiled around
+            // a gap with no panel in it. The configure below stays
+            // unconditional, because a client cannot attach its first buffer
+            // until it has been told what size to draw.
             if state.exclusive > 0
+                && has_buffer(surface.wl_surface())
                 && let Some(edge) = state.anchors.exclusive_edge()
             {
                 zones.push(Exclusive { edge, size: state.exclusive });
