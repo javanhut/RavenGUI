@@ -19,6 +19,18 @@ use crate::geometry::Rect;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceId(u64);
 
+/// How a workspace arranges its tiled windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// The split tree in [`crate::tiles`]: every window on screen, each new one
+    /// making the others smaller.
+    #[default]
+    Tiled,
+    /// The strip in [`crate::strip`]: panes keep their width and the workspace
+    /// scrolls past the edge of the output.
+    Carousel,
+}
+
 impl WorkspaceId {
     pub(crate) const fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -43,6 +55,13 @@ pub enum Direction {
 #[derive(Debug)]
 pub struct Workspace {
     id: WorkspaceId,
+    /// How this workspace lays its tiled windows out.
+    ///
+    /// Per workspace rather than global: the point of having a second layout is
+    /// to use it where it suits the work, and a setting that changed every
+    /// workspace at once would make it a mode you switch into rather than a
+    /// property of the space you are in.
+    layout: Layout,
     /// Everyone here, in the order they were opened relative to one another.
     /// Includes floating and fullscreen windows, which the tree does not.
     windows: Vec<WindowId>,
@@ -55,6 +74,7 @@ impl Workspace {
     pub(crate) fn new(id: WorkspaceId) -> Self {
         Self {
             id,
+            layout: Layout::default(),
             windows: Vec::new(),
             focus: None,
             tiles: Tiles::new(),
@@ -63,6 +83,30 @@ impl Workspace {
 
     pub const fn id(&self) -> WorkspaceId {
         self.id
+    }
+
+    /// How this workspace lays out.
+    pub const fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// Switch between tiling and the carousel.
+    ///
+    /// The tile tree is left alone. It is a cache over the tiled set that
+    /// `reconcile_tiles` rebuilds anyway, so a workspace that goes to the
+    /// carousel and back returns to the splits it had rather than to a fresh
+    /// row of equal columns.
+    pub fn set_layout(&mut self, layout: Layout) {
+        self.layout = layout;
+    }
+
+    /// Flip between the two layouts, and report the one now in force.
+    pub fn toggle_layout(&mut self) -> Layout {
+        self.layout = match self.layout {
+            Layout::Tiled => Layout::Carousel,
+            Layout::Carousel => Layout::Tiled,
+        };
+        self.layout
     }
 
     pub fn windows(&self) -> &[WindowId] {

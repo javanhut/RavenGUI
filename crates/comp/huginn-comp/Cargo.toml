@@ -41,6 +41,7 @@ smithay = { workspace = true, features = [
     "xwayland",
 ] }
 calloop.workspace = true
+inotify.workspace = true
 # Already in the tree via winit; used to load the system cursor theme.
 xcursor = "0.3"
 

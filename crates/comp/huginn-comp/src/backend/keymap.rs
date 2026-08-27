@@ -29,6 +29,8 @@ pub(crate) enum Action {
     FocusNext,
     FocusPrev,
     PromoteFocused,
+    /// Switch the active workspace between tiling and the carousel.
+    ToggleCarousel,
     CloseFocused,
     /// Move the focused window one tile in a direction.
     Move(Dir),
@@ -121,6 +123,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::PromoteFocused,
         chord: "Super+Shift+Return",
         description: "swap the focused window into the first tile",
+    },
+    Binding {
+        action: Action::ToggleCarousel,
+        chord: "Super+Shift+C",
+        description: "switch between tiling and the carousel",
     },
     Binding {
         action: Action::EnterResize,
@@ -258,6 +265,9 @@ pub(crate) fn resolve(
         keysyms::KEY_space => Action::OpenLauncher,
         keysyms::KEY_s | keysyms::KEY_S => Action::OpenSettings,
         keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
+        // Shift is what separates this from `Super`+`C`, which is copy: the
+        // branch above returns before this one whenever shift is not held.
+        keysyms::KEY_c | keysyms::KEY_C => Action::ToggleCarousel,
         keysyms::KEY_h | keysyms::KEY_H => Action::ToggleHelp,
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
         keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,

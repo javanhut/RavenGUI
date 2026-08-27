@@ -285,7 +285,7 @@ fn default_bases() -> Vec<PathBuf> {
     }
     let data_dirs = std::env::var_os("XDG_DATA_DIRS")
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+        .unwrap_or_else(|| crate::DEFAULT_DATA_DIRS.into());
     bases.extend(std::env::split_paths(&data_dirs).map(|d| d.join("icons")));
     // Not an XDG directory, but decades of software install here anyway.
     bases.push(PathBuf::from("/usr/share/pixmaps"));

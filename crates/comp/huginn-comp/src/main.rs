@@ -12,6 +12,8 @@
 #[cfg(target_os = "linux")]
 mod anim;
 #[cfg(target_os = "linux")]
+mod appwatch;
+#[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
 mod blur;

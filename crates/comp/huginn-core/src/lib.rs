@@ -29,6 +29,7 @@
 pub mod geometry;
 pub mod layer;
 pub mod scale;
+pub mod strip;
 pub mod tiles;
 pub mod window;
 pub mod workspace;
@@ -37,7 +38,7 @@ use std::collections::BTreeMap;
 
 use geometry::{Dir, Rect};
 use window::{Window, WindowId, WindowMode};
-use workspace::{Workspace, WorkspaceId};
+use workspace::{Layout, Workspace, WorkspaceId};
 
 /// How many workspaces exist at startup.
 ///
@@ -64,6 +65,21 @@ pub struct Space {
     /// knowing nothing about the desktop's appearance; the compositor sets it
     /// once from its theme.
     gap: i32,
+    /// How many panes the carousel shows at once.
+    ///
+    /// Held beside [`Self::gap`] and for the same reason: how wide a pane should
+    /// be is an appearance decision with geometric consequences, and this crate
+    /// does not get to make appearance decisions. The compositor sets it once
+    /// from its theme.
+    carousel_columns: u32,
+    /// Where the carousel is scrolled to right now, when that is not simply
+    /// wherever focus is.
+    ///
+    /// `None` means "wherever focus is" — the layout resolves the offset itself
+    /// and the strip is wherever it belongs. `Some` is the compositor sliding
+    /// the strip towards that place over several frames, which is the one thing
+    /// this crate cannot work out for itself because it has no clock.
+    carousel_offset: Option<i32>,
     next_window: u64,
 }
 
@@ -78,6 +94,8 @@ impl Space {
             active: 0,
             area,
             gap: DEFAULT_GAP,
+            carousel_columns: strip::DEFAULT_COLUMNS,
+            carousel_offset: None,
             next_window: 1,
         }
     }
@@ -85,6 +103,52 @@ impl Space {
     /// Set the gutter between tiled windows. Call [`Self::arrange`] after.
     pub fn set_gap(&mut self, gap: i32) {
         self.gap = gap.max(0);
+    }
+
+    /// Set how many panes the carousel shows at once. Call [`Self::arrange`]
+    /// after. Clamped to at least one, since zero columns has no layout.
+    pub fn set_carousel_columns(&mut self, columns: u32) {
+        self.carousel_columns = columns.max(1);
+    }
+
+    /// Flip the active workspace between tiling and the carousel, and report
+    /// the layout now in force. Call [`Self::arrange`] after.
+    pub fn toggle_layout(&mut self) -> Layout {
+        self.workspaces[self.active].toggle_layout()
+    }
+
+    /// The tiled windows of the active workspace, in order.
+    fn tiled_windows(&self) -> Vec<WindowId> {
+        self.workspaces[self.active]
+            .windows()
+            .iter()
+            .copied()
+            .filter(|id| self.windows.get(id).is_some_and(|w| !w.is_floating()))
+            .collect()
+    }
+
+    /// Where the carousel wants to be scrolled to, or `None` when the active
+    /// workspace is not a carousel.
+    ///
+    /// The compositor animates towards this. Nothing here moves on its own.
+    pub fn carousel_target_offset(&self) -> Option<i32> {
+        let ws = &self.workspaces[self.active];
+        if ws.layout() != Layout::Carousel {
+            return None;
+        }
+        Some(strip::target_offset(
+            &self.tiled_windows(),
+            ws.focused(),
+            self.area,
+            self.gap,
+            self.carousel_columns,
+        ))
+    }
+
+    /// Hold the carousel at `offset` while it is sliding, or hand it back to
+    /// focus with `None`. Call [`Self::arrange`] after.
+    pub fn set_carousel_offset(&mut self, offset: Option<i32>) {
+        self.carousel_offset = offset;
     }
 
     /// The area available to windows.
@@ -243,10 +307,27 @@ impl Space {
         // it is brought into line before it is read rather than trusted to
         // have been kept up to date by whoever last changed a window's mode.
         let gap = self.gap;
+        let columns = self.carousel_columns;
+        let held = self.carousel_offset;
         let ws = &mut self.workspaces[self.active];
-        ws.reconcile_tiles(&tiled, area, gap);
-        let laid = ws.tiles().arrange(area, gap);
-        debug_assert_eq!(laid.len(), tiled.len(), "the tree and the tiled set disagree");
+        let laid = match ws.layout() {
+            Layout::Tiled => {
+                ws.reconcile_tiles(&tiled, area, gap);
+                ws.tiles().arrange(area, gap)
+            }
+            // The strip needs no reconcile: it lays out `tiled` directly rather
+            // than keeping a tree that has to be brought back into line with it.
+            // Every window in gets a rect out, including the ones scrolled off
+            // screen, which is what keeps the assertion below true for both.
+            Layout::Carousel => {
+                let focus = ws.focused();
+                let offset = held.unwrap_or_else(|| {
+                    strip::target_offset(&tiled, focus, area, gap, columns)
+                });
+                strip::arrange_at(&tiled, area, gap, columns, offset)
+            }
+        };
+        debug_assert_eq!(laid.len(), tiled.len(), "the layout and the tiled set disagree");
 
         let mut changed = Vec::new();
         for (id, rect) in laid {
@@ -525,5 +606,124 @@ mod tests {
     fn closing_an_unknown_window_is_a_no_op() {
         let mut s = space();
         assert!(!s.close_window(WindowId::from_raw(999)));
+    }
+
+    #[test]
+    fn a_workspace_starts_tiled_and_toggles_to_the_carousel() {
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        assert_eq!(s.active_workspace().layout(), Layout::Tiled);
+        assert_eq!(s.toggle_layout(), Layout::Carousel);
+        assert_eq!(s.toggle_layout(), Layout::Tiled);
+    }
+
+    #[test]
+    fn the_carousel_keeps_pane_size_as_windows_arrive_and_tiling_does_not() {
+        // The difference the mode exists for, stated as the property rather
+        // than as one arithmetic coincidence: adding windows to a tiled
+        // workspace makes the existing ones smaller, and adding them to a
+        // carousel does not — the strip grows past the edge instead.
+        // The newest window is the probe: each `insert` splits the tile the
+        // *focused* window holds, and opening focuses what you opened, so the
+        // first window is split once and then left alone while the newest keeps
+        // being halved. Measuring the first would show tiling holding steady.
+        let size_after = |layout: Layout, count: usize| {
+            let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+            s.active_workspace_mut().set_layout(layout);
+            let mut newest = s.open_window();
+            for _ in 1..count {
+                newest = s.open_window();
+            }
+            s.arrange();
+            let g = s.window(newest).unwrap().geometry;
+            (g.w(), g.h())
+        };
+
+        assert_eq!(
+            size_after(Layout::Carousel, 2),
+            size_after(Layout::Carousel, 8),
+            "a carousel pane is the same size whether two windows are open or eight"
+        );
+        assert_ne!(
+            size_after(Layout::Tiled, 2),
+            size_after(Layout::Tiled, 8),
+            "tiling divides the same area further as windows arrive"
+        );
+    }
+
+    #[test]
+    fn a_tiled_workspace_has_no_carousel_offset_to_animate() {
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        s.open_window();
+        assert_eq!(s.carousel_target_offset(), None);
+    }
+
+    #[test]
+    fn the_held_offset_slides_the_strip_without_moving_the_target() {
+        // The animation contract. The compositor holds the strip part way while
+        // it slides; the target stays where focus is, so releasing the hold puts
+        // it exactly where it was always heading.
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let mut opened = Vec::new();
+        for _ in 0..6 {
+            opened.push(s.open_window());
+        }
+        s.toggle_layout();
+        s.active_workspace_mut().focus(opened[5]);
+
+        let target = s.carousel_target_offset().expect("a carousel has a target");
+        assert!(target > 0, "focus on the last pane must scroll the strip");
+
+        s.set_carousel_offset(Some(target / 2));
+        s.arrange();
+        let midway = s.window(opened[0]).unwrap().geometry.x();
+
+        assert_eq!(
+            s.carousel_target_offset(),
+            Some(target),
+            "holding the strip part way must not move where it is going"
+        );
+
+        s.set_carousel_offset(None);
+        s.arrange();
+        let arrived = s.window(opened[0]).unwrap().geometry.x();
+
+        assert!(arrived < midway, "releasing the hold completes the scroll");
+        assert_eq!(arrived, midway - (target - target / 2));
+    }
+
+    #[test]
+    fn a_held_offset_does_not_leak_into_a_tiled_workspace() {
+        // `set_carousel_offset` is unconditional, so the compositor clearing it
+        // when the layout is not a carousel is what keeps a stale slide from
+        // displacing tiled windows. Guard the core side of that too.
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let a = s.open_window();
+        s.arrange();
+        let tiled = s.window(a).unwrap().geometry;
+
+        s.set_carousel_offset(Some(400));
+        s.arrange();
+        assert_eq!(
+            s.window(a).unwrap().geometry,
+            tiled,
+            "a tiled workspace ignores the carousel's offset"
+        );
+    }
+
+    #[test]
+    fn going_to_the_carousel_and_back_restores_the_tiling() {
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let a = s.open_window();
+        let b = s.open_window();
+        s.arrange();
+        let before = (s.window(a).unwrap().geometry, s.window(b).unwrap().geometry);
+
+        s.toggle_layout();
+        s.arrange();
+        s.toggle_layout();
+        s.arrange();
+
+        let after = (s.window(a).unwrap().geometry, s.window(b).unwrap().geometry);
+        assert_eq!(before, after, "the tile tree survived the round trip");
     }
 }

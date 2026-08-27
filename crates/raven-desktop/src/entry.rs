@@ -15,6 +15,80 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The directories holding `.desktop` files, most significant first.
+///
+/// `$XDG_DATA_HOME` (defaulting to `~/.local/share`) comes before
+/// `$XDG_DATA_DIRS`, which is both the order the basedir specification gives
+/// them and the order shadowing depends on. A user's
+/// `~/.local/share/applications/firefox.desktop` is meant to *replace* the
+/// system's, not to put a second Firefox in the launcher — see
+/// [`shadows`] for the rule that follows from this ordering.
+///
+/// Note that this is the directory the module docs above call the security
+/// boundary: everything under `$XDG_DATA_HOME` is user-writable, which is why
+/// `Exec` is parsed to an argv here and never handed to a shell.
+pub fn directories() -> Vec<PathBuf> {
+    ordered(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("XDG_DATA_DIRS").as_deref(),
+    )
+}
+
+/// [`directories`] against explicit values, so tests need not set environment
+/// variables — which are process-global and would race every other test.
+///
+/// Every rule lives here rather than in the caller, including the one that is
+/// easiest to get wrong: an empty variable means *unset*, not "no
+/// directories". The basedir specification is explicit about it, and a session
+/// that exports `XDG_DATA_DIRS=` — which happens — would otherwise come up
+/// with an empty launcher.
+/// An environment variable's value, treating empty as absent.
+fn set(value: Option<&std::ffi::OsStr>) -> Option<&std::ffi::OsStr> {
+    value.filter(|v| !v.is_empty())
+}
+
+fn ordered(
+    data_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    data_dirs: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let data_home = set(data_home)
+        .map(PathBuf::from)
+        .or_else(|| set(home).map(|h| PathBuf::from(h).join(".local/share")));
+    let data_dirs =
+        set(data_dirs).unwrap_or_else(|| std::ffi::OsStr::new(crate::DEFAULT_DATA_DIRS));
+
+    let mut dirs: Vec<PathBuf> = data_home.into_iter().collect();
+    dirs.extend(std::env::split_paths(data_dirs));
+
+    // Duplicates are common in the wild — a session that exports
+    // `XDG_DATA_DIRS=/usr/share:/usr/share:...` is not unusual — and a
+    // directory visited twice would shadow itself and be scanned twice.
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+
+    dirs.into_iter().map(|dir| dir.join("applications")).collect()
+}
+
+/// Whether an entry already seen shadows one found later.
+///
+/// The identity is the desktop file ID, which for the flat directories this
+/// scans is the file name. Two files with the same name in two directories are
+/// the same application, and the one from the earlier directory wins.
+///
+/// The subtle half: this must be decided **before** parsing, not after. The
+/// spec's way to hide a system application is to drop a file of the same name
+/// under `$XDG_DATA_HOME` with `Hidden=true`, which [`parse`] rejects. Deciding
+/// shadowing on entries that survived parsing would let the system's copy
+/// through and make hiding an application impossible.
+pub fn shadows(seen: &mut std::collections::HashSet<std::ffi::OsString>, path: &Path) -> bool {
+    match path.file_name() {
+        Some(id) => !seen.insert(id.to_owned()),
+        None => true,
+    }
+}
+
 /// One installed application, as a launcher cares about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -543,5 +617,116 @@ Exec=/bin/impostor
     fn comments_and_blank_lines_are_ignored() {
         let text = "# a comment\n\n[Desktop Entry]\n# another\nType=Application\nName=n\nExec=e\n";
         assert!(parse(text, Path::new("/x.desktop"), &[]).is_ok());
+    }
+
+    // --- where entries come from ------------------------------------------
+
+    /// `ordered` over string literals, with `$HOME` left unset — the tests
+    /// that care about the `~/.local/share` fallback pass it explicitly.
+    fn dirs(data_home: Option<&str>, data_dirs: Option<&str>) -> Vec<PathBuf> {
+        ordered(
+            data_home.map(std::ffi::OsStr::new),
+            None,
+            data_dirs.map(std::ffi::OsStr::new),
+        )
+    }
+
+    #[test]
+    fn the_users_own_directory_is_searched_before_the_systems() {
+        // It was not searched at all until this existed: the scan read only
+        // $XDG_DATA_DIRS, so an application a user installed for themselves
+        // never appeared in the launcher however long they waited.
+        assert_eq!(
+            dirs(Some("/home/u/.local/share"), Some("/usr/local/share:/usr/share")),
+            [
+                PathBuf::from("/home/u/.local/share/applications"),
+                PathBuf::from("/usr/local/share/applications"),
+                PathBuf::from("/usr/share/applications"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_session_without_a_home_still_gets_the_system_directories() {
+        assert_eq!(
+            dirs(None, Some("/usr/share")),
+            [PathBuf::from("/usr/share/applications")],
+        );
+    }
+
+    #[test]
+    fn a_directory_named_twice_is_searched_once() {
+        // `XDG_DATA_DIRS=/usr/share:/usr/share` is not unusual in the wild,
+        // and a directory visited twice would shadow itself: every entry in it
+        // would be discarded on the second pass as a duplicate of itself.
+        assert_eq!(
+            dirs(Some("/usr/share"), Some("/usr/share:/usr/local/share:/usr/share")),
+            [
+                PathBuf::from("/usr/share/applications"),
+                PathBuf::from("/usr/local/share/applications"),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_empty_data_dirs_means_unset_rather_than_no_directories() {
+        // The basedir spec is explicit about it, and treating it literally
+        // would empty the launcher on any session that exports it blank.
+        let default = dirs(None, Some(crate::DEFAULT_DATA_DIRS));
+        assert_eq!(dirs(None, Some("")), default);
+        assert_eq!(dirs(None, None), default);
+    }
+
+    #[test]
+    fn a_home_with_no_data_home_falls_back_to_local_share() {
+        // $XDG_DATA_HOME is unset far more often than it is set; the launcher
+        // that only honoured the variable would miss the directory almost
+        // every time it mattered.
+        let derived = ordered(
+            None,
+            Some(std::ffi::OsStr::new("/home/u")),
+            Some(std::ffi::OsStr::new("/usr/share")),
+        );
+        assert_eq!(derived.first(), Some(&PathBuf::from("/home/u/.local/share/applications")));
+    }
+
+    #[test]
+    fn an_empty_data_home_falls_back_to_home_rather_than_being_used() {
+        let derived = ordered(
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("/home/u")),
+            Some(std::ffi::OsStr::new("/usr/share")),
+        );
+        assert_eq!(derived.first(), Some(&PathBuf::from("/home/u/.local/share/applications")));
+    }
+
+    #[test]
+    fn the_first_directory_to_offer_a_file_name_wins() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(!shadows(&mut seen, Path::new("/home/u/.local/share/applications/a.desktop")));
+        assert!(shadows(&mut seen, Path::new("/usr/share/applications/a.desktop")));
+        assert!(!shadows(&mut seen, Path::new("/usr/share/applications/b.desktop")));
+    }
+
+    #[test]
+    fn shadowing_is_decided_before_parsing_so_hiding_an_application_works() {
+        // The spec's way to remove a system application is a file of the same
+        // name under $XDG_DATA_HOME with Hidden=true. `parse` rejects it, so a
+        // scan that decided shadowing on entries which survived parsing would
+        // let the system copy through and make hiding impossible. Shadowing
+        // keys on the path alone, which is what makes the order below correct.
+        let user = Path::new("/home/u/.local/share/applications/firefox.desktop");
+        let system = Path::new("/usr/share/applications/firefox.desktop");
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(!shadows(&mut seen, user));
+        assert_eq!(
+            parse("[Desktop Entry]\nType=Application\nName=n\nExec=e\nHidden=true\n", user, &[]),
+            Err(Skipped::Hidden),
+        );
+        assert!(
+            shadows(&mut seen, system),
+            "the system copy survived an entry that was meant to hide it",
+        );
     }
 }

@@ -105,6 +105,16 @@ pub(crate) const GAP: i32 = 8;
 /// did before. Nothing is lost by preferring a theme that has icons in it.
 pub(crate) const ICON_THEME: &str = "breeze-dark";
 
+/// How many panes the carousel shows at once.
+///
+/// Two: wide enough that a pane still holds a readable column of text beside
+/// another, narrow enough that the strip is worth scrolling at all. A constant
+/// rather than a setting, for the reason at the top of this file — and it sits
+/// here rather than in `huginn-core` because how wide a pane should be is an
+/// appearance decision that happens to have geometric consequences, which is
+/// exactly what [`GAP`] already is.
+pub(crate) const CAROUSEL_COLUMNS: u32 = 2;
+
 /// The terminal the spawn binding launches.
 ///
 /// RavenLinux ships its own, so that is what the desktop opens. There is no

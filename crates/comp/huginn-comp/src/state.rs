@@ -263,6 +263,12 @@ pub(crate) struct Huginn {
     /// each. Storing what was sent is what keeps [`Huginn::refresh_layers`]
     /// from configuring on every commit and driving clients into a redraw loop.
     layers: Vec<(LayerSurface, Rect)>,
+    /// Where the carousel is scrolled to, while it is getting there.
+    ///
+    /// The compositor's half of the layout: `huginn-core` works out where the
+    /// strip belongs and has no clock to move it with, so the sliding lives
+    /// here and the offset is handed back down each frame.
+    carousel_scroll: crate::anim::Animated,
     /// The layer surface the pointer last clicked into, if it wanted the
     /// keyboard at all.
     ///
@@ -271,9 +277,9 @@ pub(crate) struct Huginn {
     /// since disappeared: [`Self::resolve_keyboard_focus`] drops a stale click
     /// on the floor rather than checking for one on every commit.
     focused_layer: Option<WlSurface>,
-    /// Whether the keyboard currently sits on a layer surface rather than a
-    /// window. Resolved in one place, in [`Self::refresh_focus`].
-    keyboard_on_layer: bool,
+    /// Where the keyboard currently sits. Resolved in one place, in
+    /// [`Self::refresh_focus`], and read by the `Super` rule and the ring.
+    keyboard_on: KeyboardOn,
     /// The whole output, before exclusive zones are subtracted. `space`'s area
     /// is this minus whatever the panels have claimed.
     output_area: Rect,
@@ -390,6 +396,7 @@ impl Huginn {
             space: {
                 let mut space = Space::new(area);
                 space.set_gap(crate::theme::GAP);
+                space.set_carousel_columns(crate::theme::CAROUSEL_COLUMNS);
                 space
             },
             windows: HashMap::new(),
@@ -400,8 +407,9 @@ impl Huginn {
             mapped: HashSet::new(),
             popups: PopupManager::default(),
             layers: Vec::new(),
+            carousel_scroll: crate::anim::Animated::settled(0.0),
             focused_layer: None,
-            keyboard_on_layer: false,
+            keyboard_on: KeyboardOn::default(),
             output_area: area,
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), crate::theme::ACCENT.to_rgba_f32())
@@ -691,7 +699,7 @@ impl Huginn {
         // app_id to test against the list — a namespace is not one. Falling
         // through to the window's app_id would let the terminal behind a panel
         // decide what Super+C does while the panel is what receives the keys.
-        if self.keyboard_on_layer {
+        if self.keyboard_on != KeyboardOn::Window {
             return false;
         }
         let Some(app_id) = self.focused_app_id() else {
@@ -989,6 +997,13 @@ impl Huginn {
     /// nothing, so an idle desktop still renders no frames.
     pub(crate) fn tick_animations(&mut self) {
         let now = self.uptime();
+        if !self.carousel_scroll.is_settled(now) {
+            // Re-arranging is what moves the panes; the redraw is what shows it.
+            // `arrange` reads the offset back out of `carousel_scroll`, so this
+            // is the whole of the animation.
+            self.arrange();
+            self.queue_redraw();
+        }
         if self.settings.is_animating(now) {
             self.refresh_settings();
         }
@@ -1019,6 +1034,41 @@ impl Huginn {
             )
         });
         self.queue_redraw();
+    }
+
+    /// Re-read the installed applications and rebuild what shows them.
+    ///
+    /// Driven by [`crate::appwatch`] when an application directory changes.
+    /// Cheap enough to be worth doing unconditionally — a few dozen small
+    /// files — but the early return still matters: a rescan that found nothing
+    /// new would otherwise rebuild the dock and relayout the launcher under
+    /// the user's hands every time anything at all touched `/usr/share`.
+    pub(crate) fn reload_applications(&mut self) {
+        let apps = crate::launcher::scan_applications();
+        if apps == self.apps {
+            tracing::debug!("application directories changed, list did not");
+            return;
+        }
+        tracing::info!(
+            was = self.apps.len(),
+            now = apps.len(),
+            "application list changed"
+        );
+        self.apps = apps;
+
+        // Order matters. The launcher holds indices into the list that just
+        // moved under it, so it has to be re-ranked before anything renders
+        // from it. Only when it is open: re-ranking a closed launcher would
+        // discard the selection a reopen is about to reset anyway.
+        if self.launcher.is_open() {
+            let now = self.now();
+            self.launcher.reindex(&self.apps, &self.frecency, now);
+        }
+        self.refresh_launcher();
+
+        // The dock reads the same list, and a removed application must stop
+        // being clickable rather than launch whatever took its index.
+        self.refresh_dock();
     }
 
     /// Redraw the launcher's panel, or drop it when it is closed.
@@ -1075,6 +1125,14 @@ impl Huginn {
 
     /// Where the focus ring goes, or `None` when there should not be one.
     fn focus_ring_rects(&self) -> Option<[Rect; 4]> {
+        // A panel holding the keyboard outright is a modal takeover: every
+        // keystroke goes to it, and a ring still drawn round the window would be
+        // claiming otherwise. An on-demand panel is deliberately not included —
+        // it gives the keyboard back on the next click elsewhere, and blinking
+        // the ring off for that would make clicking a bar flicker the desktop.
+        if self.keyboard_on == KeyboardOn::ExclusivePanel {
+            return None;
+        }
         let id = self.space.focused()?;
         // An unmapped window has geometry but nothing on screen; ringing it
         // would draw a rectangle around empty space. Membership in `windows`
@@ -1219,6 +1277,7 @@ impl Huginn {
     /// sends the minimum number of configures. Sending one per window on every
     /// call would make clients re-render continuously.
     pub(crate) fn arrange(&mut self) {
+        self.settle_carousel();
         for (id, rect) in self.space.arrange() {
             let Some(window) = self.windows.get(&id) else {
                 continue;
@@ -1265,17 +1324,11 @@ impl Huginn {
         }
 
         // A layer surface holding the keyboard does not take the window's
-        // `activated` state with it. The window above is still the active one,
-        // still ringed, and still what the keyboard returns to when the panel
-        // goes away — only the `wl_keyboard` focus moves.
-        let (target, on_layer) = match self.resolve_keyboard_focus() {
-            KeyboardFocus::Layer(surface) => (Some(surface), true),
-            KeyboardFocus::Window(id) => {
-                (self.windows.get(&id).and_then(|w| w.wl_surface()), false)
-            }
-            KeyboardFocus::Nothing => (None, false),
-        };
-        self.keyboard_on_layer = on_layer;
+        // `activated` state with it: the window is still the one the keyboard
+        // returns to when the panel goes away. What an exclusive claim does take
+        // is the ring — see [`Self::focus_ring_rects`].
+        let (target, keyboard_on) = self.resolve_keyboard_focus();
+        self.keyboard_on = keyboard_on;
         self.set_keyboard_focus(target, Serial::from(0));
 
         // The ring moved. Click-to-focus arrives here without going through
@@ -1298,6 +1351,42 @@ impl Huginn {
         true
     }
 
+    /// Aim the carousel at wherever focus is, and hand the layout the offset it
+    /// should draw at this frame.
+    ///
+    /// Run at the top of every [`Self::arrange`], because everything that can
+    /// move the strip — a focus change, a window opening or closing, the layout
+    /// being toggled, the usable area changing under a new panel — already goes
+    /// through there. There is no separate "scroll the carousel" path to keep in
+    /// step with this one.
+    fn settle_carousel(&mut self) {
+        let now = self.uptime();
+        let Some(target) = self.space.carousel_target_offset() else {
+            // Not a carousel workspace. Hand the offset back to the layout so a
+            // stale slide cannot hold a tiled workspace off its own geometry.
+            self.space.set_carousel_offset(None);
+            return;
+        };
+
+        // Only retarget when the destination actually moved. `Animated::animate_to`
+        // restarts its clock for a target it has already reached, and this runs
+        // on every arrange — including the arranges the animation itself asks
+        // for — so calling it unconditionally would keep the strip permanently
+        // one frame from settling and the compositor permanently redrawing.
+        #[allow(clippy::float_cmp)]
+        if (self.carousel_scroll.target() - target as f32).abs() >= 1.0 {
+            self.carousel_scroll.animate_to(
+                target as f32,
+                now,
+                self.settings.motion().duration(crate::anim::CAROUSEL_SLIDE),
+                crate::anim::Curve::EaseOut,
+            );
+        }
+
+        self.space
+            .set_carousel_offset(Some(self.carousel_scroll.value(now).round() as i32));
+    }
+
     /// Resolve who should hold the keyboard: an interactive layer surface, or
     /// the focused window.
     ///
@@ -1306,7 +1395,7 @@ impl Huginn {
     /// works in. Surfaces are keyed by their index in [`Self::layers`], which is
     /// push order and therefore also mapping order — so one number serves as
     /// both the identity and the recency tie-break.
-    fn resolve_keyboard_focus(&self) -> KeyboardFocus<WlSurface, WindowId> {
+    fn resolve_keyboard_focus(&self) -> (Option<WlSurface>, KeyboardOn) {
         let candidates: Vec<Focusable<usize>> = self
             .layers
             .iter()
@@ -1328,14 +1417,29 @@ impl Huginn {
             .and_then(|want| self.layers.iter().position(|(s, _)| s.wl_surface() == want));
 
         match keyboard_focus(&candidates, clicked, self.space.focused()) {
-            KeyboardFocus::Layer(index) => self
-                .layers
-                .get(index)
-                .map_or(KeyboardFocus::Nothing, |(surface, _)| {
-                    KeyboardFocus::Layer(surface.wl_surface().clone())
-                }),
-            KeyboardFocus::Window(id) => KeyboardFocus::Window(id),
-            KeyboardFocus::Nothing => KeyboardFocus::Nothing,
+            KeyboardFocus::Layer(index) => {
+                let Some((surface, _)) = self.layers.get(index) else {
+                    return (None, KeyboardOn::Window);
+                };
+                let exclusive = candidates
+                    .iter()
+                    .find(|c| c.key == index)
+                    .is_some_and(Focusable::holds_exclusive);
+                let on = if exclusive {
+                    KeyboardOn::ExclusivePanel
+                } else {
+                    KeyboardOn::Panel
+                };
+                (Some(surface.wl_surface().clone()), on)
+            }
+            KeyboardFocus::Window(id) => (
+                self.windows.get(&id).and_then(|w| w.wl_surface()),
+                KeyboardOn::Window,
+            ),
+            // Nothing holds the keyboard. Both callers want the ordinary answer:
+            // the ring behaves normally (there is no focused window to ring
+            // anyway), and `Super` is left to whatever gets focus next.
+            KeyboardFocus::Nothing => (None, KeyboardOn::Window),
         }
     }
 
@@ -1717,6 +1821,25 @@ pub(crate) struct LayerRequest {
     /// before focus resolution existed, which is what made an interactive panel
     /// impossible to write.
     pub(crate) interactivity: Interactivity,
+}
+
+/// Where the keyboard sits, in the terms the rest of the compositor asks about.
+///
+/// Three states rather than a bool because the two questions asked of this have
+/// different answers. `Super` belongs to the application only when a *window*
+/// holds the keyboard — a panel is never a terminal. The focus ring retires only
+/// for an *exclusive* grab: an on-demand panel is one click from handing the
+/// keyboard back, and retiring the ring for it would make the ring blink off and
+/// on every time someone clicked a bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum KeyboardOn {
+    /// A window has it, or nothing does. The ordinary case.
+    #[default]
+    Window,
+    /// A layer surface has it because it was clicked.
+    Panel,
+    /// A layer surface has it because it asked for it and its layer allows it.
+    ExclusivePanel,
 }
 
 /// Translate the protocol's layer into the core's own vocabulary.
