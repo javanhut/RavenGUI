@@ -1,37 +1,63 @@
-# ImLazy configuration file
+# RavenGUI's build interface.
+#
+# The compositor is developed nested — `imlazy run` puts a whole desktop in a
+# window inside the session you are already in — and installed over the one the
+# image shipped with `imlazy install`, which is reversible with `imlazy restore`.
 
 [settings]
-# default = "build"  # Uncomment to set default command
-# parallel = false   # Enable parallel dependency execution
-# include = ["ci.toml"]  # Include other config files
-# env_file = [".env", ".env.local"]  # Dotenv files to load
+default = "help"
 
 [variables]
-# name = "myproject"
-# output_dir = "bin"
+comp = "-p huginn-comp"
+lock = "-p muninn-lock"
+probe = "-p layer-probe"
 
-[env]
-# GO111MODULE = "on"
+[commands.help]
+desc = "Show RavenGUI's commands"
+run = ["imlazy list"]
 
-[commands]
+[commands.build]
+desc = "Build the compositor and the lock screen, optimised"
+run = ["cargo build --release {{comp}} {{lock}}"]
 
-[commands.example]
-desc = "An example command"
-run = ["echo Hello from imlazy!"]
-# alias = ["ex", "e"]  # Uncomment to add aliases
-# dep = []  # Add dependencies here
-# env = {}  # Add environment variables here
-# watch = ["**/*.go"]  # Watch patterns for watch mode
-# if_changed = ["src/**/*.go"]  # Only run if these files changed
-# dir = "subdir"  # Working directory for this command
-# timeout = "5m"  # Timeout for command execution
-# pre = ["lint"]  # Commands to run before
-# post = ["notify"]  # Commands to run after (on success)
-# retry = 2  # Number of retries on failure
-# retry_delay = "1s"  # Delay between retries
+[commands.install]
+desc = "Replace the installed huginn and muninn-lock with this tree's"
+run = ["./scripts/install.sh install"]
 
-# Platform-specific commands (use run.linux, run.darwin, run.windows)
-# [commands.build]
-# run.linux = ["go build -o app"]
-# run.darwin = ["go build -o app"]
-# run.windows = ["go build -o app.exe"]
+[commands.restore]
+desc = "Put the originals back, undoing an install"
+run = ["./scripts/install.sh restore"]
+
+[commands.installed]
+desc = "Show what is installed and where it came from"
+run = ["./scripts/install.sh status"]
+alias = ["status"]
+
+[commands.run]
+desc = "Run the compositor nested in the current session"
+run = ["cargo run {{comp}}"]
+alias = ["nested"]
+
+[commands.probe]
+desc = "Run the layer-shell probe against a nested compositor (WAYLAND_DISPLAY=wayland-N)"
+run = ["cargo run {{probe}} -- --interactivity exclusive --cycle 2"]
+
+[commands.check]
+desc = "Typecheck the workspace"
+run = ["cargo check --workspace --all-targets"]
+
+[commands.test]
+desc = "Run every test"
+run = ["cargo test --workspace"]
+
+[commands.lint]
+desc = "Clippy, and prove no crate has escaped the unsafe quarantine"
+run = ["cargo clippy --workspace --all-targets -- -D warnings", "./scripts/check-unsafe.sh"]
+
+[commands.fmt]
+desc = "Format the workspace"
+run = ["cargo fmt --all"]
+
+[commands.clean]
+desc = "Remove build output"
+run = ["cargo clean"]
