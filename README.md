@@ -225,6 +225,31 @@ only to the active session on a seat, and an ssh login has no seat at all — so
 `--backend udev` has to be run at the machine on a TTY, or in a VM with
 virtio-gpu.
 
+## Running it on the machine you are using
+
+`lazy.toml` is the build interface, the same way it is for RavenLinux:
+
+```sh
+imlazy run          # a whole desktop in a window, inside the session you are in
+imlazy probe        # a layer-shell client that says what the compositor did to it
+imlazy lint         # clippy, and the unsafe quarantine check
+imlazy install      # replace the installed huginn and muninn-lock with this tree's
+imlazy installed    # what is installed, and where it came from
+imlazy restore      # put the originals back
+```
+
+`imlazy install` builds optimised and renames the new binaries over the old ones
+rather than writing through them, because the kernel refuses to truncate a
+running executable and huginn is running whenever you are looking at the
+desktop. The live compositor keeps the inode it started with and carries on; the
+new one takes over at the next session. `imlazy restore` returns the pair the
+image shipped with, which the first install sets aside as `huginn.orig` and
+`muninn-lock.orig` and no later install overwrites.
+
+Nothing tracks these two files — `rvn owns /usr/bin/huginn` reports no owner,
+because the `gui` stage installs them directly. Replacing them corrupts no
+package database, and equally nothing but `restore` will put them back.
+
 ## Status
 
 Working: Huginn runs nested via the winit backend, hosts xdg-shell clients and
