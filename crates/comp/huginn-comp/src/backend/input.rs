@@ -86,8 +86,27 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         return;
     }
 
+    // A click on a layer surface that asked for the keyboard is how it takes
+    // focus, and a click anywhere else is how it gives it back. Settled before
+    // click-to-focus, because a panel overlapping a tile must not also raise
+    // the window behind it — the click belongs to whatever is drawn on top.
+    let clicked_layer = if button_state == ButtonState::Pressed
+        && !on_popup
+        && !state.pointer().is_grabbed()
+    {
+        let hit = state.layer_under(state.pointer_location);
+        let landed = hit.is_some();
+        if state.set_focused_layer(hit) {
+            state.refresh_focus();
+        }
+        landed
+    } else {
+        false
+    };
+
     if button_state == ButtonState::Pressed
         && !on_popup
+        && !clicked_layer
         && !state.pointer().is_grabbed()
         && let Some(window) = state.window_under(state.pointer_location)
     {

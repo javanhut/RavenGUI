@@ -15,14 +15,17 @@ use crate::window::WindowSurface;
 use smithay::{
     delegate_xwayland_shell,
     wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
-    xwayland::{X11Surface, X11Wm},
+    xwayland::{X11Surface, X11Wm, XWaylandClientData},
 };
 use huginn_core::{
     Space,
     scale::OutputScale,
     tiles::Axis,
     geometry::{Dir, Rect, Size},
-    layer::{Anchors, Exclusive, Margins, place, usable_area},
+    layer::{
+        Anchors, Exclusive, Focusable, Interactivity, KeyboardFocus, Level, Margins,
+        keyboard_focus, place, usable_area,
+    },
     window::{WindowId, WindowMode},
 };
 use smithay::{
@@ -260,6 +263,17 @@ pub(crate) struct Huginn {
     /// each. Storing what was sent is what keeps [`Huginn::refresh_layers`]
     /// from configuring on every commit and driving clients into a redraw loop.
     layers: Vec<(LayerSurface, Rect)>,
+    /// The layer surface the pointer last clicked into, if it wanted the
+    /// keyboard at all.
+    ///
+    /// Held as the surface rather than an index because [`Self::layers`]
+    /// shifts as panels come and go. It is allowed to name something that has
+    /// since disappeared: [`Self::resolve_keyboard_focus`] drops a stale click
+    /// on the floor rather than checking for one on every commit.
+    focused_layer: Option<WlSurface>,
+    /// Whether the keyboard currently sits on a layer surface rather than a
+    /// window. Resolved in one place, in [`Self::refresh_focus`].
+    keyboard_on_layer: bool,
     /// The whole output, before exclusive zones are subtracted. `space`'s area
     /// is this minus whatever the panels have claimed.
     output_area: Rect,
@@ -386,6 +400,8 @@ impl Huginn {
             mapped: HashSet::new(),
             popups: PopupManager::default(),
             layers: Vec::new(),
+            focused_layer: None,
+            keyboard_on_layer: false,
             output_area: area,
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), crate::theme::ACCENT.to_rgba_f32())
@@ -485,6 +501,15 @@ impl Huginn {
             self.space.set_area(usable);
         }
         self.arrange();
+
+        // A panel that maps with `exclusive` interactivity takes the keyboard
+        // by existing, and one that goes away gives it back, so focus has to be
+        // re-resolved wherever the set of layer surfaces can change. Cheap to
+        // do here despite running on every commit: smithay's `set_focus`
+        // compares against the focus it already holds and sends nothing when
+        // they agree, the same property `set_keyboard_focus` already relies on
+        // for the clipboard.
+        self.refresh_focus();
     }
 
     /// Every layer surface with the geometry last sent to it, in no particular
@@ -662,6 +687,13 @@ impl Huginn {
     /// of translating for a terminal is worse than the harm of not translating
     /// for an application that would have liked it.
     pub(crate) fn focus_owns_super(&self) -> bool {
+        // A layer surface holding the keyboard is not a terminal, and it has no
+        // app_id to test against the list — a namespace is not one. Falling
+        // through to the window's app_id would let the terminal behind a panel
+        // decide what Super+C does while the panel is what receives the keys.
+        if self.keyboard_on_layer {
+            return false;
+        }
         let Some(app_id) = self.focused_app_id() else {
             return true;
         };
@@ -1232,15 +1264,79 @@ impl Huginn {
             }
         }
 
-        let target = focused
-            .and_then(|id| self.windows.get(&id))
-            .and_then(|w| w.wl_surface());
+        // A layer surface holding the keyboard does not take the window's
+        // `activated` state with it. The window above is still the active one,
+        // still ringed, and still what the keyboard returns to when the panel
+        // goes away — only the `wl_keyboard` focus moves.
+        let (target, on_layer) = match self.resolve_keyboard_focus() {
+            KeyboardFocus::Layer(surface) => (Some(surface), true),
+            KeyboardFocus::Window(id) => {
+                (self.windows.get(&id).and_then(|w| w.wl_surface()), false)
+            }
+            KeyboardFocus::Nothing => (None, false),
+        };
+        self.keyboard_on_layer = on_layer;
         self.set_keyboard_focus(target, Serial::from(0));
 
         // The ring moved. Click-to-focus arrives here without going through
         // arrange, so without this a click would move focus and leave the ring
         // behind on the previous window until something else forced a frame.
         self.queue_redraw();
+    }
+
+    /// Record which layer surface the pointer clicked into, and report whether
+    /// that changed anything.
+    ///
+    /// `None` clears the claim, which is what a click anywhere else does: an
+    /// on-demand panel holds the keyboard only until the user's attention
+    /// visibly goes somewhere else.
+    pub(crate) fn set_focused_layer(&mut self, surface: Option<WlSurface>) -> bool {
+        if self.focused_layer == surface {
+            return false;
+        }
+        self.focused_layer = surface;
+        true
+    }
+
+    /// Resolve who should hold the keyboard: an interactive layer surface, or
+    /// the focused window.
+    ///
+    /// The decision is [`huginn_core::layer::keyboard_focus`], which is pure and
+    /// tested there; this only translates Wayland state into the vocabulary it
+    /// works in. Surfaces are keyed by their index in [`Self::layers`], which is
+    /// push order and therefore also mapping order — so one number serves as
+    /// both the identity and the recency tie-break.
+    fn resolve_keyboard_focus(&self) -> KeyboardFocus<WlSurface, WindowId> {
+        let candidates: Vec<Focusable<usize>> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (surface, _))| {
+                let state = layer_state(surface)?;
+                Some(Focusable {
+                    key: index,
+                    level: level_of(state.layer),
+                    interactivity: state.interactivity,
+                    mapped: index as u64,
+                })
+            })
+            .collect();
+
+        let clicked = self
+            .focused_layer
+            .as_ref()
+            .and_then(|want| self.layers.iter().position(|(s, _)| s.wl_surface() == want));
+
+        match keyboard_focus(&candidates, clicked, self.space.focused()) {
+            KeyboardFocus::Layer(index) => self
+                .layers
+                .get(index)
+                .map_or(KeyboardFocus::Nothing, |(surface, _)| {
+                    KeyboardFocus::Layer(surface.wl_surface().clone())
+                }),
+            KeyboardFocus::Window(id) => KeyboardFocus::Window(id),
+            KeyboardFocus::Nothing => KeyboardFocus::Nothing,
+        }
     }
 
     /// Give the keyboard — and with it the clipboard — to `target`.
@@ -1281,10 +1377,28 @@ impl CompositorHandler for Huginn {
         &mut self.compositor_state
     }
 
+    /// The per-client compositor state, for either kind of client.
+    ///
+    /// XWayland is the exception that has to be named. Ordinary clients arrive
+    /// through the listening socket and are inserted with [`ClientState`], but
+    /// XWayland's connection is made by smithay inside `XWayland::spawn`, and it
+    /// carries smithay's own [`XWaylandClientData`] instead — which holds a
+    /// `CompositorClientState` of its own for exactly this reason.
+    ///
+    /// Looking only for [`ClientState`] and unwrapping is therefore a panic with
+    /// a timer on it: the compositor comes up fine, XWayland connects a moment
+    /// later, binds `wl_output`, and the session dies during startup with an
+    /// expect message that blames client insertion rather than XWayland. It
+    /// survives only where the `Xwayland` binary is missing, which is why a
+    /// container build and a bare session can disagree about whether the
+    /// compositor works at all.
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        if let Some(xwayland) = client.get_data::<XWaylandClientData>() {
+            return &xwayland.compositor_state;
+        }
         &client
             .get_data::<ClientState>()
-            .expect("every client is inserted with ClientState")
+            .expect("every client is inserted with ClientState or XWaylandClientData")
             .compositor_state
     }
 
@@ -1531,6 +1645,13 @@ impl WlrLayerShellHandler for Huginn {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
+        // Let go of the click before the surface does, or the keyboard is left
+        // pointing at something that no longer exists — the same class of bug
+        // the `set_keyboard_focus` comment describes for the clipboard, and the
+        // reason `refresh_layers` below now settles focus as well as geometry.
+        if self.focused_layer.as_ref() == Some(surface.wl_surface()) {
+            self.focused_layer = None;
+        }
         self.layers.retain(|(l, _)| l != &surface);
         tracing::debug!(remaining = self.layers.len(), "layer surface destroyed");
         self.refresh_layers();
@@ -1586,20 +1707,34 @@ delegate_xwayland_shell!(Huginn);
 
 /// What a layer surface has asked for, translated out of Wayland vocabulary and
 /// into the plain geometry types `huginn-core` works in.
-struct LayerRequest {
+pub(crate) struct LayerRequest {
     anchors: Anchors,
     desired: Size,
     margins: Margins,
     exclusive: i32,
-    layer: Layer,
+    pub(crate) layer: Layer,
+    /// How much of the keyboard this surface is asking for. Read but ignored
+    /// before focus resolution existed, which is what made an interactive panel
+    /// impossible to write.
+    pub(crate) interactivity: Interactivity,
+}
+
+/// Translate the protocol's layer into the core's own vocabulary.
+pub(crate) const fn level_of(layer: Layer) -> Level {
+    match layer {
+        Layer::Background => Level::Background,
+        Layer::Bottom => Level::Bottom,
+        Layer::Top => Level::Top,
+        Layer::Overlay => Level::Overlay,
+    }
 }
 
 /// Read a layer surface's committed state.
 ///
 /// Returns `None` before the client's first commit, when there is nothing to
 /// place yet.
-fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
-    use smithay::wayland::shell::wlr_layer::{Anchor, ExclusiveZone};
+pub(crate) fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
+    use smithay::wayland::shell::wlr_layer::{Anchor, ExclusiveZone, KeyboardInteractivity};
 
     if !surface.alive() {
         return None;
@@ -1627,6 +1762,13 @@ fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
             ExclusiveZone::Neutral | ExclusiveZone::DontCare => 0,
         },
         layer: state.layer,
+        interactivity: match state.keyboard_interactivity {
+            KeyboardInteractivity::Exclusive => Interactivity::Exclusive,
+            KeyboardInteractivity::OnDemand => Interactivity::OnDemand,
+            // `None`, and anything a newer protocol version adds. Refusing the
+            // keyboard is the safe reading of a request we do not understand.
+            _ => Interactivity::None,
+        },
     })
 }
 

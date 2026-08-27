@@ -17,7 +17,7 @@ use smithay::{
 
 use huginn_core::geometry::Rect;
 
-use crate::state::Huginn;
+use crate::state::{Huginn, layer_state, level_of};
 
 /// The default cursor bitmap, loaded from the system xcursor theme.
 #[derive(Debug)]
@@ -152,6 +152,31 @@ impl Huginn {
                     .is_some_and(|w| w.geometry.contains(p))
             })
             .copied()
+    }
+
+    /// The interactive layer surface under `point`, if there is one.
+    ///
+    /// Only surfaces that asked for the keyboard are candidates. A wallpaper
+    /// spans the whole output and a status readout sits over the tiling area,
+    /// so returning either would mean every click on the desktop moved focus
+    /// away from the window the user was working in.
+    ///
+    /// Topmost wins, then most recently mapped, which is the same ordering
+    /// [`huginn_core::layer::keyboard_focus`] applies to exclusive claims —
+    /// clicking where two panels overlap should reach the one drawn on top.
+    pub(crate) fn layer_under(&self, point: Point<f64, Logical>) -> Option<WlSurface> {
+        let p = huginn_core::geometry::Point::new(point.x as i32, point.y as i32);
+        self.all_layers()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (surface, rect))| {
+                let state = layer_state(surface)?;
+                (state.interactivity != huginn_core::layer::Interactivity::None
+                    && rect.contains(p))
+                .then(|| (level_of(state.layer), index, surface.wl_surface().clone()))
+            })
+            .max_by_key(|(level, index, _)| (*level, *index))
+            .map(|(_, _, surface)| surface)
     }
 
     /// Clamp the pointer to the output. Without this a relative motion event

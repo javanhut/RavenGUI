@@ -165,6 +165,13 @@ binary ever names it.
 There is no `HUGINN_TERMINAL` override either: an environment variable is a
 user-facing configuration surface with extra steps.
 
+What this constrains is configuration, not extension. Software written outside
+this repository still gets a surface on the desktop — as a layer-shell client,
+which is a protocol it speaks rather than a file it edits.
+[`docs/integration.md`](docs/integration.md) is how to write one, and
+[`docs/protocols.md`](docs/protocols.md) lists every global the compositor
+advertises and the ones it does not.
+
 ## What the system has to provide
 
 Compiling the look in means the distribution underneath has to supply things by
