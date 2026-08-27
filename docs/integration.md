@@ -261,6 +261,27 @@ WAYLAND_DISPLAY=wayland-2 ./my-panel
 The nested backend needs no seat, no DRM master and no TTY, so it also works
 over ssh. `Super+Shift+Esc` quits it.
 
+### A client to check the compositor against
+
+`layer-probe` is a layer-shell client that exists to make the behaviours above
+visible while you develop against them. It draws a flat band, prints every
+configure, focus change and click, and turns from the panel background to the
+accent while it holds the keyboard.
+
+```sh
+cargo run -p layer-probe -- --interactivity exclusive   # takes the keyboard on map
+cargo run -p layer-probe -- --interactivity on-demand   # takes it on a click
+cargo run -p layer-probe -- --interactivity none        # never takes it
+cargo run -p layer-probe -- --cycle 2                   # unmap and remap every 2s
+cargo run -p layer-probe -- --anchor left --size 200 --exclusive 0
+```
+
+`--cycle` is the one worth running against a compositor change: an unmapped
+surface must give the keyboard back and stop reserving its zone, and take both
+again when it maps. The tiled windows behind it grow and shrink as it does.
+
+`Esc` exits.
+
 ## See also
 
 - `docs/protocols.md` — every global Huginn advertises, and what is absent
