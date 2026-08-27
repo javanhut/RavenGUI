@@ -57,13 +57,42 @@ pub(crate) fn advertise(scale: huginn_core::scale::OutputScale) -> smithay::outp
 ///
 /// The argv comes from `Entry::argv`, which has already split it and stripped
 /// field codes — it never goes near a shell. Children inherit the environment
-/// and are additionally told which display(s) to connect to.
+/// and are additionally told which display(s) to connect to, what kind of
+/// session this is, and where the session bus lives — three things huginn's own
+/// environment cannot carry, because huginn is started before any of them
+/// exist.
 pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) {
     let Some((program, args)) = argv.split_first() else {
         return;
     };
     let mut command = std::process::Command::new(program);
     command.args(args).env("WAYLAND_DISPLAY", socket);
+    // For the toolkits that ask what kind of session this is rather than
+    // looking for WAYLAND_DISPLAY. Chromium is the one that matters: its Ozone
+    // platform defaults to X11 and only chooses Wayland when the platform hint
+    // resolves, which is decided by XDG_SESSION_TYPE. Without it a browser
+    // launched from the dock or the launcher exits immediately with "Missing X
+    // server or $DISPLAY" whenever XWayland is not up.
+    command.env("XDG_SESSION_TYPE", "wayland");
+    // Same reasoning, for the bus. GLib finds the session bus at the well-known
+    // path on its own when DBUS_SESSION_BUS_ADDRESS is unset; libdbus, which
+    // Chromium uses, autolaunches instead and fails. A browser with no session
+    // bus cannot call org.freedesktop.FileManager1, so "show in folder" on a
+    // download reaches no file manager and silently does nothing.
+    //
+    // Only when absent: a session that already set it chose that address, and
+    // the well-known path is a fallback rather than an override.
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let bus = std::path::Path::new(&runtime_dir).join("bus");
+            if bus.exists() {
+                command.env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", bus.display()),
+                );
+            }
+        }
+    }
     // Toolkits pick Wayland when both are set, so this only decides where the
     // X11-only ones connect. Absent until XWayland signals ready, which is
     // deliberate: a child that inherits a DISPLAY pointing at an unmanaged X
