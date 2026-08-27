@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 huginn-core.workspace = true
 raven-desktop.workspace = true
+png.workspace = true
+zune-jpeg.workspace = true
 tracing.workspace = true
 cosmic-text.workspace = true
 anyhow.workspace = true

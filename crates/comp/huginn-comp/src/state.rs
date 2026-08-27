@@ -294,6 +294,18 @@ pub(crate) struct Huginn {
     /// every frame. `None` when it is not on screen, which is almost always.
     help: Option<crate::overlay::Overlay>,
 
+    /// The wallpaper at its own size, read from disk once at startup, and the
+    /// copy composed for this output.
+    ///
+    /// Two fields because the halves have different costs: decoding a
+    /// photograph is tens of milliseconds and its result never changes, while
+    /// scaling it is one pass over the output and has to happen again whenever
+    /// the output does. A mode change re-scales; it does not re-read the disk.
+    /// `None` on either is the ordinary state of a machine with no wallpaper
+    /// set, and leaves the backends' clear colour showing.
+    wallpaper: Option<crate::wallpaper::Wallpaper>,
+    wallpaper_panel: Option<crate::canvas::Panel>,
+
     /// What this output renders at, and what clients are told.
     ///
     /// One output for now; this becomes per-output alongside `output_area`.
@@ -423,6 +435,8 @@ impl Huginn {
             }),
             focus_ring_at: None,
             help: None,
+            wallpaper: crate::wallpaper::Wallpaper::installed(),
+            wallpaper_panel: None,
             resizing: false,
             socket: String::new(),
             dock: crate::dock::Dock::default(),
@@ -665,6 +679,14 @@ impl Huginn {
                 out.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
             }
         }
+        // Last, so it is behind everything: the scene is front to back, and a
+        // wallpaper is by definition what the rest of the desktop is on top
+        // of. Below the background layer too -- a client that asked for
+        // `Layer::Background` wants to be over the wallpaper, which is the
+        // only thing that layer is for.
+        if let Some(panel) = &self.wallpaper_panel {
+            out.push(SceneItem::Overlay(panel.buffer(), self.output_area, 1.0));
+        }
         out
     }
 
@@ -746,6 +768,13 @@ impl Huginn {
     pub(crate) fn set_output_scale(&mut self, scale: OutputScale) {
         self.scale = scale;
         self.set_output_area(Rect::from_xywh(0, 0, scale.logical.w, scale.logical.h));
+        // Composed here rather than on demand: this is the one place the size
+        // it has to match can change, and scaling a photograph in the middle
+        // of assembling a frame would drop that frame.
+        self.wallpaper_panel = self
+            .wallpaper
+            .as_ref()
+            .map(|wallpaper| wallpaper.panel(scale.render, scale.advertised));
         tracing::info!(
             advertised = scale.advertised,
             logical = %format!("{}x{}", scale.logical.w, scale.logical.h),

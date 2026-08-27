@@ -44,6 +44,8 @@ mod text;
 #[cfg(target_os = "linux")]
 mod theme;
 #[cfg(target_os = "linux")]
+mod wallpaper;
+#[cfg(target_os = "linux")]
 mod window;
 #[cfg(target_os = "linux")]
 mod xwayland;
