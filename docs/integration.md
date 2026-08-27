@@ -96,10 +96,12 @@ before anything is forwarded, so an `exclusive` surface cannot swallow the chord
 that closes it. And a focused layer surface never counts as owning the `Super`
 layer — see below.
 
-Destroying a surface releases the keyboard. **Unmapping one does not yet**: a
-surface that attaches a null buffer while staying alive keeps an exclusive claim
-it is no longer drawing. Destroy the surface rather than unmapping it if you are
-holding `exclusive`.
+Both destroying a surface and unmapping it release the keyboard. Unmapping is the
+one worth saying out loud: a surface that attaches a null buffer stays alive and
+keeps its place in the layout, but it stops being a candidate for focus, so a
+panel that hides itself while holding `exclusive` hands the keyboard back rather
+than swallowing keystrokes with nothing on screen. Attaching a buffer again makes
+it a candidate again.
 
 ### Where you land in the stack
 

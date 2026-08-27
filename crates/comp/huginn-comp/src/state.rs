@@ -143,7 +143,7 @@ const SUPER_IS_THEIRS: &[&str] = &[
 /// the interval is long — a Chromium-based application spends hundreds of
 /// milliseconds between its first commit and its first real frame. Anything
 /// drawn in that window is not the application.
-fn has_buffer(surface: &WlSurface) -> bool {
+pub(crate) fn has_buffer(surface: &WlSurface) -> bool {
     with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
 }
 
@@ -1417,6 +1417,19 @@ impl Huginn {
             .iter()
             .enumerate()
             .filter_map(|(index, (surface, _))| {
+                // An unmapped surface is not a candidate. A client may unmap by
+                // attaching a null buffer and stay alive to map again later, and
+                // one that did so while holding an exclusive claim would go on
+                // swallowing every keystroke with nothing on screen to show for
+                // it — the keyboard equivalent of the ring drawn around a window
+                // the client has taken away.
+                //
+                // Nothing else is needed to release it: the unmap is a commit,
+                // every layer commit reaches `refresh_layers`, and that settles
+                // focus. Dropping out of this list is the whole mechanism.
+                if !has_buffer(surface.wl_surface()) {
+                    return None;
+                }
                 let state = layer_state(surface)?;
                 Some(Focusable {
                     key: index,
