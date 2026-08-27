@@ -185,11 +185,21 @@ and its stage summary reports on each.
 | `launcher::scan_applications` | `.desktop` files in `$XDG_DATA_DIRS/applications` | the launcher opens and enumerates nothing |
 | `pointer::Cursor::load` | an xcursor theme at `$XCURSOR_THEME`, default `default` | no pointer is drawn over the dock, launcher or background — clients that set their own still show one, so it reads as a rendering bug |
 | `theme::ICON_THEME` | the `breeze-dark` icon theme | every dock and launcher icon draws blank |
+| `wallpaper::SET_DIR` | an image at `/usr/share/wallpaper/set/wallpaper.<ext>` | the desktop is the backends' flat clear colour, which is what an image with no wallpaper set looks like and not a fault |
 
-Two of them have no in-band failure at all: a missing cursor theme and a missing
-icon theme both take the `None` branch by design, because refusing to start over
-a cosmetic asset would be worse. That makes them the distribution's problem to
-check for, not the compositor's to report.
+Three of them have no in-band failure at all: a missing cursor theme, a missing
+icon theme and a missing wallpaper all take the `None` branch by design, because
+refusing to start over a cosmetic asset would be worse. That makes them the
+distribution's problem to check for, not the compositor's to report.
+
+The wallpaper's path is compiled in rather than configured, and that is
+deliberate: RavenLogin's greeter reads the same file, so it is a contract
+between the login screen and the session behind it — a machine where the
+password prompt and the desktop it hands over to show the same picture. The
+extension is a label; PNG and JPEG are told apart by their first bytes, and a
+symlink into `/usr/share/wallpaper` counts. The greeter dims its copy so a
+password field stays readable on it; huginn does not, having no text of its
+own to keep legible.
 
 `Entry::terminal` is parsed from `Terminal=true` and currently read by nothing —
 `Huginn::launch` hands `Entry::argv` to `Command::spawn` either way, so an entry

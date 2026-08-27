@@ -61,6 +61,17 @@ serde = { version = "1", features = ["derive"] }
 # fontdb and a font database scan into the icon path for nothing. `svgz` stays
 # because real icon themes ship compressed SVGs.
 resvg = { version = "0.48", default-features = false, features = ["svgz"] }
+
+# The wallpaper's decoders. resvg's tiny-skia reads PNG already, but only as an
+# icon-sized pixmap and not JPEG at all, and a photograph is the one thing a
+# wallpaper usually is. Both are pure Rust, which is what lets the compositor
+# decode a file at startup without a C library on the path to a working
+# desktop. RavenLogin's greeter reads the same two formats, by the same two
+# crates, for the same file.
+png = "0.18"
+# Default features off because those are the SIMD paths, which are `unsafe` by
+# construction; `std` is what is left.
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
 
 [profile.dev]
