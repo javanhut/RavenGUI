@@ -100,9 +100,92 @@ pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) {
     if let Some(display) = x11_display {
         command.env("DISPLAY", format!(":{display}"));
     }
-    match command.spawn()
-    {
-        Ok(_) => tracing::info!(?argv, "spawned"),
+    match command.spawn() {
+        Ok(child) => {
+            tracing::info!(?argv, "spawned");
+            reap(child, program);
+        }
         Err(e) => tracing::warn!(?argv, error = %e, "spawn failed"),
+    }
+}
+
+/// Wait for `child` on a thread of its own, so it does not become a zombie.
+///
+/// Nothing used to wait for these at all. `Child`'s `Drop` deliberately does
+/// not reap -- so every application huginn started stayed in the process table
+/// as a `<defunct>` entry from the moment it exited until the compositor did.
+/// One leaked PID per launch is the small half of the cost. The large half is
+/// that it hides failures: `ravencanvasd` died a tenth of a second into every
+/// boot, and because nothing reaped it and nothing restarted it, the only
+/// evidence on a running machine was a `Z` in `ps` under huginn.
+///
+/// A blocked thread rather than either alternative:
+///
+///   * `SIGCHLD` set to `SIG_IGN` has the kernel reap everything, but it is
+///     process-wide, and smithay's XWayland integration keeps and waits on a
+///     child of its own -- it would start getting ECHILD for a process it is
+///     responsible for.
+///   * A calloop timer sweeping `try_wait` would poll forever for something
+///     that happens a handful of times a session, on a compositor whose idle
+///     cost is meant to be nothing.
+///
+/// The thread is blocked in `waitpid` rather than spinning, and it ends when
+/// the application does.
+fn reap(mut child: std::process::Child, program: &str) {
+    // Owned separately rather than shadowing: the closure takes this one, and
+    // the failure branch below still needs the caller's.
+    let name = program.to_string();
+    let started = std::thread::Builder::new()
+        // Linux caps a thread name at 15 bytes; a per-program name would be
+        // truncated into something less useful than the constant.
+        .name("huginn-reap".to_string())
+        .stack_size(64 * 1024)
+        .spawn(move || match child.wait() {
+            Ok(status) => tracing::debug!(program = %name, ?status, "child exited"),
+            Err(e) => tracing::warn!(program = %name, error = %e, "cannot wait for child"),
+        });
+
+    if let Err(e) = started {
+        // Not fatal, and not worth refusing to launch things over: the child is
+        // already running and will simply linger as a zombie, which is what
+        // every launch did before this existed.
+        tracing::warn!(program, error = %e, "no thread to reap the child; it will linger");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether the kernel still has a process table entry for `pid`.
+    ///
+    /// A reaped child leaves nothing behind, so the directory disappearing is
+    /// the property under test. An unreaped one stays as a zombie and keeps it.
+    fn present(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn a_spawned_child_does_not_stay_a_zombie() {
+        // The regression: huginn spawned and forgot, so `ps` filled up with
+        // `<defunct>` entries under the compositor as applications were closed.
+        let child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("/bin/true should be spawnable");
+        let pid = child.id();
+
+        reap(child, "/bin/true");
+
+        // Generous: this is waiting on a thread to be scheduled and a process
+        // to exit, not measuring either.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while present(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            !present(pid),
+            "pid {pid} was never reaped; it is still in the process table"
+        );
     }
 }
