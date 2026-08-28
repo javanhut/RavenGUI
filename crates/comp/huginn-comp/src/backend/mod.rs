@@ -61,9 +61,15 @@ pub(crate) fn advertise(scale: huginn_core::scale::OutputScale) -> smithay::outp
 /// session this is, and where the session bus lives — three things huginn's own
 /// environment cannot carry, because huginn is started before any of them
 /// exist.
-pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) {
+/// Returns whether the process actually started.
+///
+/// Every caller but one throws the answer away -- a launcher entry that will
+/// not run is a message in the log and nothing more. The exception is the lock
+/// screen, where "did it start" decides whether the compositor is about to
+/// blank a screen that something can get past.
+pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) -> bool {
     let Some((program, args)) = argv.split_first() else {
-        return;
+        return false;
     };
     let mut command = std::process::Command::new(program);
     command.args(args).env("WAYLAND_DISPLAY", socket);
@@ -104,8 +110,12 @@ pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) {
         Ok(child) => {
             tracing::info!(?argv, "spawned");
             reap(child, program);
+            true
         }
-        Err(e) => tracing::warn!(?argv, error = %e, "spawn failed"),
+        Err(e) => {
+            tracing::warn!(?argv, error = %e, "spawn failed");
+            false
+        }
     }
 }
 

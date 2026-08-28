@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Replace the installed huginn and muninn-lock with the ones built from this tree.
+# Replace the installed huginn with the one built from this tree.
 #
 # The desktop that ships on the image is put there by RavenLinux's `gui` stage,
 # not by a package: `rvn owns /usr/bin/huginn` reports no owner. So replacing
@@ -33,7 +33,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PREFIX=${PREFIX:-/usr/bin}
-BINARIES=(huginn muninn-lock)
+BINARIES=(huginn)
 PROFILE=release
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
@@ -71,7 +71,7 @@ MSG
 do_build() {
     check_build_deps
     say "Building $PROFILE"
-    cargo build --$PROFILE -p huginn-comp -p muninn-lock
+    cargo build --$PROFILE -p huginn-comp
 }
 
 do_install() {

@@ -55,7 +55,7 @@ use huginn_core::{
 use crate::backend::advertise;
 use crate::backend::chord;
 use crate::backend::input;
-use crate::backend::keymap::{Action, help_line, resolve};
+use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
 use crate::render;
 use crate::state::{ClientState, Huginn};
@@ -369,6 +369,13 @@ impl Nested {
             WinitEvent::Redraw => self.state.queue_redraw(),
             WinitEvent::CloseRequested => self.signal.stop(),
             WinitEvent::Input(InputEvent::Keyboard { event }) => {
+                // Kept in step with the udev backend even though nothing here
+                // runs the idle timer: the nested compositor is a development
+                // tool, and one that locked itself while somebody was reading
+                // the host's screen would be a nuisance rather than a feature.
+                // Tracking the activity anyway costs a store and means the two
+                // input paths do not differ in what they record.
+                self.state.note_activity();
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
                 let key_state = event.state();
@@ -380,6 +387,7 @@ impl Nested {
                 let launcher_open = self.state.launcher.is_open();
                 let settings_open = self.state.settings.is_open();
                 let resizing = self.state.resizing;
+                let locked = self.state.is_locked();
                 let action = self
                     .keyboard
                     .input::<Option<Action>, _>(
@@ -400,10 +408,13 @@ impl Nested {
                                     key_state,
                                     modifiers,
                                     sym.raw(),
-                                    owns_super,
-                                    launcher,
-                                    settings_open,
-                                    resizing,
+                                    Modes {
+                                        focus_owns_super: owns_super,
+                                        launcher,
+                                        settings_open,
+                                        resizing,
+                                        locked,
+                                    },
                                 )
                             }
                         },
@@ -424,7 +435,10 @@ impl Nested {
                     self.apply(action, time);
                 }
             }
-            WinitEvent::Input(event) => input::handle(&mut self.state, event),
+            WinitEvent::Input(event) => {
+                self.state.note_activity();
+                input::handle(&mut self.state, event);
+            }
             _ => {}
         }
     }
@@ -509,6 +523,12 @@ impl Nested {
             Action::Launcher(key) => state.launcher_key(key),
             Action::Spawn => {
                 state.launch(None, &[state.terminal_command().to_owned()]);
+            }
+            // Nothing to do if it fails: `lock_and_launch` has already put the
+            // desktop back and said why in the log, and there is no message
+            // this compositor can put in front of somebody who just pressed it.
+            Action::Lock => {
+                state.lock_and_launch();
             }
         }
         self.state.arrange();

@@ -9,7 +9,6 @@ default = "help"
 
 [variables]
 comp = "-p huginn-comp"
-lock = "-p muninn-lock"
 probe = "-p layer-probe"
 
 [commands.help]
@@ -17,11 +16,11 @@ desc = "Show RavenGUI's commands"
 run = ["imlazy list"]
 
 [commands.build]
-desc = "Build the compositor and the lock screen, optimised"
-run = ["cargo build --release {{comp}} {{lock}}"]
+desc = "Build the compositor, optimised"
+run = ["cargo build --release {{comp}}"]
 
 [commands.install]
-desc = "Replace the installed huginn and muninn-lock with this tree's"
+desc = "Replace the installed huginn with this tree's"
 run = ["./scripts/install.sh install"]
 
 [commands.restore]

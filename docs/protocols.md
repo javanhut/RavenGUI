@@ -22,6 +22,7 @@ For how to actually use these, see `docs/integration.md`.
 | `wl_seat` | keyboard and pointer |
 | `wl_data_device_manager` | clipboard and drag-and-drop |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
+| `ext_session_lock_manager_v1` | locking the session. See below |
 
 X11 clients work: Huginn spawns XWayland and runs a window manager for it,
 including override-redirect surfaces — menus, tooltips, drag icons — drawn at
@@ -64,6 +65,34 @@ bind it. This is a tracked gap rather than a design decision, and any future
 gating will apply to this global, so do not build on being able to bind it from
 arbitrary software.
 
+## `ext-session-lock-v1`
+
+Implemented, and used by `raven-lock` from RavenLogin. Three things about this
+compositor's implementation are worth knowing before writing another client:
+
+**A locked session is not composited.** `Huginn::scene` returns the lock surface
+and nothing else, and `frame_surfaces` stops issuing frame callbacks to anything
+underneath. Clients below the lock do not keep painting into buffers nobody
+shows.
+
+**The lock is confirmed immediately, not after a vblank.** The session stops
+being composited at the instant the lock is taken, so the next frame on the
+panel cannot contain the desktop and there is nothing to wait for. Waiting for a
+presentation would leave the client believing the machine was unlocked for one
+refresh longer than it was.
+
+**The compositor can blank before any client asks.** On resume from suspend
+huginn hides the session first and starts the lock screen second, because doing
+it the other way round shows the desktop for as long as a process takes to exec.
+A client's `lock` request then claims that blank. If nothing claims it within
+ten seconds the blank comes down, so a broken lock screen leaves a desktop
+rather than a machine that has to be power-cycled.
+
+**No privilege filter.** Any client may lock. The protocol's filter exists to
+restrict the global to a privileged client, and on a single-user session there
+is nothing to distinguish one client from another: every client here already
+runs as the person whose session it is.
+
 ## Absent
 
 Not stubs — these globals do not exist, and a client asking for them will not
@@ -72,23 +101,22 @@ find them in the registry.
 | Missing | Consequence |
 |---|---|
 | `ext-foreign-toplevel-list-v1`, `wlr-foreign-toplevel-management-v1` | No window list. Task switchers, external docks and window-list panels — waybar's taskbar, wlrctl, rofi's window mode — cannot work. |
-| `ext-session-lock-v1` | No lock screen. `muninn-lock` is a stub that logs "not implemented yet"; there is nothing for it to talk to. |
 | `wlr-screencopy`, `ext-image-copy-capture-v1` | No screenshots and no screen sharing. |
 | `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. |
 | `zwp_primary_selection_v1` | No middle-click paste. The regular clipboard works. |
 | `text-input-v3`, `input-method-v2` | No input methods. CJK and other IME input will not work. |
 | `pointer-constraints`, `relative-pointer` | No pointer lock or warping. Games and 3D applications cannot capture the cursor. |
 | `wlr-virtual-pointer`, `virtual-keyboard-v1` | No input injection. Remote-desktop and automation tools cannot drive the session. |
-| `ext-idle-notify-v1` | No idle detection. Screen blankers and auto-lock have nothing to hang off. |
+| `ext-idle-notify-v1` | A client cannot be told the session went idle. The compositor locks on its own timer, so auto-lock works — what is missing is any way for *other* software to react to idleness. |
+| `idle-inhibit-unstable-v1` | A client cannot hold the idle lock off. A full-screen video is indistinguishable from an empty room, so a film longer than the timeout locks the screen mid-play. The way out is the "Lock when idle" row in quick settings, which is a person saying what a protocol would otherwise have said for them. |
 | `cursor-shape-v1` | Clients must supply cursor bitmaps rather than naming a shape. |
 | `tablet-v2` | Graphics tablets are not routed. |
 | `single-pixel-buffer-v1`, `content-type-v1`, `alpha-modifier-v1` | Minor optimisations unavailable. |
 | `drm-lease-v1` | No direct-lease VR headsets. |
 | `security-context-v1` | Sandboxes cannot identify themselves, which is also why privilege gating above has no mechanism to build on yet. |
 
-Two of these are load-bearing for the desktop rather than for third-party
-software: without foreign-toplevel there is no way to write a switcher at all,
-and without session-lock the desktop cannot be locked.
+One of these is load-bearing for the desktop rather than for third-party
+software: without foreign-toplevel there is no way to write a switcher at all.
 
 ## Deliberately not planned
 

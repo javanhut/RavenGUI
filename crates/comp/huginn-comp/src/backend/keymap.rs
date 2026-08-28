@@ -12,8 +12,10 @@
 //! macOS. A compositor that takes the whole `Super` layer leaves those chords
 //! unreachable, since a key it intercepts never arrives at the client at all.
 //!
-//! The one exception is copy and paste, which the compositor translates rather
-//! than performs. See [`Action::Copy`].
+//! There are two exceptions. Copy and paste, which the compositor translates
+//! rather than performs — see [`Action::Copy`] — and which it hands back to any
+//! client that has its own use for the chord. And [`Action::Lock`], which it
+//! does *not* hand back to anybody, for the reason given there.
 
 use huginn_core::geometry::Dir;
 use smithay::backend::input::KeyState;
@@ -48,6 +50,20 @@ pub(crate) enum Action {
     Copy,
     /// Paste in the focused client. As [`Action::Copy`], with `Ctrl`+`V`.
     Paste,
+    /// Lock the session.
+    ///
+    /// On plain `Super` rather than `Super`+`Shift`, breaking this module's own
+    /// rule, because `Super`+`L` is what a person coming from any other desktop
+    /// will press and a lock chord that is nearly right is a lock chord that
+    /// leaves machines unlocked.
+    ///
+    /// Unlike [`Action::Copy`] it is not given back to a client that owns the
+    /// `Super` layer. A chord that locks the machine everywhere except when a
+    /// terminal happens to be focused is worse than not having it: it fails
+    /// exactly when somebody is walking away from a machine they believe they
+    /// just locked. So `Super`+`L` is reserved, and RavenTerminal may not use
+    /// it.
+    Lock,
     /// Show or hide the keybinding overlay.
     ToggleHelp,
     /// Open the application launcher.
@@ -68,6 +84,31 @@ pub(crate) enum Action {
     /// there is no surface to focus and nothing to forward to. While it is
     /// open the keymap stops resolving chords entirely.
     Launcher(crate::launcher::Key),
+}
+
+/// What the compositor is already doing, which decides what a key means.
+///
+/// Gathered into one value rather than passed as five: the list grew a flag
+/// per mode until the call sites were a row of bare booleans that only their
+/// position told apart, and `resolve(.., false, None, false, false, true)` is
+/// a call nobody can read or check. Named fields also mean adding the next
+/// mode cannot silently transpose two arguments at a call site that still
+/// compiles.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Modes {
+    /// The focused client drives the `Super` layer itself, so most of it is
+    /// theirs. See [`Action::Copy`], and [`Action::Lock`] for the exception.
+    pub focus_owns_super: bool,
+    /// The launcher is open, and the character this key produces. It takes
+    /// every key.
+    pub launcher: Option<Option<char>>,
+    /// Quick settings is open, and takes every key.
+    pub settings_open: bool,
+    /// Resize mode is active, and owns the arrows.
+    pub resizing: bool,
+    /// The session is locked. Nothing resolves; every key is the lock
+    /// screen's.
+    pub locked: bool,
 }
 
 /// One row of the keybinding overlay, and one clause of the startup log line.
@@ -98,6 +139,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::Spawn,
         chord: "Super+Shift+E / T",
         description: "open a terminal",
+    },
+    Binding {
+        action: Action::Lock,
+        chord: "Super+L",
+        description: "lock the session",
     },
     Binding {
         action: Action::CloseFocused,
@@ -197,24 +243,34 @@ pub(crate) fn help_line() -> String {
 /// is still down — but only the press carries an action, or every binding fires
 /// twice and one keystroke opens two terminals.
 ///
-/// `focus_owns_super` reports whether the focused client drives the `Super`
-/// layer itself, which is the whole of what decides who handles copy and paste.
+/// [`Modes`] carries everything about the compositor's current state that
+/// changes the answer — including whether the session is locked, which is
+/// checked before anything else.
 pub(crate) fn resolve(
     key_state: KeyState,
     modifiers: &ModifiersState,
     sym: u32,
-    focus_owns_super: bool,
-    launcher: Option<Option<char>>,
-    settings_open: bool,
-    resizing: bool,
+    mode: Modes,
 ) -> FilterResult<Option<Action>> {
+    // Locked, so there are no bindings at all: every key belongs to the lock
+    // screen. First, before the modes below, and that ordering is load-bearing
+    // twice over. A window-management chord resolved here would act on the
+    // session the lock exists to hold — `Super`+`Shift`+`Q` would close a
+    // window nobody can see. And the launcher branch further down swallows
+    // *everything* when it is open, so a session locked with the launcher up
+    // would forward not one keystroke to the lock screen: no password could be
+    // typed, and the way out would be the power button.
+    if mode.locked {
+        return FilterResult::Forward;
+    }
+
     // Quick settings takes everything, for the same reason the launcher does:
     // it is compositor-drawn, so there is no surface to focus and nothing to
     // forward to. Checked first because a panel that is open owns the keyboard.
     // Resize mode owns the arrows and nothing else, so every other key both
     // leaves the mode and does what it would have done. A mode that swallowed
     // everything until it was dismissed would be a mode you get stuck in.
-    if resizing {
+    if mode.resizing {
         let action = match sym {
             keysyms::KEY_Left => Some(Action::Resize(Dir::Left)),
             keysyms::KEY_Right => Some(Action::Resize(Dir::Right)),
@@ -229,7 +285,7 @@ pub(crate) fn resolve(
         // Not a resize key: fall through, and the caller leaves the mode.
     }
 
-    if settings_open {
+    if mode.settings_open {
         let key = crate::settings::Key::from_keysym(sym);
         return FilterResult::Intercept(pressed(key_state, Action::Settings(key)));
     }
@@ -238,7 +294,7 @@ pub(crate) fn resolve(
     // A key reaching the focused client while a search field is open would let
     // a window act on what the user was typing at the launcher — and `Escape`
     // is the only way out, so it must never be shadowed by a binding.
-    if let Some(character) = launcher {
+    if let Some(character) = mode.launcher {
         let key = crate::launcher::Key::from_keysym(sym, modifiers.ctrl, character);
         return FilterResult::Intercept(pressed(key_state, Action::Launcher(key)));
     }
@@ -247,10 +303,17 @@ pub(crate) fn resolve(
         return FilterResult::Forward;
     }
 
-    // Plain Super is the application's. Copy and paste are borrowed back from
-    // it, and only from clients that have no use of their own for the chord.
+    // Plain Super is the application's, with two things taken out of it.
     if !modifiers.shift {
-        if focus_owns_super {
+        // Locking is checked before the client's claim, not after. See
+        // [`Action::Lock`]: this is the one chord that must mean the same thing
+        // whatever is focused.
+        if matches!(sym, keysyms::KEY_l | keysyms::KEY_L) {
+            return FilterResult::Intercept(pressed(key_state, Action::Lock));
+        }
+        // Copy and paste are borrowed back, and only from clients that have no
+        // use of their own for the chord.
+        if mode.focus_owns_super {
             return FilterResult::Forward;
         }
         let action = match sym {
@@ -323,7 +386,7 @@ mod tests {
 
     /// The action a press produces, if any.
     fn intercepted(mods: ModifiersState, sym: u32) -> Option<Action> {
-        match resolve(KeyState::Pressed, &mods, sym, false, None, false, false) {
+        match resolve(KeyState::Pressed, &mods, sym, Modes::default()) {
             FilterResult::Intercept(action) => action,
             FilterResult::Forward => None,
         }
@@ -332,7 +395,7 @@ mod tests {
     /// Whether the key reaches the focused client instead.
     fn forwarded(key_state: KeyState, mods: ModifiersState, sym: u32) -> bool {
         matches!(
-            resolve(key_state, &mods, sym, false, None, false, false),
+            resolve(key_state, &mods, sym, Modes::default()),
             FilterResult::Forward
         )
     }
@@ -367,20 +430,106 @@ mod tests {
         sym: u32,
         ch: Option<char>,
     ) -> FilterResult<Option<Action>> {
-        resolve(KeyState::Pressed, &mods, sym, false, Some(ch), false, false)
+        let mode = Modes {
+            launcher: Some(ch),
+            ..Modes::default()
+        };
+        resolve(KeyState::Pressed, &mods, sym, mode)
     }
 
     /// Resolve with resize mode active.
     fn while_resizing(sym: u32) -> FilterResult<Option<Action>> {
-        resolve(
-            KeyState::Pressed,
-            &ModifiersState::default(),
-            sym,
-            false,
-            None,
-            false,
-            true,
-        )
+        let mode = Modes {
+            resizing: true,
+            ..Modes::default()
+        };
+        resolve(KeyState::Pressed, &ModifiersState::default(), sym, mode)
+    }
+
+    /// Resolve as though a client owns the `Super` layer.
+    fn with_super_owned(mods: ModifiersState, sym: u32) -> FilterResult<Option<Action>> {
+        let mode = Modes {
+            focus_owns_super: true,
+            ..Modes::default()
+        };
+        resolve(KeyState::Pressed, &mods, sym, mode)
+    }
+
+    /// Resolve as though the session is locked.
+    fn while_locked(
+        mods: ModifiersState,
+        sym: u32,
+        launcher: Option<Option<char>>,
+    ) -> FilterResult<Option<Action>> {
+        let mode = Modes {
+            launcher,
+            locked: true,
+            ..Modes::default()
+        };
+        resolve(KeyState::Pressed, &mods, sym, mode)
+    }
+
+    #[test]
+    fn super_l_locks_the_session() {
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_l),
+            Some(Action::Lock)
+        );
+        // Whatever the layout does with shift-lock or a shifted layer.
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_L),
+            Some(Action::Lock)
+        );
+    }
+
+    /// The exception this binding exists on. A lock chord that a focused
+    /// terminal can swallow fails at exactly the moment somebody walks away
+    /// from a machine believing they locked it.
+    #[test]
+    fn super_l_is_not_given_back_to_a_client_that_owns_super() {
+        assert!(matches!(
+            with_super_owned(super_held(), keysyms::KEY_l),
+            FilterResult::Intercept(Some(Action::Lock))
+        ));
+        // ...unlike copy, which is handed straight back to such a client.
+        assert!(matches!(
+            with_super_owned(super_held(), keysyms::KEY_c),
+            FilterResult::Forward
+        ));
+    }
+
+    #[test]
+    fn l_on_its_own_is_just_a_letter() {
+        assert_eq!(intercepted(ModifiersState::default(), keysyms::KEY_l), None);
+    }
+
+    /// Every key belongs to the lock screen, and no binding may act on the
+    /// session behind it.
+    #[test]
+    fn a_locked_session_resolves_no_bindings() {
+        for (mods, sym) in [
+            (super_shift(), keysyms::KEY_q),      // would close a window
+            (super_shift(), keysyms::KEY_space),  // would open the launcher
+            (super_held(), keysyms::KEY_l),       // would lock again
+            (super_held(), keysyms::KEY_c),       // would send the client Ctrl+C
+            (super_shift(), keysyms::KEY_Escape), // would quit the compositor
+        ] {
+            assert!(
+                matches!(while_locked(mods, sym, None), FilterResult::Forward),
+                "a locked session must forward {sym:#x} rather than act on it"
+            );
+        }
+    }
+
+    /// The one that would be unrecoverable. The launcher swallows every key
+    /// when it is open, so a session locked with it up would forward nothing
+    /// to the lock screen -- no password could be typed at all.
+    #[test]
+    fn locking_over_an_open_launcher_still_reaches_the_lock_screen() {
+        assert!(matches!(
+            while_locked(ModifiersState::default(), keysyms::KEY_a, Some(Some('a'))),
+            FilterResult::Forward
+        ));
     }
 
     #[test]
@@ -506,10 +655,10 @@ mod tests {
                 KeyState::Released,
                 &ModifiersState::default(),
                 keysyms::KEY_a,
-                false,
-                Some(Some('a')),
-                false,
-                false
+                Modes {
+                    launcher: Some(Some('a')),
+                    ..Modes::default()
+                },
             ),
             FilterResult::Intercept(None)
         ));
@@ -637,10 +786,10 @@ mod tests {
                     KeyState::Pressed,
                     &super_held(),
                     sym,
-                    true,
-                    None,
-                    false,
-                    false
+                    Modes {
+                        focus_owns_super: true,
+                        ..Modes::default()
+                    },
                 ),
                 FilterResult::Forward
             ));
@@ -660,10 +809,7 @@ mod tests {
                 KeyState::Released,
                 &super_shift(),
                 keysyms::KEY_T,
-                false,
-                None,
-                false,
-                false
+                Modes::default(),
             ),
             FilterResult::Intercept(None)
         ));

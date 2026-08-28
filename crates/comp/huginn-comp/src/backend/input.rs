@@ -57,8 +57,14 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
 fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     state.pointer_location = location;
     // The dock watches the bottom edge. Told before the event is forwarded, so
-    // a reveal and the client's own motion land in the same frame.
-    state.dock_pointer_moved();
+    // a reveal and the client's own motion land in the same frame -- unless the
+    // session is locked, in which case the dock is not on screen and a pointer
+    // at the bottom edge must not reveal it. `surface_under` is already empty
+    // of everything but the lock, so the motion itself is harmless; this is
+    // about the compositor's own drawing, which does not go through the scene.
+    if !state.is_locked() {
+        state.dock_pointer_moved();
+    }
     let under = state.surface_under(location);
     let pointer = state.pointer();
     pointer.motion(
@@ -79,6 +85,36 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
 fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     let serial = SERIAL_COUNTER.next_serial();
     let button_state = event.state();
+
+    // Locked: the click reaches the lock screen, through the ordinary pointer
+    // path at the bottom of this function, and nothing else. Everything skipped
+    // between here and there reads the desktop directly rather than through the
+    // scene -- the dock is compositor-drawn, and click-to-focus and the layer
+    // claim walk the window list and the layer list -- so an empty scene does
+    // not stop them on its own. A click that raised a window or activated a
+    // dock item behind a lock screen would be a click that acted on a session
+    // whose whole point, right now, is that nobody is acting on it.
+    if state.is_locked() {
+        let pointer = state.pointer();
+        let under = state.surface_under(state.pointer_location);
+        if let Some((surface, _)) = under.as_ref() {
+            // Focus follows the click into the lock surface, so a compositor
+            // that had the keyboard elsewhere hands it over on the first press.
+            state.set_keyboard_focus(Some(surface.clone()), serial);
+        }
+        pointer.button(
+            state,
+            &ButtonEvent {
+                button: event.button_code(),
+                state: button_state,
+                serial,
+                time: event.time_msec(),
+            },
+        );
+        pointer.frame(state);
+        state.queue_redraw();
+        return;
+    }
 
     // Click to focus. Done on press rather than release so that a click-drag
     // starting in an unfocused window focuses it before the drag begins.

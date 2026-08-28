@@ -171,10 +171,27 @@ client cannot receive or override them:
 | `Super+Shift+1..9` | go to a workspace |
 | `Super+Ctrl+Shift+1..9` | send the focused window to a workspace |
 | `Super+C` / `Super+V` | copy / paste in the focused client |
+| `Super+L` | lock the session |
 | `Super+Shift+Space` | open the application launcher |
 | `Super+Shift+S` | open quick settings |
 | `Super+Shift+H` | show or hide the keybinding list |
 | `Super+Shift+Esc` | quit the compositor |
+
+`Super+L` is the one chord on the plain `Super` layer that is never handed back.
+`Super+C` and `Super+V` are given to a client that drives `Super` itself, since
+a terminal has its own use for them; `Super+L` is not, because a lock chord that
+does nothing whenever a terminal happens to be focused fails at exactly the
+moment somebody walks away from a machine believing they locked it.
+
+While the session is locked no chord in this table resolves at all — every key
+goes to the lock screen, including `Super+Shift+Esc`.
+
+The session also locks itself after a period with no input — ten minutes by
+default, changed or turned off from the "Lock when idle" row in quick settings
+(`Super+Shift+S`). Every input event counts as presence, including one that
+resolves to no binding. There is no `idle-inhibit-unstable-v1`, so a client
+cannot hold this off; a video player that needs to has to ask the person
+watching to turn the row off.
 
 There is no way for a client to register a global chord of its own. If your
 software needs one, it currently has to be reached from a dock icon or by being

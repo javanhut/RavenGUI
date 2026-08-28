@@ -10,7 +10,13 @@ at.
 | Binary | What it is |
 |---|---|
 | `huginn` | the compositor, and the shell it draws — dock, launcher, notifications |
-| `muninn-lock` | the lock screen |
+
+The lock screen is not here. It is `raven-lock`, from
+[RavenLogin](../RavenLogin) — the login screen's twin, drawn by the same code
+and authenticating against the same daemon, because a lock screen that merely
+*resembles* the login screen teaches its owner to type their password into
+things that look about right. What lives here is the compositor half:
+`ext-session-lock-v1`, and the rule that a locked session is not composited.
 
 ## Architecture
 
@@ -23,10 +29,20 @@ all. `huginn-comp` maps `WindowId` to a real `WlSurface` and turns
 **The shell is not a client.** The dock, launcher, overview and notifications
 are drawn by the compositor itself, inside the render loop. Anything that must
 feel instant and must never fail does not get to be a separate process that can
-miss a frame or die. `muninn-lock` is the one exception, and it has an
-independent reason: `ext-session-lock-v1` keeps the screen locked if the locking
-client dies, which is only worth anything if that client shares no address space
-with the rest of the shell.
+miss a frame or die.
+
+The lock screen is the one thing that goes the other way, and for the opposite
+reason. `ext-session-lock-v1` guarantees that if the locking client dies the
+compositor keeps the screen locked rather than revealing the session — a
+guarantee that is worth exactly nothing if the locking client is the same
+process as the launcher. So it is not merely a separate process but a separate
+*repository*: `raven-lock` ships with the login screen it is a copy of.
+
+**A locked session is not composited.** Not "the lock is drawn on top": while
+the session is locked, `Huginn::scene` returns the lock surface and nothing
+else, and `frame_surfaces` stops handing out frame callbacks to anything below.
+There is no ordering rule that could be got wrong, no surface that could be
+raised above the lock, and nothing behind it still painting.
 
 **One repository, split at protocol v1.** The custom protocol is co-designed by
 both halves, so a change to it touches the XML, the compositor, and the shell in
@@ -44,8 +60,8 @@ crates/
 │   ├── huginn-comp/       smithay glue, event loop, protocol handlers,
 │   │                        and the shell — dock, launcher, notifications
 │   └── huginn-egl/        ★ the only crate permitted `unsafe`
-└── shell/
-    └── muninn-lock/       session-lock client
+└── tools/
+    └── layer-probe/       a layer-shell client that reports what it was told
 ```
 
 ## No unsafe
@@ -253,7 +269,7 @@ virtio-gpu.
 imlazy run          # a whole desktop in a window, inside the session you are in
 imlazy probe        # a layer-shell client that says what the compositor did to it
 imlazy lint         # clippy, and the unsafe quarantine check
-imlazy install      # replace the installed huginn and muninn-lock with this tree's
+imlazy install      # replace the installed huginn with this tree's
 imlazy installed    # what is installed, and where it came from
 imlazy restore      # put the originals back
 ```
@@ -262,9 +278,9 @@ imlazy restore      # put the originals back
 rather than writing through them, because the kernel refuses to truncate a
 running executable and huginn is running whenever you are looking at the
 desktop. The live compositor keeps the inode it started with and carries on; the
-new one takes over at the next session. `imlazy restore` returns the pair the
-image shipped with, which the first install sets aside as `huginn.orig` and
-`muninn-lock.orig` and no later install overwrites.
+new one takes over at the next session. `imlazy restore` returns the binary the
+image shipped with, which the first install sets aside as `huginn.orig` and no
+later install overwrites.
 
 Nothing tracks these two files — `rvn owns /usr/bin/huginn` reports no owner,
 because the `gui` stage installs them directly. Replacing them corrupts no
@@ -301,6 +317,32 @@ synthesises the `Ctrl`+`C` that toolkits listen for. Clients that drive the
 `Ctrl`+`C` as SIGINT and would kill the job instead of copying. A client that
 advertises no `app_id` is treated as one of them: it cannot be told apart from
 a terminal that advertises none either.
+
+`Super`+`L` is the second exception, and it works the other way: it locks the
+session and it is never handed back to anybody. The rule that plain `Super`
+belongs to the application is a good one, and a lock chord that a focused
+terminal can swallow is worse than not having a lock chord — it fails precisely
+when somebody is walking away from a machine they believe they just locked. So
+that chord is reserved, and RavenTerminal may not use it.
+
+While the session is locked, no binding resolves at all: every key is the lock
+screen's, checked before the launcher and quick settings, which would otherwise
+swallow the keystrokes and leave no way to type a password.
+
+The session locks itself after ten minutes with no input, on a timer that
+reschedules itself for however long is actually left rather than polling — an
+idle desktop draws no frames, so a check that ran per frame would stop running
+at exactly the point it is meant to fire. The wait is counted on the monotonic
+clock, which does not advance across a suspend: a laptop shut for the night has
+been idle for as long as it was *awake*, so the idle lock does not also fire on
+every resume and race the one the resume already does.
+
+"Lock when idle" in quick settings steps that between 5, 10, 15 and 30 minutes
+and off, and it is the only way to hold it off — there is no
+`idle-inhibit-unstable-v1` here, so a full-screen film is indistinguishable
+from an empty room. Off is placed after the longest wait and before the
+shortest, so stepping the row to lengthen the timeout never passes through
+"never lock" on the way.
 
 The udev/TTY backend drives real hardware: a libseat session, DRM/KMS scan-out
 through GBM, libinput, VT switching, and monitor hotplug. udev has no notion of
