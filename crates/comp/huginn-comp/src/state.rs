@@ -400,6 +400,10 @@ pub(crate) struct Huginn {
     /// Quick settings, and its rendered panel.
     pub(crate) settings: crate::settings::Settings,
     settings_panel: Option<crate::canvas::Panel>,
+    /// The output volume, shared with the settings row that steps it, and
+    /// the slider drawn while it is being changed.
+    volume: crate::audio::Shared,
+    volume_panel: Option<crate::canvas::Panel>,
     /// When the compositor started, so animations have a monotonic origin.
     started: std::time::Instant,
 
@@ -481,6 +485,7 @@ pub(crate) fn place_in_pane(surface: &WlSurface, pane: Rect) -> Rect {
 
 impl Huginn {
     pub(crate) fn new(dh: &DisplayHandle, area: Rect) -> Self {
+        let volume = crate::audio::Volume::detect().shared();
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(dh, "huginn");
         // Advertised for every backend. A seat with no pointer capability makes
@@ -563,8 +568,10 @@ impl Huginn {
             dock: crate::dock::Dock::default(),
             dock_panel: None,
             dock_items: Vec::new(),
-            settings: crate::settings::Settings::default(),
+            settings: crate::settings::Settings::new(volume.clone()),
             settings_panel: None,
+            volume,
+            volume_panel: None,
             started: std::time::Instant::now(),
             launcher: crate::launcher::Launcher::default(),
             launcher_panel: None,
@@ -749,6 +756,7 @@ impl Huginn {
         //
         //   help overlay   - summoned by someone who has lost track of what is
         //                    on screen, which includes the panels
+        //   volume slider  - a key was just pressed; the answer goes on top
         //   launcher       - over the dock it grew out of
         //   settings       - likewise
         //   ---- blur boundary ----
@@ -763,6 +771,13 @@ impl Huginn {
                 help.buffer(),
                 help.placement(self.output_area),
                 1.0,
+            ));
+        }
+        if let Some(panel) = &self.volume_panel {
+            out.push(SceneItem::Overlay(
+                panel.buffer(),
+                crate::audio::placement(self.output_area, panel.size()),
+                self.volume.borrow().reveal(self.uptime()),
             ));
         }
         if let Some(panel) = &self.launcher_panel {
@@ -1680,6 +1695,7 @@ impl Huginn {
     /// cannot drift from the order [`Huginn::scene`] actually pushes in.
     pub(crate) fn blur_boundary(&self) -> usize {
         usize::from(self.help.is_some())
+            + usize::from(self.volume_panel.is_some())
             + usize::from(self.launcher_panel.is_some())
             + usize::from(self.settings_panel.is_some())
     }
@@ -1737,6 +1753,7 @@ impl Huginn {
         if self.settings.is_animating(now) {
             self.refresh_settings();
         }
+        self.tick_volume(now);
         if self.dock.is_animating(now) {
             self.refresh_dock();
         }
@@ -1751,6 +1768,57 @@ impl Huginn {
             // all the fade needs is frames. The last one paints it at zero.
             self.queue_redraw();
         }
+    }
+
+    /// A media key. Moves the level and shows the slider.
+    pub(crate) fn volume_key(&mut self, key: crate::audio::Key) {
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        self.volume.borrow_mut().press(key, now, motion);
+        self.refresh_volume();
+        // The settings row shows the same number, so if the panel is up it
+        // has to be told.
+        if self.settings_panel.is_some() {
+            self.refresh_settings();
+        }
+    }
+
+    /// Advance the slider's hold and fade, and drop it once it has gone.
+    ///
+    /// The alpha is read at draw time from the reveal, so the panel is not
+    /// recomposed here — the level has not changed, only the fade. All the
+    /// fade needs is frames.
+    fn tick_volume(&mut self, now: std::time::Duration) {
+        let motion = self.settings.motion();
+        let mut volume = self.volume.borrow_mut();
+        volume.tick(now, motion);
+        let animating = volume.is_animating(now);
+        drop(volume);
+        if animating {
+            self.queue_redraw();
+        } else if self.volume_panel.is_some() {
+            self.volume_panel = None;
+            self.queue_redraw();
+        }
+    }
+
+    /// Recompose the volume slider for the level it now shows.
+    ///
+    /// Called when the level changes, from a media key or from the settings
+    /// row — which is why the settings row's path also lands here, through
+    /// [`Huginn::refresh_settings`].
+    pub(crate) fn refresh_volume(&mut self) {
+        let now = self.uptime();
+        let volume = self.volume.borrow();
+        self.volume_panel = volume.is_visible(now).then(|| {
+            crate::audio::render(
+                &volume,
+                &mut self.text,
+                self.output_area,
+                self.scale.advertised,
+            )
+        });
+        drop(volume);
+        self.queue_redraw();
     }
 
     /// Redraw the quick settings panel, or drop it once it has closed.
@@ -1768,6 +1836,11 @@ impl Huginn {
                 self.scale.advertised,
             )
         });
+        // The volume row may just have moved the level, and the slider that
+        // shows it is drawn whether the change came from a key or a row.
+        if self.volume.borrow().is_visible(now) {
+            self.refresh_volume();
+        }
         self.queue_redraw();
     }
 
