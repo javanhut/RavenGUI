@@ -40,6 +40,8 @@ mod settings;
 #[cfg(target_os = "linux")]
 mod shell_protocol;
 #[cfg(target_os = "linux")]
+mod sleep;
+#[cfg(target_os = "linux")]
 mod state;
 #[cfg(target_os = "linux")]
 mod text;

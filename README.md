@@ -186,6 +186,16 @@ and its stage summary reports on each.
 | `pointer::Cursor::load` | an xcursor theme at `$XCURSOR_THEME`, default `default` | no pointer is drawn over the dock, launcher or background — clients that set their own still show one, so it reads as a rendering bug |
 | `theme::ICON_THEME` | the `breeze-dark` icon theme | every dock and launcher icon draws blank |
 | `wallpaper::SET_DIR` | an image at `/usr/share/wallpaper/set/wallpaper.<ext>` | the desktop is the backends' flat clear colour, which is what an image with no wallpaper set looks like and not a fault |
+| `sleep::MARKER_DIR` | `raven-init` publishing `/run/raven-power/state` | the screen may stay black after a resume until something else forces a repaint |
+
+The sleep marker is the one entry here that is not about how the desktop looks.
+Huginn holds DRM master straight through a suspend, and seatd -- unlike logind
+-- has nothing to say about sleep, so the compositor learns that the machine
+went away by watching a file `raven-init` writes either side of the suspend.
+Without it nothing tells the compositor to re-take the display and repaint, and
+what that costs is the panel staying dark after the lid opens. Under any other
+init the watch simply never arms, which is why it is a warning at startup and
+not a refusal to run.
 
 Three of them have no in-band failure at all: a missing cursor theme, a missing
 icon theme and a missing wallpaper all take the `None` branch by design, because
