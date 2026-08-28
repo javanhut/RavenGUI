@@ -205,7 +205,7 @@ spawned.
 | three fingers down | minimize the focused pane without closing it |
 | three-finger double tap | temporarily show minimized applications in a centered dock |
 | sideways while the centered dock is open | highlight a minimized application |
-| three fingers up while the centered dock is open | restore the highlighted application fullscreen in the current workspace |
+| three fingers up while the centered dock is open | restore the highlighted application into the current workspace |
 
 The current workspace shrinks into a centred card while the workspaces beside
 it appear as narrow, dimmed side cards. The row follows the fingers and settles
