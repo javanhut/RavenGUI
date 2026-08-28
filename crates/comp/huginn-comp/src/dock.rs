@@ -320,6 +320,13 @@ pub(crate) fn placement(output: Rect, items: usize, reveal: f32) -> Rect {
     Rect::from_xywh(x, y, w, h)
 }
 
+/// The dock's rectangle while it is acting as the application switcher.
+pub(crate) fn centred_placement(output: Rect, items: usize) -> Rect {
+    let mut rect = placement(output, items, 1.0);
+    rect.origin.y = output.y() + (output.h() - rect.h()) / 2;
+    rect
+}
+
 /// The rectangle one item occupies, given the dock's own rectangle.
 ///
 /// Where the launcher grows out of. Derived from the dock's height rather than
@@ -348,6 +355,7 @@ pub(crate) fn render(
     _text: &mut Text,
     output: Rect,
     density: u32,
+    selected: Option<usize>,
 ) -> Panel {
     let density = density.max(1);
     let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
@@ -367,6 +375,17 @@ pub(crate) fn render(
 
     for (index, item) in items.iter().enumerate() {
         let x = gap + (icon + gap) * index as f32;
+        if selected == Some(index) {
+            let inset = (3.0 * scale).max(2.0);
+            canvas.fill_rounded(
+                (x - inset) as usize,
+                (gap - inset) as usize,
+                (icon + inset * 2.0) as usize,
+                (icon + inset * 2.0) as usize,
+                icon * 0.24,
+                crate::theme::ACCENT.with_alpha(0x70),
+            );
+        }
         if item.is_launcher() {
             // Drawn rather than themed: the launcher is not an installed
             // application and has no `.desktop` file to take an icon from.
@@ -669,6 +688,15 @@ mod tests {
     }
 
     #[test]
+    fn switcher_placement_is_at_the_centre_of_the_page() {
+        let rect = centred_placement(SCREEN, 4);
+        let centre_x = SCREEN.x() + SCREEN.w() / 2;
+        let centre_y = SCREEN.y() + SCREEN.h() / 2;
+        assert!((rect.x() + rect.w() / 2 - centre_x).abs() <= 1);
+        assert!((rect.y() + rect.h() / 2 - centre_y).abs() <= 1);
+    }
+
+    #[test]
     fn it_grows_with_the_number_of_items() {
         assert!(placement(SCREEN, 6, 1.0).w() > placement(SCREEN, 2, 1.0).w());
     }
@@ -740,6 +768,7 @@ mod dump {
             &mut text,
             Rect::from_xywh(0, 0, 1920, 1080),
             1,
+            None,
         );
         let _ = panel;
 

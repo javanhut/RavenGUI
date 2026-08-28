@@ -140,6 +140,27 @@ impl WindowSurface {
         }
     }
 
+    /// Tell the client that the compositor has put it in fullscreen state.
+    pub(crate) fn set_fullscreen(&self, fullscreen: bool) {
+        match self {
+            Self::Xdg(t) => {
+                t.with_pending_state(|state| {
+                    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+                    if fullscreen {
+                        state.states.set(xdg_toplevel::State::Fullscreen);
+                    } else {
+                        state.states.unset(xdg_toplevel::State::Fullscreen);
+                    }
+                });
+            }
+            Self::X11(x) => {
+                if let Err(e) = x.set_fullscreen(fullscreen) {
+                    tracing::debug!("x11 set_fullscreen failed: {e}");
+                }
+            }
+        }
+    }
+
     /// Put the window at `rect`.
     ///
     /// XDG: stage the size and send one configure. X11: move and resize now.

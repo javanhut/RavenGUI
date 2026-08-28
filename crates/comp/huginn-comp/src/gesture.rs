@@ -4,6 +4,11 @@
 //! workspace shrinks into the centre, its neighbours appear at the sides, and
 //! the row follows the fingers until they choose a workspace.
 //!
+//! Vertical motion is the application switcher: down puts the current desktop
+//! away and raises the dock in the centre; up accepts the application selected
+//! there. Once that switcher is open, horizontal motion moves through its
+//! applications instead of through workspaces.
+//!
 //! # Why this is a type and not four lines in the input handler
 //!
 //! A swipe is not a single event. libinput reports a begin, a run of deltas,
@@ -52,8 +57,24 @@ enum Claim {
     Undecided,
     /// Driving the workspace row from the workspace at `origin`.
     Carousel { origin: f32 },
-    /// Vertical or the wrong number of fingers. Nothing here wants it.
+    /// A vertical application-switcher command.
+    Vertical(Vertical),
+    /// The wrong number of fingers. Nothing here wants it.
     Ignored,
+}
+
+/// A completed vertical three-finger command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Vertical {
+    Up,
+    Down,
+}
+
+/// The axis a swipe has just committed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hold {
+    Horizontal,
+    Vertical,
 }
 
 /// A touchpad swipe from the moment the fingers land to the moment they lift.
@@ -87,23 +108,26 @@ impl Swipe {
     ///
     /// True at most once per swipe: the caller answers it with [`Self::drives`]
     /// and the swipe is decided from then on.
-    pub(crate) fn takes_hold(&mut self, dx: f64, dy: f64) -> bool {
+    pub(crate) fn takes_hold(&mut self, dx: f64, dy: f64) -> Option<Hold> {
         self.travel.0 += dx;
         self.travel.1 += dy;
 
         if self.claim != Claim::Undecided {
-            return false;
+            return None;
         }
         let (x, y) = (self.travel.0.abs(), self.travel.1.abs());
         if x >= COMMIT && x > y {
-            return true;
+            return Some(Hold::Horizontal);
         }
         if y >= COMMIT {
-            // Committed the other way. Marked rather than left undecided, so a
-            // vertical swipe that wanders cannot grab the row half way down.
-            self.claim = Claim::Ignored;
+            self.claim = Claim::Vertical(if self.travel.1 < 0.0 {
+                Vertical::Up
+            } else {
+                Vertical::Down
+            });
+            return Some(Hold::Vertical);
         }
-        false
+        None
     }
 
     /// Take the swipe, recording which workspace was centred when it started.
@@ -128,6 +152,14 @@ impl Swipe {
         };
         Some(origin - (self.travel.0 / UNITS_PER_WORKSPACE) as f32)
     }
+
+    /// The vertical command this swipe committed to, if any.
+    pub(crate) fn vertical(&self) -> Option<Vertical> {
+        let Claim::Vertical(direction) = self.claim else {
+            return None;
+        };
+        Some(direction)
+    }
 }
 
 #[cfg(test)]
@@ -139,7 +171,7 @@ mod tests {
     fn swipe(origin: f32, travel: &[(f64, f64)]) -> Swipe {
         let mut s = Swipe::new(CAROUSEL_FINGERS);
         for (dx, dy) in travel {
-            if s.takes_hold(*dx, *dy) {
+            if s.takes_hold(*dx, *dy) == Some(Hold::Horizontal) {
                 s.drives(origin);
             }
         }
@@ -172,6 +204,7 @@ mod tests {
         // sideways. The axis was decided on the way down and stays decided.
         let s = swipe(0.0, &[(0.0, -20.0), (-40.0, -5.0), (-40.0, 0.0)]);
         assert_eq!(s.position(), None, "the row must not lurch mid-gesture");
+        assert_eq!(s.vertical(), Some(Vertical::Up));
     }
 
     #[test]
@@ -179,7 +212,7 @@ mod tests {
         for fingers in [1, 2, 4, 5] {
             let mut s = Swipe::new(fingers);
             assert!(
-                !s.takes_hold(-200.0, 0.0),
+                s.takes_hold(-200.0, 0.0).is_none(),
                 "{fingers} fingers must not take the row"
             );
             assert_eq!(s.position(), None);
@@ -194,7 +227,7 @@ mod tests {
         let mut s = Swipe::new(CAROUSEL_FINGERS);
         let mut claims = 0;
         for _ in 0..20 {
-            if s.takes_hold(-5.0, 0.0) {
+            if s.takes_hold(-5.0, 0.0) == Some(Hold::Horizontal) {
                 claims += 1;
                 s.drives(2.0);
             }
@@ -210,5 +243,11 @@ mod tests {
         let mut out: Vec<(f64, f64)> = (0..40).map(|_| (-7.3, 0.0)).collect();
         out.extend((0..40).map(|_| (7.3, 0.0)));
         assert_eq!(swipe(3.0, &out).position(), Some(3.0));
+    }
+
+    #[test]
+    fn vertical_direction_is_decided_from_the_fingers_motion() {
+        assert_eq!(swipe(0.0, &[(0.0, 20.0)]).vertical(), Some(Vertical::Down));
+        assert_eq!(swipe(0.0, &[(0.0, -20.0)]).vertical(), Some(Vertical::Up));
     }
 }
