@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
+use std::time::Instant;
 
 use crate::window::WindowSurface;
 use huginn_core::{
@@ -29,7 +30,8 @@ use smithay::{
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
+    delegate_output, delegate_seat, delegate_session_lock, delegate_shm, delegate_viewporter,
+    delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -62,6 +64,7 @@ use smithay::{
                 set_data_device_focus,
             },
         },
+        session_lock::{LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker},
         shell::{
             wlr_layer::{
                 Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
@@ -177,11 +180,26 @@ pub(crate) struct Huginn {
     /// and clients would lose their output information mid-session.
     #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
+    /// `ext_session_lock_manager_v1`. What `raven-lock` binds to hold the
+    /// session.
+    pub session_lock_state: SessionLockManagerState,
+    /// The lock, if the session is being held. See [`Lock`].
+    pub(crate) lock: Option<Lock>,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub seat: Seat<Self>,
     /// Pointer position in compositor-global logical coordinates.
     pub pointer_location: Point<f64, Logical>,
+    /// When input last arrived, for the idle lock.
+    ///
+    /// `Instant` is `CLOCK_MONOTONIC`, which on Linux does not advance while
+    /// the machine is suspended — so a laptop shut for the night and opened in
+    /// the morning has been idle for however long it was *awake*, not for
+    /// eight hours. That is the behaviour you want here and it is not the one
+    /// a wall clock gives: the resume already locks the session on its own,
+    /// and counting the sleep as idle time would mean the idle lock also fired
+    /// on every wake, racing it for no reason.
+    last_input: Instant,
     /// What the focused client last asked the cursor to look like.
     pub cursor_status: CursorImageStatus,
     /// Keyboards whose LEDs the compositor drives, and what they should show.
@@ -403,10 +421,20 @@ impl Huginn {
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
             scale: OutputScale::for_output(Size::new(area.w(), area.h()), Size::new(0, 0)),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
+            // Any client may lock. The protocol's filter exists to restrict the
+            // global to a privileged client, which needs a way to tell one
+            // client from another -- and on a single-user session there is
+            // none: every client here runs as the person whose session it is
+            // and can already read their files, take their keystrokes and open
+            // their windows. A filter that cannot distinguish them would be a
+            // check that looks like security and is not.
+            session_lock_state: SessionLockManagerState::new::<Self, _>(dh, |_| true),
+            lock: None,
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
             seat,
             pointer_location: (0.0, 0.0).into(),
+            last_input: Instant::now(),
             // Default until a client sets its own on pointer enter.
             cursor_status: CursorImageStatus::default_named(),
             keyboard_led_devices: Vec::new(),
@@ -601,6 +629,27 @@ impl Huginn {
     /// separately they would eventually disagree, and the bug would look like
     /// clicks landing on windows hidden behind a panel.
     pub(crate) fn scene(&self) -> Vec<SceneItem<'_>> {
+        // Locked, and that is the whole scene. Not "the lock drawn on top of
+        // the desktop": the desktop is not in the list at all, so there is no
+        // ordering bug, no surface that could be raised above it and no
+        // animation that could slide it aside. What is behind a lock screen
+        // should be nothing, and the cheapest way to guarantee that is for it
+        // to *be* nothing.
+        //
+        // An empty list is the correct answer while the lock is still a blank:
+        // the backend clears the framebuffer every frame, so no elements means
+        // a cleared screen rather than a stale one.
+        if let Some(lock) = &self.lock {
+            let mut out = Vec::new();
+            if let Some(surface) = lock.surface() {
+                out.push(SceneItem::Surface(
+                    surface.wl_surface().clone(),
+                    self.output_area,
+                ));
+            }
+            return out;
+        }
+
         let mut out = Vec::new();
         // Front to back, and the order is the whole point:
         //
@@ -734,6 +783,17 @@ impl Huginn {
     /// waiting for the buffer that callback would have produced.
     pub(crate) fn frame_surfaces(&self) -> Vec<(WlSurface, Rect)> {
         let mut out: Vec<(WlSurface, Rect)> = self.scene_surfaces().collect();
+
+        // While locked that is the entire list. The windows below would
+        // otherwise go on receiving frame callbacks and go on painting -- into
+        // buffers nobody composites, which wastes a session's worth of GPU
+        // work, and, worse, keeps a video call or a terminal live behind a
+        // screen whose whole purpose is that nothing behind it is running
+        // where anybody can see it.
+        if self.lock.is_some() {
+            return out;
+        }
+
         out.extend(
             self.space
                 .active_workspace()
@@ -747,6 +807,118 @@ impl Huginn {
                 }),
         );
         out
+    }
+
+    /// Put the lock screen up.
+    ///
+    /// Order matters and is the opposite of the obvious one: the screen is
+    /// blanked *first*, then the lock screen is started. Starting it first
+    /// would leave the desktop on the panel for as long as a process takes to
+    /// exec, connect to Wayland and ask -- which is exactly the window somebody
+    /// walking up to a just-woken laptop would be looking at.
+    ///
+    /// If the spawn fails the blank comes straight back down. A machine whose
+    /// lock screen is not installed should show its desktop, not a screen
+    /// nobody can ever get past.
+    pub(crate) fn lock_and_launch(&mut self) -> bool {
+        if !self.begin_lock() {
+            return false;
+        }
+
+        let argv = [crate::theme::LOCK_SCREEN.to_string()];
+        if crate::backend::spawn(&argv, &self.socket, self.x11_display) {
+            return true;
+        }
+
+        tracing::error!(
+            program = crate::theme::LOCK_SCREEN,
+            "the lock screen would not start; leaving the session unlocked"
+        );
+        self.lock = None;
+        self.refresh_focus();
+        self.queue_redraw();
+        false
+    }
+
+    /// Input arrived; the session is not idle.
+    ///
+    /// Called once per input event by each backend, before the event is
+    /// interpreted — a keystroke that resolves to no binding at all is still
+    /// somebody at the keyboard.
+    pub(crate) fn note_activity(&mut self) {
+        self.last_input = Instant::now();
+    }
+
+    /// Whether the session has been idle long enough to lock itself.
+    ///
+    /// Answered here rather than in the backend's timer so that the rule is
+    /// testable and lives next to the state it reads. A session already locked
+    /// is never "due": it cannot be locked twice, and asking would restart the
+    /// lock screen on top of itself.
+    pub(crate) fn idle_lock_due(&self, now: Instant) -> bool {
+        idle_due(
+            self.is_locked(),
+            self.settings.idle_after().duration(),
+            now.saturating_duration_since(self.last_input),
+        )
+    }
+
+    /// How long until [`Self::idle_lock_due`] is worth asking again.
+    ///
+    /// The idle timer reschedules itself by this rather than polling on a fixed
+    /// tick, so a ten-minute timeout costs one wakeup ten minutes from now
+    /// instead of twenty wakeups that find nothing. The coarse fallback covers
+    /// the two cases with nothing to count down to — the setting is off, or the
+    /// session is already locked — where the only thing being waited for is
+    /// somebody changing the setting.
+    pub(crate) fn idle_check_in(&self, now: Instant) -> std::time::Duration {
+        idle_wait(
+            self.is_locked(),
+            self.settings.idle_after().duration(),
+            now.saturating_duration_since(self.last_input),
+        )
+    }
+
+    /// Whether the session is being held by a lock screen.
+    pub(crate) fn is_locked(&self) -> bool {
+        self.lock.is_some()
+    }
+
+    /// Stop drawing the session, before any client has asked.
+    ///
+    /// This is the compositor's own half of the lock; see [`Lock`] for why it
+    /// exists separately from the protocol's. Returns whether it did anything,
+    /// so a caller that spawned a lock screen can tell a fresh blank from one
+    /// that was already up.
+    pub(crate) fn begin_lock(&mut self) -> bool {
+        if self.lock.is_some() {
+            return false;
+        }
+        tracing::info!("locking the session");
+        self.lock = Some(Lock::default());
+        self.refresh_focus();
+        self.queue_redraw();
+        true
+    }
+
+    /// Take the blank back down if no client ever claimed it.
+    ///
+    /// The escape hatch described on [`Lock`]. Does nothing once a client has
+    /// asked for the lock -- from that point the session stays hidden until it
+    /// says otherwise, which is the guarantee the protocol is for.
+    pub(crate) fn abandon_lock_if_unclaimed(&mut self) {
+        let unclaimed = self.lock.as_ref().is_some_and(|lock| lock.client.is_none());
+        if !unclaimed {
+            return;
+        }
+
+        tracing::error!(
+            "no lock screen claimed the session; revealing the desktop again. \
+             Is raven-lock installed?"
+        );
+        self.lock = None;
+        self.refresh_focus();
+        self.queue_redraw();
     }
 
     /// Whether the focused client handles the `Super` layer itself.
@@ -1007,7 +1179,9 @@ impl Huginn {
             let now = self.now();
             self.frecency.record(&path, now);
         }
-        crate::backend::spawn(argv, &self.socket, self.x11_display);
+        // The answer is not used here: a desktop entry that will not run is a
+        // line in the log, not something the launcher can do anything about.
+        let _ = crate::backend::spawn(argv, &self.socket, self.x11_display);
     }
 
     /// Resize the focused window one step in `dir`.
@@ -1562,6 +1736,17 @@ impl Huginn {
     /// push order and therefore also mapping order — so one number serves as
     /// both the identity and the recency tie-break.
     fn resolve_keyboard_focus(&self) -> (Option<WlSurface>, KeyboardOn) {
+        // Locked: the lock screen has the keyboard, and nothing else is even a
+        // candidate. Returning `None` while the lock has no surface yet is
+        // deliberate -- for those few milliseconds the keystrokes go nowhere at
+        // all, which is the only safe place for them to go.
+        if let Some(lock) = &self.lock {
+            return (
+                lock.surface().map(|s| s.wl_surface().clone()),
+                KeyboardOn::Lock,
+            );
+        }
+
         let candidates: Vec<Focusable<usize>> = self
             .layers
             .iter()
@@ -1966,6 +2151,94 @@ delegate_data_device!(Huginn);
 delegate_output!(Huginn);
 delegate_viewporter!(Huginn);
 delegate_fractional_scale!(Huginn);
+impl SessionLockHandler for Huginn {
+    fn lock_state(&mut self) -> &mut SessionLockManagerState {
+        &mut self.session_lock_state
+    }
+
+    /// A client asked to lock the session.
+    ///
+    /// The protocol says: hide the session, present a cleared frame on every
+    /// output, and only then confirm. The confirmation is what lets the client
+    /// tell its user the machine is safe, so confirming early would be a lie
+    /// with a screenshot's worth of consequences.
+    ///
+    /// Here the hiding is [`Huginn::begin_lock`], which may have happened
+    /// already -- a resume blanks the screen before any client exists, and this
+    /// call is that client arriving to claim the blank.
+    fn lock(&mut self, confirmation: SessionLocker) {
+        self.begin_lock();
+
+        let Some(lock) = self.lock.as_mut() else {
+            // Unreachable: `begin_lock` either created it or found it. Dropping
+            // the confirmation rather than unwrapping tells the client the lock
+            // failed, which is the safe direction to be wrong in -- a client
+            // that is told "no" shows an error, where one wrongly told "yes"
+            // reports a locked machine that is not.
+            return;
+        };
+
+        if lock.client.is_some() {
+            tracing::warn!("a second client tried to lock an already-locked session");
+            return;
+        }
+
+        lock.client = Some(ClientLock::default());
+        self.refresh_focus();
+        self.queue_redraw();
+
+        // Confirmed here rather than after the next frame. The session stopped
+        // being drawn the moment `scene` started returning the lock's contents,
+        // which is this instant and not the next vblank: the frame currently on
+        // the panel is the one that was there before the lock, and the next one
+        // composited cannot contain the desktop. Waiting for a vblank to say so
+        // would leave the client believing the machine was unlocked for one
+        // refresh longer than it was.
+        confirmation.lock();
+        tracing::info!("session locked");
+    }
+
+    /// The client unlocked. It has already checked a password to get here.
+    fn unlock(&mut self) {
+        tracing::info!("session unlocked");
+        self.lock = None;
+        // The desktop is in the scene again, and the keyboard has to be given
+        // back to whatever had it before the lock -- otherwise the session
+        // comes back with every keystroke going nowhere.
+        self.refresh_focus();
+        self.queue_redraw();
+    }
+
+    /// The client made a surface to draw the lock screen on.
+    fn new_surface(&mut self, surface: LockSurface, _output: WlOutput) {
+        // Sized to the output before anything else. A lock surface has no say
+        // in its own size -- the compositor tells it, and until it is told it
+        // has nothing to draw into.
+        let area = self.output_area;
+        surface.with_pending_state(|state| {
+            state.size = Some((area.w() as u32, area.h() as u32).into());
+        });
+        surface.send_configure();
+
+        let Some(lock) = self.lock.as_mut() else {
+            return;
+        };
+        let Some(client) = lock.client.as_mut() else {
+            return;
+        };
+
+        // One output, so one surface; a second replaces the first rather than
+        // being stacked behind it. When this compositor grows a second output
+        // this becomes a map keyed by the `output` argument, which is why that
+        // argument is already here.
+        client.surface = Some(surface);
+        self.refresh_focus();
+        self.queue_redraw();
+    }
+}
+
+delegate_session_lock!(Huginn);
+
 delegate_layer_shell!(Huginn);
 
 /// XWayland associating an X11 window with a Wayland surface.
@@ -2012,6 +2285,94 @@ pub(crate) enum KeyboardOn {
     Panel,
     /// A layer surface has it because it asked for it and its layer allows it.
     ExclusivePanel,
+    /// The session is locked, and the lock screen has it. Nothing else can.
+    Lock,
+}
+
+/// Whether an idle session is due to lock.
+///
+/// Free-standing rather than a method for one reason: a `Huginn` needs a
+/// Wayland display to exist, so a rule written inside it is a rule that can
+/// only be checked by running a compositor. The three inputs are the whole of
+/// what decides this.
+fn idle_due(locked: bool, after: Option<std::time::Duration>, idle: std::time::Duration) -> bool {
+    // Already locked: it cannot be locked twice, and asking again would start
+    // a second lock screen on top of the first.
+    if locked {
+        return false;
+    }
+    after.is_some_and(|after| idle >= after)
+}
+
+/// How long until [`idle_due`] is worth asking again.
+fn idle_wait(
+    locked: bool,
+    after: Option<std::time::Duration>,
+    idle: std::time::Duration,
+) -> std::time::Duration {
+    /// Long enough to cost nothing, short enough that turning the setting back
+    /// on takes effect while somebody is still sitting there. Used for the two
+    /// cases with nothing to count down to.
+    const NOTHING_TO_COUNT: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Never reschedule tighter than this. A zero-length timer that keeps
+    /// finding itself due would spin the event loop at full tilt.
+    const FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
+
+    if locked {
+        return NOTHING_TO_COUNT;
+    }
+    match after {
+        Some(after) => after.saturating_sub(idle).max(FLOOR),
+        None => NOTHING_TO_COUNT,
+    }
+}
+
+/// The session, held.
+///
+/// # The two-stage lock, and why the first stage exists
+///
+/// `ext-session-lock-v1` is client-driven: a client asks, the compositor stops
+/// showing the session, and only then does the compositor confirm. That is the
+/// whole protocol and it is enough for a lock somebody asked for.
+///
+/// It is not enough for a lock on *resume*. The session has to be hidden the
+/// instant the machine comes back, and at that instant no client has asked for
+/// anything -- `raven-lock` has not been spawned, let alone connected. So this
+/// exists in two stages. [`Huginn::begin_lock`] creates it with
+/// `client: None`: the desktop stops being drawn immediately, before there is
+/// any client at all. The client then connects, asks, and takes it over.
+///
+/// The danger in that is a screen nobody can get past -- a blank display and no
+/// process able to accept a password is a machine that has to be power-cycled.
+/// [`Huginn::abandon_lock_if_unclaimed`] is the way out: if no client has
+/// claimed the lock within a few seconds of the blank going up, the blank comes
+/// back down. A desktop revealed because the lock screen would not start is
+/// bad; a machine bricked by the same failure is worse, and the second is not a
+/// security trade -- somebody standing at a wedged blank screen can already
+/// hold the power button.
+#[derive(Debug, Default)]
+pub(crate) struct Lock {
+    /// The client's lock object, once one has asked. `None` while this is the
+    /// compositor's own pre-emptive blank.
+    client: Option<ClientLock>,
+}
+
+impl Lock {
+    /// The surface covering the output, if a client has provided one.
+    pub(crate) fn surface(&self) -> Option<&LockSurface> {
+        self.client.as_ref()?.surface.as_ref()
+    }
+}
+
+/// A lock a client asked for and the compositor confirmed.
+#[derive(Debug, Default)]
+pub(crate) struct ClientLock {
+    /// The surface covering the output, once the client has made one.
+    ///
+    /// `None` between the lock being confirmed and the first lock surface
+    /// arriving, which is a handful of milliseconds of blank screen and is
+    /// exactly what the protocol asks for.
+    surface: Option<LockSurface>,
 }
 
 /// Translate the protocol's layer into the core's own vocabulary.
@@ -2068,4 +2429,62 @@ pub(crate) fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
             _ => Interactivity::None,
         },
     })
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::{idle_due, idle_wait};
+    use std::time::Duration;
+
+    const AFTER: Option<Duration> = Some(Duration::from_secs(600));
+
+    #[test]
+    fn a_session_locks_once_it_has_been_idle_long_enough() {
+        assert!(!idle_due(false, AFTER, Duration::from_secs(599)));
+        assert!(idle_due(false, AFTER, Duration::from_secs(600)));
+        assert!(idle_due(false, AFTER, Duration::from_secs(6000)));
+    }
+
+    #[test]
+    fn off_never_locks_however_long_it_sits() {
+        assert!(!idle_due(false, None, Duration::from_secs(86_400)));
+    }
+
+    /// Otherwise every tick past the timeout starts another lock screen on top
+    /// of the one already holding the session.
+    #[test]
+    fn an_already_locked_session_is_never_due() {
+        assert!(!idle_due(true, AFTER, Duration::from_secs(6000)));
+    }
+
+    #[test]
+    fn the_next_check_is_the_time_that_is_left() {
+        assert_eq!(
+            idle_wait(false, AFTER, Duration::from_secs(60)),
+            Duration::from_secs(540)
+        );
+    }
+
+    /// The reschedule must never be zero, or the event loop spins: past the
+    /// timeout, `idle_due` is true and the lock is taken, but the timer is
+    /// rearmed before the lock screen has connected.
+    #[test]
+    fn the_next_check_never_comes_back_instantly() {
+        for idle in [600, 601, 100_000] {
+            let wait = idle_wait(false, AFTER, Duration::from_secs(idle));
+            assert!(
+                wait >= Duration::from_secs(1),
+                "rescheduled in {wait:?} at {idle}s idle"
+            );
+        }
+    }
+
+    /// With nothing counting down, the only thing being waited for is somebody
+    /// changing the setting — so keep looking, but cheaply.
+    #[test]
+    fn nothing_to_count_still_checks_back() {
+        let coarse = Duration::from_secs(60);
+        assert_eq!(idle_wait(false, None, Duration::from_secs(5)), coarse);
+        assert_eq!(idle_wait(true, AFTER, Duration::from_secs(5)), coarse);
+    }
 }

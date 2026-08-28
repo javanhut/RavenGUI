@@ -1072,15 +1072,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "muninn-lock"
-version = "0.0.1"
-dependencies = [
- "smithay-client-toolkit 0.21.1",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

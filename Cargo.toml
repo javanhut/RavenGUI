@@ -6,7 +6,6 @@ members = [
     "crates/comp/huginn-core",
     "crates/comp/huginn-comp",
     "crates/comp/huginn-egl",
-    "crates/shell/muninn-lock",
     "crates/tools/layer-probe",
 ]
 

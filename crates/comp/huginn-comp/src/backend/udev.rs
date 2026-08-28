@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use smithay::{
@@ -60,7 +60,9 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
+            generic::Generic,
+            timer::{TimeoutAction, Timer},
         },
         drm::control::{Device as _, Mode as DrmMode, ResourceHandles, connector, crtc},
         input::{DeviceCapability, Libinput},
@@ -85,7 +87,7 @@ use huginn_core::{
 use crate::backend::advertise;
 use crate::backend::chord;
 use crate::backend::input;
-use crate::backend::keymap::{Action, help_line, resolve};
+use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
 use crate::render;
 use crate::state::{ClientState, Huginn};
@@ -334,7 +336,31 @@ pub(crate) fn run() -> Result<()> {
     // why the recovery has to be the heavier one: we still hold DRM master over
     // a device whose state the firmware has been through, and only a full
     // modeset can be trusted to put a picture back on the panel.
-    crate::sleep::watch::<Udev, _>(&handle, |data: &mut Udev| {
+    // The idle lock. Its own timer rather than a check inside the frame loop:
+    // an idle session draws no frames at all, so a check that ran per frame
+    // would never run once the desktop went quiet -- which is precisely when
+    // it is supposed to fire.
+    let idle_timer = Timer::from_duration(Duration::from_secs(60));
+    handle
+        .insert_source(idle_timer, |_, _, data: &mut Udev| {
+            let now = Instant::now();
+            if data.state.idle_lock_due(now) {
+                tracing::info!("idle; locking the session");
+                data.state.lock_and_launch();
+            }
+            TimeoutAction::ToDuration(data.state.idle_check_in(now))
+        })
+        .map_err(|e| anyhow::anyhow!("idle timer: {e}"))?;
+
+    let lock_handle = handle.clone();
+    crate::sleep::watch::<Udev, _>(&handle, move |data: &mut Udev| {
+        // Locked *before* the display comes back, and that ordering is the
+        // whole security of it. `reclaim_display` is what puts the next frame
+        // on the panel; blanking the session first means the first thing drawn
+        // after a resume is the lock screen and never the desktop. There is no
+        // window in which the machine shows what it was doing, because the
+        // compositor simply never composites it.
+        data.lock_after_resume(&lock_handle);
         data.reclaim_display(true);
     });
 
@@ -481,6 +507,49 @@ fn refresh_mhz(mode: &smithay::reexports::drm::control::Mode) -> i32 {
 }
 
 impl Udev {
+    /// Lock the session on the way back from a suspend.
+    ///
+    /// A laptop that sleeps when the lid closes and wakes showing the desktop
+    /// when it opens has a lock screen in name only, so this is not optional
+    /// and has no setting; see `theme::LOCK_SCREEN`.
+    ///
+    /// The timer is the safety catch described on `state::Lock`. The blank goes
+    /// up before `raven-lock` has connected -- that is the point of it -- so
+    /// something has to take the blank back down if the lock screen never
+    /// arrives. Without it, a machine whose `raven-lock` is present but broken
+    /// resumes into a black screen with no way past it but the power button.
+    fn lock_after_resume(&mut self, handle: &LoopHandle<'static, Udev>) {
+        /// How long the lock screen has to claim the session before the
+        /// compositor gives up on it. Generous: this covers a cold exec, a
+        /// Wayland connection and a socket round-trip to `ravend`, on a machine
+        /// that is a few hundred milliseconds out of suspend and still bringing
+        /// its disk back.
+        const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+
+        if self.state.is_locked() {
+            // Already held -- the machine was locked when it went to sleep.
+            // Nothing to do, and nothing to start: the lock screen suspended
+            // along with everything else and is still there.
+            return;
+        }
+
+        if !self.state.lock_and_launch() {
+            return;
+        }
+
+        let timer = Timer::from_duration(CLAIM_TIMEOUT);
+        if let Err(e) = handle.insert_source(timer, |_, _, data: &mut Udev| {
+            data.state.abandon_lock_if_unclaimed();
+            TimeoutAction::Drop
+        }) {
+            // The timer is the way out of a blank screen, so a session that
+            // cannot have one must not be blanked on a promise. Take it down
+            // now, while there is still something able to.
+            tracing::error!(error = %e, "cannot arm the lock timeout; unlocking again");
+            self.state.abandon_lock_if_unclaimed();
+        }
+    }
+
     /// Take the display back and repaint all of it.
     ///
     /// Two things arrive here: a VT switch handing the session back, and a
@@ -977,6 +1046,13 @@ impl Udev {
             }
             _ => {}
         }
+        // Somebody is here. Noted before the event is interpreted, because a
+        // keystroke that resolves to no binding and a pointer motion of one
+        // pixel are both a person at the machine — the idle lock counts
+        // presence, not commands. Device add and remove are excluded above:
+        // hardware appearing is not somebody using it.
+        self.state.note_activity();
+
         let InputEvent::Keyboard { event } = event else {
             // Motion, buttons and scroll all go to the shared handler, so the
             // udev and winit backends cannot drift apart.
@@ -994,6 +1070,7 @@ impl Udev {
         let launcher_open = self.state.launcher.is_open();
         let settings_open = self.state.settings.is_open();
         let resizing = self.state.resizing;
+        let locked = self.state.is_locked();
         let action = self
             .keyboard
             .input::<Option<Action>, _>(
@@ -1014,10 +1091,13 @@ impl Udev {
                             key_state,
                             modifiers,
                             sym.raw(),
-                            owns_super,
-                            launcher,
-                            settings_open,
-                            resizing,
+                            Modes {
+                                focus_owns_super: owns_super,
+                                launcher,
+                                settings_open,
+                                resizing,
+                                locked,
+                            },
                         )
                     }
                 },
@@ -1110,6 +1190,12 @@ impl Udev {
             Action::Launcher(key) => state.launcher_key(key),
             Action::Spawn => {
                 state.launch(None, &[state.terminal_command().to_owned()]);
+            }
+            // Nothing to do if it fails: `lock_and_launch` has already put the
+            // desktop back and said why in the log, and there is no message
+            // this compositor can put in front of somebody who just pressed it.
+            Action::Lock => {
+                state.lock_and_launch();
             }
         }
         self.state.arrange();

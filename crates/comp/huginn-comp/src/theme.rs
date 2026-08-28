@@ -122,6 +122,19 @@ pub(crate) const CAROUSEL_COLUMNS: u32 = 2;
 /// with extra steps, and §11 does not distinguish the two.
 pub(crate) const TERMINAL: &str = "raven-terminal";
 
+/// The lock screen the compositor puts up.
+///
+/// From RavenLogin rather than from this repo, and that is deliberate: it is
+/// the login screen's twin, drawn by the same code and authenticating against
+/// the same daemon. A lock screen that merely resembles the login screen is one
+/// that teaches its owner to type their password into things that look about
+/// right.
+///
+/// Named here with no override, for the reason [`TERMINAL`] gives. A
+/// configurable lock screen is a configurable answer to "what is allowed to ask
+/// me for my password", which is not a question that should have a knob.
+pub(crate) const LOCK_SCREEN: &str = "raven-lock";
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -57,6 +57,79 @@ impl Motion {
     }
 }
 
+/// How long the session waits before locking itself.
+///
+/// A closed set rather than a number, because this row is stepped with one key
+/// and there is nowhere to type into. The values are the ones people actually
+/// want: long enough to read a page, short enough to matter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum IdleAfter {
+    /// Never lock on idle. For a machine giving a presentation, or playing a
+    /// film — there is no idle-inhibit protocol here, so a video is
+    /// indistinguishable from an empty room and this is the only way to say
+    /// which it is.
+    Off,
+    Minutes5,
+    #[default]
+    Minutes10,
+    Minutes15,
+    Minutes30,
+}
+
+impl IdleAfter {
+    /// How long to wait, or `None` for never.
+    pub(crate) fn duration(self) -> Option<Duration> {
+        let minutes = match self {
+            Self::Off => return None,
+            Self::Minutes5 => 5,
+            Self::Minutes10 => 10,
+            Self::Minutes15 => 15,
+            Self::Minutes30 => 30,
+        };
+        Some(Duration::from_secs(minutes * 60))
+    }
+
+    /// What the row shows on its right.
+    ///
+    /// Paired with [`Self::from_value`] and tested to round-trip: the panel
+    /// stores a control's state inside the control and reads it back out
+    /// through its display string, so a label and its parse that disagree
+    /// would be a setting that silently reverts.
+    fn value(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Minutes5 => "5 min",
+            Self::Minutes10 => "10 min",
+            Self::Minutes15 => "15 min",
+            Self::Minutes30 => "30 min",
+        }
+    }
+
+    fn from_value(value: &str) -> Option<Self> {
+        [
+            Self::Off,
+            Self::Minutes5,
+            Self::Minutes10,
+            Self::Minutes15,
+            Self::Minutes30,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.value() == value)
+    }
+
+    /// The next setting, wrapping. Off comes last, so stepping through the
+    /// row does not pass through "never lock" on the way to a longer wait.
+    fn stepped(self) -> Self {
+        match self {
+            Self::Minutes5 => Self::Minutes10,
+            Self::Minutes10 => Self::Minutes15,
+            Self::Minutes15 => Self::Minutes30,
+            Self::Minutes30 => Self::Off,
+            Self::Off => Self::Minutes5,
+        }
+    }
+}
+
 /// A control's current reading, and whether it is real.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reading {
@@ -182,6 +255,28 @@ impl Control for Animations {
     }
 }
 
+/// The idle lock. Wired up, like [`Animations`] and unlike the rest.
+#[derive(Debug)]
+struct IdleLock {
+    after: IdleAfter,
+}
+
+impl Control for IdleLock {
+    fn label(&self) -> &str {
+        "Lock when idle"
+    }
+    fn read(&self) -> Reading {
+        Reading {
+            value: self.after.value().to_owned(),
+            real: true,
+        }
+    }
+    fn activate(&mut self) -> bool {
+        self.after = self.after.stepped();
+        true
+    }
+}
+
 /// What a keystroke means to the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Key {
@@ -233,6 +328,9 @@ impl Default for Settings {
                 Box::new(Animations {
                     motion: Motion::default(),
                 }),
+                Box::new(IdleLock {
+                    after: IdleAfter::default(),
+                }),
                 Box::new(Brightness { percent: 75 }),
                 Box::new(WiFi { on: true }),
                 Box::new(Bluetooth { on: false }),
@@ -271,6 +369,20 @@ impl Settings {
                 "Reduced" => Some(Motion::Reduced),
                 _ => Some(Motion::Full),
             })
+            .unwrap_or_default()
+    }
+
+    /// How long before the session locks itself, read from the control that
+    /// owns it.
+    ///
+    /// Same shape as [`Self::motion`]: the value lives in the control, because
+    /// a panel that keeps a second copy of what a row displays is a panel with
+    /// two answers to the same question.
+    pub(crate) fn idle_after(&self) -> IdleAfter {
+        self.controls
+            .iter()
+            .find(|c| c.label() == "Lock when idle")
+            .and_then(|c| IdleAfter::from_value(&c.read().value))
             .unwrap_or_default()
     }
 
@@ -495,6 +607,31 @@ mod tests {
         settings
     }
 
+    /// Where a row sits, by name.
+    ///
+    /// Tests used to index the control list directly, and adding a row in the
+    /// middle silently repointed three of them at the wrong control — a test
+    /// that still passed while checking something else entirely.
+    fn index_of(settings: &Settings, label: &str) -> usize {
+        settings
+            .controls
+            .iter()
+            .position(|c| c.label() == label)
+            .unwrap_or_else(|| panic!("no control labelled {label:?}"))
+    }
+
+    /// Move the highlight onto a row by name.
+    fn select(settings: &mut Settings, label: &str) {
+        let want = index_of(settings, label);
+        for _ in 0..settings.controls.len() {
+            if settings.selected == want {
+                return;
+            }
+            settings.press(Key::Down, T0);
+        }
+        panic!("could not reach {label:?}");
+    }
+
     #[test]
     fn opening_reveals_over_time_rather_than_appearing() {
         let settings = opened();
@@ -516,18 +653,93 @@ mod tests {
         assert!(!settings.is_visible(ms(500)));
     }
 
+    /// The panel keeps a control's state inside the control and reads it back
+    /// out through the string it displays, so a value and its parse that
+    /// disagree would be a setting that silently reverts to the default.
     #[test]
-    fn the_animations_switch_is_the_one_control_that_is_real() {
-        // Everything else is a stub and must say so, or the panel shows
-        // invented readings indistinguishable from measurements.
+    fn every_idle_setting_survives_the_round_trip() {
+        for after in [
+            IdleAfter::Off,
+            IdleAfter::Minutes5,
+            IdleAfter::Minutes10,
+            IdleAfter::Minutes15,
+            IdleAfter::Minutes30,
+        ] {
+            assert_eq!(IdleAfter::from_value(after.value()), Some(after));
+        }
+    }
+
+    #[test]
+    fn off_is_the_only_idle_setting_with_no_duration() {
+        assert_eq!(IdleAfter::Off.duration(), None);
+        assert_eq!(
+            IdleAfter::Minutes10.duration(),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    /// Stepping must not pass through "never lock" on the way to a longer
+    /// wait: somebody lengthening the timeout should not silently disable it
+    /// in passing, however briefly.
+    #[test]
+    fn stepping_reaches_off_only_at_the_end() {
+        // Off sits after the longest wait and before the shortest, so somebody
+        // stepping the row to lengthen the timeout never passes through
+        // "never lock" on the way — the setting is only ever turned off on
+        // purpose.
+        assert_eq!(IdleAfter::Minutes30.stepped(), IdleAfter::Off);
+        assert_eq!(IdleAfter::Off.stepped(), IdleAfter::Minutes5);
+
+        // And every setting is reachable: a row that could not be stepped back
+        // to where it started would be one somebody could not undo.
+        let mut seen = vec![IdleAfter::default()];
+        while seen.len() < 6 {
+            seen.push(seen[seen.len() - 1].stepped());
+        }
+        assert_eq!(seen[5], IdleAfter::default(), "the cycle must close");
+        for wanted in [
+            IdleAfter::Off,
+            IdleAfter::Minutes5,
+            IdleAfter::Minutes10,
+            IdleAfter::Minutes15,
+            IdleAfter::Minutes30,
+        ] {
+            assert!(
+                seen.contains(&wanted),
+                "{wanted:?} is unreachable: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_idle_row_is_wired_up_and_steps() {
+        let mut settings = opened();
+        assert_eq!(settings.idle_after(), IdleAfter::default());
+        select(&mut settings, "Lock when idle");
+        settings.press(Key::Activate, T0);
+        assert_ne!(
+            settings.idle_after(),
+            IdleAfter::default(),
+            "activating the row must change what the compositor reads"
+        );
+    }
+
+    #[test]
+    fn every_stub_admits_that_it_is_one() {
+        // A panel that shows invented readings indistinguishable from
+        // measurements is worse than one that admits it is not wired up, so
+        // the thing worth pinning is which rows claim to be real. Asserted as
+        // the stub list rather than the real one: a row wired up later should
+        // move off this list, and a row *added* as a stub without saying so
+        // should fail here.
         let settings = Settings::default();
-        let real: Vec<&str> = settings
+        let stubs: Vec<&str> = settings
             .controls
             .iter()
-            .filter(|c| c.read().real)
+            .filter(|c| !c.read().real)
             .map(|c| c.label())
             .collect();
-        assert_eq!(real, ["Animations"]);
+        assert_eq!(stubs, ["Brightness", "Wi-Fi", "Bluetooth"]);
     }
 
     #[test]
@@ -579,24 +791,26 @@ mod tests {
     #[test]
     fn activating_changes_only_the_highlighted_control() {
         let mut settings = opened();
-        settings.press(Key::Down, T0); // Brightness
+        select(&mut settings, "Brightness");
+        let brightness = index_of(&settings, "Brightness");
         let before: Vec<String> = settings.controls.iter().map(|c| c.read().value).collect();
         settings.press(Key::Activate, T0);
         let after: Vec<String> = settings.controls.iter().map(|c| c.read().value).collect();
         let changed: Vec<usize> = (0..before.len())
             .filter(|i| before[*i] != after[*i])
             .collect();
-        assert_eq!(changed, [1], "activation touched {changed:?}");
+        assert_eq!(changed, [brightness], "activation touched {changed:?}");
     }
 
     #[test]
     fn brightness_wraps_rather_than_sticking_at_full() {
         let mut settings = opened();
-        settings.press(Key::Down, T0);
+        select(&mut settings, "Brightness");
+        let brightness = index_of(&settings, "Brightness");
         let mut seen = Vec::new();
         for _ in 0..6 {
             settings.press(Key::Activate, T0);
-            seen.push(settings.controls[1].read().value.clone());
+            seen.push(settings.controls[brightness].read().value.clone());
         }
         assert!(seen.contains(&"100%".to_owned()));
         assert!(
