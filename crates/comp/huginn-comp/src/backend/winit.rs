@@ -35,7 +35,9 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
+            generic::Generic,
+            timer::{TimeoutAction, Timer},
         },
         wayland_server::{Display, protocol::wl_surface::WlSurface},
     },
@@ -83,6 +85,8 @@ struct Nested {
     cursor: Option<Cursor>,
     start: Instant,
     signal: LoopSignal,
+    /// The event loop, for arming the lock claim timeout from a keystroke.
+    handle: LoopHandle<'static, Nested>,
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -227,6 +231,7 @@ pub(crate) fn run() -> Result<()> {
         cursor,
         start: Instant::now(),
         signal,
+        handle: handle.clone(),
     };
 
     // NOTE: no SIGTERM handling. calloop's signal source needs its `signals`
@@ -247,6 +252,24 @@ pub(crate) fn run() -> Result<()> {
 }
 
 impl Nested {
+    /// Lock the session, with the same claim timeout the udev backend gives
+    /// it: a lock screen that never claims the blank must not leave a nested
+    /// window that can only be closed from outside.
+    fn lock_session(&mut self) {
+        const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+        if self.state.is_locked() || !self.state.lock_and_launch() {
+            return;
+        }
+        let timer = Timer::from_duration(CLAIM_TIMEOUT);
+        if let Err(e) = self.handle.insert_source(timer, |_, _, data: &mut Nested| {
+            data.state.abandon_lock_if_unclaimed();
+            TimeoutAction::Drop
+        }) {
+            tracing::error!(error = %e, "cannot arm the lock timeout; unlocking again");
+            self.state.abandon_lock_if_unclaimed();
+        }
+    }
+
     /// Render if anything asked us to, then flush.
     fn dispatch_end_of_cycle(&mut self) -> Result<()> {
         self.state.refresh();
@@ -524,7 +547,7 @@ impl Nested {
             // desktop back and said why in the log, and there is no message
             // this compositor can put in front of somebody who just pressed it.
             Action::Lock => {
-                state.lock_and_launch();
+                self.lock_session();
             }
         }
         self.state.arrange();
