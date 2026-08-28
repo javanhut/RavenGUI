@@ -30,6 +30,7 @@ use smithay::{
             render_elements,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+            utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
         },
         gles::{GlesRenderer, element::TextureShaderElement},
     },
@@ -51,6 +52,9 @@ render_elements! {
     pub(crate) HuginnElement<=GlesRenderer>;
     /// A client surface: window, panel, wallpaper.
     Surface = WaylandSurfaceRenderElement<GlesRenderer>,
+    /// A client surface transformed as part of a workspace preview card.
+    Workspace = RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
+    WorkspaceCard = RelocateRenderElement<RescaleRenderElement<SolidColorRenderElement>>,
     /// The cursor, when no client has supplied its own.
     Cursor = MemoryRenderBufferRenderElement<GlesRenderer>,
     /// One edge of the ring around the focused window.
@@ -158,6 +162,53 @@ pub(crate) fn elements(
                 .into_iter()
                 .map(HuginnElement::Surface),
             ),
+            SceneItem::WorkspaceSurface(surface, rect, transform) => {
+                let origin = Point::<i32, Logical>::from((rect.x(), rect.y()))
+                    .to_physical_precise_round::<f64, i32>(scale);
+                let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))
+                    .to_physical_precise_round::<f64, i32>(scale);
+                out.extend(
+                    render_elements_from_surface_tree(
+                        renderer,
+                        &surface,
+                        origin,
+                        scale,
+                        transform.alpha,
+                        Kind::Unspecified,
+                    )
+                    .into_iter()
+                    .map(|element| {
+                        RescaleRenderElement::from_element(
+                            element,
+                            (0, 0).into(),
+                            (transform.scale_x, transform.scale_y),
+                        )
+                    })
+                    .map(|element| {
+                        RelocateRenderElement::from_element(element, offset, Relocate::Relative)
+                    })
+                    .map(HuginnElement::Workspace),
+                );
+            }
+            SceneItem::WorkspaceCard(buffer, transform) => {
+                let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))
+                    .to_physical_precise_round::<f64, i32>(scale);
+                let element = SolidColorRenderElement::from_buffer(
+                    buffer,
+                    (0, 0),
+                    scale,
+                    transform.alpha,
+                    Kind::Unspecified,
+                );
+                let element = RescaleRenderElement::from_element(
+                    element,
+                    (0, 0).into(),
+                    (transform.scale_x, transform.scale_y),
+                );
+                out.push(HuginnElement::WorkspaceCard(
+                    RelocateRenderElement::from_element(element, offset, Relocate::Relative),
+                ));
+            }
             SceneItem::Overlay(buffer, rect, alpha) => {
                 // `size` scales the buffer and `alpha` fades it, both per
                 // frame and both free — which is what lets the launcher grow

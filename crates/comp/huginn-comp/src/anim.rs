@@ -170,6 +170,13 @@ pub(crate) const LAUNCHER_OPEN: Duration = Duration::from_millis(150);
 /// the right — not to be watched.
 pub(crate) const CAROUSEL_SLIDE: Duration = Duration::from_millis(170);
 
+/// Shrink the desktop into the workspace switcher quickly enough to stay
+/// attached to the gesture that summoned it.
+pub(crate) const WORKSPACE_CAROUSEL_OPEN: Duration = Duration::from_millis(150);
+
+/// Snap to the selected workspace and expand it back to the output.
+pub(crate) const WORKSPACE_CAROUSEL_CLOSE: Duration = Duration::from_millis(220);
+
 /// How long a panel takes to slide away. Shorter than opening: dismissing is
 /// an instruction that has already been given, and waiting for it to finish is
 /// waiting for nothing.

@@ -502,8 +502,7 @@ impl Nested {
             Action::Resize(dir) => state.resize_focused(dir),
             Action::LeaveResize => state.resizing = false,
             Action::ToggleCarousel => {
-                let layout = state.space.toggle_layout();
-                tracing::debug!(?layout, "workspace layout switched");
+                state.toggle_workspace_carousel();
             }
             Action::OpenSettings => {
                 let now = state.uptime();
