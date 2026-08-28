@@ -199,6 +199,14 @@ impl XwmHandler for Huginn {
         self.x11_resize_request();
     }
 
+    fn fullscreen_request(&mut self, _xwm: smithay::xwayland::xwm::XwmId, w: X11Surface) {
+        self.x11_fullscreen_request(&w, true);
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: smithay::xwayland::xwm::XwmId, w: X11Surface) {
+        self.x11_fullscreen_request(&w, false);
+    }
+
     fn move_request(&mut self, _xwm: smithay::xwayland::xwm::XwmId, _w: X11Surface, _button: u32) {
         self.x11_move_request();
     }
@@ -317,6 +325,14 @@ impl Huginn {
     /// layout owns geometry and there is no drag-to-resize. Doing nothing is
     /// the correct answer here, not a missing one.
     pub(crate) fn x11_resize_request(&mut self) {}
+
+    /// An X11 client asking for `_NET_WM_STATE_FULLSCREEN`, or asking out of
+    /// it. Same path as an XDG client: see [`Huginn::set_fullscreen`].
+    pub(crate) fn x11_fullscreen_request(&mut self, window: &X11Surface, on: bool) {
+        if let Some(id) = self.x11_window_id(window) {
+            self.set_fullscreen(id, on);
+        }
+    }
     pub(crate) fn x11_move_request(&mut self) {}
 }
 
@@ -459,6 +475,22 @@ macro_rules! impl_xwm_handler {
                     button,
                     edges,
                 );
+            }
+
+            fn fullscreen_request(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                w: smithay::xwayland::X11Surface,
+            ) {
+                smithay::xwayland::XwmHandler::fullscreen_request(&mut self.state, xwm, w);
+            }
+
+            fn unfullscreen_request(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                w: smithay::xwayland::X11Surface,
+            ) {
+                smithay::xwayland::XwmHandler::unfullscreen_request(&mut self.state, xwm, w);
             }
 
             fn move_request(

@@ -117,7 +117,7 @@ pub(crate) enum SceneItem<'a> {
     /// One edge of the ring around the focused window. Drawn by the compositor
     /// itself, so unlike a surface there is no client to click on or to send a
     /// frame callback to.
-    Ring(&'a SolidColorBuffer, Rect),
+    Ring(&'a SolidColorBuffer, Rect, f32),
     /// The keybinding overlay. Compositor-drawn like the ring, so it too is
     /// invisible to hit testing — clicks fall through it to whatever is
     /// underneath, which is right for something that is a label rather than a
@@ -438,6 +438,45 @@ pub(crate) struct Huginn {
     focus_ring: [SolidColorBuffer; 4],
     workspace_card: SolidColorBuffer,
     focus_ring_at: Option<[Rect; 4]>,
+    /// Which window the ring was last shown on, and when it appeared. The
+    /// ring is a cue that focus *moved*, not a permanent frame: it is shown
+    /// when the focused window changes and fades out shortly after. Tracked
+    /// by window rather than by rect so a relayout that shifts the focused
+    /// pane does not re-announce a focus that never changed.
+    focus_ring_shown: Option<(huginn_core::window::WindowId, std::time::Duration)>,
+}
+
+/// Where a window's *surface* goes so that its visible frame sits in the
+/// middle of `pane`.
+///
+/// The layout hands every window a pane and asks it to fill it, but what the
+/// client commits is its own business: an application with a fixed or
+/// clamped size comes back smaller than it was asked for, and one drawing its
+/// own shadows comes back with a margin around the frame. Painting the buffer
+/// with its corner at the pane's corner leaves both huddled top-left. So the
+/// frame — the xdg window geometry, or the whole buffer when the client set
+/// none — is centred in the pane, and the surface origin is wherever that
+/// puts it. Rendering, popups and hit-testing all read this one rect, so they
+/// cannot disagree about where the window is.
+///
+/// A frame larger than the pane is pinned to the pane's corner rather than
+/// centred: overflowing evenly on both sides would hide the title bar.
+pub(crate) fn place_in_pane(surface: &WlSurface, pane: Rect) -> Rect {
+    let mut frame = crate::popup::window_geometry(surface);
+    if frame.size.w <= 0 || frame.size.h <= 0 {
+        frame = smithay::desktop::utils::bbox_from_surface_tree(surface, (0, 0));
+    }
+    if frame.size.w <= 0 || frame.size.h <= 0 {
+        return pane;
+    }
+    let slack_x = (pane.w() - frame.size.w).max(0) / 2;
+    let slack_y = (pane.h() - frame.size.h).max(0) / 2;
+    Rect::from_xywh(
+        pane.x() + slack_x - frame.loc.x,
+        pane.y() + slack_y - frame.loc.y,
+        frame.size.w,
+        frame.size.h,
+    )
 }
 
 impl Huginn {
@@ -515,6 +554,7 @@ impl Huginn {
                 crate::theme::BACKGROUND.to_rgba_f32(),
             ),
             focus_ring_at: None,
+            focus_ring_shown: None,
             help: None,
             wallpaper: crate::wallpaper::Wallpaper::installed(),
             wallpaper_panel: None,
@@ -562,6 +602,7 @@ impl Huginn {
     /// Set the full output rectangle and reflow everything beneath it.
     pub(crate) fn set_output_area(&mut self, area: Rect) {
         self.output_area = area;
+        self.space.set_output(area);
         self.workspace_card.resize((area.w(), area.h()));
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
@@ -753,10 +794,22 @@ impl Huginn {
         }
         // A panel's own menu belongs directly on top of the panel, not on top
         // of everything, so each layer surface carries its popups with it.
+        //
+        // The `top` layer is where bars and docks live, and a fullscreen window
+        // goes over them: the layer-shell protocol says as much, and a video
+        // with a status bar across it is not full screen. The `overlay` layer
+        // stays above everything regardless — that is what it is for.
+        let fullscreen = self.has_fullscreen();
+        let mut top_layers = Vec::new();
         for layer in [Layer::Overlay, Layer::Top] {
             for (surface, rect) in self.layers_on(layer) {
-                out.extend(self.popups_of(surface.wl_surface(), rect));
-                out.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
+                let mut items = self.popups_of(surface.wl_surface(), rect);
+                items.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
+                if layer == Layer::Top && fullscreen {
+                    top_layers.extend(items);
+                } else {
+                    out.extend(items);
+                }
             }
         }
         // Override-redirect X11 windows: menus, tooltips, drag icons. They sit
@@ -797,7 +850,7 @@ impl Huginn {
             out.extend(
                 self.focus_ring()
                     .into_iter()
-                    .map(|(b, r)| SceneItem::Ring(b, r)),
+                    .map(|(b, r, a)| SceneItem::Ring(b, r, a)),
             );
             out.extend(
                 self.render_list()
@@ -805,6 +858,9 @@ impl Huginn {
                     .map(|(surface, r)| SceneItem::Surface(surface, r)),
             );
         }
+        // Top-layer panels displaced by a fullscreen window: behind it, but
+        // still above everything else, so the rest of the desktop is unchanged.
+        out.extend(top_layers);
         for layer in [Layer::Bottom, Layer::Background] {
             for (surface, rect) in self.layers_on(layer) {
                 out.extend(self.popups_of(surface.wl_surface(), rect));
@@ -1291,6 +1347,42 @@ impl Huginn {
         }
     }
 
+    /// Put `id` into or out of fullscreen: the core's geometry, the client's
+    /// `fullscreen` state, and the configure that carries both.
+    ///
+    /// The one path for every way a window can go fullscreen — a client asking
+    /// for itself, an X11 window setting `_NET_WM_STATE`, the app switcher
+    /// restoring one — so they cannot disagree about what fullscreen is: the
+    /// whole output, at the output's logical size, above the panels.
+    ///
+    /// The configure goes out unconditionally rather than through `arrange`'s
+    /// changed-only filter. A lone window with no panels already sits at the
+    /// output's size, so its geometry does not change on the way in; the state
+    /// still has to reach it or it never learns it is fullscreen.
+    pub(crate) fn set_fullscreen(&mut self, id: WindowId, on: bool) {
+        if !self.space.set_fullscreen(id, on) {
+            return;
+        }
+        tracing::debug!(window = id.raw(), on, "fullscreen");
+        if let Some(surface) = self.windows.get(&id) {
+            surface.set_fullscreen(on);
+        }
+        self.arrange();
+        if let Some(surface) = self.windows.get(&id) {
+            surface.send_configure();
+        }
+        self.refresh_focus();
+        self.refresh_dock();
+    }
+
+    /// The window an XDG toplevel belongs to.
+    fn xdg_window_id(&self, surface: &ToplevelSurface) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find(|(_, w)| w.as_xdg() == Some(surface))
+            .map(|(id, _)| *id)
+    }
+
     /// Put only the highlighted pane in the background, leaving the workspace usable.
     fn minimize_focused(&mut self) {
         let Some(id) = self.space.minimize_focused() else {
@@ -1357,18 +1449,7 @@ impl Huginn {
                 });
             if let Some(id) = minimized {
                 self.space.bring_to_active_workspace(id);
-                let area = self.space.area();
-                if let Some(window) = self.space.window_mut(id) {
-                    window.fullscreen(area);
-                }
-                if let Some(surface) = self.windows.get(&id) {
-                    surface.set_fullscreen(true);
-                }
-                self.arrange();
-                if let Some(surface) = self.windows.get(&id) {
-                    surface.send_configure();
-                }
-                self.refresh_focus();
+                self.set_fullscreen(id, true);
             }
         }
         self.refresh_dock();
@@ -1652,6 +1733,11 @@ impl Huginn {
             // to be asked for, or the motion happens with nothing drawing it.
             self.queue_redraw();
         }
+        if self.focus_ring_is_animating(now) {
+            // Same shape as the launcher: the alpha is read at draw time, so
+            // all the fade needs is frames. The last one paints it at zero.
+            self.queue_redraw();
+        }
     }
 
     /// Redraw the quick settings panel, or drop it once it has closed.
@@ -1757,6 +1843,38 @@ impl Huginn {
             buffer.resize((rect.w(), rect.h()));
         }
         self.focus_ring_at = rects;
+        // Start the ring's clock only when it lands on a different window.
+        // A ring that has already faded on this window stays faded.
+        let on = rects.and(self.space.focused());
+        match (on, self.focus_ring_shown) {
+            (None, _) => self.focus_ring_shown = None,
+            (Some(id), Some((shown_on, _))) if shown_on == id => {}
+            (Some(id), _) => self.focus_ring_shown = Some((id, self.uptime())),
+        }
+    }
+
+    /// How opaque the focus ring is right now: fully, for a moment after focus
+    /// moves, then fading to nothing.
+    fn focus_ring_alpha(&self, now: std::time::Duration) -> f32 {
+        let Some((_, shown_at)) = self.focus_ring_shown else {
+            return 0.0;
+        };
+        let since = now.saturating_sub(shown_at);
+        if since <= crate::anim::FOCUS_RING_HOLD {
+            return 1.0;
+        }
+        let fading = since - crate::anim::FOCUS_RING_HOLD;
+        let t = fading.as_secs_f32() / crate::anim::FOCUS_RING_FADE.as_secs_f32();
+        (1.0 - t).clamp(0.0, 1.0)
+    }
+
+    /// Whether the ring is still on its way out and needs frames to get there.
+    fn focus_ring_is_animating(&self, now: std::time::Duration) -> bool {
+        self.focus_ring_at.is_some()
+            && self.focus_ring_shown.is_some_and(|(_, shown_at)| {
+                now.saturating_sub(shown_at)
+                    < crate::anim::FOCUS_RING_HOLD + crate::anim::FOCUS_RING_FADE
+            })
     }
 
     /// Where the focus ring goes, or `None` when there should not be one.
@@ -1792,11 +1910,19 @@ impl Huginn {
 
     /// The focus ring's edges, each paired with the buffer that paints it.
     /// Empty when nothing is ringed.
-    fn focus_ring(&self) -> Vec<(&SolidColorBuffer, Rect)> {
+    fn focus_ring(&self) -> Vec<(&SolidColorBuffer, Rect, f32)> {
         let Some(rects) = self.focus_ring_at else {
             return Vec::new();
         };
-        self.focus_ring.iter().zip(rects).collect()
+        let alpha = self.focus_ring_alpha(self.uptime());
+        if alpha <= 0.0 {
+            return Vec::new();
+        }
+        self.focus_ring
+            .iter()
+            .zip(rects)
+            .map(|(b, r)| (b, r, alpha))
+            .collect()
     }
 
     /// Consume the redraw request, if there is one.
@@ -1880,8 +2006,9 @@ impl Huginn {
             })
             .filter_map(|id| {
                 let surface = self.windows.get(id)?.wl_surface()?;
-                let geometry = self.space.window(*id)?.geometry;
-                Some((surface, geometry))
+                let pane = self.space.window(*id)?.geometry;
+                let placed = place_in_pane(&surface, pane);
+                Some((surface, placed))
             })
             .collect()
     }
@@ -2335,13 +2462,25 @@ impl XdgShellHandler for Huginn {
         self.refresh_focus();
     }
 
+    /// A client asking to go fullscreen — F11 in a browser, a video player's
+    /// full-screen button, a game starting up.
+    ///
+    /// `output` is ignored: there is one output area, and that is what
+    /// fullscreen covers.
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        if let Some(id) = self.xdg_window_id(&surface) {
+            self.set_fullscreen(id, true);
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if let Some(id) = self.xdg_window_id(&surface) {
+            self.set_fullscreen(id, false);
+        }
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self
-            .windows
-            .iter()
-            .find(|(_, w)| w.as_xdg() == Some(&surface))
-            .map(|(id, _)| *id)
-        else {
+        let Some(id) = self.xdg_window_id(&surface) else {
             return;
         };
         self.windows.remove(&id);

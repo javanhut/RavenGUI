@@ -229,13 +229,13 @@ pub(crate) fn elements(
                     out.push(HuginnElement::Cursor(element));
                 }
             }
-            SceneItem::Ring(buffer, rect) => {
+            SceneItem::Ring(buffer, rect, alpha) => {
                 out.push(HuginnElement::Ring(SolidColorRenderElement::from_buffer(
                     buffer,
                     Point::<i32, Logical>::from((rect.x(), rect.y()))
                         .to_physical_precise_round::<f64, i32>(scale),
                     scale,
-                    1.0,
+                    alpha,
                     Kind::Unspecified,
                 )));
             }

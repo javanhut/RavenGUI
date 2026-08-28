@@ -59,6 +59,10 @@ pub struct Space {
     /// subtracted. Single-output for now; multi-output arrives with the udev
     /// backend, at which point this becomes a per-output field.
     area: Rect,
+    /// The whole output, before panels take anything. What a fullscreen
+    /// window covers: fullscreen means the screen, not the space between the
+    /// bars.
+    output: Rect,
     /// Space between tiled windows and around the edge of the pane.
     ///
     /// Held here rather than read from a constant so `huginn-core` keeps
@@ -104,6 +108,7 @@ impl Space {
                 .collect(),
             active: 0,
             area,
+            output: area,
             gap: DEFAULT_GAP,
             carousel_columns: strip::DEFAULT_COLUMNS,
             carousel_offset: None,
@@ -283,6 +288,32 @@ impl Space {
     /// output is resized. Call [`Self::arrange`] afterwards to apply it.
     pub fn set_area(&mut self, area: Rect) {
         self.area = area;
+    }
+
+    /// The whole output rectangle, which is what fullscreen covers.
+    pub const fn output(&self) -> Rect {
+        self.output
+    }
+
+    /// Update the whole output rectangle. Call [`Self::arrange`] afterwards.
+    pub fn set_output(&mut self, output: Rect) {
+        self.output = output;
+    }
+
+    /// Put `id` into or out of fullscreen, and report whether anything
+    /// changed. Call [`Self::arrange`] afterwards to apply it.
+    pub fn set_fullscreen(&mut self, id: WindowId, on: bool) -> bool {
+        let output = self.output;
+        let Some(window) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        let was = window.mode;
+        if on {
+            window.fullscreen(output);
+        } else {
+            window.unfullscreen();
+        }
+        window.mode != was
     }
 
     /// Register a new window on the active workspace and focus it.
@@ -476,6 +507,7 @@ impl Space {
     /// that as a resize and re-render.
     pub fn arrange(&mut self) -> Vec<(WindowId, Rect)> {
         let area = self.area;
+        let output = self.output;
         let ws = &self.workspaces[self.active];
 
         // Everything that owns a tile — which is everything except floating
@@ -569,7 +601,7 @@ impl Space {
             };
             let wanted = match win.mode {
                 WindowMode::Tiled => continue,
-                WindowMode::Fullscreen => area,
+                WindowMode::Fullscreen => output,
                 WindowMode::Floating => win.geometry.constrain_to(area),
                 WindowMode::Minimized => continue,
             };
@@ -689,11 +721,48 @@ mod tests {
         s.arrange();
         assert_eq!(s.window(a).expect("open").geometry, SCREEN);
 
-        s.window_mut(a)
-            .expect("open")
-            .unfullscreen(WindowMode::Tiled);
+        s.window_mut(a).expect("open").unfullscreen();
         s.arrange();
         assert_eq!(s.window(a).expect("open").geometry, tiled_geom);
+    }
+
+    #[test]
+    fn fullscreen_covers_the_output_not_the_area_between_panels() {
+        let mut s = space();
+        // A 40px top panel takes an exclusive zone; windows tile beneath it.
+        s.set_area(Rect::from_xywh(0, 40, 1920, 1040));
+        let a = s.open_window();
+        s.open_window();
+        s.arrange();
+        let tiled_geom = s.window(a).expect("open").geometry;
+        assert!(tiled_geom.y() >= 40, "tiled under the panel");
+
+        assert!(s.set_fullscreen(a, true));
+        s.arrange();
+        assert_eq!(
+            s.window(a).expect("open").geometry,
+            SCREEN,
+            "fullscreen is the whole screen, panel included"
+        );
+        assert!(!s.set_fullscreen(a, true), "already fullscreen");
+
+        assert!(s.set_fullscreen(a, false));
+        s.arrange();
+        assert_eq!(s.window(a).expect("open").geometry, tiled_geom);
+    }
+
+    #[test]
+    fn a_resized_output_moves_the_fullscreen_window_with_it() {
+        let mut s = space();
+        let a = s.open_window();
+        s.arrange();
+        s.set_fullscreen(a, true);
+        s.arrange();
+        let bigger = Rect::from_xywh(0, 0, 2560, 1440);
+        s.set_output(bigger);
+        s.set_area(bigger);
+        s.arrange();
+        assert_eq!(s.window(a).expect("open").geometry, bigger);
     }
 
     #[test]
