@@ -130,6 +130,9 @@ struct Udev {
     state: Huginn,
     display: Display<Huginn>,
     dh: DisplayHandle,
+    /// The event loop, for arming timers from inside a callback -- the lock
+    /// claim timeout is the one that needs it.
+    handle: LoopHandle<'static, Udev>,
     session: LibSeatSession,
     /// The GPU we are driving, as udev identifies it. Every udev event carries
     /// a device id and most of them are about something else.
@@ -346,13 +349,12 @@ pub(crate) fn run() -> Result<()> {
             let now = Instant::now();
             if data.state.idle_lock_due(now) {
                 tracing::info!("idle; locking the session");
-                data.state.lock_and_launch();
+                data.lock_session();
             }
             TimeoutAction::ToDuration(data.state.idle_check_in(now))
         })
         .map_err(|e| anyhow::anyhow!("idle timer: {e}"))?;
 
-    let lock_handle = handle.clone();
     crate::sleep::watch::<Udev, _>(&handle, move |data: &mut Udev| {
         // Locked *before* the display comes back, and that ordering is the
         // whole security of it. `reclaim_display` is what puts the next frame
@@ -360,7 +362,7 @@ pub(crate) fn run() -> Result<()> {
         // after a resume is the lock screen and never the desktop. There is no
         // window in which the machine shows what it was doing, because the
         // compositor simply never composites it.
-        data.lock_after_resume(&lock_handle);
+        data.lock_session();
         data.reclaim_display(true);
     });
 
@@ -380,6 +382,7 @@ pub(crate) fn run() -> Result<()> {
         state,
         display,
         dh,
+        handle: handle.clone(),
         session,
         device_id: node.dev_id(),
         manager,
@@ -507,18 +510,15 @@ fn refresh_mhz(mode: &smithay::reexports::drm::control::Mode) -> i32 {
 }
 
 impl Udev {
-    /// Lock the session on the way back from a suspend.
+    /// Lock the session: blank it, start the lock screen, and give the lock
+    /// screen a bounded time to claim the blank.
     ///
-    /// A laptop that sleeps when the lid closes and wakes showing the desktop
-    /// when it opens has a lock screen in name only, so this is not optional
-    /// and has no setting; see `theme::LOCK_SCREEN`.
-    ///
-    /// The timer is the safety catch described on `state::Lock`. The blank goes
-    /// up before `raven-lock` has connected -- that is the point of it -- so
-    /// something has to take the blank back down if the lock screen never
-    /// arrives. Without it, a machine whose `raven-lock` is present but broken
-    /// resumes into a black screen with no way past it but the power button.
-    fn lock_after_resume(&mut self, handle: &LoopHandle<'static, Udev>) {
+    /// Every way into a lock comes through here -- `Super`+`L`, the idle
+    /// timer, and the resume from suspend below -- so every one of them gets
+    /// the timeout. A lock screen that starts and then dies before it claims
+    /// the session must not leave a blank nobody can get past, and it makes
+    /// no difference which path put the blank up.
+    fn lock_session(&mut self) {
         /// How long the lock screen has to claim the session before the
         /// compositor gives up on it. Generous: this covers a cold exec, a
         /// Wayland connection and a socket round-trip to `ravend`, on a machine
@@ -527,9 +527,9 @@ impl Udev {
         const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 
         if self.state.is_locked() {
-            // Already held -- the machine was locked when it went to sleep.
-            // Nothing to do, and nothing to start: the lock screen suspended
-            // along with everything else and is still there.
+            // Already held -- locked before it went to sleep, or `Super`+`L`
+            // pressed twice. Nothing to do, and nothing to start: starting
+            // another lock screen would put one on top of itself.
             return;
         }
 
@@ -538,7 +538,7 @@ impl Udev {
         }
 
         let timer = Timer::from_duration(CLAIM_TIMEOUT);
-        if let Err(e) = handle.insert_source(timer, |_, _, data: &mut Udev| {
+        if let Err(e) = self.handle.insert_source(timer, |_, _, data: &mut Udev| {
             data.state.abandon_lock_if_unclaimed();
             TimeoutAction::Drop
         }) {
@@ -1191,7 +1191,7 @@ impl Udev {
             // desktop back and said why in the log, and there is no message
             // this compositor can put in front of somebody who just pressed it.
             Action::Lock => {
-                state.lock_and_launch();
+                self.lock_session();
             }
         }
         self.state.arrange();
