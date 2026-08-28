@@ -1028,6 +1028,20 @@ impl Huginn {
             return false;
         }
         tracing::info!("locking the session");
+        // The quick settings panel goes down with the session, disarmed. Its
+        // Power row stays armed until something stands it down, and the
+        // keymap forwards nothing to the panel while locked, so left open it
+        // would come back after the unlock exactly as it was: highlighted on
+        // Power, armed, one Return from a reboot. The person unlocking may
+        // not be the one who pressed Return before the idle timer fired, and
+        // Return is the key most people reach for to get rid of a panel they
+        // did not expect. Dismiss is the same path the panel's own key takes,
+        // so it disarms every row and leaves through the close animation.
+        let now = self.uptime();
+        let dismissed = self.settings.press(crate::settings::Key::Dismiss, now);
+        if dismissed == crate::settings::Outcome::Dismissed {
+            self.refresh_settings();
+        }
         self.lock = Some(Lock::default());
         self.refresh_focus();
         self.queue_redraw();
@@ -1819,6 +1833,17 @@ impl Huginn {
         });
         drop(volume);
         self.queue_redraw();
+    }
+
+    /// Open the quick settings panel.
+    ///
+    /// One entry point for the keybinding and for the shell's
+    /// `open_quick_settings` request, so that the two cannot drift: whatever
+    /// opening the panel comes to involve happens here, whichever side asked.
+    pub(crate) fn open_settings(&mut self) {
+        let now = self.uptime();
+        self.settings.open(now);
+        self.refresh_settings();
     }
 
     /// Redraw the quick settings panel, or drop it once it has closed.

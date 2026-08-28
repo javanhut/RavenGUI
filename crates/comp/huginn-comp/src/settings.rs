@@ -1280,6 +1280,166 @@ mod tests {
         );
     }
 
+    /// A panel whose Power row reports into `sent` instead of at the daemon.
+    fn with_recorder() -> (Settings, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut settings = Settings::with_power(
+            crate::audio::Volume::default().shared(),
+            Box::new(FakePower { sent: sent.clone() }),
+        );
+        settings.open(T0);
+        (settings, sent)
+    }
+
+    #[test]
+    fn the_power_row_is_last() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.controls.last().map(|c| c.label()),
+            Some("Power"),
+            "a stray Return at the top of the panel must not be a shutdown"
+        );
+    }
+
+    #[test]
+    fn power_steps_suspend_then_power_off_then_reboot_and_wraps() {
+        let mut settings = opened();
+        select(&mut settings, "Power");
+        let row = index_of(&settings, "Power");
+        let mut seen = vec![settings.controls[row].read().value.clone()];
+        for _ in 0..3 {
+            assert_eq!(settings.press(Key::Right, T0), Outcome::Redraw);
+            seen.push(settings.controls[row].read().value.clone());
+        }
+        assert_eq!(seen, ["Suspend", "Power off", "Reboot", "Suspend"]);
+        assert_eq!(PowerAction::Suspend.stepped(), PowerAction::PowerOff);
+        assert_eq!(PowerAction::PowerOff.stepped(), PowerAction::Reboot);
+        assert_eq!(PowerAction::Reboot.stepped(), PowerAction::Suspend);
+    }
+
+    #[test]
+    fn a_first_press_on_power_arms_and_sends_nothing() {
+        let (mut settings, sent) = with_recorder();
+        select(&mut settings, "Power");
+        let row = index_of(&settings, "Power");
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Redraw);
+        assert_eq!(settings.controls[row].read().value, "Suspend?");
+        assert!(settings.is_open(), "arming closed the panel");
+        assert!(
+            sent.borrow().is_empty(),
+            "a first press sent {:?}",
+            sent.borrow()
+        );
+    }
+
+    #[test]
+    fn moving_off_an_armed_power_row_disarms_it() {
+        let (mut settings, sent) = with_recorder();
+        select(&mut settings, "Power");
+        let row = index_of(&settings, "Power");
+        settings.press(Key::Activate, T0);
+        assert_eq!(settings.controls[row].read().value, "Suspend?");
+        // Power is the last row, so Down goes nowhere — and must still be a
+        // change of mind, because that is the key somebody stepping through
+        // the panel is holding.
+        assert_eq!(settings.press(Key::Down, T0), Outcome::Redraw);
+        assert_eq!(settings.controls[row].read().value, "Suspend");
+        settings.press(Key::Activate, T0);
+        assert_eq!(settings.press(Key::Up, T0), Outcome::Redraw);
+        assert_eq!(settings.controls[row].read().value, "Suspend");
+        // Back on the row, one Return is arming again, not confirming what
+        // was armed before the highlight left.
+        settings.press(Key::Down, T0);
+        settings.press(Key::Activate, T0);
+        assert!(
+            sent.borrow().is_empty(),
+            "a disarmed row still sent {:?}",
+            sent.borrow()
+        );
+        assert!(settings.is_open());
+    }
+
+    #[test]
+    fn dismissing_disarms_the_power_row() {
+        let (mut settings, sent) = with_recorder();
+        select(&mut settings, "Power");
+        let row = index_of(&settings, "Power");
+        settings.press(Key::Activate, T0);
+        assert_eq!(settings.press(Key::Dismiss, T0), Outcome::Dismissed);
+        settings.open(ms(10));
+        select(&mut settings, "Power");
+        assert_eq!(settings.controls[row].read().value, "Suspend");
+        settings.press(Key::Activate, ms(10));
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn two_presses_on_suspend_send_exactly_suspend_and_close_the_panel() {
+        let (mut settings, sent) = with_recorder();
+        select(&mut settings, "Power");
+        settings.press(Key::Activate, T0);
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Dismissed);
+        assert_eq!(*sent.borrow(), ["suspend"]);
+        assert!(!settings.is_open(), "the panel stayed up over a suspend");
+    }
+
+    #[test]
+    fn power_off_and_reboot_are_never_sent_by_a_first_press() {
+        for (steps, verb) in [(1, "poweroff"), (2, "reboot")] {
+            let (mut settings, sent) = with_recorder();
+            select(&mut settings, "Power");
+            for _ in 0..steps {
+                settings.press(Key::Right, T0);
+            }
+            settings.press(Key::Activate, T0);
+            assert!(sent.borrow().is_empty(), "{verb} went out on a first press");
+            settings.press(Key::Activate, T0);
+            assert_eq!(*sent.borrow(), [verb]);
+        }
+    }
+
+    #[test]
+    fn stepping_an_armed_power_row_disarms_it() {
+        let (mut settings, sent) = with_recorder();
+        select(&mut settings, "Power");
+        settings.press(Key::Activate, T0);
+        settings.press(Key::Right, T0);
+        settings.press(Key::Activate, T0);
+        assert!(
+            sent.borrow().is_empty(),
+            "changing the choice confirmed it: {:?}",
+            sent.borrow()
+        );
+    }
+
+    #[test]
+    fn a_refused_verb_is_shown_and_does_not_close_the_panel() {
+        #[derive(Debug)]
+        struct Refusing;
+        impl PowerSender for Refusing {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn send(&mut self, _: &str) -> std::io::Result<String> {
+                Ok("error: init unreachable".to_owned())
+            }
+        }
+        let mut settings =
+            Settings::with_power(crate::audio::Volume::default().shared(), Box::new(Refusing));
+        settings.open(T0);
+        select(&mut settings, "Power");
+        let row = index_of(&settings, "Power");
+        settings.press(Key::Activate, T0);
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Redraw);
+        assert!(settings.is_open());
+        assert_eq!(
+            settings.controls[row].read().value,
+            "error: init unreachable"
+        );
+        settings.press(Key::Up, T0);
+        assert_eq!(settings.controls[row].read().value, "Suspend");
+    }
+
     #[test]
     fn escape_closes_it() {
         let mut settings = opened();

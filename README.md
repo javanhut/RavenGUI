@@ -344,6 +344,19 @@ from an empty room. Off is placed after the longest wait and before the
 shortest, so stepping the row to lengthen the timeout never passes through
 "never lock" on the way.
 
+The last row is "Power", which suspends, powers off or reboots the machine by
+sending one word to raven-powerd's control socket — the desktop gets a verb
+into the daemon that already decides whether the machine may sleep, never a
+line into init. It is the one row that takes two presses. Every other row can
+be undone by pressing it again, but there is no undo for a reboot, and Return
+on the last row of a panel somebody was stepping through with the arrows is
+exactly the press that happens by accident. So the first Return arms the row,
+which shows as a question, and only the second sends; moving the highlight off
+the row, stepping the choice, or closing the panel stands it down. Suspend
+comes first and is the default because it is the one asked for daily and the
+cheapest to have asked for by mistake. A bar can open the panel too, over
+`raven_shell_v1`, so a click on a battery reading leads here.
+
 The udev/TTY backend drives real hardware: a libseat session, DRM/KMS scan-out
 through GBM, libinput, VT switching, and monitor hotplug. udev has no notion of
 a connector — plugging a monitor in shows up as a `Changed` event on the GPU's
