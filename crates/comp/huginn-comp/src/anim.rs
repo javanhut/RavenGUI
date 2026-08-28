@@ -182,6 +182,14 @@ pub(crate) const WORKSPACE_CAROUSEL_CLOSE: Duration = Duration::from_millis(220)
 /// waiting for nothing.
 pub(crate) const PANEL_CLOSE: Duration = Duration::from_millis(110);
 
+/// How long the focus ring stays fully visible after focus moves. Long enough
+/// to be seen without looking for it, short enough that it is gone before the
+/// eye has settled on the window it marked.
+pub(crate) const FOCUS_RING_HOLD: Duration = Duration::from_millis(700);
+
+/// How long the focus ring takes to fade out after its hold.
+pub(crate) const FOCUS_RING_FADE: Duration = Duration::from_millis(250);
+
 #[cfg(test)]
 mod tests {
     use super::*;

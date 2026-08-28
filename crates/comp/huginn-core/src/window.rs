@@ -65,8 +65,8 @@ pub struct Window {
     /// Geometry as the compositor last assigned it. For a tiled window this is
     /// overwritten on every arrange; for a floating one it is authoritative.
     pub geometry: Rect,
-    /// Geometry to restore when leaving fullscreen.
-    restore: Option<Rect>,
+    /// Geometry and mode to restore when leaving fullscreen.
+    restore: Option<(Rect, WindowMode)>,
     pub mode: WindowMode,
     pub hints: SizeHints,
     pub app_id: Option<String>,
@@ -117,27 +117,35 @@ impl Window {
         self.mode = WindowMode::Minimized;
     }
 
-    /// Enter fullscreen over `area`, remembering where to return to.
-    pub fn fullscreen(&mut self, area: Rect) {
+    /// Enter fullscreen over `output`, remembering where to return to.
+    ///
+    /// `output` is the whole output, not the area left after panels: a
+    /// fullscreen window covers the screen edge to edge.
+    pub fn fullscreen(&mut self, output: Rect) {
         if self.mode != WindowMode::Fullscreen {
-            self.restore = Some(self.geometry);
+            self.restore = Some((self.geometry, self.mode));
         }
         self.mode = WindowMode::Fullscreen;
-        self.geometry = area;
+        self.geometry = output;
     }
 
-    /// Leave fullscreen, restoring the pre-fullscreen geometry if there is one.
+    /// Leave fullscreen, going back to the mode and geometry it came from.
     ///
     /// A window that was tiled before going fullscreen returns to `Tiled` and
     /// the next arrange overwrites its geometry anyway; restoring it here keeps
-    /// the frame before that arrange from flashing at fullscreen size.
-    pub fn unfullscreen(&mut self, back_to: WindowMode) {
+    /// the frame before that arrange from flashing at fullscreen size. One
+    /// that was floating gets its old rect back for good. A window that was
+    /// never anything else — fullscreen from its first frame — is tiled.
+    pub fn unfullscreen(&mut self) {
         if self.mode != WindowMode::Fullscreen {
             return;
         }
-        self.mode = back_to;
-        if let Some(prev) = self.restore.take() {
-            self.geometry = prev;
+        match self.restore.take() {
+            Some((geometry, mode)) => {
+                self.geometry = geometry;
+                self.mode = mode;
+            }
+            None => self.mode = WindowMode::Tiled,
         }
     }
 }
@@ -160,8 +168,9 @@ mod tests {
         w.fullscreen(Rect::from_xywh(0, 0, 1920, 1080));
         assert_eq!(w.geometry, Rect::from_xywh(0, 0, 1920, 1080));
 
-        w.unfullscreen(WindowMode::Floating);
+        w.unfullscreen();
         assert_eq!(w.geometry, Rect::from_xywh(10, 10, 300, 200));
+        assert_eq!(w.mode, WindowMode::Floating);
     }
 
     #[test]
@@ -172,8 +181,9 @@ mod tests {
         // A client re-requesting fullscreen must not make the restore point
         // the fullscreen rect itself.
         w.fullscreen(Rect::from_xywh(0, 0, 2560, 1440));
-        w.unfullscreen(WindowMode::Tiled);
+        w.unfullscreen();
         assert_eq!(w.geometry, Rect::from_xywh(10, 10, 300, 200));
+        assert_eq!(w.mode, WindowMode::Tiled);
     }
 
     #[test]
