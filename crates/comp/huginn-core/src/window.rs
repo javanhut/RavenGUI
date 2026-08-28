@@ -117,6 +117,20 @@ impl Window {
         self.mode = WindowMode::Minimized;
     }
 
+    /// Bring a minimized window back into the layout as an ordinary tile.
+    ///
+    /// Restoring is not fullscreen: the window takes its place in the
+    /// workspace at whatever size the layout gives it, so the panels and the
+    /// client's own chrome (a browser's tab strip, say) stay usable. Returns
+    /// whether the window was minimized.
+    pub fn unminimize(&mut self) -> bool {
+        if self.mode != WindowMode::Minimized {
+            return false;
+        }
+        self.mode = WindowMode::Tiled;
+        true
+    }
+
     /// Enter fullscreen over `output`, remembering where to return to.
     ///
     /// `output` is the whole output, not the area left after panels: a

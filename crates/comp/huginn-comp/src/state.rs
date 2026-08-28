@@ -1423,7 +1423,12 @@ impl Huginn {
         self.refresh_focus();
     }
 
-    /// Restore the highlighted application and make its window fullscreen.
+    /// Restore the highlighted application into the current workspace.
+    ///
+    /// The window comes back as an ordinary tile filling the layout — not
+    /// fullscreen. Fullscreen tells the client it owns the whole screen, and a
+    /// browser answers by hiding its tab strip and chrome, which is not what
+    /// sliding an application back up from the bar means.
     fn accept_app_switcher(&mut self) {
         let Some(switcher) = self.app_switcher.take() else {
             return;
@@ -1449,7 +1454,15 @@ impl Huginn {
                 });
             if let Some(id) = minimized {
                 self.space.bring_to_active_workspace(id);
-                self.set_fullscreen(id, true);
+                self.space.unminimize(id);
+                if let Some(surface) = self.windows.get(&id) {
+                    surface.set_fullscreen(false);
+                }
+                self.arrange();
+                if let Some(surface) = self.windows.get(&id) {
+                    surface.send_configure();
+                }
+                self.refresh_focus();
             }
         }
         self.refresh_dock();

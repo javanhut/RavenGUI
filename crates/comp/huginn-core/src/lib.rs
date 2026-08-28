@@ -443,6 +443,12 @@ impl Space {
         Some(id)
     }
 
+    /// Bring a minimized window back into the layout, and report whether it
+    /// was minimized. Call [`Self::arrange`] afterwards to give it a tile.
+    pub fn unminimize(&mut self, id: WindowId) -> bool {
+        self.windows.get_mut(&id).is_some_and(Window::unminimize)
+    }
+
     /// Move an existing window into the active workspace and focus it.
     pub fn bring_to_active_workspace(&mut self, id: WindowId) -> bool {
         if !self.windows.contains_key(&id) {
@@ -1326,6 +1332,26 @@ mod tests {
                 "letting go at {stop} focused a pane at {geometry:?}, off screen"
             );
         }
+    }
+
+    #[test]
+    fn unminimizing_returns_the_pane_to_the_layout_as_a_tile() {
+        let mut s = space();
+        let first = s.open_window();
+        let second = s.open_window();
+        s.arrange();
+        assert_eq!(s.minimize_focused(), Some(second));
+        s.arrange();
+
+        assert!(s.unminimize(second));
+        assert!(!s.unminimize(second), "already restored");
+        s.bring_to_active_workspace(second);
+        s.arrange();
+        let restored = s.window(second).unwrap();
+        assert!(restored.is_tiled(), "restore is a tile, not fullscreen");
+        assert_ne!(restored.geometry, s.output(), "must not cover the output");
+        assert!(s.window(first).unwrap().geometry.right() <= restored.geometry.x());
+        assert_eq!(s.focused(), Some(second));
     }
 
     #[test]
