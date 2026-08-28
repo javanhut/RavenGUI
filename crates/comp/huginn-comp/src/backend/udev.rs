@@ -321,17 +321,22 @@ pub(crate) fn run() -> Result<()> {
             }
             SessionEvent::ActivateSession => {
                 tracing::info!("session activated; reclaiming devices");
-                if let Err(e) = data.manager.activate(false) {
-                    tracing::error!(error = %e, "could not reactivate DRM");
-                }
-                for screen in data.screens.values_mut() {
-                    screen.dirty = true;
-                    screen.awaiting_flip = false;
-                }
-                data.state.queue_redraw();
+                // We dropped DRM master on the way out and the connectors are
+                // as we left them, so there is no need to tear them down first.
+                data.reclaim_display(false);
             }
         })
         .map_err(|e| anyhow::anyhow!("session source: {e}"))?;
+
+    // Suspend. seatd has no equivalent of logind's PrepareForSleep, so this
+    // arrives as a change to a file raven-init writes; see `crate::sleep`.
+    // Nothing paused the session on the way into the suspend, which is exactly
+    // why the recovery has to be the heavier one: we still hold DRM master over
+    // a device whose state the firmware has been through, and only a full
+    // modeset can be trusted to put a picture back on the panel.
+    crate::sleep::watch::<Udev, _>(&handle, |data: &mut Udev| {
+        data.reclaim_display(true);
+    });
 
     // For the density the state starts with; `relayout` loads it again when
     // the first screen — or a different one — says otherwise.
@@ -476,6 +481,35 @@ fn refresh_mhz(mode: &smithay::reexports::drm::control::Mode) -> i32 {
 }
 
 impl Udev {
+    /// Take the display back and repaint all of it.
+    ///
+    /// Two things arrive here: a VT switch handing the session back, and a
+    /// resume from suspend. They differ in one argument and one assumption.
+    ///
+    /// `disable_connectors` asks smithay to tear the connectors down before
+    /// bringing them back up, which forces a full modeset rather than trusting
+    /// the state the device claims to be in. A VT switch does not need it —
+    /// we surrendered DRM master cleanly and took it back the same way. A
+    /// resume does: nothing surrendered anything, we held master straight
+    /// through a firmware transition, and what the device reports afterwards
+    /// is not necessarily what is actually programmed into it.
+    ///
+    /// Every screen is marked dirty either way. Whatever is in the scanout
+    /// buffer after either event is not something we put there.
+    fn reclaim_display(&mut self, disable_connectors: bool) {
+        if let Err(e) = self.manager.activate(disable_connectors) {
+            tracing::error!(error = %e, "could not reactivate DRM");
+        }
+        for screen in self.screens.values_mut() {
+            screen.dirty = true;
+            // A flip we were waiting on before the interruption will never
+            // complete. Left set, it would make every future frame look like
+            // one already in flight and nothing would ever be drawn again.
+            screen.awaiting_flip = false;
+        }
+        self.state.queue_redraw();
+    }
+
     /// A DRM device appeared, changed, or went away.
     ///
     /// Almost every event here is about a device we are not driving — udev
