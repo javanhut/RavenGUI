@@ -13,6 +13,7 @@
 mod anim;
 #[cfg(target_os = "linux")]
 mod appwatch;
+mod audio;
 #[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]

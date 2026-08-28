@@ -13,6 +13,9 @@
 //! and judged before any of that exists — and so the real ones swap in without
 //! the UI changing. What is fake says so on screen rather than pretending.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
 use huginn_core::geometry::Rect;
@@ -151,6 +154,77 @@ pub(crate) trait Control: std::fmt::Debug {
     fn read(&self) -> Reading;
     /// Act on the row. Returns whether anything changed.
     fn activate(&mut self) -> bool;
+    /// Nudge the row by `delta` steps, for the arrows. Returns whether
+    /// anything changed; most rows have nothing to nudge.
+    fn adjust(&mut self, _delta: i32) -> bool {
+        false
+    }
+    /// The row's position along a slider, 0..=1, if it is the kind of row
+    /// that has one. Drawn under the label; the reading stays on the right.
+    fn slider(&self) -> Option<f32> {
+        None
+    }
+    /// What time it is and whether the desktop animates, for the one row
+    /// that pops something up when it is moved. A switch has no use for
+    /// either, so the default is to ignore both.
+    fn set_clock(&mut self, _now: Duration, _motion: Motion) {}
+    /// Stand down anything the row had primed, because the highlight left
+    /// it or the panel went away. Returns whether there was anything to
+    /// stand down; most rows never arm, so the default is nothing.
+    fn disarm(&mut self) -> bool {
+        false
+    }
+    /// Whether the last [`Self::activate`] finished what the row is for, so
+    /// the panel should get out of the way rather than stay up waiting for
+    /// a next step. A toggle is never finished in that sense.
+    fn concluded(&self) -> bool {
+        false
+    }
+}
+
+/// The output volume. Real, through whatever [`crate::audio::Volume`] found.
+///
+/// Shares the compositor's own volume rather than keeping one, so the media
+/// keys and this row move the same number and the slider that pops up for
+/// the keys shows what this row shows.
+#[derive(Debug)]
+struct VolumeRow {
+    volume: crate::audio::Shared,
+    /// The clock, for the slider's reveal. The row is stepped from
+    /// [`Settings::press`], which has `now`; the control trait does not.
+    now: Duration,
+    motion: Motion,
+}
+
+impl Control for VolumeRow {
+    fn label(&self) -> &str {
+        "Volume"
+    }
+    fn read(&self) -> Reading {
+        let volume = self.volume.borrow();
+        Reading {
+            value: volume.level().caption(),
+            real: volume.is_real(),
+        }
+    }
+    fn activate(&mut self) -> bool {
+        self.volume.borrow_mut().toggle_mute(self.now, self.motion);
+        true
+    }
+    fn adjust(&mut self, delta: i32) -> bool {
+        let before = self.volume.borrow().level();
+        self.volume
+            .borrow_mut()
+            .adjust(delta * crate::audio::STEP as i32, self.now, self.motion);
+        self.volume.borrow().level() != before
+    }
+    fn slider(&self) -> Option<f32> {
+        Some(self.volume.borrow().level().fraction())
+    }
+    fn set_clock(&mut self, now: Duration, motion: Motion) {
+        self.now = now;
+        self.motion = motion;
+    }
 }
 
 /// Brightness, as a percentage.
@@ -277,11 +351,214 @@ impl Control for IdleLock {
     }
 }
 
+/// What the Power row can ask the machine to do.
+///
+/// A closed set stepped with one key, like [`IdleAfter`]. Suspend comes
+/// first and is the default because it is the one that is asked for daily and
+/// the one that is cheapest to have asked for by mistake: a suspended laptop
+/// is back in a second, a rebooted one is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PowerAction {
+    #[default]
+    Suspend,
+    PowerOff,
+    Reboot,
+}
+
+impl PowerAction {
+    /// What the row shows.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Suspend => "Suspend",
+            Self::PowerOff => "Power off",
+            Self::Reboot => "Reboot",
+        }
+    }
+
+    /// The word raven-powerd accepts on its control socket. Its vocabulary,
+    /// not ours: the daemon is the policy gatekeeper and this is a request.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Suspend => "suspend",
+            Self::PowerOff => "poweroff",
+            Self::Reboot => "reboot",
+        }
+    }
+
+    /// The next action, wrapping, in order of how much is lost by mistake.
+    fn stepped(self) -> Self {
+        match self {
+            Self::Suspend => Self::PowerOff,
+            Self::PowerOff => Self::Reboot,
+            Self::Reboot => Self::Suspend,
+        }
+    }
+}
+
+/// Where the Power row's verb goes.
+///
+/// A trait for the reason every other backend here is one: the real target is
+/// a socket that only exists on a Raven machine with raven-powerd running, and
+/// the thing worth testing — that a first press never sends anything and a
+/// second sends exactly one word — must be checkable on a machine that would
+/// actually reboot if the test got it wrong.
+pub(crate) trait PowerSender: std::fmt::Debug {
+    /// Whether there is anything on the other end right now.
+    fn is_available(&self) -> bool;
+    /// Send one verb and return the daemon's one-line reply.
+    fn send(&mut self, verb: &str) -> std::io::Result<String>;
+}
+
+/// raven-powerd's control socket for the desktop session.
+///
+/// Group-owned by `video`, which the session's user is already in for the
+/// display, so the compositor can reach it without any privilege it does not
+/// already hold. Init's own socket is a different file and stays root-only:
+/// the desktop gets a verb into the daemon that already decides whether the
+/// machine may sleep, never a line into PID 1.
+#[derive(Debug, Default)]
+struct PowerSocket;
+
+impl PowerSocket {
+    const PATH: &'static str = "/run/raven-power/ctl";
+}
+
+impl PowerSender for PowerSocket {
+    fn is_available(&self) -> bool {
+        // Asked at read time rather than remembered: the daemon may start
+        // after the compositor, and a row that decided at startup that it was
+        // a stub would stay one for the whole session.
+        Path::new(Self::PATH).exists()
+    }
+
+    fn send(&mut self, verb: &str) -> std::io::Result<String> {
+        let mut stream = UnixStream::connect(Self::PATH)?;
+        // The daemon replies before it acts, so a reply that takes long is a
+        // daemon that is wedged, and the compositor must not hang with it.
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(format!("{verb}\n").as_bytes())?;
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply)?;
+        Ok(reply.trim_end().to_owned())
+    }
+}
+
+/// A sender that records instead of sending, for tests.
+#[derive(Debug, Default)]
+struct FakePower {
+    sent: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+impl PowerSender for FakePower {
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn send(&mut self, verb: &str) -> std::io::Result<String> {
+        self.sent.borrow_mut().push(verb.to_owned());
+        Ok("ok".to_owned())
+    }
+}
+
+/// Suspend, power off or reboot, through raven-powerd.
+///
+/// Two presses, not one. Every other row here is safe to activate by accident
+/// — a toggle can be toggled back — but there is no undo for a reboot, and
+/// Return on the last row of a panel somebody was stepping through with the
+/// arrows is exactly the kind of press that happens by accident. So the first
+/// Activate arms the row, shown as a question, and only the second sends;
+/// moving off the row or dismissing the panel stands it down again.
+#[derive(Debug)]
+struct PowerRow {
+    action: PowerAction,
+    armed: bool,
+    /// The daemon's answer when it refused or could not be reached, shown in
+    /// place of the label until the highlight moves. Cleared on disarm.
+    error: Option<String>,
+    /// Set once a verb has gone out, so the panel closes behind it.
+    sent: bool,
+    sender: Box<dyn PowerSender>,
+}
+
+impl PowerRow {
+    fn new(sender: Box<dyn PowerSender>) -> Self {
+        Self {
+            action: PowerAction::default(),
+            armed: false,
+            error: None,
+            sent: false,
+            sender,
+        }
+    }
+}
+
+impl Control for PowerRow {
+    fn label(&self) -> &str {
+        "Power"
+    }
+    fn read(&self) -> Reading {
+        let value = match &self.error {
+            Some(error) => error.clone(),
+            None if self.armed => format!("{}?", self.action.label()),
+            None => self.action.label().to_owned(),
+        };
+        Reading {
+            value,
+            real: self.sender.is_available(),
+        }
+    }
+    fn activate(&mut self) -> bool {
+        self.sent = false;
+        if !self.armed {
+            self.armed = true;
+            self.error = None;
+            return true;
+        }
+        self.armed = false;
+        match self.sender.send(self.action.verb()) {
+            Ok(reply) if reply.starts_with("error") => {
+                tracing::warn!(verb = self.action.verb(), reply, "raven-powerd refused");
+                self.error = Some(reply);
+            }
+            Ok(reply) => {
+                tracing::info!(verb = self.action.verb(), reply, "asked raven-powerd");
+                self.sent = true;
+            }
+            Err(err) => {
+                tracing::warn!(verb = self.action.verb(), %err, "raven-powerd unreachable");
+                self.error = Some(format!("error: {err}"));
+            }
+        }
+        true
+    }
+    fn adjust(&mut self, delta: i32) -> bool {
+        // Stepping the choice is also a change of mind about the armed one.
+        self.armed = false;
+        self.error = None;
+        let steps = delta.rem_euclid(3);
+        for _ in 0..steps {
+            self.action = self.action.stepped();
+        }
+        steps != 0
+    }
+    fn disarm(&mut self) -> bool {
+        let was = self.armed || self.error.is_some();
+        self.armed = false;
+        self.error = None;
+        was
+    }
+    fn concluded(&self) -> bool {
+        self.sent
+    }
+}
+
 /// What a keystroke means to the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Key {
     Up,
     Down,
+    /// Nudge the highlighted control down or up, if it is a slider.
+    Left,
+    Right,
     /// Toggle or step the highlighted control.
     Activate,
     Dismiss,
@@ -295,6 +572,12 @@ impl Key {
             keysyms::KEY_Escape => Self::Dismiss,
             keysyms::KEY_Up | keysyms::KEY_k | keysyms::KEY_K => Self::Up,
             keysyms::KEY_Down | keysyms::KEY_j | keysyms::KEY_J => Self::Down,
+            keysyms::KEY_Left | keysyms::KEY_h | keysyms::KEY_H | keysyms::KEY_minus => Self::Left,
+            keysyms::KEY_Right
+            | keysyms::KEY_l
+            | keysyms::KEY_L
+            | keysyms::KEY_plus
+            | keysyms::KEY_equal => Self::Right,
             keysyms::KEY_Return | keysyms::KEY_KP_Enter | keysyms::KEY_space => Self::Activate,
             _ => Self::Ignored,
         }
@@ -320,11 +603,35 @@ pub(crate) struct Settings {
 }
 
 impl Default for Settings {
+    /// A panel with a volume of its own, connected to nothing. For tests;
+    /// the compositor builds one with [`Settings::new`] around its volume.
     fn default() -> Self {
+        Self::with_power(
+            crate::audio::Volume::default().shared(),
+            Box::new(FakePower::default()),
+        )
+    }
+}
+
+impl Settings {
+    /// The panel, with its volume row driving `volume` and its Power row
+    /// talking to raven-powerd.
+    pub(crate) fn new(volume: crate::audio::Shared) -> Self {
+        Self::with_power(volume, Box::new(PowerSocket))
+    }
+
+    /// The panel with a Power row that sends through `power`, so a test can
+    /// press Return on it without leaving the machine off.
+    fn with_power(volume: crate::audio::Shared, power: Box<dyn PowerSender>) -> Self {
         Self {
             open: false,
             selected: 0,
             controls: vec![
+                Box::new(VolumeRow {
+                    volume,
+                    now: Duration::ZERO,
+                    motion: Motion::default(),
+                }),
                 Box::new(Animations {
                     motion: Motion::default(),
                 }),
@@ -334,6 +641,10 @@ impl Default for Settings {
                 Box::new(Brightness { percent: 75 }),
                 Box::new(WiFi { on: true }),
                 Box::new(Bluetooth { on: false }),
+                // Last, so that stepping down through the panel arrives at it
+                // deliberately and a stray Return on the first row is a mute,
+                // not a shutdown.
+                Box::new(PowerRow::new(power)),
             ],
             reveal: Animated::settled(0.0),
         }
@@ -389,6 +700,12 @@ impl Settings {
     pub(crate) fn open(&mut self, now: Duration) {
         self.open = true;
         self.selected = 0;
+        // A row left armed when the panel was last closed must not still be
+        // armed when it comes back: the person opening it now may not be the
+        // one who pressed Return then.
+        for control in &mut self.controls {
+            control.disarm();
+        }
         let motion = self.motion();
         self.reveal.animate_to(
             1.0,
@@ -415,17 +732,53 @@ impl Settings {
         }
         match key {
             Key::Dismiss => {
+                for control in &mut self.controls {
+                    control.disarm();
+                }
                 self.close(now);
                 Outcome::Dismissed
             }
-            Key::Up => self.move_selection(-1),
-            Key::Down => self.move_selection(1),
+            Key::Up | Key::Down => {
+                // Leaving a row stands it down, even when the highlight is
+                // already at the end and has nowhere to go: the Power row is
+                // last, and Down on it must still be a change of mind.
+                let disarmed = self
+                    .controls
+                    .get_mut(self.selected)
+                    .is_some_and(|control| control.disarm());
+                let moved = self.move_selection(if key == Key::Up { -1 } else { 1 });
+                if disarmed || moved == Outcome::Redraw {
+                    Outcome::Redraw
+                } else {
+                    Outcome::Unchanged
+                }
+            }
+            Key::Left | Key::Right => {
+                let delta = if key == Key::Left { -1 } else { 1 };
+                self.sync_clock(now);
+                let Some(control) = self.controls.get_mut(self.selected) else {
+                    return Outcome::Unchanged;
+                };
+                if control.adjust(delta) {
+                    Outcome::Redraw
+                } else {
+                    Outcome::Unchanged
+                }
+            }
             Key::Activate => {
+                self.sync_clock(now);
                 let Some(control) = self.controls.get_mut(self.selected) else {
                     return Outcome::Unchanged;
                 };
                 if !control.activate() {
                     return Outcome::Unchanged;
+                }
+                if control.concluded() {
+                    // The machine is about to sleep or go down; a panel still
+                    // up over it would be the last thing on screen and the
+                    // first thing on resume.
+                    self.close(now);
+                    return Outcome::Dismissed;
                 }
                 // Turning animations off must take effect on the panel that
                 // turned them off, not on the next thing to animate — landing
@@ -437,6 +790,17 @@ impl Settings {
                 Outcome::Redraw
             }
             Key::Ignored => Outcome::Unchanged,
+        }
+    }
+
+    /// Tell the rows what time it is and whether the desktop animates, so
+    /// the slider the volume row pops up fades on the same clock as
+    /// everything else. Done before a row is acted on, not when the panel
+    /// opens: the animations switch can be flipped while it is open.
+    fn sync_clock(&mut self, now: Duration) {
+        let motion = self.motion();
+        for control in &mut self.controls {
+            control.set_clock(now, motion);
         }
     }
 
@@ -543,6 +907,60 @@ fn compose(
         }
 
         let text_y = (y + (row - size * 1.35) / 2.0) as i32;
+        // The value, right-aligned. A stub says so instead of showing a
+        // plausible reading nobody can tell is invented.
+        let shown = if reading.real {
+            reading.value.clone()
+        } else {
+            format!("{} · {STUB}", reading.value)
+        };
+        let value_w = text.measure(&shown, size * 0.95).0;
+        // A slider row draws its track between the label and the reading,
+        // so what the arrows move is visible as a bar rather than as a
+        // number changing.
+        if let Some(fraction) = control.slider() {
+            let track_h = 4.0 * scale;
+            let label_w = text.measure(control.label(), size).0;
+            let track_x = pad + 6.0 * scale + label_w + 14.0 * scale;
+            let track_end = width as f32 - pad - value_w - 14.0 * scale;
+            let track_w = track_end - track_x;
+            if track_w > track_h * 2.0 {
+                let track_y = y + row / 2.0 - track_h / 2.0;
+                canvas.fill_rounded(
+                    track_x as usize,
+                    track_y as usize,
+                    track_w as usize,
+                    track_h as usize,
+                    track_h / 2.0,
+                    crate::theme::BORDER,
+                );
+                let filled = (track_w * fraction.clamp(0.0, 1.0)).round();
+                if filled >= 1.0 {
+                    canvas.fill_rounded(
+                        track_x as usize,
+                        track_y as usize,
+                        filled as usize,
+                        track_h as usize,
+                        track_h / 2.0,
+                        crate::theme::ACCENT,
+                    );
+                }
+                let knob = 10.0 * scale;
+                let knob_x = (track_x + filled - knob / 2.0).clamp(track_x, track_end - knob);
+                canvas.fill_rounded(
+                    knob_x as usize,
+                    (track_y + track_h / 2.0 - knob / 2.0) as usize,
+                    knob as usize,
+                    knob as usize,
+                    knob / 2.0,
+                    if highlighted {
+                        crate::theme::TEXT
+                    } else {
+                        crate::theme::TEXT_DIM
+                    },
+                );
+            }
+        }
         text.draw(
             &mut canvas,
             control.label(),
@@ -556,14 +974,6 @@ fn compose(
             },
         );
 
-        // The value, right-aligned. A stub says so instead of showing a
-        // plausible reading nobody can tell is invented.
-        let shown = if reading.real {
-            reading.value.clone()
-        } else {
-            format!("{} · {STUB}", reading.value)
-        };
-        let value_w = text.measure(&shown, size * 0.95).0;
         text.draw(
             &mut canvas,
             &shown,
@@ -739,7 +1149,9 @@ mod tests {
             .filter(|c| !c.read().real)
             .map(|c| c.label())
             .collect();
-        assert_eq!(stubs, ["Brightness", "Wi-Fi", "Bluetooth"]);
+        // Volume is on the list only because a default panel has a silent
+        // mixer behind it; on a machine with PipeWire the row is real.
+        assert_eq!(stubs, ["Volume", "Brightness", "Wi-Fi", "Bluetooth"]);
     }
 
     #[test]
@@ -747,6 +1159,7 @@ mod tests {
         // Landing the change on the *next* interaction reads as the switch
         // having done nothing at all.
         let mut settings = opened();
+        select(&mut settings, "Animations");
         assert_eq!(settings.motion(), Motion::Full);
         assert_eq!(settings.press(Key::Activate, ms(10)), Outcome::Redraw);
         assert_eq!(settings.motion(), Motion::Reduced);
@@ -760,6 +1173,7 @@ mod tests {
     #[test]
     fn reduced_motion_makes_the_next_reveal_instant() {
         let mut settings = opened();
+        select(&mut settings, "Animations");
         settings.press(Key::Activate, ms(10));
         settings.close(ms(20));
         settings.open(ms(30));
@@ -816,6 +1230,53 @@ mod tests {
         assert!(
             seen.contains(&"0%".to_owned()),
             "it stuck at full: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_volume_row_is_a_slider_the_arrows_move() {
+        let mut settings = opened();
+        select(&mut settings, "Volume");
+        let row = index_of(&settings, "Volume");
+        let before = settings.controls[row]
+            .slider()
+            .expect("volume has a slider");
+        assert_eq!(settings.press(Key::Right, T0), Outcome::Redraw);
+        let after = settings.controls[row].slider().unwrap();
+        assert!(after > before, "Right did not turn it up");
+        assert_eq!(settings.press(Key::Left, T0), Outcome::Redraw);
+        assert!((settings.controls[row].slider().unwrap() - before).abs() < 1e-6);
+        // Return mutes, and a muted slider sits at nothing.
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Redraw);
+        assert_eq!(settings.controls[row].slider(), Some(0.0));
+        assert_eq!(settings.controls[row].read().value, "Muted");
+    }
+
+    #[test]
+    fn the_arrows_do_nothing_on_a_row_without_a_slider() {
+        let mut settings = opened();
+        select(&mut settings, "Animations");
+        assert_eq!(settings.press(Key::Right, T0), Outcome::Unchanged);
+        assert_eq!(settings.press(Key::Left, T0), Outcome::Unchanged);
+    }
+
+    /// The row and the media keys move one number, not two.
+    #[test]
+    fn the_volume_row_shares_the_compositors_volume() {
+        let volume = crate::audio::Volume::default().shared();
+        let mut settings = Settings::new(volume.clone());
+        settings.open(T0);
+        select(&mut settings, "Volume");
+        let row = index_of(&settings, "Volume");
+        volume
+            .borrow_mut()
+            .press(crate::audio::Key::Raise, T0, Motion::Full);
+        let level = volume.borrow().level();
+        assert_eq!(settings.controls[row].read().value, level.caption());
+        settings.press(Key::Right, T0);
+        assert_eq!(
+            volume.borrow().level().percent,
+            level.percent + crate::audio::STEP
         );
     }
 

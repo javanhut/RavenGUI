@@ -1184,6 +1184,10 @@ impl Udev {
             Action::OpenLauncher => state.open_launcher(),
             Action::Launcher(key) => state.launcher_key(key),
             Action::DismissSwitcher => state.dismiss_app_switcher(),
+            Action::Volume(key) => {
+                state.volume_key(key);
+                return;
+            }
             Action::Spawn => {
                 state.launch(None, &[state.terminal_command().to_owned()]);
             }

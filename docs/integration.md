@@ -176,6 +176,7 @@ client cannot receive or override them:
 | `Super+Shift+S` | open quick settings |
 | `Super+Shift+H` | show or hide the keybinding list |
 | `Super+Shift+Esc` | quit the compositor |
+| volume keys | raise, lower or mute the output volume |
 
 `Super+L` is the one chord on the plain `Super` layer that is never handed back.
 `Super+C` and `Super+V` are given to a client that drives `Super` itself, since
@@ -184,7 +185,13 @@ does nothing whenever a terminal happens to be focused fails at exactly the
 moment somebody walks away from a machine believing they locked it.
 
 While the session is locked no chord in this table resolves at all — every key
-goes to the lock screen, including `Super+Shift+Esc`.
+goes to the lock screen, including `Super+Shift+Esc`. The volume keys are the
+one exception: they act on the speakers rather than on the session, and they
+work whatever is open — the launcher, quick settings, or the lock screen. Each
+press shows a slider at the bottom of the screen for a moment; the level is set
+through `wpctl`, so it needs PipeWire, and the slider says "not connected" when
+there is none. The same level is a row in quick settings (`Super+Shift+S`),
+where the left and right arrows step it and `Return` mutes.
 
 The session also locks itself after a period with no input — ten minutes by
 default, changed or turned off from the "Lock when idle" row in quick settings

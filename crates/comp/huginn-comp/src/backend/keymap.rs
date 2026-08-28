@@ -86,6 +86,14 @@ pub(crate) enum Action {
     Launcher(crate::launcher::Key),
     /// Dismiss the temporary minimized-application switcher.
     DismissSwitcher,
+    /// A media key: raise, lower or mute the output volume.
+    ///
+    /// Resolved before every mode but the lock — and, unlike everything else
+    /// in this table, while locked too. The keys act on the speakers, not on
+    /// the session: the one thing somebody wants from a locked laptop that
+    /// has started playing something is for it to stop, and a mute key that
+    /// works only after the password is a mute key that arrives late.
+    Volume(crate::audio::Key),
 }
 
 /// What the compositor is already doing, which decides what a key means.
@@ -224,6 +232,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         chord: "Super+Shift+Esc",
         description: "quit the compositor",
     },
+    Binding {
+        action: Action::Volume(crate::audio::Key::Raise),
+        chord: "Volume keys",
+        description: "raise, lower or mute the volume",
+    },
 ];
 
 /// The startup log line, built from [`BINDINGS`] rather than written out again.
@@ -264,6 +277,14 @@ pub(crate) fn resolve(
     // *everything* when it is open, so a session locked with the launcher up
     // would forward not one keystroke to the lock screen: no password could be
     // typed, and the way out would be the power button.
+    // The media keys, whatever else is going on. Before the lock check, for
+    // the reason given on [`Action::Volume`], and before every panel: a
+    // launcher that swallowed the mute key would be a launcher you could not
+    // silence the machine through.
+    if let Some(key) = volume_key(sym) {
+        return FilterResult::Intercept(pressed(key_state, Action::Volume(key)));
+    }
+
     if mode.locked {
         return FilterResult::Forward;
     }
@@ -359,6 +380,22 @@ pub(crate) fn resolve(
         },
     };
     FilterResult::Intercept(pressed(key_state, action))
+}
+
+/// The media key a keysym names, if it is one.
+///
+/// These arrive without modifiers: on a laptop the volume keys are `Fn`
+/// chords that the firmware has already turned into the XF86 keysyms, and on
+/// a desktop keyboard they are keys of their own. Either way there is no
+/// `Super` to check for.
+fn volume_key(sym: u32) -> Option<crate::audio::Key> {
+    use crate::audio::Key;
+    match sym {
+        keysyms::KEY_XF86AudioRaiseVolume => Some(Key::Raise),
+        keysyms::KEY_XF86AudioLowerVolume => Some(Key::Lower),
+        keysyms::KEY_XF86AudioMute => Some(Key::ToggleMute),
+        _ => None,
+    }
 }
 
 /// The action, but only on the way down.
@@ -915,6 +952,13 @@ mod tests {
                 }
             }
         }
+        // The XF86 block, where the media keys live, sits well above the
+        // 16-bit keysyms and needs no modifier at all.
+        for sym in 0x1008_FF00..=0x1008_FFFF {
+            if let Some(action) = intercepted(ModifiersState::default(), sym) {
+                reachable.insert(discriminant(&action));
+            }
+        }
 
         let documented: HashSet<_> = BINDINGS.iter().map(|b| discriminant(&b.action)).collect();
 
@@ -933,6 +977,78 @@ mod tests {
             "an action is reachable by a key but missing from BINDINGS, so the \
              overlay and the log line will not mention it"
         );
+    }
+
+    #[test]
+    fn the_media_keys_need_no_modifier() {
+        use crate::audio::Key;
+        let none = ModifiersState::default();
+        assert_eq!(
+            intercepted(none, keysyms::KEY_XF86AudioRaiseVolume),
+            Some(Action::Volume(Key::Raise))
+        );
+        assert_eq!(
+            intercepted(none, keysyms::KEY_XF86AudioLowerVolume),
+            Some(Action::Volume(Key::Lower))
+        );
+        assert_eq!(
+            intercepted(none, keysyms::KEY_XF86AudioMute),
+            Some(Action::Volume(Key::ToggleMute))
+        );
+    }
+
+    /// Every panel swallows every key while it is open, and the lock forwards
+    /// every key to the lock screen. The mute key is the one thing that has
+    /// to get through all of them.
+    #[test]
+    fn the_media_keys_work_whatever_is_open() {
+        use crate::audio::Key;
+        let sym = keysyms::KEY_XF86AudioMute;
+        let modes = [
+            Modes {
+                locked: true,
+                ..Modes::default()
+            },
+            Modes {
+                launcher: Some(None),
+                ..Modes::default()
+            },
+            Modes {
+                settings_open: true,
+                ..Modes::default()
+            },
+            Modes {
+                switcher_open: true,
+                ..Modes::default()
+            },
+            Modes {
+                resizing: true,
+                ..Modes::default()
+            },
+            Modes {
+                focus_owns_super: true,
+                ..Modes::default()
+            },
+        ];
+        for mode in modes {
+            assert!(
+                matches!(
+                    resolve(KeyState::Pressed, &ModifiersState::default(), sym, mode),
+                    FilterResult::Intercept(Some(Action::Volume(Key::ToggleMute)))
+                ),
+                "mute did not resolve under {mode:?}"
+            );
+        }
+        // And the release is swallowed with its press, like every binding.
+        assert!(matches!(
+            resolve(
+                KeyState::Released,
+                &ModifiersState::default(),
+                sym,
+                Modes::default()
+            ),
+            FilterResult::Intercept(None)
+        ));
     }
 
     /// The overlay draws with an ASCII bitmap font, so a chord or description

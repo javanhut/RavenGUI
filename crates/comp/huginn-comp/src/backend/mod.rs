@@ -141,7 +141,7 @@ pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) -> 
 ///
 /// The thread is blocked in `waitpid` rather than spinning, and it ends when
 /// the application does.
-fn reap(mut child: std::process::Child, program: &str) {
+pub(crate) fn reap(mut child: std::process::Child, program: &str) {
     // Owned separately rather than shadowing: the closure takes this one, and
     // the failure branch below still needs the caller's.
     let name = program.to_string();
