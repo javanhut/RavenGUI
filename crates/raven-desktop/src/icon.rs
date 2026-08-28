@@ -63,9 +63,7 @@ impl ThemeDir {
             // scalable directory at its declared MinSize or MaxSize, which for
             // an SVG-only theme means finding no icon at all.
             SizeKind::Scalable => self.min <= size && size <= self.max,
-            SizeKind::Threshold => {
-                self.size.abs_diff(size) <= self.threshold
-            }
+            SizeKind::Threshold => self.size.abs_diff(size) <= self.threshold,
         }
     }
 
@@ -434,7 +432,11 @@ Context=Applications
         let found = tree.icons("hicolor").find("raven-terminal", 48, 1);
         assert_eq!(
             found.as_deref(),
-            Some(tree.0.join("hicolor/scalable/apps/raven-terminal.svg").as_path()),
+            Some(
+                tree.0
+                    .join("hicolor/scalable/apps/raven-terminal.svg")
+                    .as_path()
+            ),
             "the scalable SVG was not found at 48px"
         );
     }
@@ -571,8 +573,14 @@ Context=Applications
         .icon("hidpi/32x32/apps/app.png")
         .icon("hidpi/32x32@2/apps/app.png");
         let icons = tree.icons("hidpi");
-        assert_eq!(icons.find("app", 32, 1), Some(tree.0.join("hidpi/32x32/apps/app.png")));
-        assert_eq!(icons.find("app", 32, 2), Some(tree.0.join("hidpi/32x32@2/apps/app.png")));
+        assert_eq!(
+            icons.find("app", 32, 1),
+            Some(tree.0.join("hidpi/32x32/apps/app.png"))
+        );
+        assert_eq!(
+            icons.find("app", 32, 2),
+            Some(tree.0.join("hidpi/32x32@2/apps/app.png"))
+        );
     }
 
     #[test]
@@ -602,8 +610,14 @@ Context=Applications
 
         // User base first, as default_bases orders them.
         let icons = Icons::with_bases("hicolor", vec![user.0.clone(), system.0.clone()]);
-        assert!(icons.find("app", 48, 1).is_some(), "system icon unreachable");
-        assert!(icons.find("override", 48, 1).is_some(), "user icon unreachable");
+        assert!(
+            icons.find("app", 48, 1).is_some(),
+            "system icon unreachable"
+        );
+        assert!(
+            icons.find("override", 48, 1).is_some(),
+            "user icon unreachable"
+        );
     }
 
     #[test]
@@ -627,8 +641,14 @@ Context=Applications
     #[test]
     fn the_default_bases_put_the_user_first_and_include_pixmaps() {
         let bases = default_bases();
-        let position = |needle: &str| bases.iter().position(|b| b.to_string_lossy().contains(needle));
-        if let (Some(user), Some(system)) = (position(".local/share/icons"), position("/usr/share/icons")) {
+        let position = |needle: &str| {
+            bases
+                .iter()
+                .position(|b| b.to_string_lossy().contains(needle))
+        };
+        if let (Some(user), Some(system)) =
+            (position(".local/share/icons"), position("/usr/share/icons"))
+        {
             assert!(user < system, "system icons would shadow user icons");
         }
         assert!(position("pixmaps").is_some(), "legacy pixmaps not searched");

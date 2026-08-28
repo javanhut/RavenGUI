@@ -11,9 +11,9 @@
 //! membership list and each window's mode every time the layout runs, which
 //! turns a missed update from a wrong layout into nothing at all.
 
+use crate::geometry::Rect;
 use crate::tiles::Tiles;
 use crate::window::WindowId;
-use crate::geometry::Rect;
 
 /// Opaque handle to a workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -477,7 +477,11 @@ mod tests {
         // Focus is on id(3), now in the first tile. Next on screen is id(2).
         assert_eq!(w.cycle_focus(Direction::Forward), Some(id(2)));
         assert_eq!(w.cycle_focus(Direction::Forward), Some(id(1)));
-        assert_eq!(w.cycle_focus(Direction::Forward), Some(id(3)), "should wrap");
+        assert_eq!(
+            w.cycle_focus(Direction::Forward),
+            Some(id(3)),
+            "should wrap"
+        );
     }
 
     #[test]
@@ -489,7 +493,10 @@ mod tests {
         w.focus(id(1));
         let seen: Vec<Option<WindowId>> =
             (0..3).map(|_| w.cycle_focus(Direction::Forward)).collect();
-        assert!(seen.contains(&Some(id(3))), "the floating window was unreachable: {seen:?}");
+        assert!(
+            seen.contains(&Some(id(3))),
+            "the floating window was unreachable: {seen:?}"
+        );
     }
 
     #[test]

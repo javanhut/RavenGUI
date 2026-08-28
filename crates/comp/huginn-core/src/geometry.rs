@@ -251,7 +251,12 @@ mod tests {
 
     #[test]
     fn a_zero_width_ring_is_four_empty_rects() {
-        assert!(Rect::from_xywh(0, 0, 10, 10).ring(0).iter().all(|e| e.is_empty()));
+        assert!(
+            Rect::from_xywh(0, 0, 10, 10)
+                .ring(0)
+                .iter()
+                .all(|e| e.is_empty())
+        );
     }
 
     #[test]

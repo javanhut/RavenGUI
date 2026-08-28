@@ -70,7 +70,10 @@ impl Huginn {
             .dmabuf_state
             .create_global_with_default_feedback::<Self>(dh, &feedback);
         self.dmabuf_global = Some(global);
-        tracing::info!(formats = count, "dmabuf enabled; clients can use hardware buffers");
+        tracing::info!(
+            formats = count,
+            "dmabuf enabled; clients can use hardware buffers"
+        );
     }
 
     /// Take the queued imports so the backend can validate them.
@@ -105,7 +108,12 @@ impl DmabufHandler for Huginn {
         &mut self.dmabuf_state
     }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
         // Queue rather than answer now: validating means importing, and the
         // renderer is not reachable from here. The backend drains this next
         // frame and answers the notifier either way.

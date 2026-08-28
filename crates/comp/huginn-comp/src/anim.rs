@@ -189,8 +189,16 @@ mod tests {
     fn every_curve_starts_at_zero_and_ends_at_one() {
         // A curve that does not is a value that jumps at one end or never
         // arrives at the other.
-        for curve in [Curve::Linear, Curve::EaseOut, Curve::EaseInOut, Curve::Spring] {
-            assert!(curve.ease(0.0).abs() < 1e-5, "{curve:?} does not start at 0");
+        for curve in [
+            Curve::Linear,
+            Curve::EaseOut,
+            Curve::EaseInOut,
+            Curve::Spring,
+        ] {
+            assert!(
+                curve.ease(0.0).abs() < 1e-5,
+                "{curve:?} does not start at 0"
+            );
             assert!(
                 (curve.ease(1.0) - 1.0).abs() < 1e-5,
                 "{curve:?} does not end at 1"

@@ -17,9 +17,7 @@
 //! [`Text::new`] scans the system's font directories, which takes on the order
 //! of a hundred milliseconds. It is built once and kept, never per draw.
 
-use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
-};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 
 use crate::theme::Color;
 
@@ -35,7 +33,9 @@ impl std::fmt::Debug for Text {
     /// `FontSystem` and `SwashCache` are large and not `Debug`; printing the
     /// whole font database in a state dump helps nobody.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Text").field("usable", &self.usable).finish()
+        f.debug_struct("Text")
+            .field("usable", &self.usable)
+            .finish()
     }
 }
 
@@ -49,9 +49,7 @@ impl Text {
         // draw becomes a no-op.
         let usable = !fonts.db().is_empty();
         if !usable {
-            tracing::error!(
-                "no fonts found; the shell will draw no text. Install a font package."
-            );
+            tracing::error!("no fonts found; the shell will draw no text. Install a font package.");
         } else {
             tracing::debug!(faces = fonts.db().len(), "fonts loaded");
         }
@@ -80,7 +78,9 @@ impl Text {
         buffer.set_size(width, None);
         buffer.set_text(
             text,
-            &Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL),
+            &Attrs::new()
+                .family(Family::SansSerif)
+                .weight(Weight::NORMAL),
             // Advanced shaping: ligatures, kerning, and the reordering that
             // scripts like Devanagari need. The cheaper mode is only correct
             // for text that happens to be Latin, which the name of an
@@ -150,12 +150,7 @@ impl Text {
                 {
                     for (column, coverage) in chunk.iter().enumerate() {
                         if *coverage > 0 {
-                            surface.blend(
-                                left + column as i32,
-                                top + row as i32,
-                                color,
-                                *coverage,
-                            );
+                            surface.blend(left + column as i32, top + row as i32, color, *coverage);
                         }
                     }
                 }
@@ -221,7 +216,11 @@ mod tests {
         };
         let mut surface = Recorder::new(400, 60);
         text.draw(&mut surface, "Raven", 24.0, 4, 4, crate::theme::TEXT);
-        assert!(surface.covered() > 50, "only {} pixels drawn", surface.covered());
+        assert!(
+            surface.covered() > 50,
+            "only {} pixels drawn",
+            surface.covered()
+        );
     }
 
     #[test]
@@ -231,8 +230,22 @@ mod tests {
             return;
         };
         let mut surface = Recorder::new(20, 20);
-        text.draw(&mut surface, "overflowing text", 40.0, -30, -10, crate::theme::TEXT);
-        text.draw(&mut surface, "overflowing text", 40.0, 15, 15, crate::theme::TEXT);
+        text.draw(
+            &mut surface,
+            "overflowing text",
+            40.0,
+            -30,
+            -10,
+            crate::theme::TEXT,
+        );
+        text.draw(
+            &mut surface,
+            "overflowing text",
+            40.0,
+            15,
+            15,
+            crate::theme::TEXT,
+        );
     }
 
     #[test]
@@ -279,7 +292,14 @@ mod tests {
         assert!(width > 0.0 && height > 0.0, "measured {width}x{height}");
 
         let mut surface = Recorder::new(800, 100);
-        text.draw(&mut surface, "Raven Terminal", 24.0, 0, 0, crate::theme::TEXT);
+        text.draw(
+            &mut surface,
+            "Raven Terminal",
+            24.0,
+            0,
+            0,
+            crate::theme::TEXT,
+        );
         let drawn = surface.rightmost().unwrap_or(0);
         // Within a few pixels: the measure is the advance, the drawing is ink,
         // and the last glyph's ink stops short of its advance.

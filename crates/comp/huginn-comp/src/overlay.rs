@@ -31,7 +31,9 @@ const OVERLAY_ALPHA: u8 = 0xF2;
 // The palette, resolved from the one theme at compile time. There is nothing
 // to vary: the desktop ships one look, so this is a constant rather than a
 // value threaded down from a caller.
-const BG: [u8; 4] = crate::theme::BACKGROUND.with_alpha(OVERLAY_ALPHA).to_rgba_bytes();
+const BG: [u8; 4] = crate::theme::BACKGROUND
+    .with_alpha(OVERLAY_ALPHA)
+    .to_rgba_bytes();
 const BORDER: [u8; 4] = crate::theme::BORDER.to_rgba_bytes();
 
 const TITLE: &str = "Huginn keybindings";
@@ -100,7 +102,7 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
         + rule + line_gap          // rule
         + rows * (line + line_gap) // bindings
         + line_gap
-        + line)                    // footer
+        + line) // footer
         .ceil() as usize;
 
     let mut canvas = Canvas::new(w, h);
@@ -108,13 +110,33 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
     canvas.frame(BORDER);
 
     let mut y = pad;
-    text.draw(&mut canvas, TITLE, size, pad as i32, y as i32, crate::theme::ACCENT);
+    text.draw(
+        &mut canvas,
+        TITLE,
+        size,
+        pad as i32,
+        y as i32,
+        crate::theme::ACCENT,
+    );
     y += line + line_gap;
-    canvas.fill(pad as usize, y as usize, body_w as usize, rule as usize, BORDER);
+    canvas.fill(
+        pad as usize,
+        y as usize,
+        body_w as usize,
+        rule as usize,
+        BORDER,
+    );
     y += rule + line_gap;
 
     for binding in BINDINGS {
-        text.draw(&mut canvas, binding.chord, size, pad as i32, y as i32, crate::theme::ACCENT);
+        text.draw(
+            &mut canvas,
+            binding.chord,
+            size,
+            pad as i32,
+            y as i32,
+            crate::theme::ACCENT,
+        );
         text.draw(
             &mut canvas,
             binding.description,
@@ -126,7 +148,14 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
         y += line + line_gap;
     }
     y += line_gap;
-    text.draw(&mut canvas, FOOTER, size, pad as i32, y as i32, crate::theme::TEXT_DIM);
+    text.draw(
+        &mut canvas,
+        FOOTER,
+        size,
+        pad as i32,
+        y as i32,
+        crate::theme::TEXT_DIM,
+    );
 
     canvas
 }
@@ -141,9 +170,18 @@ mod tests {
         let overlay = Overlay::render(output, &mut Text::new(), 1);
         let at = overlay.placement(output);
         // Integer division leaves an odd screen a pixel wider on one side.
-        assert!((output.w() - (at.x() * 2 + at.w())).abs() <= 1, "not horizontally centred");
-        assert!((output.h() - (at.y() * 2 + at.h())).abs() <= 1, "not vertically centred");
-        assert!(at.w() <= output.w() && at.h() <= output.h(), "wider than the screen");
+        assert!(
+            (output.w() - (at.x() * 2 + at.w())).abs() <= 1,
+            "not horizontally centred"
+        );
+        assert!(
+            (output.h() - (at.y() * 2 + at.h())).abs() <= 1,
+            "not vertically centred"
+        );
+        assert!(
+            at.w() <= output.w() && at.h() <= output.h(),
+            "wider than the screen"
+        );
     }
 
     #[test]
@@ -210,7 +248,10 @@ mod tests {
         }
         let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let clear = canvas.pixels.chunks_exact(4).filter(|p| p[3] == 0).count();
-        assert_eq!(clear, 0, "{clear} fully transparent pixels inside the panel");
+        assert_eq!(
+            clear, 0,
+            "{clear} fully transparent pixels inside the panel"
+        );
     }
 
     #[test]
@@ -232,7 +273,10 @@ mod tests {
                 p[0] > BG[0].min(accent[0]) && p[0] < BG[0].max(accent[0]) && p[0] != BG[0]
             })
             .count();
-        assert!(partial > 0, "no partially-covered pixels; text is not antialiased");
+        assert!(
+            partial > 0,
+            "no partially-covered pixels; text is not antialiased"
+        );
     }
 
     #[test]
@@ -245,7 +289,10 @@ mod tests {
         }
         let small = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let large = compose(Rect::from_xywh(0, 0, 3840, 2160), &mut text, 1);
-        assert!(large.height > small.height, "panel did not grow with the output");
+        assert!(
+            large.height > small.height,
+            "panel did not grow with the output"
+        );
     }
 
     #[test]
@@ -262,8 +309,18 @@ mod tests {
         let two = compose(output, &mut text, 2);
         // Shaped text does not scale to the pixel, so allow it a little slack.
         let close = |a: usize, b: usize| (a as f32 - b as f32).abs() <= (b as f32 * 0.02).max(2.0);
-        assert!(close(two.stride, one.stride * 2), "{} vs {}", two.stride, one.stride);
-        assert!(close(two.height, one.height * 2), "{} vs {}", two.height, one.height);
+        assert!(
+            close(two.stride, one.stride * 2),
+            "{} vs {}",
+            two.stride,
+            one.stride
+        );
+        assert!(
+            close(two.height, one.height * 2),
+            "{} vs {}",
+            two.height,
+            one.height
+        );
 
         let at_one = Overlay::render(output, &mut text, 1).placement(output);
         let at_two = Overlay::render(output, &mut text, 2).placement(output);
@@ -282,12 +339,13 @@ mod tests {
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         // The canvas is RGBA and PPM is RGB, so the alpha is dropped. Every
         // pixel the overlay draws is opaque enough for that to be honest.
-        for pixel in compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1).pixels.chunks_exact(4)
+        for pixel in compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1)
+            .pixels
+            .chunks_exact(4)
         {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write(&path, ppm).expect("writing the dump");
         println!("wrote {w}x{h} to {path}");
     }
-
 }

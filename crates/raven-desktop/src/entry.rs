@@ -68,7 +68,9 @@ fn ordered(
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|dir| seen.insert(dir.clone()));
 
-    dirs.into_iter().map(|dir| dir.join("applications")).collect()
+    dirs.into_iter()
+        .map(|dir| dir.join("applications"))
+        .collect()
 }
 
 /// Whether an entry already seen shadows one found later.
@@ -441,8 +443,14 @@ StartupWMClass=raven-terminal
     fn entries_not_meant_for_a_menu_are_skipped_with_a_reason() {
         let cases = [
             ("Type=Link\nName=n\nExec=e\n", Skipped::NotAnApplication),
-            ("Type=Application\nNoDisplay=true\nName=n\nExec=e\n", Skipped::NoDisplay),
-            ("Type=Application\nHidden=true\nName=n\nExec=e\n", Skipped::Hidden),
+            (
+                "Type=Application\nNoDisplay=true\nName=n\nExec=e\n",
+                Skipped::NoDisplay,
+            ),
+            (
+                "Type=Application\nHidden=true\nName=n\nExec=e\n",
+                Skipped::Hidden,
+            ),
             ("Type=Application\nName=n\n", Skipped::Incomplete),
             ("Type=Application\nExec=e\n", Skipped::Incomplete),
         ];
@@ -505,7 +513,10 @@ Exec=/bin/impostor
     #[test]
     fn a_localized_key_does_not_overwrite_the_plain_one() {
         let text = "[Desktop Entry]\nType=Application\nName=Terminal\nName[de]=Konsole\nExec=e\n";
-        assert_eq!(parse(text, Path::new("/x.desktop"), &[]).unwrap().name, "Terminal");
+        assert_eq!(
+            parse(text, Path::new("/x.desktop"), &[]).unwrap().name,
+            "Terminal"
+        );
     }
 
     #[test]
@@ -518,7 +529,10 @@ Exec=/bin/impostor
     #[test]
     fn field_codes_taking_all_items_expand_in_place() {
         let targets = ["/a.txt".to_owned(), "/b.txt".to_owned()];
-        assert_eq!(entry("app %F").argv(&targets).unwrap(), ["app", "/a.txt", "/b.txt"]);
+        assert_eq!(
+            entry("app %F").argv(&targets).unwrap(),
+            ["app", "/a.txt", "/b.txt"]
+        );
         // And expand to nothing at all when there is nothing to open, rather
         // than to an empty string argument the program would try to open.
         assert_eq!(entry("app %F").argv(&[]).unwrap(), ["app"]);
@@ -591,7 +605,11 @@ Exec=/bin/impostor
         // split, so no content of a target is ever re-parsed as syntax.
         let nasty = [r#"; rm -rf / "$(whoami)" 'x' \ %F"#.to_owned()];
         let argv = entry("app %f").argv(&nasty).unwrap();
-        assert_eq!(argv.len(), 2, "target became more than one argument: {argv:?}");
+        assert_eq!(
+            argv.len(),
+            2,
+            "target became more than one argument: {argv:?}"
+        );
         assert_eq!(argv[1], nasty[0], "target was altered on the way through");
     }
 
@@ -604,7 +622,8 @@ Exec=/bin/impostor
 
     #[test]
     fn try_exec_hides_an_app_whose_binary_is_gone() {
-        let missing = "[Desktop Entry]\nType=Application\nName=n\nExec=e\nTryExec=/nonexistent/xyzzy\n";
+        let missing =
+            "[Desktop Entry]\nType=Application\nName=n\nExec=e\nTryExec=/nonexistent/xyzzy\n";
         assert_eq!(
             parse(missing, Path::new("/x.desktop"), &[]),
             Err(Skipped::TryExecMissing)
@@ -637,7 +656,10 @@ Exec=/bin/impostor
         // $XDG_DATA_DIRS, so an application a user installed for themselves
         // never appeared in the launcher however long they waited.
         assert_eq!(
-            dirs(Some("/home/u/.local/share"), Some("/usr/local/share:/usr/share")),
+            dirs(
+                Some("/home/u/.local/share"),
+                Some("/usr/local/share:/usr/share")
+            ),
             [
                 PathBuf::from("/home/u/.local/share/applications"),
                 PathBuf::from("/usr/local/share/applications"),
@@ -660,7 +682,10 @@ Exec=/bin/impostor
         // and a directory visited twice would shadow itself: every entry in it
         // would be discarded on the second pass as a duplicate of itself.
         assert_eq!(
-            dirs(Some("/usr/share"), Some("/usr/share:/usr/local/share:/usr/share")),
+            dirs(
+                Some("/usr/share"),
+                Some("/usr/share:/usr/local/share:/usr/share")
+            ),
             [
                 PathBuf::from("/usr/share/applications"),
                 PathBuf::from("/usr/local/share/applications"),
@@ -687,7 +712,10 @@ Exec=/bin/impostor
             Some(std::ffi::OsStr::new("/home/u")),
             Some(std::ffi::OsStr::new("/usr/share")),
         );
-        assert_eq!(derived.first(), Some(&PathBuf::from("/home/u/.local/share/applications")));
+        assert_eq!(
+            derived.first(),
+            Some(&PathBuf::from("/home/u/.local/share/applications"))
+        );
     }
 
     #[test]
@@ -697,15 +725,27 @@ Exec=/bin/impostor
             Some(std::ffi::OsStr::new("/home/u")),
             Some(std::ffi::OsStr::new("/usr/share")),
         );
-        assert_eq!(derived.first(), Some(&PathBuf::from("/home/u/.local/share/applications")));
+        assert_eq!(
+            derived.first(),
+            Some(&PathBuf::from("/home/u/.local/share/applications"))
+        );
     }
 
     #[test]
     fn the_first_directory_to_offer_a_file_name_wins() {
         let mut seen = std::collections::HashSet::new();
-        assert!(!shadows(&mut seen, Path::new("/home/u/.local/share/applications/a.desktop")));
-        assert!(shadows(&mut seen, Path::new("/usr/share/applications/a.desktop")));
-        assert!(!shadows(&mut seen, Path::new("/usr/share/applications/b.desktop")));
+        assert!(!shadows(
+            &mut seen,
+            Path::new("/home/u/.local/share/applications/a.desktop")
+        ));
+        assert!(shadows(
+            &mut seen,
+            Path::new("/usr/share/applications/a.desktop")
+        ));
+        assert!(!shadows(
+            &mut seen,
+            Path::new("/usr/share/applications/b.desktop")
+        ));
     }
 
     #[test]
@@ -721,7 +761,11 @@ Exec=/bin/impostor
         let mut seen = std::collections::HashSet::new();
         assert!(!shadows(&mut seen, user));
         assert_eq!(
-            parse("[Desktop Entry]\nType=Application\nName=n\nExec=e\nHidden=true\n", user, &[]),
+            parse(
+                "[Desktop Entry]\nType=Application\nName=n\nExec=e\nHidden=true\n",
+                user,
+                &[]
+            ),
             Err(Skipped::Hidden),
         );
         assert!(

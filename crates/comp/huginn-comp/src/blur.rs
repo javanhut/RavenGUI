@@ -189,7 +189,11 @@ mod tests {
         // tap should carry very little, or the Gaussian is being cut off where
         // it still had weight and the blur shows a hard edge.
         let w = weights(TAPS as f32 / 3.0);
-        assert!(w[TAPS] < w[0] / 50.0, "outermost tap is {} of centre", w[TAPS] / w[0]);
+        assert!(
+            w[TAPS] < w[0] / 50.0,
+            "outermost tap is {} of centre",
+            w[TAPS] / w[0]
+        );
     }
 
     #[test]
@@ -207,10 +211,19 @@ mod tests {
         // Without this marker smithay cannot inject its own defines and the
         // shader fails to compile at runtime — where the only symptom is the
         // blur silently never appearing.
-        assert!(SHADER.contains("//_DEFINES"), "the defines marker is missing");
+        assert!(
+            SHADER.contains("//_DEFINES"),
+            "the defines marker is missing"
+        );
         assert!(SHADER.contains("v_coords"), "the vertex varying is missing");
-        assert!(SHADER.contains("uniform sampler2D tex"), "the sampler is missing");
-        assert!(SHADER.contains("uniform float alpha"), "the alpha uniform is missing");
+        assert!(
+            SHADER.contains("uniform sampler2D tex"),
+            "the sampler is missing"
+        );
+        assert!(
+            SHADER.contains("uniform float alpha"),
+            "the alpha uniform is missing"
+        );
     }
 
     #[test]
@@ -316,10 +329,10 @@ impl Blur {
         {
             let (scene, _, _) = self.scene.as_mut()?;
             let mut fb = renderer.bind(scene).ok()?;
-            let mut frame = renderer
-                .render(&mut fb, size, Transform::Normal)
+            let mut frame = renderer.render(&mut fb, size, Transform::Normal).ok()?;
+            frame
+                .clear(Color32F::from([0.0, 0.0, 0.0, 1.0]), &[full])
                 .ok()?;
-            frame.clear(Color32F::from([0.0, 0.0, 0.0, 1.0]), &[full]).ok()?;
             let _ = smithay::backend::renderer::utils::draw_render_elements::<GlesRenderer, _, _>(
                 &mut frame,
                 Scale::from(scale),
@@ -337,7 +350,9 @@ impl Blur {
             let source = scene.clone();
             let mut fb = renderer.bind(horizontal).ok()?;
             let mut frame = renderer.render(&mut fb, size, Transform::Normal).ok()?;
-            frame.clear(Color32F::from([0.0, 0.0, 0.0, 1.0]), &[full]).ok()?;
+            frame
+                .clear(Color32F::from([0.0, 0.0, 0.0, 1.0]), &[full])
+                .ok()?;
             let element = shader_element(
                 context.clone(),
                 &source,
@@ -377,7 +392,11 @@ impl Blur {
         renderer: &mut GlesRenderer,
         size: Size<i32, Physical>,
     ) -> Option<()> {
-        if self.scene.as_ref().is_some_and(|(_, _, held)| *held == size) {
+        if self
+            .scene
+            .as_ref()
+            .is_some_and(|(_, _, held)| *held == size)
+        {
             return Some(());
         }
         let buffer_size = Size::from((size.w, size.h));

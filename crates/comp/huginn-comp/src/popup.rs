@@ -126,8 +126,10 @@ impl Huginn {
         };
 
         let output = self.output_area();
-        let mut target =
-            Rectangle::new((output.x(), output.y()).into(), (output.w(), output.h()).into());
+        let mut target = Rectangle::new(
+            (output.x(), output.y()).into(),
+            (output.w(), output.h()).into(),
+        );
         target.loc -= get_popup_toplevel_coords(&kind);
         target.loc -= Point::from((rect.x(), rect.y())) + window_geometry(&root).loc;
 

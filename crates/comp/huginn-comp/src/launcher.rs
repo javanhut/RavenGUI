@@ -445,7 +445,10 @@ mod tests {
     fn two_characters_narrow_to_the_right_application() {
         // The acceptance criterion, as far as this half of it goes.
         let (launcher, apps) = typed("ra");
-        assert_eq!(selected_name(&launcher, &apps).as_deref(), Some("Raven Terminal"));
+        assert_eq!(
+            selected_name(&launcher, &apps).as_deref(),
+            Some("Raven Terminal")
+        );
     }
 
     #[test]
@@ -476,8 +479,14 @@ mod tests {
         for c in "raven".chars() {
             launcher.press(Key::Insert(c), &apps, &frecency, NOW, CLOCK, STILL);
         }
-        assert!(launcher.results().len() < apps.len(), "the list did not narrow");
-        assert!(launcher.selection().is_some(), "the highlight fell off the list");
+        assert!(
+            launcher.results().len() < apps.len(),
+            "the list did not narrow"
+        );
+        assert!(
+            launcher.selection().is_some(),
+            "the highlight fell off the list"
+        );
     }
 
     #[test]
@@ -487,14 +496,20 @@ mod tests {
         let mut launcher = Launcher::default();
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
 
-        assert_eq!(launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL), Outcome::Unchanged);
+        assert_eq!(
+            launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged
+        );
         assert_eq!(launcher.selection(), launcher.results().first().copied());
 
         for _ in 0..20 {
             launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         }
         assert_eq!(launcher.selection(), launcher.results().last().copied());
-        assert_eq!(launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL), Outcome::Unchanged);
+        assert_eq!(
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged
+        );
     }
 
     #[test]
@@ -508,7 +523,10 @@ mod tests {
             Outcome::Dismissed
         );
         assert!(!launcher.is_open());
-        assert!(launcher.query().is_empty(), "the query outlived the launcher");
+        assert!(
+            launcher.query().is_empty(),
+            "the query outlived the launcher"
+        );
     }
 
     #[test]
@@ -525,7 +543,10 @@ mod tests {
         // not reach the command line as a literal argument.
         let (mut launcher, apps) = typed("raven");
         let outcome = launcher.press(Key::Launch, &apps, &Frecency::new(), NOW, CLOCK, STILL);
-        assert_eq!(outcome, Outcome::Launch(vec!["/bin/raven-terminal".to_owned()]));
+        assert_eq!(
+            outcome,
+            Outcome::Launch(vec!["/bin/raven-terminal".to_owned()])
+        );
     }
 
     #[test]
@@ -598,7 +619,10 @@ mod tests {
         let frecency = Frecency::new();
         let mut launcher = Launcher::default();
         for key in [Key::Insert('a'), Key::Launch, Key::Down, Key::Dismiss] {
-            assert_eq!(launcher.press(key, &apps, &frecency, NOW, CLOCK, STILL), Outcome::Unchanged);
+            assert_eq!(
+                launcher.press(key, &apps, &frecency, NOW, CLOCK, STILL),
+                Outcome::Unchanged
+            );
         }
         assert!(!launcher.is_open());
     }
@@ -622,21 +646,36 @@ mod tests {
     fn characters_come_from_the_layout_not_from_the_keysym() {
         // Mapping KEY_a to 'a' here is correct on exactly one layout. The
         // character the keymap produced is what gets typed.
-        assert_eq!(Key::from_keysym(keysyms::KEY_a, false, Some('a')), Key::Insert('a'));
-        assert_eq!(Key::from_keysym(keysyms::KEY_a, false, Some('ä')), Key::Insert('ä'));
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_a, false, Some('a')),
+            Key::Insert('a')
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_a, false, Some('ä')),
+            Key::Insert('ä')
+        );
     }
 
     #[test]
     fn control_chords_never_leak_a_character_into_the_query() {
         // Ctrl+S has a character on some layouts. Typing an 's' because of it
         // would corrupt the query on a keystroke meant for something else.
-        assert_eq!(Key::from_keysym(keysyms::KEY_s, true, Some('s')), Key::Ignored);
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_s, true, Some('s')),
+            Key::Ignored
+        );
     }
 
     #[test]
     fn the_editing_chords_are_the_ones_people_already_know() {
-        assert_eq!(Key::from_keysym(keysyms::KEY_u, true, Some('u')), Key::Clear);
-        assert_eq!(Key::from_keysym(keysyms::KEY_w, true, Some('w')), Key::DeleteWord);
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_u, true, Some('u')),
+            Key::Clear
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_w, true, Some('w')),
+            Key::DeleteWord
+        );
         assert_eq!(Key::from_keysym(keysyms::KEY_p, true, Some('p')), Key::Up);
         assert_eq!(Key::from_keysym(keysyms::KEY_n, true, Some('n')), Key::Down);
         assert_eq!(
@@ -647,9 +686,18 @@ mod tests {
 
     #[test]
     fn escape_and_return_are_recognised_without_a_character() {
-        assert_eq!(Key::from_keysym(keysyms::KEY_Escape, false, None), Key::Dismiss);
-        assert_eq!(Key::from_keysym(keysyms::KEY_Return, false, None), Key::Launch);
-        assert_eq!(Key::from_keysym(keysyms::KEY_KP_Enter, false, None), Key::Launch);
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Escape, false, None),
+            Key::Dismiss
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Return, false, None),
+            Key::Launch
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_KP_Enter, false, None),
+            Key::Launch
+        );
     }
 
     #[test]
@@ -657,7 +705,10 @@ mod tests {
         // A keysym can carry \t or \r as its character; appending either would
         // put an invisible character in the search field.
         for c in ['\t', '\r', '\n', '\u{7f}'] {
-            assert_eq!(Key::from_keysym(keysyms::KEY_a, false, Some(c)), Key::Ignored);
+            assert_eq!(
+                Key::from_keysym(keysyms::KEY_a, false, Some(c)),
+                Key::Ignored
+            );
         }
     }
 
@@ -666,7 +717,10 @@ mod tests {
         // Still swallowed by the caller: a modifier press reaching the focused
         // client while the launcher is open lets a window act on a chord the
         // user was typing at the launcher.
-        assert_eq!(Key::from_keysym(keysyms::KEY_Shift_L, false, None), Key::Ignored);
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Shift_L, false, None),
+            Key::Ignored
+        );
     }
 
     #[test]
@@ -675,7 +729,9 @@ mod tests {
         // every index after it, so a launcher left un-reindexed highlights one
         // application and launches the one that took its place.
         let (mut launcher, apps) = typed("fi");
-        let chosen = apps[launcher.selection().expect("a selection")].name.clone();
+        let chosen = apps[launcher.selection().expect("a selection")]
+            .name
+            .clone();
 
         let mut grown = apps.clone();
         grown.insert(0, entry("Aardvark", "/bin/aardvark"));
@@ -697,9 +753,12 @@ mod tests {
         launcher.reindex(&apps, &Frecency::new(), NOW);
         assert_eq!(launcher.results.len(), before);
         assert!(
-            launcher.results.iter().all(|i| apps[*i].name.starts_with("Fi")
-                || apps[*i].name.contains("fi")
-                || apps[*i].name.starts_with("Fr")),
+            launcher
+                .results
+                .iter()
+                .all(|i| apps[*i].name.starts_with("Fi")
+                    || apps[*i].name.contains("fi")
+                    || apps[*i].name.starts_with("Fr")),
             "the query was lost and everything matched",
         );
     }
@@ -752,7 +811,12 @@ const PLACEHOLDER: &str = "Search applications";
 /// Never scales below [`MIN_SCALE`] of full size. Growing from the icon's
 /// literal 44 pixels means the first frames are an unreadable smear, and the
 /// eye reads the motion, not the content, at that point anyway.
-pub(crate) fn placement(output: Rect, panel: (i32, i32), origin: Option<Rect>, reveal: f32) -> Rect {
+pub(crate) fn placement(
+    output: Rect,
+    panel: (i32, i32),
+    origin: Option<Rect>,
+    reveal: f32,
+) -> Rect {
     /// How small the panel gets at the start of the motion.
     const MIN_SCALE: f32 = 0.86;
 
@@ -774,10 +838,7 @@ pub(crate) fn placement(output: Rect, panel: (i32, i32), origin: Option<Rect>, r
     // The centre travels from the origin to the middle of the screen; with no
     // origin it simply grows in place.
     let from = origin.unwrap_or(full);
-    let (fx, fy) = (
-        from.x() + from.w() / 2,
-        from.y() + from.h() / 2,
-    );
+    let (fx, fy) = (from.x() + from.w() / 2, from.y() + from.h() / 2);
     let (tx, ty) = (full.x() + full.w() / 2, full.y() + full.h() / 2);
     let cx = fx + ((tx - fx) as f32 * t) as i32;
     let cy = fy + ((ty - fy) as f32 * t) as i32;
@@ -795,7 +856,10 @@ pub(crate) fn render(
     output: Rect,
     density: u32,
 ) -> Panel {
-    Panel::from_canvas(&compose(launcher, apps, text, icons, pixmaps, output, density), density)
+    Panel::from_canvas(
+        &compose(launcher, apps, text, icons, pixmaps, output, density),
+        density,
+    )
 }
 
 /// Lay the launcher out and paint it. Split from [`render`] so a test can get
@@ -826,7 +890,13 @@ fn compose(
     let height = (pad * 2.0 + field + if shown > 0 { row * shown as f32 } else { 0.0 }) as usize;
 
     let mut canvas = Canvas::new(width, height.max(1));
-    canvas.fill(0, 0, width, height, crate::theme::BACKGROUND.with_alpha(ALPHA).to_rgba_bytes());
+    canvas.fill(
+        0,
+        0,
+        width,
+        height,
+        crate::theme::BACKGROUND.with_alpha(ALPHA).to_rgba_bytes(),
+    );
     canvas.frame(crate::theme::BORDER.to_rgba_bytes());
 
     // The query, or a hint in the dim colour. A field that looks empty and a
@@ -847,7 +917,14 @@ fn compose(
     } else {
         pad
     };
-    text.draw(&mut canvas, query_text, size * 1.25, text_x as i32, text_y, query_color);
+    text.draw(
+        &mut canvas,
+        query_text,
+        size * 1.25,
+        text_x as i32,
+        text_y,
+        query_color,
+    );
 
     // A caret, so the field reads as focused even when it is empty.
     // Measured from the query, not the placeholder, so an empty field puts the
@@ -879,17 +956,35 @@ fn compose(
     let first = selected.saturating_sub(VISIBLE - 1);
 
     let mut y = pad + field;
-    for (offset, index) in launcher.results().iter().skip(first).take(VISIBLE).enumerate() {
+    for (offset, index) in launcher
+        .results()
+        .iter()
+        .skip(first)
+        .take(VISIBLE)
+        .enumerate()
+    {
         let Some(entry) = apps.get(*index) else {
             continue;
         };
         let highlighted = first + offset == selected;
         if highlighted {
-            canvas.tint(1, y as usize, width - 2, row as usize, crate::theme::ACCENT, 0x2E);
+            canvas.tint(
+                1,
+                y as usize,
+                width - 2,
+                row as usize,
+                crate::theme::ACCENT,
+                0x2E,
+            );
             // A solid bar down the left edge, so the highlight is legible even
             // where the wash behind it is subtle.
-            canvas.fill(1, y as usize, (3.0 * scale) as usize, row as usize,
-                        crate::theme::ACCENT.to_rgba_bytes());
+            canvas.fill(
+                1,
+                y as usize,
+                (3.0 * scale) as usize,
+                row as usize,
+                crate::theme::ACCENT.to_rgba_bytes(),
+            );
         }
         // The icon, if the theme has one. An application with no icon gets
         // its name at the same indent as everything else rather than shifted
@@ -914,7 +1009,11 @@ fn compose(
             size,
             (icon_x + icon_size as f32 + 10.0 * scale) as i32,
             (y + (row - size * 1.35) / 2.0) as i32,
-            if highlighted { crate::theme::TEXT } else { crate::theme::TEXT_DIM },
+            if highlighted {
+                crate::theme::TEXT
+            } else {
+                crate::theme::TEXT_DIM
+            },
         );
         y += row;
     }
@@ -924,8 +1023,8 @@ fn compose(
 
 #[cfg(test)]
 mod render_tests {
-    use super::*;
     use super::tests::{CLOCK, NOW, STILL, apps};
+    use super::*;
 
     fn drawn(query: &str, down: usize) -> (Canvas, Vec<Entry>) {
         let mut text = Text::new();
@@ -989,7 +1088,10 @@ mod render_tests {
     fn it_scales_up_rather_than_appearing_at_full_size() {
         let small = placement(OUTPUT, PANEL, Some(ICON), 0.0);
         let big = placement(OUTPUT, PANEL, Some(ICON), 1.0);
-        assert!(small.w() < big.w() && small.h() < big.h(), "it did not grow");
+        assert!(
+            small.w() < big.w() && small.h() < big.h(),
+            "it did not grow"
+        );
     }
 
     #[test]
@@ -1038,7 +1140,11 @@ mod render_tests {
         assert!(!launcher.query().is_empty());
         launcher.close(CLOCK, STILL);
         assert!(!launcher.is_open());
-        assert_eq!(launcher.query(), "firefox", "the query was cleared mid-dismissal");
+        assert_eq!(
+            launcher.query(),
+            "firefox",
+            "the query was cleared mid-dismissal"
+        );
         // Reopening still starts clean.
         launcher.open(&apps, &Frecency::new(), NOW, None, CLOCK, STILL);
         assert!(launcher.query().is_empty());
@@ -1083,14 +1189,20 @@ mod render_tests {
             .count();
         // The caret and the left bar are solid accent; a flooded row would be
         // thousands of pixels.
-        assert!(flooded < 2_000, "{flooded} solid-accent pixels; the row is flooded");
+        assert!(
+            flooded < 2_000,
+            "{flooded} solid-accent pixels; the row is flooded"
+        );
     }
 
     #[test]
     fn the_panel_grows_and_shrinks_with_the_result_count() {
         let (many, _) = drawn("", 0);
         let (few, _) = drawn("raven", 0);
-        assert!(few.height < many.height, "the panel did not shrink to its results");
+        assert!(
+            few.height < many.height,
+            "the panel did not shrink to its results"
+        );
     }
 
     #[test]

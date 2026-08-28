@@ -1,13 +1,19 @@
-//! Pointer input, shared by both backends.
+//! Pointer and touchpad input, shared by both backends.
 //!
 //! winit reports absolute positions inside its window; libinput reports
 //! relative deltas from a physical mouse. Both end up here so that focus
 //! behaviour, clamping and hit testing cannot drift between the two.
+//!
+//! Touchpad gestures only ever arrive from libinput — winit's backend types
+//! them as the uninhabited `UnusedEvent`, so the arms below compile there and
+//! can never run. What the gesture *means* still lives in [`crate::gesture`]
+//! rather than here, which is what keeps it testable without a touchpad.
 
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
+        GestureSwipeUpdateEvent, InputBackend, InputEvent, PointerAxisEvent, PointerButtonEvent,
+        PointerMotionEvent,
     },
     input::pointer::{AxisFrame, ButtonEvent, MotionEvent},
     utils::{Logical, Point, SERIAL_COUNTER, Size},
@@ -34,6 +40,16 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
         }
         InputEvent::PointerButton { event } => button::<B>(state, &event),
         InputEvent::PointerAxis { event } => axis::<B>(state, &event),
+        // Three fingers sliding sideways drive the carousel. Not forwarded to
+        // any client: huginn advertises no pointer-gestures protocol, so there
+        // is nothing downstream this could be taken away from.
+        InputEvent::GestureSwipeBegin { event } => state.swipe_begin(event.fingers()),
+        InputEvent::GestureSwipeUpdate { event } => {
+            state.swipe_update(event.delta_x(), event.delta_y());
+        }
+        // The end event's `cancelled` is deliberately not read; see
+        // `Huginn::swipe_end`.
+        InputEvent::GestureSwipeEnd { .. } => state.swipe_end(),
         _ => {}
     }
 }
@@ -90,19 +106,17 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     // focus, and a click anywhere else is how it gives it back. Settled before
     // click-to-focus, because a panel overlapping a tile must not also raise
     // the window behind it — the click belongs to whatever is drawn on top.
-    let clicked_layer = if button_state == ButtonState::Pressed
-        && !on_popup
-        && !state.pointer().is_grabbed()
-    {
-        let hit = state.layer_under(state.pointer_location);
-        let landed = hit.is_some();
-        if state.set_focused_layer(hit) {
-            state.refresh_focus();
-        }
-        landed
-    } else {
-        false
-    };
+    let clicked_layer =
+        if button_state == ButtonState::Pressed && !on_popup && !state.pointer().is_grabbed() {
+            let hit = state.layer_under(state.pointer_location);
+            let landed = hit.is_some();
+            if state.set_focused_layer(hit) {
+                state.refresh_focus();
+            }
+            landed
+        } else {
+            false
+        };
 
     if button_state == ButtonState::Pressed
         && !on_popup

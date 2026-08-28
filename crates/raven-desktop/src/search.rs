@@ -304,7 +304,11 @@ mod tests {
             entry("Firefox", Some("Web Browser"), &["internet", "www"]),
             entry("Files", Some("File Manager"), &["folder"]),
             entry("File Roller", Some("Archive Manager"), &["zip"]),
-            entry("Raven Terminal", Some("Terminal Emulator"), &["shell", "console"]),
+            entry(
+                "Raven Terminal",
+                Some("Terminal Emulator"),
+                &["shell", "console"],
+            ),
             entry("Fractal", Some("Matrix Client"), &["chat"]),
         ]
     }
@@ -360,7 +364,11 @@ mod tests {
         assert_eq!(names(&hits, &apps)[0], "Fractal");
 
         let hits = search(&apps, "chat", &Frecency::new(), NOW);
-        assert_eq!(names(&hits, &apps)[0], "Fractal", "keywords are searched too");
+        assert_eq!(
+            names(&hits, &apps)[0],
+            "Fractal",
+            "keywords are searched too"
+        );
     }
 
     #[test]
@@ -386,7 +394,11 @@ mod tests {
         // it has, and no amount of fixing the sort recovers it.
         let apps = vec![entry("Raven Terminal", None, &["terminal"])];
         let hits = search(&apps, "te", &Frecency::new(), NOW);
-        assert_eq!(hits[0].quality, Quality::WordPrefix, "picked the keyword over the name");
+        assert_eq!(
+            hits[0].quality,
+            Quality::WordPrefix,
+            "picked the keyword over the name"
+        );
     }
 
     #[test]
@@ -404,10 +416,7 @@ mod tests {
 
     #[test]
     fn a_name_hit_outranks_a_keyword_hit() {
-        let apps = vec![
-            entry("Zebra", None, &["files"]),
-            entry("Files", None, &[]),
-        ];
+        let apps = vec![entry("Zebra", None, &["files"]), entry("Files", None, &[])];
         let hits = search(&apps, "files", &Frecency::new(), NOW);
         assert_eq!(names(&hits, &apps)[0], "Files");
     }
@@ -501,7 +510,10 @@ mod tests {
         let fortnight = frecency.score(path, NOW + 14 * DAY);
         let year = frecency.score(path, NOW + 365 * DAY);
 
-        assert!((fortnight - fresh / 2.0).abs() < 1e-6, "half-life is not a fortnight");
+        assert!(
+            (fortnight - fresh / 2.0).abs() < 1e-6,
+            "half-life is not a fortnight"
+        );
         assert!(year < 0.01, "a year-old launch still weighs {year}");
     }
 
@@ -527,7 +539,10 @@ mod tests {
         let mut frecency = Frecency::new();
         frecency.record(path, NOW);
         let backwards = frecency.score(path, NOW - 100 * DAY);
-        assert!(backwards <= 1.0, "score grew to {backwards} when time went back");
+        assert!(
+            backwards <= 1.0,
+            "score grew to {backwards} when time went back"
+        );
     }
 
     #[test]

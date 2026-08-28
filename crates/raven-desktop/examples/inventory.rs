@@ -46,7 +46,8 @@ fn main() {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
-    let icons = Icons::discover(&std::env::var("RAVEN_ICON_THEME").unwrap_or_else(|_| "hicolor".into()));
+    let icons =
+        Icons::discover(&std::env::var("RAVEN_ICON_THEME").unwrap_or_else(|_| "hicolor".into()));
 
     for dir in entry::directories() {
         println!("searching {}", dir.display());
@@ -56,10 +57,7 @@ fn main() {
     let mut without_icon = 0;
 
     for app in &all {
-        let icon = app
-            .icon
-            .as_deref()
-            .and_then(|name| icons.find(name, 48, 1));
+        let icon = app.icon.as_deref().and_then(|name| icons.find(name, 48, 1));
         if icon.is_none() {
             without_icon += 1;
         }
@@ -73,14 +71,21 @@ fn main() {
             );
         }
     }
-    println!("\n{} applications, {without_icon} with no resolvable icon", all.len());
+    println!(
+        "\n{} applications, {without_icon} with no resolvable icon",
+        all.len()
+    );
 
     // Rank the real desktop against a few queries, so the ordering can be
     // judged against what is installed rather than against a fixture.
     let frecency = raven_desktop::Frecency::new();
     for query in ["te", "fi", "term", "raven", "web"] {
         let hits = raven_desktop::search(&all, query, &frecency, 1_700_000_000);
-        let top: Vec<&str> = hits.iter().take(3).map(|h| all[h.index].name.as_str()).collect();
+        let top: Vec<&str> = hits
+            .iter()
+            .take(3)
+            .map(|h| all[h.index].name.as_str())
+            .collect();
         println!("{query:>8} -> {top:?}");
     }
 }

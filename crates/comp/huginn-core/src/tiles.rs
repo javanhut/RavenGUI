@@ -160,7 +160,11 @@ impl Node {
         if *split_axis != axis {
             return false;
         }
-        let wanted = if in_first { *ratio + delta } else { *ratio - delta };
+        let wanted = if in_first {
+            *ratio + delta
+        } else {
+            *ratio - delta
+        };
         let clamped = wanted.clamp(MIN_RATIO, MAX_RATIO);
         if (clamped - *ratio).abs() < f32::EPSILON {
             return false;
@@ -173,9 +177,7 @@ impl Node {
     fn contains(&self, target: WindowId) -> bool {
         match self {
             Self::Leaf(id) => *id == target,
-            Self::Split { first, second, .. } => {
-                first.contains(target) || second.contains(target)
-            }
+            Self::Split { first, second, .. } => first.contains(target) || second.contains(target),
         }
     }
 
@@ -241,12 +243,7 @@ fn divide(rect: Rect, axis: Axis, ratio: f32, gap: i32) -> (Rect, Rect) {
             let first = (usable as f32 * ratio).round() as i32;
             (
                 Rect::from_xywh(rect.x(), rect.y(), first, rect.h()),
-                Rect::from_xywh(
-                    rect.x() + first + gap,
-                    rect.y(),
-                    usable - first,
-                    rect.h(),
-                ),
+                Rect::from_xywh(rect.x() + first + gap, rect.y(), usable - first, rect.h()),
             )
         }
         Axis::Vertical => {
@@ -254,12 +251,7 @@ fn divide(rect: Rect, axis: Axis, ratio: f32, gap: i32) -> (Rect, Rect) {
             let first = (usable as f32 * ratio).round() as i32;
             (
                 Rect::from_xywh(rect.x(), rect.y(), rect.w(), first),
-                Rect::from_xywh(
-                    rect.x(),
-                    rect.y() + first + gap,
-                    rect.w(),
-                    usable - first,
-                ),
+                Rect::from_xywh(rect.x(), rect.y() + first + gap, rect.w(), usable - first),
             )
         }
     }
@@ -522,7 +514,11 @@ mod tests {
         assert!(tiles.remove(id(2)));
         let laid = tiles.arrange(SCREEN, GAP);
         assert_eq!(laid.len(), 1);
-        assert_eq!(laid[0].1, SCREEN.inset(GAP), "the survivor did not reclaim the space");
+        assert_eq!(
+            laid[0].1,
+            SCREEN.inset(GAP),
+            "the survivor did not reclaim the space"
+        );
     }
 
     #[test]
@@ -608,16 +604,28 @@ mod tests {
         // Dragging a window into another's slot must not rearrange the pane
         // around it: the tiles stay put and only their occupants trade.
         let tiles = chain(4);
-        let before: Vec<Rect> = tiles.arrange(SCREEN, GAP).into_iter().map(|(_, r)| r).collect();
+        let before: Vec<Rect> = tiles
+            .arrange(SCREEN, GAP)
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
 
         let mut swapped = tiles.clone();
         let (a, b) = (swapped.windows()[0], swapped.windows()[3]);
         assert!(swapped.swap(a, b));
 
-        let after: Vec<Rect> = swapped.arrange(SCREEN, GAP).into_iter().map(|(_, r)| r).collect();
+        let after: Vec<Rect> = swapped
+            .arrange(SCREEN, GAP)
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
         assert_eq!(before, after, "the split shape moved");
 
-        let ids: Vec<WindowId> = swapped.arrange(SCREEN, GAP).into_iter().map(|(i, _)| i).collect();
+        let ids: Vec<WindowId> = swapped
+            .arrange(SCREEN, GAP)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(ids[0], b, "the windows did not trade places");
         assert_eq!(ids[3], a);
     }
@@ -669,8 +677,14 @@ mod tests {
         let before = tiles.arrange(SCREEN, GAP);
         assert!(tiles.resize(id(1), Axis::Horizontal, 0.1));
         let after = tiles.arrange(SCREEN, GAP);
-        assert!(after[0].1.w() > before[0].1.w(), "the focused window did not grow");
-        assert!(after[1].1.w() < before[1].1.w(), "its neighbour did not give way");
+        assert!(
+            after[0].1.w() > before[0].1.w(),
+            "the focused window did not grow"
+        );
+        assert!(
+            after[1].1.w() < before[1].1.w(),
+            "its neighbour did not give way"
+        );
         // And the pane is still fully covered — no gap opened between them.
         assert_eq!(
             after[0].1.w() + after[1].1.w() + GAP,
@@ -686,7 +700,10 @@ mod tests {
         let before = tiles.arrange(SCREEN, GAP);
         assert!(tiles.resize(id(2), Axis::Horizontal, 0.1));
         let after = tiles.arrange(SCREEN, GAP);
-        assert!(after[1].1.w() > before[1].1.w(), "the right window shrank instead");
+        assert!(
+            after[1].1.w() > before[1].1.w(),
+            "the right window shrank instead"
+        );
     }
 
     #[test]
@@ -720,7 +737,10 @@ mod tests {
         let before = tiles.arrange(SCREEN, GAP);
         assert!(tiles.resize(id(2), Axis::Horizontal, 0.1));
         let after = tiles.arrange(SCREEN, GAP);
-        assert!(after[0].1.w() < before[0].1.w(), "the outer split did not move");
+        assert!(
+            after[0].1.w() < before[0].1.w(),
+            "the outer split did not move"
+        );
     }
 
     #[test]

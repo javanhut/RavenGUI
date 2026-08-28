@@ -49,7 +49,9 @@ impl Cursor {
             .unwrap_or(24);
         let cursor = Self::load(&theme, "default", size, density);
         if cursor.is_none() {
-            tracing::warn!("no cursor theme found; the pointer will be invisible over the background");
+            tracing::warn!(
+                "no cursor theme found; the pointer will be invisible over the background"
+            );
         }
         cursor
     }
@@ -70,7 +72,10 @@ impl Cursor {
         let density = density.max(1);
         let path = xcursor::CursorTheme::load(theme).load_icon(name)?;
         let mut bytes = Vec::new();
-        std::fs::File::open(&path).ok()?.read_to_end(&mut bytes).ok()?;
+        std::fs::File::open(&path)
+            .ok()?
+            .read_to_end(&mut bytes)
+            .ok()?;
         let images = xcursor::parser::parse_xcursor(&bytes)?;
 
         // Themes ship several sizes; take the closest to what was asked for
@@ -178,9 +183,8 @@ impl Huginn {
                     return None;
                 }
                 let state = layer_state(surface)?;
-                (state.interactivity != huginn_core::layer::Interactivity::None
-                    && rect.contains(p))
-                .then(|| (level_of(state.layer), index, surface.wl_surface().clone()))
+                (state.interactivity != huginn_core::layer::Interactivity::None && rect.contains(p))
+                    .then(|| (level_of(state.layer), index, surface.wl_surface().clone()))
             })
             .max_by_key(|(level, index, _)| (*level, *index))
             .map(|(_, _, surface)| surface)
