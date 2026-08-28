@@ -185,11 +185,24 @@ impl Space {
     /// [`Self::toggle_layout`] makes, so it leaves the workspace in the same
     /// place and the layout stays put when the fingers lift.
     ///
-    /// `None` when the workspace has no tiled panes. There is nothing to take
-    /// hold of, and flipping the layout under a gesture that can do nothing
-    /// visible would be a mode change the user never sees happen.
+    /// `None` when the strip has nowhere to go: no panes at all, or few enough
+    /// that they already fill the viewport. Both are the same thing to a swipe.
+    /// There is nothing to take hold of, and flipping the layout under a
+    /// gesture that can do nothing visible would be a mode change the user
+    /// never sees happen — the workspace would sit in [`Layout::Carousel`] with
+    /// nothing on screen to say so, and the next `Super`+`Shift`+`C` would read
+    /// as inverted because it toggles back to tiling.
+    ///
+    /// "Nowhere to go" is [`strip::max_offset`] rather than an emptiness test,
+    /// because at the default two columns a workspace of one or two panes lays
+    /// out identically under both layouts. Refusing on emptiness alone accepted
+    /// exactly those cases, which is the invisible flip this rule exists to
+    /// prevent.
     pub fn begin_carousel_drag(&mut self) -> Option<i32> {
-        if self.tiled_windows().is_empty() {
+        // Subsumes the empty case: `max_offset` is zero for a strip with no
+        // panes, so there is no separate emptiness test to keep in step.
+        let tiled = self.tiled_windows();
+        if strip::max_offset(&tiled, self.area, self.gap, self.carousel_columns) == 0 {
             return None;
         }
         let ws = &mut self.workspaces[self.active];
@@ -960,12 +973,18 @@ mod tests {
     fn a_swipe_turns_a_tiled_workspace_into_the_carousel_and_leaves_it_there() {
         // The gesture is how you get to the carousel, so it makes the same
         // change the keybinding does — including outlasting the fingers.
+        //
+        // Three panes, not two: at the default two columns a pair already
+        // fills the viewport, and a swipe there is refused precisely because
+        // it could change nothing visible. See the test below.
         let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        s.open_window();
         s.open_window();
         s.open_window();
         assert_eq!(s.active_workspace().layout(), Layout::Tiled);
 
-        s.begin_carousel_drag().expect("two panes to take hold of");
+        s.begin_carousel_drag()
+            .expect("three panes to take hold of");
         assert_eq!(s.active_workspace().layout(), Layout::Carousel);
 
         s.end_carousel_drag();
@@ -974,6 +993,55 @@ mod tests {
             Layout::Carousel,
             "the layout is a decision, not a thing the fingers hold open"
         );
+    }
+
+    #[test]
+    fn a_swipe_over_a_workspace_that_already_fits_changes_nothing() {
+        // The invisible-flip bug: one or two panes at two columns lay out
+        // identically tiled and carousel, and the strip cannot scroll at all,
+        // so taking the claim would leave the workspace silently in a mode the
+        // screen gives no sign of — and the next Super+Shift+C would look
+        // inverted, toggling back to tiling instead of into the carousel.
+        for panes in [1, 2] {
+            let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+            for _ in 0..panes {
+                s.open_window();
+            }
+            assert_eq!(
+                strip::max_offset(&s.tiled_windows(), s.area(), s.gap, s.carousel_columns),
+                0,
+                "{panes} panes must have nothing to scroll"
+            );
+            assert_eq!(
+                s.begin_carousel_drag(),
+                None,
+                "{panes} panes: a swipe that can do nothing visible must be refused"
+            );
+            assert_eq!(
+                s.active_workspace().layout(),
+                Layout::Tiled,
+                "{panes} panes: the layout must not flip under a refused swipe"
+            );
+            assert!(!s.carousel_dragging());
+        }
+    }
+
+    #[test]
+    fn a_swipe_is_taken_as_soon_as_the_strip_can_actually_move() {
+        // The other half of the rule: refusing what cannot scroll must not
+        // turn into refusing a strip that can. A third pane is what makes the
+        // strip longer than the viewport at two columns.
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        s.open_window();
+        s.open_window();
+        assert_eq!(s.begin_carousel_drag(), None, "two panes still fit");
+
+        s.open_window();
+        assert!(
+            s.begin_carousel_drag().is_some(),
+            "a third pane gives the strip somewhere to go"
+        );
+        assert_eq!(s.active_workspace().layout(), Layout::Carousel);
     }
 
     #[test]

@@ -765,6 +765,35 @@ mod tests {
     }
 
     #[test]
+    fn the_carousel_chord_is_not_swallowed_by_copy() {
+        // Super+Shift+C must reach the carousel in both sym forms, and must do
+        // so even when the focused client owns the Super layer -- the copy
+        // branch consults `focus_owns_super`, the shift layer must not.
+        for sym in [keysyms::KEY_c, keysyms::KEY_C] {
+            assert_eq!(
+                intercepted(super_shift(), sym),
+                Some(Action::ToggleCarousel),
+                "Super+Shift+C resolved to something other than the carousel"
+            );
+            assert!(
+                matches!(
+                    resolve(
+                        KeyState::Pressed,
+                        &super_shift(),
+                        sym,
+                        Modes {
+                            focus_owns_super: true,
+                            ..Modes::default()
+                        },
+                    ),
+                    FilterResult::Intercept(Some(Action::ToggleCarousel))
+                ),
+                "a terminal must not keep Super+Shift+C"
+            );
+        }
+    }
+
+    #[test]
     fn copy_and_paste_are_translated_for_a_client_that_needs_it() {
         assert_eq!(
             intercepted(super_held(), keysyms::KEY_c),
