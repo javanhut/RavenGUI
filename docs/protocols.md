@@ -13,7 +13,7 @@ For how to actually use these, see `docs/integration.md`.
 | `wl_compositor`, `wl_subcompositor` | surfaces and subsurfaces |
 | `xdg_wm_base` | ordinary application windows |
 | `zwlr_layer_shell_v1` | panels, docks, bars, wallpapers |
-| `raven_shell_manager_v1` | workspace count, active index, occupancy, switching |
+| `raven_shell_manager_v1` | workspace count, active index, occupancy, switching; opening quick settings |
 | `wl_shm` | shared-memory buffers |
 | `zwp_linux_dmabuf_v1` | hardware buffers; advertised once the backend has a renderer |
 | `wp_viewporter` | source cropping and destination scaling |
@@ -34,12 +34,18 @@ The contract between Huginn and the desktop shell, covering only what no
 standard protocol provides. Panels, the dock and the wallpaper are layer-shell
 surfaces; this file does not duplicate them.
 
-### `raven_shell_manager_v1` — version 1
+### `raven_shell_manager_v1` — version 2
 
 | | |
 |---|---|
 | `destroy` | request, destructor. Objects made through the manager are unaffected. |
 | `get_workspace_state` | request. Creates a `raven_workspace_state_v1`. |
+| `open_quick_settings` | request, since 2. Opens the compositor-drawn quick settings panel as the keybinding would. A no-op if it is already open, and while the session is locked. |
+
+The second version exists for a bar whose battery reading is a natural place
+to click: the panel it should lead to is drawn by the compositor, so the bar
+cannot open it by showing a surface of its own and has to ask. A client bound
+at version 1 sees no difference.
 
 ### `raven_workspace_state_v1` — version 1
 

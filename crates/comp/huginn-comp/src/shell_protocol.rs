@@ -67,7 +67,7 @@ impl RavenShellState {
         // switch workspaces. Harmless on a single-user session, but it must be
         // gated (security-context, or a socket only the shell can reach)
         // before anything untrusted runs on this compositor.
-        dh.create_global::<Huginn, RavenShellManagerV1, ()>(1, ());
+        dh.create_global::<Huginn, RavenShellManagerV1, ()>(2, ());
         Self::default()
     }
 }
@@ -134,6 +134,21 @@ impl Dispatch<RavenShellManagerV1, ()> for Huginn {
                 state.raven_shell.last_sent = Some(snapshot);
                 state.raven_shell.observers.push(observer);
                 tracing::debug!("shell is now observing workspace state");
+            }
+            raven_shell_manager_v1::Request::OpenQuickSettings => {
+                // The same path the keybinding takes, including the rule that
+                // nothing resolves while the session is locked. The keymap
+                // enforces that before a chord becomes an action; a request
+                // arriving over the wire skipped the keymap, so the check is
+                // repeated here rather than trusted to a client.
+                if state.is_locked() {
+                    tracing::debug!("shell asked for quick settings while locked; ignored");
+                } else if state.settings.is_open() {
+                    tracing::debug!("shell asked for quick settings; already open");
+                } else {
+                    tracing::debug!("shell opened quick settings");
+                    state.open_settings();
+                }
             }
             raven_shell_manager_v1::Request::Destroy => {}
             _ => {}

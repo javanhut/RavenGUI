@@ -523,11 +523,7 @@ impl Nested {
             Action::ToggleCarousel => {
                 state.toggle_workspace_carousel();
             }
-            Action::OpenSettings => {
-                let now = state.uptime();
-                state.settings.open(now);
-                state.refresh_settings();
-            }
+            Action::OpenSettings => state.open_settings(),
             Action::Settings(key) => {
                 let now = state.uptime();
                 match state.settings.press(key, now) {

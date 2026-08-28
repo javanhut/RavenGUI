@@ -21,7 +21,7 @@
     is what makes moving this file to its own repository a mechanical step.
   </description>
 
-  <interface name="raven_shell_manager_v1" version="1">
+  <interface name="raven_shell_manager_v1" version="2">
     <description summary="entry point for the desktop shell">
       Handed to the shell so it can observe compositor state it cannot see as an
       ordinary Wayland client.
@@ -43,6 +43,19 @@
         client never has to render a placeholder while it waits.
       </description>
       <arg name="id" type="new_id" interface="raven_workspace_state_v1"/>
+    </request>
+
+    <request name="open_quick_settings" since="2">
+      <description summary="open the compositor-drawn quick settings panel">
+        Open the quick settings panel, exactly as the keybinding would. The
+        panel is drawn by the compositor, so a bar that wants a click on its
+        battery to lead somewhere has to ask for it here; it has no surface of
+        its own to show.
+
+        A no-op if the panel is already open, and while the session is locked:
+        nothing resolves under the lock screen, and a request from a client is
+        not an exception to that.
+      </description>
     </request>
   </interface>
 
