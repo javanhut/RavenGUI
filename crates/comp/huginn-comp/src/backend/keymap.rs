@@ -31,7 +31,7 @@ pub(crate) enum Action {
     FocusNext,
     FocusPrev,
     PromoteFocused,
-    /// Switch the active workspace between tiling and the carousel.
+    /// Open or accept the workspace carousel.
     ToggleCarousel,
     CloseFocused,
     /// Move the focused window one tile in a direction.
@@ -173,7 +173,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         action: Action::ToggleCarousel,
         chord: "Super+Shift+C",
-        description: "switch between tiling and the carousel",
+        description: "open or accept the workspace carousel",
     },
     Binding {
         action: Action::EnterResize,

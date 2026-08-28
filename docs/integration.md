@@ -166,7 +166,7 @@ client cannot receive or override them:
 | `Super+Shift+J` / `K` | focus the next / previous window |
 | `Super+Shift+arrows` | move the focused window between tiles |
 | `Super+Shift+Return` | swap the focused window into the first tile |
-| `Super+Shift+C` | switch the workspace between tiling and the carousel |
+| `Super+Shift+C` | open or accept the workspace carousel |
 | `Super+Shift+R` | resize the focused window with the arrows |
 | `Super+Shift+1..9` | go to a workspace |
 | `Super+Ctrl+Shift+1..9` | send the focused window to a workspace |
@@ -201,13 +201,14 @@ spawned.
 
 | Gesture | Does |
 |---|---|
-| three fingers sideways | switch the workspace to the carousel and scroll the strip |
+| three fingers sideways | preview and switch between workspaces |
 
-The strip follows the fingers rather than sliding after them, and settles onto
-the pane nearest where they lift — which also moves focus there, because on a
-carousel being scrolled to and being focused are the same thing. A workspace
-that was tiling becomes a carousel and stays one, exactly as if you had pressed
-`Super+Shift+C`; `Super+Shift+C` is how you go back.
+The current workspace shrinks into a centred card while the workspaces beside
+it appear as narrow, dimmed side cards. The row follows the fingers and settles
+onto the workspace nearest where they lift; that workspace then expands to fill
+the output. Each card is a complete workspace, not a window from the current
+workspace. `Super+Shift+C` opens the same view from the keyboard and a second
+press accepts the centred workspace.
 
 **A three-finger swipe never reaches a client.** Huginn advertises no
 `pointer-gestures-unstable-v1` global, so no client can see swipe, pinch or hold

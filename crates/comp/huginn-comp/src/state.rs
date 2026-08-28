@@ -107,6 +107,13 @@ pub(crate) enum SceneItem<'a> {
     /// into anything the compositor holds. A `WlSurface` is a handle, so the
     /// clone costs a refcount.
     Surface(WlSurface, Rect),
+    /// A window belonging to one of the workspace cards in the touchpad
+    /// switcher. The transform is applied to the whole workspace coordinate
+    /// system, so every window keeps its place inside the card.
+    WorkspaceSurface(WlSurface, Rect, WorkspacePreview),
+    /// Opaque backing for a workspace card, so empty space and empty
+    /// workspaces still read as physical cards rather than holes in the row.
+    WorkspaceCard(&'a SolidColorBuffer, WorkspacePreview),
     /// One edge of the ring around the focused window. Drawn by the compositor
     /// itself, so unlike a surface there is no client to click on or to send a
     /// frame callback to.
@@ -116,6 +123,23 @@ pub(crate) enum SceneItem<'a> {
     /// underneath, which is right for something that is a label rather than a
     /// window.
     Overlay(&'a MemoryRenderBuffer, Rect, f32),
+}
+
+/// The compositor transform for one workspace card.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorkspacePreview {
+    pub scale_x: f64,
+    pub scale_y: f64,
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub alpha: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceCarousel {
+    position: crate::anim::Animated,
+    reveal: crate::anim::Animated,
+    closing: bool,
 }
 
 /// Applications that drive the `Super` layer themselves.
@@ -284,6 +308,8 @@ pub(crate) struct Huginn {
     /// strip belongs and has no clock to move it with, so the sliding lives
     /// here and the offset is handed back down each frame.
     carousel_scroll: crate::anim::Animated,
+    /// Workspace-level Cover Flow shown while a three-finger swipe is active.
+    workspace_carousel: Option<WorkspaceCarousel>,
     /// The touchpad swipe in progress, if any.
     ///
     /// Held on the compositor rather than in the core because a gesture is
@@ -393,6 +419,7 @@ pub(crate) struct Huginn {
     /// flip. `None` means nothing is ringed: no window is focused, or the
     /// focused one is fullscreen.
     focus_ring: [SolidColorBuffer; 4],
+    workspace_card: SolidColorBuffer,
     focus_ring_at: Option<[Rect; 4]>,
 }
 
@@ -454,6 +481,7 @@ impl Huginn {
             popups: PopupManager::default(),
             layers: Vec::new(),
             carousel_scroll: crate::anim::Animated::settled(0.0),
+            workspace_carousel: None,
             swipe: None,
             carousel_on: None,
             focused_layer: None,
@@ -462,6 +490,10 @@ impl Huginn {
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), crate::theme::ACCENT.to_rgba_f32())
             }),
+            workspace_card: SolidColorBuffer::new(
+                (area.w(), area.h()),
+                crate::theme::BACKGROUND.to_rgba_f32(),
+            ),
             focus_ring_at: None,
             help: None,
             wallpaper: crate::wallpaper::Wallpaper::installed(),
@@ -510,6 +542,7 @@ impl Huginn {
     /// Set the full output rectangle and reflow everything beneath it.
     pub(crate) fn set_output_area(&mut self, area: Rect) {
         self.output_area = area;
+        self.workspace_card.resize((area.w(), area.h()));
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
         if self.help.is_some() {
@@ -723,28 +756,35 @@ impl Huginn {
             out.extend(self.popups_of(&surface, rect));
             out.push(SceneItem::Surface(surface, rect));
         }
-        // Window popups go above every window and above the ring. A menu is
-        // routinely taller than the button that opened it and reaches over the
-        // neighbouring tile; drawing it under that tile, or letting the ring
-        // draw a line across it, is worse than the alternative of a menu
-        // covering a window it does not belong to — which is what a menu is
-        // supposed to do.
-        for (surface, rect) in self.render_list() {
-            out.extend(self.popups_of(&surface, rect));
+        if let Some(previews) = self.workspace_previews() {
+            // The centre card is first because scene order is front-to-back.
+            // Popups and the focus ring belong to the interactive full-size
+            // desktop, not to passive workspace previews.
+            for (workspace, transform) in previews {
+                out.extend(
+                    self.render_list_for(workspace)
+                        .into_iter()
+                        .map(|(surface, rect)| {
+                            SceneItem::WorkspaceSurface(surface, rect, transform)
+                        }),
+                );
+                out.push(SceneItem::WorkspaceCard(&self.workspace_card, transform));
+            }
+        } else {
+            for (surface, rect) in self.render_list() {
+                out.extend(self.popups_of(&surface, rect));
+            }
+            out.extend(
+                self.focus_ring()
+                    .into_iter()
+                    .map(|(b, r)| SceneItem::Ring(b, r)),
+            );
+            out.extend(
+                self.render_list()
+                    .into_iter()
+                    .map(|(surface, r)| SceneItem::Surface(surface, r)),
+            );
         }
-        // Directly above the windows: over its neighbours, whose pixels it
-        // reaches into when the layout leaves no gap, but under a panel or an
-        // overlay, which are entitled to cover the desktop.
-        out.extend(
-            self.focus_ring()
-                .into_iter()
-                .map(|(b, r)| SceneItem::Ring(b, r)),
-        );
-        out.extend(
-            self.render_list()
-                .into_iter()
-                .map(|(surface, r)| SceneItem::Surface(surface, r)),
-        );
         for layer in [Layer::Bottom, Layer::Background] {
             for (surface, rect) in self.layers_on(layer) {
                 out.extend(self.popups_of(surface.wl_surface(), rect));
@@ -768,8 +808,10 @@ impl Huginn {
     /// the focus ring has none.
     pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (WlSurface, Rect)> {
         self.scene().into_iter().filter_map(|item| match item {
-            SceneItem::Surface(surface, rect) => Some((surface, rect)),
-            SceneItem::Ring(..) | SceneItem::Overlay(..) => None,
+            SceneItem::Surface(surface, rect) | SceneItem::WorkspaceSurface(surface, rect, _) => {
+                Some((surface, rect))
+            }
+            SceneItem::Ring(..) | SceneItem::Overlay(..) | SceneItem::WorkspaceCard(..) => None,
         })
     }
 
@@ -1073,17 +1115,14 @@ impl Huginn {
         }
     }
 
-    /// A click landed. Returns the item hit, if any.
     /// Fingers landed on the touchpad.
     ///
     /// Nothing is claimed yet — see [`crate::gesture`].
     ///
     /// A swipe still in flight is *ended* rather than dropped. libinput sends
     /// an end for every begin, so one arriving here means the last gesture's
-    /// end went missing — and a dropped swipe would leave the core still
-    /// holding that workspace's strip, pinned outside the focus rule with
-    /// nothing left alive to let go of it. The strip would then sit still while
-    /// focus moved around it, for the rest of the session.
+    /// end went missing. Ending it first keeps an interrupted gesture from
+    /// leaving the workspace switcher open with nothing controlling it.
     pub(crate) fn swipe_begin(&mut self, fingers: u32) {
         if self.swipe.is_some() {
             tracing::debug!("a touchpad swipe began before the last one ended");
@@ -1092,33 +1131,23 @@ impl Huginn {
         self.swipe = Some(crate::gesture::Swipe::new(fingers));
     }
 
-    /// The fingers moved. Drives the carousel once the swipe has proved itself
-    /// a horizontal three-finger one.
+    /// The fingers moved. Opens and drives the workspace row once the swipe has
+    /// proved itself a horizontal three-finger one.
     pub(crate) fn swipe_update(&mut self, dx: f64, dy: f64) {
         let Some(mut swipe) = self.swipe.take() else {
             return;
         };
         if swipe.takes_hold(dx, dy) {
-            match self.space.begin_carousel_drag() {
-                Some(origin) => swipe.drives(origin),
-                // A workspace with no panes. Refused here rather than in the
-                // gesture, because "is there anything to scroll" is a question
-                // about the layout and only the core can answer it.
-                None => swipe.ignore(),
-            }
+            let origin = self.space.active_index() as f32;
+            self.open_workspace_carousel();
+            swipe.drives(origin);
         }
-        if let Some(offset) = swipe.offset() {
-            self.space.drag_carousel(offset);
-            // `arrange` is the whole of the motion: it hands the dragged offset
-            // to the layout, and asks for the frame that shows it. Nothing else
-            // would — the strip is pinned to the fingers rather than animating,
-            // so `tick_animations` has nothing to advance and would never call
-            // for a redraw of its own.
-            //
-            // It costs no configures. Scrolling slides every pane at a constant
-            // width, and `Window::configure` only sends one when the size
-            // changed, so a frame of this gesture puts nothing on the wire.
-            self.arrange();
+        if let Some(position) = swipe.position() {
+            let last = self.space.workspaces().len().saturating_sub(1) as f32;
+            if let Some(carousel) = &mut self.workspace_carousel {
+                carousel.position.jump_to(position.clamp(0.0, last));
+                self.queue_redraw();
+            }
         }
         self.swipe = Some(swipe);
     }
@@ -1126,30 +1155,84 @@ impl Huginn {
     /// The fingers lifted, or libinput gave up on the gesture.
     ///
     /// A cancelled swipe settles exactly like a completed one. The fingers are
-    /// off the pad either way, and leaving the strip parked mid-column because
-    /// the touchpad lost track of a finger would read as the compositor having
-    /// broken rather than as the gesture having been abandoned.
+    /// off the pad either way, and leaving the workspace row between cards
+    /// because the touchpad lost track of a finger would look broken.
     pub(crate) fn swipe_end(&mut self) {
         let Some(swipe) = self.swipe.take() else {
             return;
         };
-        if swipe.offset().is_none() {
-            // Never took the strip — too short to commit to an axis, vertical,
-            // the wrong number of fingers, or refused by an empty workspace.
-            // There is nothing to let go of and nothing to settle.
+        if swipe.position().is_none() {
+            // Never took the row — too short to commit to an axis, vertical,
+            // or the wrong number of fingers. There is nothing to settle.
             return;
         }
-        // `None` back from here means the swipe took hold of a workspace that
-        // is no longer the active one, so there is no settling to do — but the
-        // hold has still been released, which is the part that matters.
-        if self.space.end_carousel_drag().is_some() {
-            // Focus moved, so the keyboard and the ring follow it. The arrange
-            // after it slides the strip the short distance to the pane it
-            // settled on: the drag no longer holds the offset, so
-            // `settle_carousel` is back on the animated path and eases the last
-            // half-column rather than snapping it.
-            self.refresh_focus();
-            self.arrange();
+        self.close_workspace_carousel();
+    }
+
+    /// Open the workspace Cover Flow at the active workspace.
+    pub(crate) fn open_workspace_carousel(&mut self) {
+        let now = self.uptime();
+        if let Some(carousel) = &mut self.workspace_carousel {
+            // A fresh gesture may arrive while the previous selection is still
+            // expanding. Reverse that motion from its current value instead of
+            // letting the old close finish underneath the new fingers.
+            carousel.reveal.animate_to(
+                1.0,
+                now,
+                crate::anim::WORKSPACE_CAROUSEL_OPEN,
+                crate::anim::Curve::EaseOut,
+            );
+            carousel.closing = false;
+            self.queue_redraw();
+            return;
+        }
+        let mut reveal = crate::anim::Animated::settled(0.0);
+        reveal.animate_to(
+            1.0,
+            now,
+            crate::anim::WORKSPACE_CAROUSEL_OPEN,
+            crate::anim::Curve::EaseOut,
+        );
+        self.workspace_carousel = Some(WorkspaceCarousel {
+            position: crate::anim::Animated::settled(self.space.active_index() as f32),
+            reveal,
+            closing: false,
+        });
+        self.queue_redraw();
+    }
+
+    /// Select the nearest card and expand it back to a normal workspace.
+    pub(crate) fn close_workspace_carousel(&mut self) {
+        let now = self.uptime();
+        let last = self.space.workspaces().len().saturating_sub(1);
+        let Some(carousel) = &mut self.workspace_carousel else {
+            return;
+        };
+        let target = carousel.position.value(now).round().clamp(0.0, last as f32) as usize;
+        carousel.position.animate_to(
+            target as f32,
+            now,
+            crate::anim::WORKSPACE_CAROUSEL_CLOSE,
+            crate::anim::Curve::EaseInOut,
+        );
+        carousel.reveal.animate_to(
+            0.0,
+            now,
+            crate::anim::WORKSPACE_CAROUSEL_CLOSE,
+            crate::anim::Curve::EaseInOut,
+        );
+        carousel.closing = true;
+        self.space.activate_workspace(target);
+        self.arrange();
+        self.refresh_focus();
+    }
+
+    /// Keyboard counterpart: first press opens, second accepts the centre card.
+    pub(crate) fn toggle_workspace_carousel(&mut self) {
+        if self.workspace_carousel.is_some() {
+            self.close_workspace_carousel();
+        } else {
+            self.open_workspace_carousel();
         }
     }
 
@@ -1322,6 +1405,20 @@ impl Huginn {
     /// nothing, so an idle desktop still renders no frames.
     pub(crate) fn tick_animations(&mut self) {
         let now = self.uptime();
+        let mut finish_workspace_carousel = false;
+        if let Some(carousel) = &self.workspace_carousel {
+            let moving = !carousel.position.is_settled(now) || !carousel.reveal.is_settled(now);
+            if moving {
+                self.queue_redraw();
+            } else if carousel.closing {
+                finish_workspace_carousel = true;
+            }
+        }
+        if finish_workspace_carousel {
+            self.workspace_carousel = None;
+            self.arrange();
+            self.refresh_focus();
+        }
         if !self.carousel_scroll.is_settled(now) {
             // Re-arranging is what moves the panes; the redraw is what shows it.
             // `arrange` reads the offset back out of `carousel_scroll`, so this
@@ -1548,8 +1645,14 @@ impl Huginn {
     /// builder do not each have to decide what an X11 window with no surface yet
     /// should mean. It means the same thing as an unmapped window: skip it.
     pub(crate) fn render_list(&self) -> Vec<(WlSurface, Rect)> {
-        self.space
-            .active_workspace()
+        self.render_list_for(self.space.active_index())
+    }
+
+    fn render_list_for(&self, workspace: usize) -> Vec<(WlSurface, Rect)> {
+        let Some(workspace) = self.space.workspaces().get(workspace) else {
+            return Vec::new();
+        };
+        workspace
             .windows()
             .iter()
             .filter(|id| self.mapped.contains(id))
@@ -1559,6 +1662,55 @@ impl Huginn {
                 Some((surface, geometry))
             })
             .collect()
+    }
+
+    /// The visible workspace cards, centre first, with a flattened side-card
+    /// transform that reads like the edge of a record sleeve.
+    fn workspace_previews(&self) -> Option<Vec<(usize, WorkspacePreview)>> {
+        let carousel = self.workspace_carousel?;
+        let now = self.uptime();
+        let position = carousel.position.value(now);
+        let reveal = carousel.reveal.value(now).clamp(0.0, 1.0) as f64;
+        let area = self.output_area;
+        let mut cards: Vec<(usize, f32, WorkspacePreview)> = self
+            .space
+            .workspaces()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                let distance = index as f32 - position;
+                (distance.abs() <= 1.6).then(|| {
+                    let front = (1.0 - f64::from(distance.abs())).clamp(0.0, 1.0);
+                    let overview_x = 0.30 + 0.46 * front;
+                    let overview_y = 0.58 + 0.18 * front;
+                    let scale_x = 1.0 + (overview_x - 1.0) * reveal;
+                    let scale_y = 1.0 + (overview_y - 1.0) * reveal;
+                    let slot = f64::from(distance) * f64::from(area.w()) * 0.48 * reveal;
+                    let offset_x = (1.0 - scale_x) * f64::from(area.w()) * 0.5 + slot;
+                    let offset_y = (1.0 - scale_y) * f64::from(area.h()) * 0.5;
+                    let side = (f64::from(distance.abs()) - 0.15).clamp(0.0, 1.0);
+                    let alpha = (1.0 - side * 0.48 * reveal) as f32;
+                    (
+                        index,
+                        distance.abs(),
+                        WorkspacePreview {
+                            scale_x,
+                            scale_y,
+                            offset_x,
+                            offset_y,
+                            alpha,
+                        },
+                    )
+                })
+            })
+            .collect();
+        cards.sort_by(|a, b| a.1.total_cmp(&b.1));
+        Some(
+            cards
+                .into_iter()
+                .map(|(index, _, transform)| (index, transform))
+                .collect(),
+        )
     }
 
     /// Bring a window's mapped state into line with whether it has a buffer.
