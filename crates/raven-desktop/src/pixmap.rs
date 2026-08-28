@@ -167,11 +167,9 @@ fn from_svg(bytes: &[u8], size: u32) -> Option<tiny_skia::Pixmap> {
     // each axis independently to fill the box would stretch it.
     let scale = (size as f32 / source.width()).min(size as f32 / source.height());
     let (w, h) = (source.width() * scale, source.height() * scale);
-    let transform = tiny_skia::Transform::from_translate(
-        (size as f32 - w) / 2.0,
-        (size as f32 - h) / 2.0,
-    )
-    .pre_scale(scale, scale);
+    let transform =
+        tiny_skia::Transform::from_translate((size as f32 - w) / 2.0, (size as f32 - h) / 2.0)
+            .pre_scale(scale, scale);
 
     let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
     resvg::render(&tree, transform, &mut pixmap.as_mut());
@@ -189,7 +187,10 @@ fn from_png(bytes: &[u8], size: u32) -> Option<tiny_skia::Pixmap> {
     }
 
     let scale = (size as f32 / source.width() as f32).min(size as f32 / source.height() as f32);
-    let (w, h) = (source.width() as f32 * scale, source.height() as f32 * scale);
+    let (w, h) = (
+        source.width() as f32 * scale,
+        source.height() as f32 * scale,
+    );
     let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
     pixmap.draw_pixmap(
         0,
@@ -269,9 +270,20 @@ mod tests {
 
         // Twice as tall as wide, fitted into 40x40, is 20 wide and centred —
         // so the far left and right columns are empty and the centre is not.
-        assert_eq!(pixmap.pixel(1, 20).expect("left edge")[3], 0, "left edge is not clear");
-        assert_eq!(pixmap.pixel(38, 20).expect("right edge")[3], 0, "right edge is not clear");
-        assert!(pixmap.pixel(20, 20).expect("centre")[3] > 0, "centre is empty");
+        assert_eq!(
+            pixmap.pixel(1, 20).expect("left edge")[3],
+            0,
+            "left edge is not clear"
+        );
+        assert_eq!(
+            pixmap.pixel(38, 20).expect("right edge")[3],
+            0,
+            "right edge is not clear"
+        );
+        assert!(
+            pixmap.pixel(20, 20).expect("centre")[3] > 0,
+            "centre is empty"
+        );
     }
 
     #[test]
@@ -305,10 +317,18 @@ mod tests {
         // A blue square fills the canvas; the green portrait is fitted, so
         // its left edge is clear. One pixel tells them apart without printing
         // two whole images on failure.
-        let before = cache.get(&f.0, 16).expect("first").pixel(1, 8).expect("edge");
+        let before = cache
+            .get(&f.0, 16)
+            .expect("first")
+            .pixel(1, 8)
+            .expect("edge");
 
         std::fs::write(&f.0, PORTRAIT.as_bytes()).expect("replace");
-        let after = cache.get(&f.0, 16).expect("second").pixel(1, 8).expect("edge");
+        let after = cache
+            .get(&f.0, 16)
+            .expect("second")
+            .pixel(1, 8)
+            .expect("edge");
         assert_ne!(
             before, after,
             "the stale icon survived the file being replaced"

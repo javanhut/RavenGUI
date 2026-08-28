@@ -180,6 +180,28 @@ There is no way for a client to register a global chord of its own. If your
 software needs one, it currently has to be reached from a dock icon or by being
 spawned.
 
+## Touchpad gestures huginn takes
+
+| Gesture | Does |
+|---|---|
+| three fingers sideways | switch the workspace to the carousel and scroll the strip |
+
+The strip follows the fingers rather than sliding after them, and settles onto
+the pane nearest where they lift — which also moves focus there, because on a
+carousel being scrolled to and being focused are the same thing. A workspace
+that was tiling becomes a carousel and stays one, exactly as if you had pressed
+`Super+Shift+C`; `Super+Shift+C` is how you go back.
+
+**A three-finger swipe never reaches a client.** Huginn advertises no
+`pointer-gestures-unstable-v1` global, so no client can see swipe, pinch or hold
+gestures at all today — they are not being taken away from you by this binding,
+they were never delivered. Two-finger scrolling is unaffected: libinput reports
+it as an axis event rather than a gesture, and it is forwarded as normal.
+
+A three-finger swipe that goes *vertically* is currently ignored, and stays
+ignored for its whole length even if it later drifts sideways. That axis is
+deliberately left free.
+
 ### The `Super` rule
 
 **Plain `Super` belongs to the focused application.** `Super+C` and `Super+V`

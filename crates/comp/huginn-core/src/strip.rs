@@ -52,7 +52,21 @@ fn metrics(area: Rect, gap: i32, columns: u32, count: usize) -> Metrics {
     // pixel off from the one beside it is more visible than a strip that stops
     // a pixel short of the edge.
     let col_w = ((inner.w() - gap * (visible - 1)) / visible).max(1);
-    Metrics { inner, col_w, stride: col_w + gap }
+    Metrics {
+        inner,
+        col_w,
+        stride: col_w + gap,
+    }
+}
+
+/// The furthest a strip of `count` panes can be scrolled: the offset at which
+/// its last pane ends flush with the right of the viewport.
+///
+/// Zero when the whole strip already fits, so a short strip has exactly one
+/// legal position rather than a range it can drift within.
+fn furthest(m: Metrics, count: usize) -> i32 {
+    let span = (count as i32 - 1) * m.stride + m.col_w;
+    (span - m.inner.w()).max(0)
 }
 
 /// How far the strip should be scrolled to show `focus`, in pixels.
@@ -72,7 +86,61 @@ pub fn target_offset(
         return 0;
     }
     let m = metrics(area, gap, columns, windows.len());
-    scroll_offset(windows, focus, m.inner.w(), m.col_w, m.stride, current)
+    scroll_offset(windows, focus, m, current)
+}
+
+/// The furthest the strip can be scrolled, in pixels.
+///
+/// What a touchpad drag clamps to. It has to be the same number
+/// [`target_offset`] clamps to, or a swipe could park the strip a pixel past
+/// where focus is ever allowed to take it and the next arrange would spring it
+/// back under a hand that had not moved.
+pub fn max_offset(windows: &[WindowId], area: Rect, gap: i32, columns: u32) -> i32 {
+    if windows.is_empty() {
+        return 0;
+    }
+    furthest(metrics(area, gap, columns, windows.len()), windows.len())
+}
+
+/// Where a strip let go of at `offset` should come to rest, and which pane ends
+/// up at the left of the viewport there.
+///
+/// The two are returned together because they have to agree, and the caller
+/// needs both: the compositor focuses the pane and slides to the offset, and
+/// [`target_offset`] is asked to confirm the pair on the very next arrange. It
+/// returns this same offset only because the pane named beside it is fully on
+/// screen at it — which is what stops the settle from being undone by the focus
+/// rule a frame later.
+///
+/// Nearest column, rather than the pane the drag started on: a swipe that
+/// travelled more than half a column has moved on, and one that travelled less
+/// has not. `None` when the strip has no panes to rest on.
+pub fn snap(
+    windows: &[WindowId],
+    area: Rect,
+    gap: i32,
+    columns: u32,
+    offset: i32,
+) -> Option<(WindowId, i32)> {
+    if windows.is_empty() {
+        return None;
+    }
+    let m = metrics(area, gap, columns, windows.len());
+    let furthest = furthest(m, windows.len());
+    let settled = offset.clamp(0, furthest);
+
+    let last = windows.len() as i32 - 1;
+    let index = (settled as f32 / m.stride as f32)
+        .round()
+        .clamp(0.0, last as f32) as i32;
+    // Clamped again on the way out: at the end of a strip whose length is not a
+    // whole number of columns, the nearest column boundary lies past the last
+    // legal offset. Stopping at the end still leaves that pane fully on screen,
+    // because the end is defined as the place the final pane is flush with.
+    Some((
+        windows[index as usize],
+        (index * m.stride).clamp(0, furthest),
+    ))
 }
 
 /// Lay `windows` out left to right, scrolled by `offset` pixels.
@@ -105,7 +173,10 @@ pub fn arrange_at(
         .enumerate()
         .map(|(index, id)| {
             let x = m.inner.x() + index as i32 * m.stride - offset;
-            (*id, Rect::from_xywh(x, m.inner.y(), m.col_w, m.inner.h().max(0)))
+            (
+                *id,
+                Rect::from_xywh(x, m.inner.y(), m.col_w, m.inner.h().max(0)),
+            )
         })
         .collect()
 }
@@ -132,18 +203,9 @@ pub fn arrange(
 /// instead of recentring the whole thing under you. Centring reads well in a
 /// demo and badly in use, because it moves panes that were already where you
 /// were looking.
-fn scroll_offset(
-    windows: &[WindowId],
-    focus: Option<WindowId>,
-    viewport: i32,
-    col_w: i32,
-    stride: i32,
-    current: i32,
-) -> i32 {
-    // The strip is as wide as its panes and the gaps between them; the last
-    // pane contributes a column rather than a stride, since nothing follows it.
-    let span = (windows.len() as i32 - 1) * stride + col_w;
-    let furthest = (span - viewport).max(0);
+fn scroll_offset(windows: &[WindowId], focus: Option<WindowId>, m: Metrics, current: i32) -> i32 {
+    let viewport = m.inner.w();
+    let furthest = furthest(m, windows.len());
 
     // Where the strip is now, made safe to reason from: a held offset can be
     // stale after windows closed and the strip got shorter.
@@ -156,8 +218,8 @@ fn scroll_offset(
         return settled;
     };
 
-    let left = index as i32 * stride;
-    let right = left + col_w;
+    let left = index as i32 * m.stride;
+    let right = left + m.col_w;
 
     // Start from where the strip already is. A pane that is fully on screen
     // satisfies neither test below and the offset comes back unchanged, which
@@ -251,7 +313,10 @@ mod tests {
         let at_third = arrange(&windows, Some(id(3)), SCREEN, GAP, 2, 0);
 
         let third = at_third.iter().find(|(w, _)| *w == id(3)).unwrap().1;
-        assert!(third.x() >= 0 && third.right() <= SCREEN.right(), "fully visible");
+        assert!(
+            third.x() >= 0 && third.right() <= SCREEN.right(),
+            "fully visible"
+        );
         assert!(xs(&at_third)[0] < xs(&at_first)[0], "the strip moved left");
     }
 
@@ -269,7 +334,10 @@ mod tests {
 
         let laid = arrange_at(&windows, SCREEN, GAP, 2, out);
         let two = laid.iter().find(|(w, _)| *w == id(2)).expect("pane 2").1;
-        assert!(two.x() >= 10 && two.right() <= 990, "pane 2 is fully on screen");
+        assert!(
+            two.x() >= 10 && two.right() <= 990,
+            "pane 2 is fully on screen"
+        );
 
         let back = target_offset(&windows, Some(id(2)), SCREEN, GAP, 2, out);
         assert_eq!(back, out, "a pane already in view must not move the strip");
@@ -282,7 +350,10 @@ mod tests {
         let windows = ids(6);
         let out = target_offset(&windows, Some(id(5)), SCREEN, GAP, 2, 0);
         let back = target_offset(&windows, Some(id(1)), SCREEN, GAP, 2, out);
-        assert!(back < out, "the strip scrolls back for a pane off to the left");
+        assert!(
+            back < out,
+            "the strip scrolls back for a pane off to the left"
+        );
         let laid = arrange_at(&windows, SCREEN, GAP, 2, back);
         assert_eq!(laid[0].1.x(), 10, "pane 1 ends up at the left gutter");
     }
@@ -296,7 +367,10 @@ mod tests {
         let out = target_offset(&windows, Some(id(3)), SCREEN, GAP, 2, start);
         let back_two = target_offset(&windows, Some(id(2)), SCREEN, GAP, 2, out);
         let back_one = target_offset(&windows, Some(id(1)), SCREEN, GAP, 2, back_two);
-        assert_eq!(back_one, start, "back at the start, not a column short of it");
+        assert_eq!(
+            back_one, start,
+            "back at the start, not a column short of it"
+        );
     }
 
     #[test]
@@ -320,7 +394,10 @@ mod tests {
         // Two columns, so the pane before it is the other visible one and sits
         // at the left gutter. Everything earlier is off screen to the left.
         assert_eq!(xs(&laid)[4], 10);
-        assert!(xs(&laid)[..4].iter().all(|x| *x < 0), "the rest scrolled off");
+        assert!(
+            xs(&laid)[..4].iter().all(|x| *x < 0),
+            "the rest scrolled off"
+        );
     }
 
     #[test]
@@ -352,7 +429,11 @@ mod tests {
     fn a_focus_that_is_not_in_the_strip_is_ignored() {
         let laid = arrange(&ids(3), Some(id(99)), SCREEN, GAP, 2, 0);
         assert_eq!(laid.len(), 3);
-        assert_eq!(xs(&laid)[0], 10, "no scroll, rather than a panic or an empty layout");
+        assert_eq!(
+            xs(&laid)[0],
+            10,
+            "no scroll, rather than a panic or an empty layout"
+        );
     }
 
     #[test]
@@ -396,6 +477,93 @@ mod tests {
             assert_eq!(a.1.w(), b.1.w());
             assert_eq!(b.1.x(), a.1.x() - 247);
         }
+    }
+
+    #[test]
+    fn the_furthest_offset_is_where_the_last_pane_ends_at_the_edge() {
+        let windows = ids(6);
+        let end = max_offset(&windows, SCREEN, GAP, 2);
+        let laid = arrange_at(&windows, SCREEN, GAP, 2, end);
+        assert_eq!(
+            laid.last().unwrap().1.right(),
+            990,
+            "flush with the far gutter"
+        );
+        // And it agrees with what focusing the last pane asks for, which is the
+        // property that keeps a drag and a focus change from disagreeing about
+        // where the end of the strip is.
+        assert_eq!(end, target_offset(&windows, Some(id(6)), SCREEN, GAP, 2, 0));
+    }
+
+    #[test]
+    fn a_strip_that_already_fits_cannot_be_scrolled_at_all() {
+        // Two panes in two columns fill the viewport exactly, so there is one
+        // legal position rather than a range a swipe could drift within.
+        assert_eq!(max_offset(&ids(2), SCREEN, GAP, 2), 0);
+        assert_eq!(max_offset(&ids(1), SCREEN, GAP, 2), 0);
+        assert_eq!(max_offset(&[], SCREEN, GAP, 2), 0);
+    }
+
+    #[test]
+    fn letting_go_part_way_settles_on_the_nearer_column() {
+        let windows = ids(6);
+        // One column plus the gap after it, read off the layout rather than
+        // recomputed here, so the test cannot disagree with the geometry.
+        let laid = arrange_at(&windows, SCREEN, GAP, 2, 0);
+        let stride = laid[1].1.x() - laid[0].1.x();
+        assert_eq!(stride, 495);
+
+        // A third of the way across: still nearer where it started.
+        let (pane, offset) = snap(&windows, SCREEN, GAP, 2, stride / 3).expect("panes to rest on");
+        assert_eq!(
+            (pane, offset),
+            (id(1), 0),
+            "short of half a column stays put"
+        );
+
+        // Two thirds: it has moved on.
+        let (pane, offset) =
+            snap(&windows, SCREEN, GAP, 2, stride * 2 / 3).expect("panes to rest on");
+        assert_eq!(
+            (pane, offset),
+            (id(2), stride),
+            "past half a column moves on"
+        );
+    }
+
+    #[test]
+    fn the_pane_a_snap_names_is_the_one_on_screen_at_the_offset_it_names() {
+        // The contract the compositor leans on: it focuses the pane and slides
+        // to the offset, and `target_offset` must then agree rather than pull
+        // the strip somewhere else on the next arrange.
+        let windows = ids(7);
+        let end = max_offset(&windows, SCREEN, GAP, 2);
+        for raw in [-500, 0, 37, 260, 900, end - 1, end, end + 500] {
+            let (pane, offset) = snap(&windows, SCREEN, GAP, 2, raw).expect("panes to rest on");
+            assert_eq!(
+                target_offset(&windows, Some(pane), SCREEN, GAP, 2, offset),
+                offset,
+                "settling at {raw} named a pane the offset does not show"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snap_never_lands_past_the_end_of_the_strip() {
+        // Five panes in two columns: the strip's length is not a whole number
+        // of columns, so the column boundary nearest the end lies past it.
+        let windows = ids(5);
+        let end = max_offset(&windows, SCREEN, GAP, 2);
+        let (_, offset) = snap(&windows, SCREEN, GAP, 2, end).expect("panes to rest on");
+        assert_eq!(
+            offset, end,
+            "stops at the end rather than at the boundary past it"
+        );
+    }
+
+    #[test]
+    fn an_empty_strip_has_nothing_to_settle_onto() {
+        assert_eq!(snap(&[], SCREEN, GAP, 2, 400), None);
     }
 
     #[test]

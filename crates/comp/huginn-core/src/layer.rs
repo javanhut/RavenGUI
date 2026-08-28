@@ -321,8 +321,14 @@ mod tests {
         let area = usable_area(
             SCREEN,
             &[
-                Exclusive { edge: Edge::Top, size: 32 },
-                Exclusive { edge: Edge::Bottom, size: 64 },
+                Exclusive {
+                    edge: Edge::Top,
+                    size: 32,
+                },
+                Exclusive {
+                    edge: Edge::Bottom,
+                    size: 64,
+                },
             ],
         );
         assert_eq!(area, Rect::from_xywh(0, 32, 1920, 984));
@@ -333,8 +339,14 @@ mod tests {
         let area = usable_area(
             SCREEN,
             &[
-                Exclusive { edge: Edge::Left, size: 50 },
-                Exclusive { edge: Edge::Left, size: 30 },
+                Exclusive {
+                    edge: Edge::Left,
+                    size: 50,
+                },
+                Exclusive {
+                    edge: Edge::Left,
+                    size: 30,
+                },
             ],
         );
         assert_eq!(area, Rect::from_xywh(80, 0, 1840, 1080));
@@ -344,7 +356,10 @@ mod tests {
     fn an_absurd_zone_starves_the_area_without_inverting_it() {
         let area = usable_area(
             SCREEN,
-            &[Exclusive { edge: Edge::Top, size: 99_999 }],
+            &[Exclusive {
+                edge: Edge::Top,
+                size: 99_999,
+            }],
         );
         assert!(area.is_empty());
         assert_eq!(area.h(), 0, "height must clamp at zero, not go negative");
@@ -353,13 +368,28 @@ mod tests {
     #[test]
     fn exclusive_edge_follows_the_protocol_rules() {
         // One edge: unambiguous.
-        assert_eq!(anchors(true, false, false, false).exclusive_edge(), Some(Edge::Top));
-        assert_eq!(anchors(false, true, false, false).exclusive_edge(), Some(Edge::Bottom));
+        assert_eq!(
+            anchors(true, false, false, false).exclusive_edge(),
+            Some(Edge::Top)
+        );
+        assert_eq!(
+            anchors(false, true, false, false).exclusive_edge(),
+            Some(Edge::Bottom)
+        );
         // One edge plus both perpendicular edges: still unambiguous. This is
         // how every real panel anchors itself.
-        assert_eq!(anchors(true, false, true, true).exclusive_edge(), Some(Edge::Top));
-        assert_eq!(anchors(false, true, true, true).exclusive_edge(), Some(Edge::Bottom));
-        assert_eq!(anchors(true, true, true, false).exclusive_edge(), Some(Edge::Left));
+        assert_eq!(
+            anchors(true, false, true, true).exclusive_edge(),
+            Some(Edge::Top)
+        );
+        assert_eq!(
+            anchors(false, true, true, true).exclusive_edge(),
+            Some(Edge::Bottom)
+        );
+        assert_eq!(
+            anchors(true, true, true, false).exclusive_edge(),
+            Some(Edge::Left)
+        );
         // A corner has no single edge to reserve from.
         assert_eq!(anchors(true, false, true, false).exclusive_edge(), None);
         // All four edges, or none, likewise.
@@ -384,14 +414,24 @@ mod tests {
             SCREEN,
             anchors(true, false, true, true),
             Size::new(0, 40),
-            Margins { top: 8, right: 12, bottom: 0, left: 12 },
+            Margins {
+                top: 8,
+                right: 12,
+                bottom: 0,
+                left: 12,
+            },
         );
         assert_eq!(rect, Rect::from_xywh(12, 8, 1896, 40));
     }
 
     #[test]
     fn an_unanchored_surface_is_centred() {
-        let rect = place(SCREEN, Anchors::default(), Size::new(400, 300), Margins::default());
+        let rect = place(
+            SCREEN,
+            Anchors::default(),
+            Size::new(400, 300),
+            Margins::default(),
+        );
         assert_eq!(rect, Rect::from_xywh(760, 390, 400, 300));
         assert_eq!(rect.center(), SCREEN.center());
     }
@@ -411,7 +451,12 @@ mod tests {
     #[test]
     fn a_fullscreen_overlay_anchors_to_every_edge() {
         // This is how a lock screen covers the output.
-        let rect = place(SCREEN, anchors(true, true, true, true), Size::ZERO, Margins::default());
+        let rect = place(
+            SCREEN,
+            anchors(true, true, true, true),
+            Size::ZERO,
+            Margins::default(),
+        );
         assert_eq!(rect, SCREEN);
     }
 }
@@ -422,7 +467,12 @@ mod focus {
 
     /// A layer surface asking for `interactivity` on `level`.
     const fn claimant(key: u8, level: Level, interactivity: Interactivity) -> Focusable<u8> {
-        Focusable { key, level, interactivity, mapped: key as u64 }
+        Focusable {
+            key,
+            level,
+            interactivity,
+            mapped: key as u64,
+        }
     }
 
     /// Shorthand for the common call: no click, one focused window.
@@ -496,7 +546,11 @@ mod focus {
     #[test]
     fn a_click_focuses_an_on_demand_panel() {
         let layers = [claimant(1, Level::Top, Interactivity::OnDemand)];
-        assert_eq!(resolve(&layers), KeyboardFocus::Window(7), "not until clicked");
+        assert_eq!(
+            resolve(&layers),
+            KeyboardFocus::Window(7),
+            "not until clicked"
+        );
         assert_eq!(
             keyboard_focus(&layers, Some(1), Some(7)),
             KeyboardFocus::Layer(1)

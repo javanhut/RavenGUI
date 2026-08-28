@@ -132,10 +132,7 @@ impl OutputScale {
             divide_ceil(physical.h, effective),
         );
 
-        let render = Size::new(
-            logical.w * advertised as i32,
-            logical.h * advertised as i32,
-        );
+        let render = Size::new(logical.w * advertised as i32, logical.h * advertised as i32);
 
         Self {
             advertised,
@@ -261,7 +258,10 @@ mod tests {
         assert_eq!(scale.advertised, 1);
         assert_eq!(scale.logical, px);
         assert_eq!(scale.render, px);
-        assert!(!scale.needs_resample(), "an ordinary monitor should not resample");
+        assert!(
+            !scale.needs_resample(),
+            "an ordinary monitor should not resample"
+        );
     }
 
     #[test]
@@ -323,17 +323,20 @@ mod tests {
         // rendered a 4096x2304 buffer and downsampled it every frame. These
         // panels are run at 1x everywhere and cost nothing extra here.
         for (w, h, inches) in [
-            (2560, 1440, 27.0),  // 109 dpi
-            (3440, 1440, 34.0),  // 110 dpi
-            (1366, 768, 14.0),   // 112 dpi
-            (1920, 1080, 24.0),  //  92 dpi
-            (3840, 2160, 43.0),  // 102 dpi
+            (2560, 1440, 27.0), // 109 dpi
+            (3440, 1440, 34.0), // 110 dpi
+            (1366, 768, 14.0),  // 112 dpi
+            (1920, 1080, 24.0), //  92 dpi
+            (3840, 2160, 43.0), // 102 dpi
         ] {
             let (px, mm) = panel(w, h, inches);
             let scale = OutputScale::for_output(px, mm);
             assert_eq!(scale.advertised, 1, "{w}x{h} @{inches}\" was promoted");
             assert_eq!(scale.logical, px);
-            assert!(!scale.needs_resample(), "{w}x{h} @{inches}\" resamples for nothing");
+            assert!(
+                !scale.needs_resample(),
+                "{w}x{h} @{inches}\" resamples for nothing"
+            );
         }
     }
 
@@ -366,7 +369,11 @@ mod tests {
             let (px, mm) = panel(w, h, inches);
             let scale = OutputScale::for_output(px, mm);
             let f = scale.fractional();
-            assert_eq!((f64::from(scale.logical.w) * f).round() as i32, px.w, "{w}x{h}");
+            assert_eq!(
+                (f64::from(scale.logical.w) * f).round() as i32,
+                px.w,
+                "{w}x{h}"
+            );
             let composed_h = f64::from(scale.logical.h) * f;
             assert!(
                 composed_h >= f64::from(px.h) && composed_h < f64::from(px.h) + f,
@@ -395,7 +402,10 @@ mod tests {
         let scale = OutputScale::for_output(px, mm);
         assert_eq!(scale.advertised, 2);
         assert_eq!(scale.logical, Size::new(1440, 900));
-        assert!(!scale.needs_resample(), "an exact 2x panel should not resample");
+        assert!(
+            !scale.needs_resample(),
+            "an exact 2x panel should not resample"
+        );
     }
 
     #[test]
@@ -450,35 +460,43 @@ mod tests {
             assert!(scale.render.w >= 1 && scale.render.h >= 1, "{scale:?}");
         }
     }
-#[test]
-fn print_the_scale_table() {
-    if std::env::var("SCALE_TABLE").is_err() { return; }
-    println!("\n{:<22} {:>5} {:>4}  {:<11} {:<11} {:<11} resample",
-             "panel", "dpi", "adv", "logical", "render", "physical");
-    for (name, w, h, inches) in [
-        ("1366x768 14\"",      1366, 768, 14.0),
-        ("1920x1080 24\"",     1920, 1080, 24.0),
-        ("1920x1080 13.3\"",   1920, 1080, 13.3),
-        ("2256x1504 13.5\"",   2256, 1504, 13.5),
-        ("2560x1440 27\"",     2560, 1440, 27.0),
-        ("2880x1800 15.4\"",   2880, 1800, 15.4),
-        ("3440x1440 34\"",     3440, 1440, 34.0),
-        ("3840x2160 27\"",     3840, 2160, 27.0),
-        ("3840x2160 43\"",     3840, 2160, 43.0),
-    ] {
-        let aspect = f64::from(w).hypot(f64::from(h));
-        let mm = inches * 25.4;
-        let phys = Size::new(w, h);
-        let pmm = Size::new((f64::from(w)/aspect*mm).round() as i32,
-                            (f64::from(h)/aspect*mm).round() as i32);
-        let s = OutputScale::for_output(phys, pmm);
-        let dpi = aspect / inches;
-        println!("{name:<22} {dpi:>5.0} {:>4}  {:<11} {:<11} {:<11} {}",
-                 s.advertised,
-                 format!("{}x{}", s.logical.w, s.logical.h),
-                 format!("{}x{}", s.render.w, s.render.h),
-                 format!("{}x{}", s.physical.w, s.physical.h),
-                 if s.needs_resample() { "yes" } else { "no" });
+    #[test]
+    fn print_the_scale_table() {
+        if std::env::var("SCALE_TABLE").is_err() {
+            return;
+        }
+        println!(
+            "\n{:<22} {:>5} {:>4}  {:<11} {:<11} {:<11} resample",
+            "panel", "dpi", "adv", "logical", "render", "physical"
+        );
+        for (name, w, h, inches) in [
+            ("1366x768 14\"", 1366, 768, 14.0),
+            ("1920x1080 24\"", 1920, 1080, 24.0),
+            ("1920x1080 13.3\"", 1920, 1080, 13.3),
+            ("2256x1504 13.5\"", 2256, 1504, 13.5),
+            ("2560x1440 27\"", 2560, 1440, 27.0),
+            ("2880x1800 15.4\"", 2880, 1800, 15.4),
+            ("3440x1440 34\"", 3440, 1440, 34.0),
+            ("3840x2160 27\"", 3840, 2160, 27.0),
+            ("3840x2160 43\"", 3840, 2160, 43.0),
+        ] {
+            let aspect = f64::from(w).hypot(f64::from(h));
+            let mm = inches * 25.4;
+            let phys = Size::new(w, h);
+            let pmm = Size::new(
+                (f64::from(w) / aspect * mm).round() as i32,
+                (f64::from(h) / aspect * mm).round() as i32,
+            );
+            let s = OutputScale::for_output(phys, pmm);
+            let dpi = aspect / inches;
+            println!(
+                "{name:<22} {dpi:>5.0} {:>4}  {:<11} {:<11} {:<11} {}",
+                s.advertised,
+                format!("{}x{}", s.logical.w, s.logical.h),
+                format!("{}x{}", s.render.w, s.render.h),
+                format!("{}x{}", s.physical.w, s.physical.h),
+                if s.needs_resample() { "yes" } else { "no" }
+            );
+        }
     }
-}
 }

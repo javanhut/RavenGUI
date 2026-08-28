@@ -27,9 +27,7 @@ use smithay::{
         egl::EGLDevice,
         input::{Event as _, InputEvent, KeyboardKeyEvent},
         renderer::{
-            Color32F, Frame, ImportDma, Renderer,
-            gles::GlesRenderer,
-            utils::draw_render_elements,
+            Color32F, Frame, ImportDma, Renderer, gles::GlesRenderer, utils::draw_render_elements,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
@@ -55,8 +53,8 @@ use huginn_core::{
 };
 
 use crate::backend::advertise;
-use crate::backend::input;
 use crate::backend::chord;
+use crate::backend::input;
 use crate::backend::keymap::{Action, help_line, resolve};
 use crate::pointer::Cursor;
 use crate::render;
@@ -125,7 +123,9 @@ pub(crate) fn run() -> Result<()> {
             state.enable_dmabuf(&dh, node.dev_id(), formats);
         }
         Ok(None) => tracing::warn!("EGL display has no render node; clients stay on shm"),
-        Err(e) => tracing::warn!(error = %e, "could not identify the render node; clients stay on shm"),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not identify the render node; clients stay on shm")
+        }
     }
 
     // A real wl_output makes toolkits behave: GTK and Qt both query scale and
@@ -317,8 +317,13 @@ impl Nested {
                 .map_err(|e| anyhow::anyhow!("clearing frame: {e}"))?;
             // The blurred desktop goes down first, then everything above it.
             if let Some(element) = &blurred {
-                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, std::slice::from_ref(element), &[damage])
-                    .map_err(|e| anyhow::anyhow!("drawing the blurred desktop: {e}"))?;
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    scale,
+                    std::slice::from_ref(element),
+                    &[damage],
+                )
+                .map_err(|e| anyhow::anyhow!("drawing the blurred desktop: {e}"))?;
             }
             draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &[damage])
                 .map_err(|e| anyhow::anyhow!("drawing: {e}"))?;
@@ -354,7 +359,8 @@ impl Nested {
                     size,
                     refresh: 60_000,
                 };
-                self.output.change_current_state(Some(mode), None, None, None);
+                self.output
+                    .change_current_state(Some(mode), None, None, None);
                 // Panels re-anchor and re-reserve first; the window area is
                 // whatever is left over.
                 self.state
@@ -390,7 +396,15 @@ impl Nested {
                                 // than what a US keyboard would have.
                                 let character = sym.key_char();
                                 let launcher = launcher_open.then_some(character);
-                                resolve(key_state, modifiers, sym.raw(), owns_super, launcher, settings_open, resizing)
+                                resolve(
+                                    key_state,
+                                    modifiers,
+                                    sym.raw(),
+                                    owns_super,
+                                    launcher,
+                                    settings_open,
+                                    resizing,
+                                )
                             }
                         },
                     )
@@ -415,7 +429,6 @@ impl Nested {
         }
     }
 
-
     /// Apply a keybinding.
     fn apply(&mut self, action: Action, time: u32) {
         let state = &mut self.state;
@@ -425,10 +438,16 @@ impl Nested {
                 return;
             }
             Action::FocusNext => {
-                state.space.active_workspace_mut().cycle_focus(Direction::Forward);
+                state
+                    .space
+                    .active_workspace_mut()
+                    .cycle_focus(Direction::Forward);
             }
             Action::FocusPrev => {
-                state.space.active_workspace_mut().cycle_focus(Direction::Backward);
+                state
+                    .space
+                    .active_workspace_mut()
+                    .cycle_focus(Direction::Backward);
             }
             Action::PromoteFocused => {
                 state.space.active_workspace_mut().promote_focused();
@@ -480,8 +499,9 @@ impl Nested {
             Action::Settings(key) => {
                 let now = state.uptime();
                 match state.settings.press(key, now) {
-                    crate::settings::Outcome::Dismissed
-                    | crate::settings::Outcome::Redraw => state.refresh_settings(),
+                    crate::settings::Outcome::Dismissed | crate::settings::Outcome::Redraw => {
+                        state.refresh_settings()
+                    }
                     crate::settings::Outcome::Unchanged => {}
                 }
             }

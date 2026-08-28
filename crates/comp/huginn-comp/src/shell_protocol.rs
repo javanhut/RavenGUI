@@ -13,8 +13,7 @@ use raven_protocol::server::{
     raven_workspace_state_v1::{self, RavenWorkspaceStateV1},
 };
 use smithay::reexports::wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
-    backend::ClientId,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, backend::ClientId,
 };
 
 use huginn_core::Space;
@@ -90,7 +89,11 @@ impl Huginn {
             tracing::debug!(
                 observers = self.raven_shell.observers.len(),
                 active = snapshot.active,
-                occupied = format!("{:0width$b}", snapshot.occupied, width = snapshot.count as usize),
+                occupied = format!(
+                    "{:0width$b}",
+                    snapshot.occupied,
+                    width = snapshot.count as usize
+                ),
                 "workspace state sent"
             );
         }

@@ -24,6 +24,8 @@ mod dmabuf;
 #[cfg(target_os = "linux")]
 mod dock;
 #[cfg(target_os = "linux")]
+mod gesture;
+#[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
 mod overlay;

@@ -80,6 +80,17 @@ pub struct Space {
     /// the strip towards that place over several frames, which is the one thing
     /// this crate cannot work out for itself because it has no clock.
     carousel_offset: Option<i32>,
+    /// The workspace whose strip a touchpad swipe currently has hold of.
+    ///
+    /// While this names the active workspace the fingers decide where the strip
+    /// sits and [`Self::update_carousel_target`] stops deriving it from focus.
+    /// Without that, every frame of a drag would pull the strip back to
+    /// whichever pane happened to be focused when the fingers went down, and
+    /// the gesture would spend its whole length fighting the layout.
+    ///
+    /// A workspace id rather than a flag, so switching workspace mid-swipe ends
+    /// the drag for the one you left instead of freezing the one you arrive on.
+    carousel_drag: Option<WorkspaceId>,
     next_window: u64,
 }
 
@@ -96,6 +107,7 @@ impl Space {
             gap: DEFAULT_GAP,
             carousel_columns: strip::DEFAULT_COLUMNS,
             carousel_offset: None,
+            carousel_drag: None,
             next_window: 1,
         }
     }
@@ -140,9 +152,19 @@ impl Space {
     pub fn update_carousel_target(&mut self) -> Option<i32> {
         let tiled = self.tiled_windows();
         let (area, gap, columns) = (self.area, self.gap, self.carousel_columns);
+        // Read before the workspace is borrowed, not because the order matters
+        // to the logic but because it does to the borrow checker.
+        let drag = self.carousel_drag;
         let ws = &mut self.workspaces[self.active];
         if ws.layout() != Layout::Carousel {
             return None;
+        }
+        if drag == Some(ws.id()) {
+            // The fingers are deciding. Report where they have put it rather
+            // than where focus would ask for — a drag is the one time the strip
+            // is allowed to leave the focused pane off screen, because the pane
+            // it settles on is not chosen until they lift.
+            return Some(ws.scroll());
         }
         let settled = strip::target_offset(&tiled, ws.focused(), area, gap, columns, ws.scroll());
         ws.set_scroll(settled);
@@ -153,6 +175,86 @@ impl Space {
     /// focus with `None`. Call [`Self::arrange`] after.
     pub fn set_carousel_offset(&mut self, offset: Option<i32>) {
         self.carousel_offset = offset;
+    }
+
+    /// Take hold of the active workspace's strip for a touchpad swipe, and
+    /// report the offset it is resting at — where the drag starts from.
+    ///
+    /// A tiled workspace becomes a carousel here, because the gesture is how
+    /// you get there. Three fingers on the strip is the same statement
+    /// [`Self::toggle_layout`] makes, so it leaves the workspace in the same
+    /// place and the layout stays put when the fingers lift.
+    ///
+    /// `None` when the workspace has no tiled panes. There is nothing to take
+    /// hold of, and flipping the layout under a gesture that can do nothing
+    /// visible would be a mode change the user never sees happen.
+    pub fn begin_carousel_drag(&mut self) -> Option<i32> {
+        if self.tiled_windows().is_empty() {
+            return None;
+        }
+        let ws = &mut self.workspaces[self.active];
+        ws.set_layout(Layout::Carousel);
+        let (id, scroll) = (ws.id(), ws.scroll());
+        self.carousel_drag = Some(id);
+        Some(scroll)
+    }
+
+    /// Whether a swipe has hold of the active workspace's strip.
+    ///
+    /// The compositor asks so it can put the strip exactly where the fingers
+    /// are rather than sliding towards them. A drag that animated would sit a
+    /// fixed distance behind the hand moving it, which is the one thing direct
+    /// manipulation must not do.
+    pub fn carousel_dragging(&self) -> bool {
+        self.carousel_drag == Some(self.workspaces[self.active].id())
+    }
+
+    /// Move the held strip to `offset`, clamped to its own ends, and report
+    /// where it actually landed. Call [`Self::arrange`] after.
+    ///
+    /// The clamp is the whole of the edge behaviour: the strip stops and the
+    /// fingers keep going. No rubber band, because there is nothing past the
+    /// end to hint at — the strip is the entire workspace, and stretching it
+    /// would suggest content that does not exist.
+    ///
+    /// `None`, and nothing moves, unless [`Self::begin_carousel_drag`] took
+    /// hold of *this* workspace first.
+    pub fn drag_carousel(&mut self, offset: i32) -> Option<i32> {
+        let held = self.carousel_drag?;
+        let tiled = self.tiled_windows();
+        let (area, gap, columns) = (self.area, self.gap, self.carousel_columns);
+        let ws = &mut self.workspaces[self.active];
+        if held != ws.id() {
+            return None;
+        }
+        let landed = offset.clamp(0, strip::max_offset(&tiled, area, gap, columns));
+        ws.set_scroll(landed);
+        Some(landed)
+    }
+
+    /// Let go of the strip: settle it onto the pane nearest where the fingers
+    /// left it, focus that pane, and report it. Call [`Self::arrange`] after.
+    ///
+    /// Focusing is what makes the settle stick. Everything else about the
+    /// carousel derives the scroll from focus, so a drag that moved the strip
+    /// without moving focus would be undone by the very next arrange — and the
+    /// pane you swiped to would not be the one the keyboard was talking to,
+    /// which is a worse bug than the strip springing back, because it is quiet.
+    ///
+    /// Ends the drag either way, so a swipe over an emptied workspace releases
+    /// its hold rather than leaving the strip pinned.
+    pub fn end_carousel_drag(&mut self) -> Option<WindowId> {
+        let held = self.carousel_drag.take()?;
+        let tiled = self.tiled_windows();
+        let (area, gap, columns) = (self.area, self.gap, self.carousel_columns);
+        let ws = &mut self.workspaces[self.active];
+        if held != ws.id() {
+            return None;
+        }
+        let (pane, offset) = strip::snap(&tiled, area, gap, columns, ws.scroll())?;
+        ws.set_scroll(offset);
+        ws.focus(pane);
+        Some(pane)
     }
 
     /// The area available to windows.
@@ -313,6 +415,7 @@ impl Space {
         let gap = self.gap;
         let columns = self.carousel_columns;
         let held = self.carousel_offset;
+        let drag = self.carousel_drag;
         let ws = &mut self.workspaces[self.active];
         let laid = match ws.layout() {
             Layout::Tiled => {
@@ -330,6 +433,12 @@ impl Space {
                 // do — still lands where focus asks for.
                 let offset = match held {
                     Some(offset) => offset,
+                    // A swipe has hold of it, and the compositor has not
+                    // handed an offset down this frame. The fingers still win
+                    // over focus, or arranging for any other reason mid-drag —
+                    // a window opening, a panel resizing the area — would yank
+                    // the strip out from under them.
+                    None if drag == Some(ws.id()) => ws.scroll(),
                     None => {
                         let settled = strip::target_offset(
                             &tiled,
@@ -346,7 +455,11 @@ impl Space {
                 strip::arrange_at(&tiled, area, gap, columns, offset)
             }
         };
-        debug_assert_eq!(laid.len(), tiled.len(), "the layout and the tiled set disagree");
+        debug_assert_eq!(
+            laid.len(),
+            tiled.len(),
+            "the layout and the tiled set disagree"
+        );
 
         let mut changed = Vec::new();
         for (id, rect) in laid {
@@ -421,8 +534,14 @@ mod tests {
         s.arrange();
         for id in s.active_workspace().windows() {
             let g = s.window(*id).expect("window is registered").geometry;
-            assert!(g.x() >= SCREEN.x() && g.right() <= SCREEN.right(), "{g:?} escaped horizontally");
-            assert!(g.y() >= SCREEN.y() && g.bottom() <= SCREEN.bottom(), "{g:?} escaped vertically");
+            assert!(
+                g.x() >= SCREEN.x() && g.right() <= SCREEN.right(),
+                "{g:?} escaped horizontally"
+            );
+            assert!(
+                g.y() >= SCREEN.y() && g.bottom() <= SCREEN.bottom(),
+                "{g:?} escaped vertically"
+            );
         }
     }
 
@@ -440,7 +559,10 @@ mod tests {
         s.arrange();
 
         let g = s.window(w).expect("still open").geometry;
-        assert!(g.right() <= 800 && g.bottom() <= 600, "{g:?} left the screen");
+        assert!(
+            g.right() <= 800 && g.bottom() <= 600,
+            "{g:?} left the screen"
+        );
     }
 
     #[test]
@@ -465,7 +587,10 @@ mod tests {
             max: Some(Size::new(640, 480)),
         };
         s.arrange();
-        assert_eq!(s.window(w).expect("still open").geometry.size, Size::new(640, 480));
+        assert_eq!(
+            s.window(w).expect("still open").geometry.size,
+            Size::new(640, 480)
+        );
     }
 
     #[test]
@@ -480,7 +605,9 @@ mod tests {
         s.arrange();
         assert_eq!(s.window(a).expect("open").geometry, SCREEN);
 
-        s.window_mut(a).expect("open").unfullscreen(WindowMode::Tiled);
+        s.window_mut(a)
+            .expect("open")
+            .unfullscreen(WindowMode::Tiled);
         s.arrange();
         assert_eq!(s.window(a).expect("open").geometry, tiled_geom);
     }
@@ -571,7 +698,10 @@ mod tests {
         // The master column is full height at the left edge: nothing is above,
         // below, or left of it.
         for dir in [Dir::Left, Dir::Up, Dir::Down] {
-            assert!(!s.move_focused(dir), "{dir:?} found a neighbour that is not there");
+            assert!(
+                !s.move_focused(dir),
+                "{dir:?} found a neighbour that is not there"
+            );
         }
         assert_eq!(s.active_workspace().windows()[0], a);
     }
@@ -596,7 +726,10 @@ mod tests {
         s.window_mut(b).expect("open").mode = WindowMode::Floating;
         s.arrange();
         s.active_workspace_mut().focus(b);
-        assert!(!s.move_focused(Dir::Left), "a floating window has no slot to swap");
+        assert!(
+            !s.move_focused(Dir::Left),
+            "a floating window has no slot to swap"
+        );
 
         // And it is not a target either: from the master, right must skip it.
         s.active_workspace_mut().focus(a);
@@ -689,7 +822,10 @@ mod tests {
         s.toggle_layout();
         s.active_workspace_mut().focus(first[5]);
         let scrolled = s.update_carousel_target().expect("a carousel has a target");
-        assert!(scrolled > 0, "the first workspace is scrolled along its strip");
+        assert!(
+            scrolled > 0,
+            "the first workspace is scrolled along its strip"
+        );
 
         // A second carousel workspace, with its own short strip.
         assert!(s.activate_workspace(1));
@@ -795,5 +931,192 @@ mod tests {
 
         let after = (s.window(a).unwrap().geometry, s.window(b).unwrap().geometry);
         assert_eq!(before, after, "the tile tree survived the round trip");
+    }
+
+    /// A carousel workspace with `n` panes on a 1000x600 screen, focused on the
+    /// first, with the strip resting at its start.
+    ///
+    /// Returns the column stride alongside, read off the geometry rather than
+    /// recomputed, so a test that swipes "two panes across" cannot disagree
+    /// with the layout about how far that is.
+    fn strip_of(n: usize) -> (Space, Vec<WindowId>, i32) {
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let windows: Vec<WindowId> = (0..n).map(|_| s.open_window()).collect();
+        if let Some(first) = windows.first() {
+            s.active_workspace_mut().focus(*first);
+        }
+        s.toggle_layout();
+        s.arrange();
+        let stride = match windows.get(1) {
+            Some(second) => {
+                s.window(*second).unwrap().geometry.x() - s.window(windows[0]).unwrap().geometry.x()
+            }
+            None => 0,
+        };
+        (s, windows, stride)
+    }
+
+    #[test]
+    fn a_swipe_turns_a_tiled_workspace_into_the_carousel_and_leaves_it_there() {
+        // The gesture is how you get to the carousel, so it makes the same
+        // change the keybinding does — including outlasting the fingers.
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        s.open_window();
+        s.open_window();
+        assert_eq!(s.active_workspace().layout(), Layout::Tiled);
+
+        s.begin_carousel_drag().expect("two panes to take hold of");
+        assert_eq!(s.active_workspace().layout(), Layout::Carousel);
+
+        s.end_carousel_drag();
+        assert_eq!(
+            s.active_workspace().layout(),
+            Layout::Carousel,
+            "the layout is a decision, not a thing the fingers hold open"
+        );
+    }
+
+    #[test]
+    fn a_swipe_over_an_empty_workspace_changes_nothing() {
+        // Nothing to take hold of. Flipping the layout anyway would be a mode
+        // change with no visible cause, discovered later on an empty screen.
+        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        assert_eq!(s.begin_carousel_drag(), None);
+        assert_eq!(s.active_workspace().layout(), Layout::Tiled);
+        assert!(!s.carousel_dragging());
+    }
+
+    #[test]
+    fn the_strip_follows_the_fingers_rather_than_the_focused_pane() {
+        // The whole point of the drag flag: focus is still on pane 1, and the
+        // strip must be allowed to leave it off screen until the fingers lift.
+        let (mut s, windows, _) = strip_of(6);
+        s.begin_carousel_drag().expect("panes to take hold of");
+        assert_eq!(s.drag_carousel(700), Some(700));
+        assert_eq!(
+            s.update_carousel_target(),
+            Some(700),
+            "focus does not pull it back"
+        );
+
+        s.arrange();
+        let first = s.window(windows[0]).unwrap().geometry;
+        assert!(
+            first.right() < 0,
+            "pane 1 is off screen while the drag holds it there"
+        );
+    }
+
+    #[test]
+    fn a_drag_stops_at_the_ends_of_the_strip() {
+        let (mut s, windows, stride) = strip_of(6);
+        s.begin_carousel_drag().expect("panes to take hold of");
+
+        assert_eq!(s.drag_carousel(-4000), Some(0), "it stops at the start");
+        let end = s
+            .drag_carousel(99_999)
+            .expect("the drag holds this workspace");
+        assert!(
+            end > 0 && end < 5 * stride,
+            "the end is the last pane flush, not past it"
+        );
+
+        // Which is to say: at the end, the final pane sits at the right edge.
+        s.arrange();
+        assert_eq!(s.window(windows[5]).unwrap().geometry.right(), 992);
+    }
+
+    #[test]
+    fn letting_go_settles_on_a_pane_and_focuses_it() {
+        let (mut s, windows, stride) = strip_of(6);
+        assert_eq!(s.focused(), Some(windows[0]));
+
+        s.begin_carousel_drag().expect("panes to take hold of");
+        // Two full columns across, so the third pane is what the fingers left
+        // at the left of the viewport.
+        s.drag_carousel(stride * 2);
+        let settled = s.end_carousel_drag().expect("a pane to settle on");
+
+        assert_eq!(settled, windows[2]);
+        assert_eq!(
+            s.focused(),
+            Some(windows[2]),
+            "the keyboard went where the fingers did"
+        );
+        assert!(!s.carousel_dragging(), "the strip was let go of");
+    }
+
+    #[test]
+    fn a_settled_strip_stays_where_the_swipe_left_it() {
+        // The regression this guards: the drag moves the strip, focus stays
+        // put, and the next arrange snaps it straight back. Focusing the pane
+        // it settled on is what stops that, and this is the proof.
+        let (mut s, _, stride) = strip_of(6);
+        s.begin_carousel_drag().expect("panes to take hold of");
+        // Two columns across and a few pixels short of it, so the settle has
+        // somewhere to round to and the test is not asserting on a no-op.
+        s.drag_carousel(stride * 2 - 6);
+        s.end_carousel_drag().expect("a pane to settle on");
+
+        let after = s.update_carousel_target().expect("a carousel has a target");
+        assert_eq!(
+            after,
+            stride * 2,
+            "the arrange after the swipe leaves it alone"
+        );
+        // And again, because the nudge rule reads the position it last wrote.
+        assert_eq!(s.update_carousel_target(), Some(stride * 2));
+    }
+
+    #[test]
+    fn a_swipe_that_barely_moves_settles_back_where_it_started() {
+        let (mut s, windows, _) = strip_of(6);
+        s.begin_carousel_drag().expect("panes to take hold of");
+        s.drag_carousel(20);
+        assert_eq!(s.end_carousel_drag(), Some(windows[0]));
+        assert_eq!(
+            s.update_carousel_target(),
+            Some(0),
+            "back to the start, not stuck at 20"
+        );
+    }
+
+    #[test]
+    fn switching_workspace_mid_swipe_lets_go_rather_than_freezing_the_new_one() {
+        // The drag is held by workspace id precisely so this cannot strand the
+        // strip you arrive on outside the focus rule that governs it.
+        let (mut s, _, _) = strip_of(6);
+        s.begin_carousel_drag().expect("panes to take hold of");
+        s.drag_carousel(600);
+
+        s.activate_workspace(1);
+        assert!(
+            !s.carousel_dragging(),
+            "the swipe does not follow you across"
+        );
+        assert_eq!(
+            s.drag_carousel(900),
+            None,
+            "and it cannot move the strip here"
+        );
+        assert_eq!(s.end_carousel_drag(), None);
+    }
+
+    #[test]
+    fn a_swipe_never_settles_a_pane_the_strip_does_not_show() {
+        // The pairing `strip::snap` promises, exercised through the whole path
+        // rather than in the layout alone.
+        for stop in [0, 130, 495, 700, 1200, 9_000] {
+            let (mut s, _, _) = strip_of(7);
+            s.begin_carousel_drag().expect("panes to take hold of");
+            s.drag_carousel(stop);
+            let pane = s.end_carousel_drag().expect("a pane to settle on");
+            s.arrange();
+            let geometry = s.window(pane).unwrap().geometry;
+            assert!(
+                geometry.x() >= 0 && geometry.right() <= 1000,
+                "letting go at {stop} focused a pane at {geometry:?}, off screen"
+            );
+        }
     }
 }

@@ -82,15 +82,15 @@ pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) {
     //
     // Only when absent: a session that already set it chose that address, and
     // the well-known path is a fallback rather than an override.
-    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let bus = std::path::Path::new(&runtime_dir).join("bus");
-            if bus.exists() {
-                command.env(
-                    "DBUS_SESSION_BUS_ADDRESS",
-                    format!("unix:path={}", bus.display()),
-                );
-            }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        && let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+    {
+        let bus = std::path::Path::new(&runtime_dir).join("bus");
+        if bus.exists() {
+            command.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            );
         }
     }
     // Toolkits pick Wayland when both are set, so this only decides where the

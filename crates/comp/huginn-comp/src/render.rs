@@ -24,12 +24,14 @@ use std::sync::Mutex;
 
 use smithay::{
     backend::renderer::{
-        gles::{GlesRenderer, element::TextureShaderElement},
         element::{
-            Kind, memory::MemoryRenderBufferRenderElement, render_elements,
+            Kind,
+            memory::MemoryRenderBufferRenderElement,
+            render_elements,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
+        gles::{GlesRenderer, element::TextureShaderElement},
     },
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     utils::{Logical, Point},

@@ -254,7 +254,9 @@ fn decode_png(bytes: &[u8]) -> Result<Wallpaper, String> {
         bytes: MAX_PIXELS * 4,
     });
 
-    let mut reader = decoder.read_info().map_err(|e| format!("bad PNG header: {e}"))?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("bad PNG header: {e}"))?;
     let (width, height) = {
         let info = reader.info();
         (info.width, info.height)
@@ -295,7 +297,8 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Wallpaper, String> {
         .set_max_width(MAX_DIMENSION)
         .set_max_height(MAX_DIMENSION);
 
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
     decoder
         .decode_headers()
         .map_err(|e| format!("bad JPEG header: {e}"))?;
@@ -308,7 +311,9 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Wallpaper, String> {
     );
     check_dimensions(width, height)?;
 
-    let decoded = decoder.decode().map_err(|e| format!("bad JPEG data: {e}"))?;
+    let decoded = decoder
+        .decode()
+        .map_err(|e| format!("bad JPEG data: {e}"))?;
 
     // A greyscale JPEG comes back as one channel even having asked for RGB:
     // the requested colourspace is a request and not a conversion.
@@ -349,7 +354,12 @@ fn check_dimensions(width: u32, height: u32) -> Result<(), String> {
 /// Alpha is dropped rather than honoured: this is the backmost thing on the
 /// screen, so a transparent wallpaper would show the clear colour and not
 /// anything a user would call transparency.
-fn to_canvas_order(src: &[u8], width: u32, height: u32, channels: usize) -> Result<Vec<u8>, String> {
+fn to_canvas_order(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    channels: usize,
+) -> Result<Vec<u8>, String> {
     let count = (width as usize)
         .checked_mul(height as usize)
         .ok_or_else(|| "absurd dimensions".to_string())?;
@@ -392,12 +402,21 @@ mod tests {
             0xFF, 0x00, 0x00, 0xFF,   0x00, 0xFF, 0x00, 0xFF,
             0x00, 0x00, 0xFF, 0xFF,   0xFF, 0xFF, 0xFF, 0xFF,
         ];
-        Wallpaper { width: 2, height: 2, pixels }
+        Wallpaper {
+            width: 2,
+            height: 2,
+            pixels,
+        }
     }
 
     #[test]
     fn any_extension_is_the_wallpaper() {
-        for name in ["wallpaper.png", "wallpaper.jpg", "wallpaper.jpeg", "wallpaper"] {
+        for name in [
+            "wallpaper.png",
+            "wallpaper.jpg",
+            "wallpaper.jpeg",
+            "wallpaper",
+        ] {
             assert_eq!(
                 choose(paths(&[name]).into_iter()),
                 Some(Path::new(SET_DIR).join(name)),
@@ -471,9 +490,18 @@ mod tests {
         };
         let (top_left, top_right, bottom_left) = (at(0, 0), at(19, 0), at(0, 9));
 
-        assert!(top_left[0] > 200 && top_left[1] == 0, "{top_left:?} is not red");
-        assert!(top_right[1] > 200 && top_right[0] < 60, "{top_right:?} is not green");
-        assert!(bottom_left[2] > 200 && bottom_left[0] < 60, "{bottom_left:?} is not blue");
+        assert!(
+            top_left[0] > 200 && top_left[1] == 0,
+            "{top_left:?} is not red"
+        );
+        assert!(
+            top_right[1] > 200 && top_right[0] < 60,
+            "{top_right:?} is not green"
+        );
+        assert!(
+            bottom_left[2] > 200 && bottom_left[0] < 60,
+            "{bottom_left:?} is not blue"
+        );
         assert!(top_left[0] < 0xFF, "{top_left:?} is the uncropped top row");
     }
 
@@ -510,6 +538,9 @@ mod tests {
 
     #[test]
     fn grey_expands_to_three_channels() {
-        assert_eq!(to_canvas_order(&[0x7F], 1, 1, 1).unwrap(), vec![0x7F, 0x7F, 0x7F, 0xFF]);
+        assert_eq!(
+            to_canvas_order(&[0x7F], 1, 1, 1).unwrap(),
+            vec![0x7F, 0x7F, 0x7F, 0xFF]
+        );
     }
 }

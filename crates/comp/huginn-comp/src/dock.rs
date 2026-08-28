@@ -104,7 +104,11 @@ pub(crate) fn matches(entry: &Entry, app_id: &str) -> bool {
     let Some(stem) = entry.path.file_stem().and_then(|s| s.to_str()) else {
         return false;
     };
-    same(stem, app_id) || app_id.rsplit('.').next().is_some_and(|tail| same(stem, tail))
+    same(stem, app_id)
+        || app_id
+            .rsplit('.')
+            .next()
+            .is_some_and(|tail| same(stem, tail))
 }
 
 /// Build the strip: the launcher, then pinned applications, then anything else
@@ -244,7 +248,11 @@ impl Dock {
             // A spring on the way up, so it arrives like an object; plain
             // easing on the way down, because an overshoot while leaving reads
             // as the dock trying to follow the pointer off the screen.
-            if should_show { Curve::Spring } else { Curve::EaseOut },
+            if should_show {
+                Curve::Spring
+            } else {
+                Curve::EaseOut
+            },
         );
         true
     }
@@ -450,7 +458,10 @@ mod tests {
     #[test]
     fn startup_wm_class_wins_when_it_is_there() {
         assert!(matches(&apps()[2], "Navigator"), "Firefox's real app_id");
-        assert!(matches(&apps()[2], "navigator"), "case is not authoritative");
+        assert!(
+            matches(&apps()[2], "navigator"),
+            "case is not authoritative"
+        );
     }
 
     #[test]
@@ -492,10 +503,20 @@ mod tests {
         // Exec resolves to something runnable — not just a name to draw.
         let apps = apps();
         let items = items(&apps, &[]);
-        let item = items.iter().find(|i| !i.is_launcher()).expect("pinned item");
+        let item = items
+            .iter()
+            .find(|i| !i.is_launcher())
+            .expect("pinned item");
         assert!(!item.running);
-        let entry = item.entry.and_then(|i| apps.get(i)).expect("resolves to an entry");
-        assert!(entry.argv(&[]).is_some(), "nothing to run for {}", entry.name);
+        let entry = item
+            .entry
+            .and_then(|i| apps.get(i))
+            .expect("resolves to an entry");
+        assert!(
+            entry.argv(&[]).is_some(),
+            "nothing to run for {}",
+            entry.name
+        );
     }
 
     #[test]
@@ -525,7 +546,10 @@ mod tests {
             entry("Brave", "com.brave.Browser", Some("Brave-browser")),
         ];
         let items = items(&twice, &["Brave-browser".to_owned()]);
-        let braves = items.iter().filter(|i| i.entry.is_some_and(|e| e > 0)).count();
+        let braves = items
+            .iter()
+            .filter(|i| i.entry.is_some_and(|e| e > 0))
+            .count();
         assert_eq!(braves, 1, "one window produced {braves} dock items");
     }
 
@@ -558,7 +582,10 @@ mod tests {
         dock.pointer_moved(1079, SCREEN, false, ms(0), FULL);
         assert!(!dock.is_visible(ms(100)), "it came up during the delay");
         dock.pointer_moved(500, SCREEN, false, ms(100), FULL);
-        assert!(!dock.is_visible(ms(1_000)), "it came up after the pointer left");
+        assert!(
+            !dock.is_visible(ms(1_000)),
+            "it came up after the pointer left"
+        );
     }
 
     #[test]
@@ -567,7 +594,10 @@ mod tests {
         dock.pointer_moved(1079, SCREEN, false, ms(0), FULL);
         dock.pointer_moved(1079, SCREEN, false, ms(300), FULL);
         assert!(dock.is_visible(ms(400)));
-        assert!((dock.reveal(ms(1_000)) - 1.0).abs() < 1e-3, "it did not finish rising");
+        assert!(
+            (dock.reveal(ms(1_000)) - 1.0).abs() < 1e-3,
+            "it did not finish rising"
+        );
     }
 
     #[test]
@@ -607,7 +637,11 @@ mod tests {
         let reduced = crate::settings::Motion::Reduced;
         dock.pointer_moved(1079, SCREEN, false, ms(0), reduced);
         dock.pointer_moved(1079, SCREEN, false, ms(300), reduced);
-        assert_eq!(dock.reveal(ms(300)), 1.0, "it animated despite reduced motion");
+        assert_eq!(
+            dock.reveal(ms(300)),
+            1.0,
+            "it animated despite reduced motion"
+        );
     }
 
     #[test]
@@ -615,9 +649,15 @@ mod tests {
         // Sliding rather than fading: a partly-revealed dock is partly off
         // screen, which reads as an object arriving.
         let hidden = placement(SCREEN, 3, 0.0);
-        assert!(hidden.y() >= SCREEN.h(), "a hidden dock is on screen at {hidden:?}");
+        assert!(
+            hidden.y() >= SCREEN.h(),
+            "a hidden dock is on screen at {hidden:?}"
+        );
         let shown = placement(SCREEN, 3, 1.0);
-        assert!(shown.y() + shown.h() <= SCREEN.h(), "a shown dock hangs off the bottom");
+        assert!(
+            shown.y() + shown.h() <= SCREEN.h(),
+            "a shown dock hangs off the bottom"
+        );
     }
 
     #[test]
@@ -649,7 +689,11 @@ mod tests {
         let rect = placement(SCREEN, 4, 1.0);
         assert_eq!(dock.item_at(rect.x() - 10, rect, 4), None);
         assert_eq!(dock.item_at(rect.x() + rect.w() + 10, rect, 4), None);
-        assert_eq!(dock.item_at(rect.x() + 1, rect, 0), None, "no items, no hit");
+        assert_eq!(
+            dock.item_at(rect.x() + 1, rect, 0),
+            None,
+            "no items, no hit"
+        );
     }
 
     #[test]
@@ -707,8 +751,14 @@ mod dump {
         let mut canvas = Canvas::new(w, h);
         // Opaque behind it so the PPM (which drops alpha) shows the rounding.
         canvas.fill(0, 0, w, h, [0x0A, 0x0A, 0x10, 0xFF]);
-        canvas.fill_rounded(0, 0, w, h, h as f32 * RADIUS,
-                            crate::theme::BACKGROUND.with_alpha(ALPHA));
+        canvas.fill_rounded(
+            0,
+            0,
+            w,
+            h,
+            h as f32 * RADIUS,
+            crate::theme::BACKGROUND.with_alpha(ALPHA),
+        );
         for (index, item) in items.iter().enumerate() {
             let x = gap + (icon + gap) * index as f32;
             if item.is_launcher() {
@@ -724,10 +774,14 @@ mod dump {
             }
             if item.running {
                 let dot = (4.0 * scale).max(3.0);
-                canvas.fill_rounded((x + icon / 2.0 - dot / 2.0) as usize,
-                                    (h as f32 - gap * 0.6) as usize,
-                                    dot as usize, dot as usize, dot / 2.0,
-                                    crate::theme::ACCENT);
+                canvas.fill_rounded(
+                    (x + icon / 2.0 - dot / 2.0) as usize,
+                    (h as f32 - gap * 0.6) as usize,
+                    dot as usize,
+                    dot as usize,
+                    dot / 2.0,
+                    crate::theme::ACCENT,
+                );
             }
         }
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();

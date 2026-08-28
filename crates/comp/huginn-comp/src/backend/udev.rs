@@ -52,11 +52,7 @@ use smithay::{
         egl::EGLDevice,
         input::{Event as _, InputEvent, KeyboardKeyEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::{
-            ImportDma,
-            element::surface::WaylandSurfaceRenderElement,
-            gles::GlesRenderer,
-        },
+        renderer::{ImportDma, element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
@@ -87,8 +83,8 @@ use huginn_core::{
 };
 
 use crate::backend::advertise;
-use crate::backend::input;
 use crate::backend::chord;
+use crate::backend::input;
 use crate::backend::keymap::{Action, help_line, resolve};
 use crate::pointer::Cursor;
 use crate::render;
@@ -177,7 +173,10 @@ pub(crate) fn run() -> Result<()> {
     // carries DRM master, and what lets logind revoke it on VT switch.
     let mut session_for_open = session.clone();
     let fd = session_for_open
-        .open(&gpu_path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK)
+        .open(
+            &gpu_path,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+        )
         .map_err(|e| anyhow::anyhow!("session refused to open {gpu_path:?}: {e}"))?;
     let device_fd = DrmDeviceFd::new(DeviceFd::from(fd));
 
@@ -197,7 +196,10 @@ pub(crate) fn run() -> Result<()> {
     let manager = DrmOutputManager::new(
         drm_device,
         allocator,
-        GbmFramebufferExporter::new(gbm.clone(), node.node_with_type(NodeType::Render).and_then(|r| r.ok())),
+        GbmFramebufferExporter::new(
+            gbm.clone(),
+            node.node_with_type(NodeType::Render).and_then(|r| r.ok()),
+        ),
         Some(gbm.clone()),
         // Xrgb8888 first: opaque scan-out is the common case and avoids the
         // compositor blending against nothing.
@@ -228,7 +230,9 @@ pub(crate) fn run() -> Result<()> {
             state.enable_dmabuf(&dh, render_node.dev_id(), formats);
         }
         Ok(None) => tracing::warn!("EGL display has no render node; clients stay on shm"),
-        Err(e) => tracing::warn!(error = %e, "could not identify the render node; clients stay on shm"),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not identify the render node; clients stay on shm")
+        }
     }
 
     // Outputs are not scanned here. The first scan is the same reconciliation
@@ -410,9 +414,7 @@ pub(crate) fn run() -> Result<()> {
 ///
 /// The preferred mode is the panel's native one. Falling back to the first
 /// available beats refusing to light up the screen at all.
-fn preferred_mode(
-    connector: &connector::Info,
-) -> Option<smithay::reexports::drm::control::Mode> {
+fn preferred_mode(connector: &connector::Info) -> Option<smithay::reexports::drm::control::Mode> {
     use smithay::reexports::drm::control::ModeTypeFlags;
 
     connector
@@ -492,11 +494,17 @@ impl Udev {
                 tracing::error!("the GPU huginn is driving was removed; shutting down");
                 self.signal.stop();
             }
-            UdevEvent::Added { device_id, ref path } if device_id != self.device_id => {
+            UdevEvent::Added {
+                device_id,
+                ref path,
+            } if device_id != self.device_id => {
                 // Multi-GPU needs a DrmOutputManager per device and a way to
                 // move buffers between them; until then, say so rather than
                 // leave a plugged-in card silently dark.
-                tracing::info!(?path, "another GPU appeared; huginn drives only the primary one");
+                tracing::info!(
+                    ?path,
+                    "another GPU appeared; huginn drives only the primary one"
+                );
             }
             _ => {}
         }
@@ -549,8 +557,11 @@ impl Udev {
         });
 
         // --- new, or still here but different ---
-        let known: HashSet<connector::Handle> =
-            self.screens.values().map(|screen| screen.connector).collect();
+        let known: HashSet<connector::Handle> = self
+            .screens
+            .values()
+            .map(|screen| screen.connector)
+            .collect();
         for connector in &connected {
             if known.contains(&connector.handle()) {
                 changed |= self.refresh_screen(connector);
@@ -558,7 +569,9 @@ impl Udev {
             }
             match self.add_screen(&resources, connector) {
                 Ok(()) => changed = true,
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "could not bring up a connector"),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "could not bring up a connector")
+                }
             }
         }
 
@@ -574,7 +587,11 @@ impl Udev {
         resources: &ResourceHandles,
         connector: &connector::Info,
     ) -> Result<()> {
-        let name = format!("{}-{}", connector.interface().as_str(), connector.interface_id());
+        let name = format!(
+            "{}-{}",
+            connector.interface().as_str(),
+            connector.interface_id()
+        );
 
         let Some(mode) = preferred_mode(connector) else {
             anyhow::bail!("{name} reports no modes");
@@ -608,23 +625,26 @@ impl Udev {
         let global = self.state.add_output(&output, &self.dh);
 
         let dh = self.dh.clone();
-        let drm = self
-            .manager
-            .initialize_output(
-                crtc,
-                mode,
-                &[connector.handle()],
-                &output,
-                None,
-                &mut self.renderer,
-                &DrmOutputRenderElements::<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>::default(),
-            )
-            .map_err(|e| {
-                // The global went out before the CRTC came up, so take it back
-                // rather than advertise an output that renders nothing.
-                dh.remove_global::<Huginn>(global.clone());
-                anyhow::anyhow!("initialising {name}: {e}")
-            })?;
+        let drm =
+            self.manager
+                .initialize_output(
+                    crtc,
+                    mode,
+                    &[connector.handle()],
+                    &output,
+                    None,
+                    &mut self.renderer,
+                    &DrmOutputRenderElements::<
+                        GlesRenderer,
+                        WaylandSurfaceRenderElement<GlesRenderer>,
+                    >::default(),
+                )
+                .map_err(|e| {
+                    // The global went out before the CRTC came up, so take it back
+                    // rather than advertise an output that renders nothing.
+                    dh.remove_global::<Huginn>(global.clone());
+                    anyhow::anyhow!("initialising {name}: {e}")
+                })?;
 
         tracing::info!(
             %name,
@@ -690,11 +710,16 @@ impl Udev {
         }
 
         if mode != screen.mode {
-            if let Err(e) = screen.drm.use_mode(
-                mode,
-                &mut self.renderer,
-                &DrmOutputRenderElements::<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>::default(),
-            ) {
+            if let Err(e) =
+                screen.drm.use_mode(
+                    mode,
+                    &mut self.renderer,
+                    &DrmOutputRenderElements::<
+                        GlesRenderer,
+                        WaylandSurfaceRenderElement<GlesRenderer>,
+                    >::default(),
+                )
+            {
                 tracing::warn!(name = %screen.name, error = %e, "switching mode; keeping the old one");
                 return false;
             }
@@ -715,12 +740,9 @@ impl Udev {
         // The physical size on the `wl_output` global is fixed at creation and
         // stays as the old panel reported it; nothing downstream reads it, the
         // scale policy having already been applied here.
-        screen.output.change_current_state(
-            Some(wl_mode),
-            None,
-            Some(advertise(scale)),
-            None,
-        );
+        screen
+            .output
+            .change_current_state(Some(wl_mode), None, Some(advertise(scale)), None);
         screen.output.set_preferred(wl_mode);
         screen.dirty = true;
         true
@@ -826,11 +848,15 @@ impl Udev {
                 .unwrap_or_default();
             let (_, behind) =
                 render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref());
-            self.blur
-                .as_mut()
-                .and_then(|blur| {
-                    blur.pass(&mut self.renderer, &behind, size, self.state.scale.fractional(), radius)
-                })
+            self.blur.as_mut().and_then(|blur| {
+                blur.pass(
+                    &mut self.renderer,
+                    &behind,
+                    size,
+                    self.state.scale.fractional(),
+                    radius,
+                )
+            })
         } else {
             None
         };
@@ -933,7 +959,7 @@ impl Udev {
         // Read before the filter borrows the state.
         let launcher_open = self.state.launcher.is_open();
         let settings_open = self.state.settings.is_open();
-                let resizing = self.state.resizing;
+        let resizing = self.state.resizing;
         let action = self
             .keyboard
             .input::<Option<Action>, _>(
@@ -944,14 +970,22 @@ impl Udev {
                 time,
                 |_state, modifiers, handle| {
                     {
-                                let sym = handle.modified_sym();
-                                // The character the layout produces, so the
-                                // launcher types what the user pressed rather
-                                // than what a US keyboard would have.
-                                let character = sym.key_char();
-                                let launcher = launcher_open.then_some(character);
-                                resolve(key_state, modifiers, sym.raw(), owns_super, launcher, settings_open, resizing)
-                            }
+                        let sym = handle.modified_sym();
+                        // The character the layout produces, so the
+                        // launcher types what the user pressed rather
+                        // than what a US keyboard would have.
+                        let character = sym.key_char();
+                        let launcher = launcher_open.then_some(character);
+                        resolve(
+                            key_state,
+                            modifiers,
+                            sym.raw(),
+                            owns_super,
+                            launcher,
+                            settings_open,
+                            resizing,
+                        )
+                    }
                 },
             )
             .flatten();
@@ -974,10 +1008,16 @@ impl Udev {
                 return;
             }
             Action::FocusNext => {
-                state.space.active_workspace_mut().cycle_focus(Direction::Forward);
+                state
+                    .space
+                    .active_workspace_mut()
+                    .cycle_focus(Direction::Forward);
             }
             Action::FocusPrev => {
-                state.space.active_workspace_mut().cycle_focus(Direction::Backward);
+                state
+                    .space
+                    .active_workspace_mut()
+                    .cycle_focus(Direction::Backward);
             }
             Action::PromoteFocused => {
                 state.space.active_workspace_mut().promote_focused();
@@ -1026,8 +1066,9 @@ impl Udev {
             Action::Settings(key) => {
                 let now = state.uptime();
                 match state.settings.press(key, now) {
-                    crate::settings::Outcome::Dismissed
-                    | crate::settings::Outcome::Redraw => state.refresh_settings(),
+                    crate::settings::Outcome::Dismissed | crate::settings::Outcome::Redraw => {
+                        state.refresh_settings()
+                    }
                     crate::settings::Outcome::Unchanged => {}
                 }
             }

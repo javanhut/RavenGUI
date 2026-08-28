@@ -12,20 +12,15 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
 
 use crate::window::WindowSurface;
-use smithay::{
-    delegate_xwayland_shell,
-    wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
-    xwayland::{X11Surface, X11Wm, XWaylandClientData},
-};
 use huginn_core::{
     Space,
-    scale::OutputScale,
-    tiles::Axis,
     geometry::{Dir, Rect, Size},
     layer::{
         Anchors, Exclusive, Focusable, Interactivity, KeyboardFocus, Level, Margins,
         keyboard_focus, place, usable_area,
     },
+    scale::OutputScale,
+    tiles::Axis,
     window::{WindowId, WindowMode},
 };
 use smithay::{
@@ -33,18 +28,15 @@ use smithay::{
         element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
+    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
+    delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
-    utils::{Logical, Point},
-    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_output,
-    delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::LedState,
         pointer::{CursorImageStatus, PointerHandle},
     },
     output::Output,
-    delegate_layer_shell,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -54,12 +46,14 @@ use smithay::{
         },
     },
     utils::Serial,
+    utils::{Logical, Point},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
-        fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale},
-        viewporter::ViewporterState,
+        fractional_scale::{
+            FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
+        },
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
@@ -73,12 +67,16 @@ use smithay::{
                 Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
                 WlrLayerShellState,
             },
-            xdg::{
-                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            },
+            xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
         },
         shm::{ShmHandler, ShmState},
+        viewporter::ViewporterState,
     },
+};
+use smithay::{
+    delegate_xwayland_shell,
+    wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
+    xwayland::{X11Surface, X11Wm, XWaylandClientData},
 };
 
 /// Per-client state the compositor attaches to every connection.
@@ -134,7 +132,6 @@ const SUPER_IS_THEIRS: &[&str] = &[
     "kitty",
     "org.wezfurlong.wezterm",
 ];
-
 
 /// Whether `surface` currently holds a buffer.
 ///
@@ -269,6 +266,12 @@ pub(crate) struct Huginn {
     /// strip belongs and has no clock to move it with, so the sliding lives
     /// here and the offset is handed back down each frame.
     carousel_scroll: crate::anim::Animated,
+    /// The touchpad swipe in progress, if any.
+    ///
+    /// Held on the compositor rather than in the core because a gesture is
+    /// input, not window management: `huginn-core` is told where the strip
+    /// should be, and has no interest in how many fingers said so.
+    swipe: Option<crate::gesture::Swipe>,
     /// Which workspace [`Self::carousel_scroll`] is currently sliding for.
     ///
     /// Scroll position belongs to the workspace, so a change here means the
@@ -398,10 +401,7 @@ impl Huginn {
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
             viewporter_state: ViewporterState::new::<Self>(dh),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
-            scale: OutputScale::for_output(
-                Size::new(area.w(), area.h()),
-                Size::new(0, 0),
-            ),
+            scale: OutputScale::for_output(Size::new(area.w(), area.h()), Size::new(0, 0)),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
@@ -426,6 +426,7 @@ impl Huginn {
             popups: PopupManager::default(),
             layers: Vec::new(),
             carousel_scroll: crate::anim::Animated::settled(0.0),
+            swipe: None,
             carousel_on: None,
             focused_layer: None,
             keyboard_on: KeyboardOn::default(),
@@ -467,7 +468,11 @@ impl Huginn {
             Some(_) => None,
             None => {
                 let area = self.output_area;
-                Some(crate::overlay::Overlay::render(area, &mut self.text, self.scale.advertised))
+                Some(crate::overlay::Overlay::render(
+                    area,
+                    &mut self.text,
+                    self.scale.advertised,
+                ))
             }
         };
         tracing::debug!(visible = self.help.is_some(), "keybinding overlay");
@@ -480,7 +485,11 @@ impl Huginn {
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
         if self.help.is_some() {
-            self.help = Some(crate::overlay::Overlay::render(area, &mut self.text, self.scale.advertised));
+            self.help = Some(crate::overlay::Overlay::render(
+                area,
+                &mut self.text,
+                self.scale.advertised,
+            ));
         }
         self.refresh_layers();
     }
@@ -516,7 +525,10 @@ impl Huginn {
                 && has_buffer(surface.wl_surface())
                 && let Some(edge) = state.anchors.exclusive_edge()
             {
-                zones.push(Exclusive { edge, size: state.exclusive });
+                zones.push(Exclusive {
+                    edge,
+                    size: state.exclusive,
+                });
             }
 
             if rect != *last {
@@ -554,7 +566,10 @@ impl Huginn {
     /// order. Used to find a popup's root, which cares which surface it is
     /// rather than which layer it sits on.
     pub(crate) fn all_layers(&self) -> Vec<(&LayerSurface, Rect)> {
-        self.layers.iter().map(|(surface, rect)| (surface, *rect)).collect()
+        self.layers
+            .iter()
+            .map(|(surface, rect)| (surface, *rect))
+            .collect()
     }
 
     /// Layer surfaces on `layer`, with their geometry, for rendering.
@@ -601,7 +616,11 @@ impl Huginn {
         // Everything below the boundary is what a panel blurs. See
         // [`Huginn::blur_boundary`], which counts the items above it.
         if let Some(help) = &self.help {
-            out.push(SceneItem::Overlay(help.buffer(), help.placement(self.output_area), 1.0));
+            out.push(SceneItem::Overlay(
+                help.buffer(),
+                help.placement(self.output_area),
+                1.0,
+            ));
         }
         if let Some(panel) = &self.launcher_panel {
             let clock = self.uptime();
@@ -667,7 +686,11 @@ impl Huginn {
         // Directly above the windows: over its neighbours, whose pixels it
         // reaches into when the layout leaves no gap, but under a panel or an
         // overlay, which are entitled to cover the desktop.
-        out.extend(self.focus_ring().into_iter().map(|(b, r)| SceneItem::Ring(b, r)));
+        out.extend(
+            self.focus_ring()
+                .into_iter()
+                .map(|(b, r)| SceneItem::Ring(b, r)),
+        );
         out.extend(
             self.render_list()
                 .into_iter()
@@ -870,12 +893,94 @@ impl Huginn {
             .is_some_and(|rect| rect.contains(self.pointer_point()));
         let motion = self.settings.motion();
         let y = self.pointer_location.y.round() as i32;
-        if self.dock.pointer_moved(y, self.output_area, over_dock, now, motion) {
+        if self
+            .dock
+            .pointer_moved(y, self.output_area, over_dock, now, motion)
+        {
             self.refresh_dock();
         }
     }
 
     /// A click landed. Returns the item hit, if any.
+    /// Fingers landed on the touchpad.
+    ///
+    /// Nothing is claimed yet — see [`crate::gesture`].
+    ///
+    /// A swipe still in flight is *ended* rather than dropped. libinput sends
+    /// an end for every begin, so one arriving here means the last gesture's
+    /// end went missing — and a dropped swipe would leave the core still
+    /// holding that workspace's strip, pinned outside the focus rule with
+    /// nothing left alive to let go of it. The strip would then sit still while
+    /// focus moved around it, for the rest of the session.
+    pub(crate) fn swipe_begin(&mut self, fingers: u32) {
+        if self.swipe.is_some() {
+            tracing::debug!("a touchpad swipe began before the last one ended");
+            self.swipe_end();
+        }
+        self.swipe = Some(crate::gesture::Swipe::new(fingers));
+    }
+
+    /// The fingers moved. Drives the carousel once the swipe has proved itself
+    /// a horizontal three-finger one.
+    pub(crate) fn swipe_update(&mut self, dx: f64, dy: f64) {
+        let Some(mut swipe) = self.swipe.take() else {
+            return;
+        };
+        if swipe.takes_hold(dx, dy) {
+            match self.space.begin_carousel_drag() {
+                Some(origin) => swipe.drives(origin),
+                // A workspace with no panes. Refused here rather than in the
+                // gesture, because "is there anything to scroll" is a question
+                // about the layout and only the core can answer it.
+                None => swipe.ignore(),
+            }
+        }
+        if let Some(offset) = swipe.offset() {
+            self.space.drag_carousel(offset);
+            // `arrange` is the whole of the motion: it hands the dragged offset
+            // to the layout, and asks for the frame that shows it. Nothing else
+            // would — the strip is pinned to the fingers rather than animating,
+            // so `tick_animations` has nothing to advance and would never call
+            // for a redraw of its own.
+            //
+            // It costs no configures. Scrolling slides every pane at a constant
+            // width, and `Window::configure` only sends one when the size
+            // changed, so a frame of this gesture puts nothing on the wire.
+            self.arrange();
+        }
+        self.swipe = Some(swipe);
+    }
+
+    /// The fingers lifted, or libinput gave up on the gesture.
+    ///
+    /// A cancelled swipe settles exactly like a completed one. The fingers are
+    /// off the pad either way, and leaving the strip parked mid-column because
+    /// the touchpad lost track of a finger would read as the compositor having
+    /// broken rather than as the gesture having been abandoned.
+    pub(crate) fn swipe_end(&mut self) {
+        let Some(swipe) = self.swipe.take() else {
+            return;
+        };
+        if swipe.offset().is_none() {
+            // Never took the strip — too short to commit to an axis, vertical,
+            // the wrong number of fingers, or refused by an empty workspace.
+            // There is nothing to let go of and nothing to settle.
+            return;
+        }
+        // `None` back from here means the swipe took hold of a workspace that
+        // is no longer the active one, so there is no settling to do — but the
+        // hold has still been released, which is the part that matters.
+        if self.space.end_carousel_drag().is_some() {
+            // Focus moved, so the keyboard and the ring follow it. The arrange
+            // after it slides the strip the short distance to the pane it
+            // settled on: the drag no longer holds the offset, so
+            // `settle_carousel` is back on the animated path and eases the last
+            // half-column rather than snapping it.
+            self.refresh_focus();
+            self.arrange();
+        }
+    }
+
     pub(crate) fn dock_click(&self) -> Option<crate::dock::Item> {
         let rect = self.dock_rect()?;
         let point = self.pointer_point();
@@ -942,7 +1047,8 @@ impl Huginn {
     pub(crate) fn open_launcher(&mut self) {
         let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
         let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
-        self.launcher.open(&self.apps, &self.frecency, now, origin, clock, motion);
+        self.launcher
+            .open(&self.apps, &self.frecency, now, origin, clock, motion);
         self.refresh_launcher();
     }
 
@@ -1419,7 +1525,13 @@ impl Huginn {
         // last strip sat and where this one does — animating across would move
         // this workspace's panes a distance that belongs to the other one.
         let workspace = self.space.active_workspace().id();
-        if self.carousel_on != Some(workspace) {
+        // A swipe in progress is not a slide either, for the opposite reason:
+        // the fingers are the animation. Easing towards them would leave the
+        // strip a fixed distance behind the hand moving it, which is the one
+        // thing direct manipulation must never do — and the ease would then
+        // have to unwind after the fingers stopped, so the strip would keep
+        // drifting for a sixth of a second after the gesture ended.
+        if self.carousel_on != Some(workspace) || self.space.carousel_dragging() {
             self.carousel_on = Some(workspace);
             self.carousel_scroll.jump_to(target as f32);
         } else if (self.carousel_scroll.target() - target as f32).abs() >= 1.0 {
@@ -1608,11 +1720,7 @@ impl CompositorHandler for Huginn {
         // first commit and expects a configure in response. Doing this on every
         // commit covers both that first configure and any later change, without
         // needing to track which is which.
-        if self
-            .layers
-            .iter()
-            .any(|(l, _)| l.wl_surface() == surface)
-        {
+        if self.layers.iter().any(|(l, _)| l.wl_surface() == surface) {
             self.refresh_layers();
         }
     }
@@ -1646,13 +1754,10 @@ impl XdgShellHandler for Huginn {
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
-            state.size = Some(
-                self.space
-                    .window(id)
-                    .map_or_else(|| (0, 0).into(), |w| {
-                        (w.geometry.w(), w.geometry.h()).into()
-                    }),
-            );
+            state.size = Some(self.space.window(id).map_or_else(
+                || (0, 0).into(),
+                |w| (w.geometry.w(), w.geometry.h()).into(),
+            ));
         });
         // xdg-shell requires the client to ack a configure before its first
         // commit, so a window that never gets one simply never appears.
@@ -1930,7 +2035,10 @@ pub(crate) fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
         return None;
     }
     let state = with_states(surface.wl_surface(), |states| {
-        *states.cached_state.get::<LayerSurfaceCachedState>().current()
+        *states
+            .cached_state
+            .get::<LayerSurfaceCachedState>()
+            .current()
     });
 
     Some(LayerRequest {
@@ -1961,4 +2069,3 @@ pub(crate) fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
         },
     })
 }
-

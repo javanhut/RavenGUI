@@ -97,8 +97,7 @@ impl Canvas {
                         (u32::from(source) + under * inverse / 255).min(255) as u8;
                 }
                 let under = u32::from(self.pixels[offset + 3]);
-                self.pixels[offset + 3] =
-                    (u32::from(sa) + under * inverse / 255).min(255) as u8;
+                self.pixels[offset + 3] = (u32::from(sa) + under * inverse / 255).min(255) as u8;
             }
         }
     }
@@ -155,8 +154,7 @@ impl Canvas {
                 (under + (f32::from(value) - under) * coverage).round() as u8;
         }
         let under = f32::from(self.pixels[offset + 3]);
-        self.pixels[offset + 3] =
-            (under + (255.0 - under) * coverage).round() as u8;
+        self.pixels[offset + 3] = (under + (255.0 - under) * coverage).round() as u8;
     }
 
     /// A one-pixel border around the whole canvas, so the panel has an edge
@@ -171,7 +169,6 @@ impl Canvas {
             self.set(self.stride - 1, row, color);
         }
     }
-
 
     /// Write one pixel, ignoring anything off the canvas.
     fn set(&mut self, col: usize, row: usize, color: [u8; 4]) {

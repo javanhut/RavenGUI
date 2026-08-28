@@ -28,7 +28,10 @@ pub(crate) fn send_ctrl(
         keycode_for(keyboard, state, Keysym::Control_L),
         keycode_for(keyboard, state, sym),
     ) else {
-        tracing::warn!(?sym, "no key on this layout produces the chord; nothing sent");
+        tracing::warn!(
+            ?sym,
+            "no key on this layout produces the chord; nothing sent"
+        );
         return;
     };
 
@@ -49,7 +52,14 @@ pub(crate) fn send_ctrl(
         let mut mods = keyboard.modifier_state();
         mods.logo = false;
         keyboard.set_modifier_state(mods);
-        keyboard.input_forward(state, code, key_state, SERIAL_COUNTER.next_serial(), time, true);
+        keyboard.input_forward(
+            state,
+            code,
+            key_state,
+            SERIAL_COUNTER.next_serial(),
+            time,
+            true,
+        );
     }
 
     // The Super key is still held, and the compositor's own bindings read this

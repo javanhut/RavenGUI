@@ -235,7 +235,11 @@ mod tests {
         /// the `applications` directory itself exists yet.
         fn applications(&self, base: &str, created: bool) -> PathBuf {
             let dir = self.0.join(base).join("applications");
-            let made = if created { &dir } else { dir.parent().expect("has a parent") };
+            let made = if created {
+                &dir
+            } else {
+                dir.parent().expect("has a parent")
+            };
             std::fs::create_dir_all(made).expect("base dir");
             dir
         }
@@ -249,8 +253,11 @@ mod tests {
 
     fn write_entry(dir: &Path) -> PathBuf {
         let path = dir.join("com.example.App.desktop");
-        std::fs::write(&path, "[Desktop Entry]\nType=Application\nName=App\nExec=app\n")
-            .expect("desktop file");
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=App\nExec=app\n",
+        )
+        .expect("desktop file");
         path
     }
 
@@ -284,7 +291,10 @@ mod tests {
         let dirs = raven_desktop::directories();
         assert!(!dirs.is_empty(), "nothing to watch at all");
         for dir in dirs {
-            assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("applications"));
+            assert_eq!(
+                dir.file_name().and_then(|n| n.to_str()),
+                Some("applications")
+            );
             assert!(dir.parent().is_some(), "{} has no parent", dir.display());
         }
     }

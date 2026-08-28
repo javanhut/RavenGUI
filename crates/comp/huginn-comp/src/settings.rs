@@ -365,7 +365,13 @@ pub(crate) fn render(
     Panel::from_canvas(&compose(settings, text, output, now, density), density)
 }
 
-fn compose(settings: &Settings, text: &mut Text, output: Rect, now: Duration, density: u32) -> Canvas {
+fn compose(
+    settings: &Settings,
+    text: &mut Text,
+    output: Rect,
+    now: Duration,
+    density: u32,
+) -> Canvas {
     // In the canvas's own pixels, `density` times the logical ones. See
     // `Panel::from_canvas`.
     let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density.max(1) as f32;
@@ -386,7 +392,14 @@ fn compose(settings: &Settings, text: &mut Text, output: Rect, now: Duration, de
     );
     canvas.frame(crate::theme::BORDER.to_rgba_bytes());
 
-    text.draw(&mut canvas, TITLE, size, pad as i32, pad as i32, crate::theme::ACCENT);
+    text.draw(
+        &mut canvas,
+        TITLE,
+        size,
+        pad as i32,
+        pad as i32,
+        crate::theme::ACCENT,
+    );
     canvas.fill(
         pad as usize,
         (pad + header - size * 0.6) as usize,
@@ -400,7 +413,14 @@ fn compose(settings: &Settings, text: &mut Text, output: Rect, now: Duration, de
         let reading = control.read();
         let highlighted = index == settings.selected;
         if highlighted {
-            canvas.tint(1, y as usize, width - 2, row as usize, crate::theme::ACCENT, 0x2E);
+            canvas.tint(
+                1,
+                y as usize,
+                width - 2,
+                row as usize,
+                crate::theme::ACCENT,
+                0x2E,
+            );
             canvas.fill(
                 1,
                 y as usize,
@@ -417,7 +437,11 @@ fn compose(settings: &Settings, text: &mut Text, output: Rect, now: Duration, de
             size,
             (pad + 6.0 * scale) as i32,
             text_y,
-            if highlighted { crate::theme::TEXT } else { crate::theme::TEXT_DIM },
+            if highlighted {
+                crate::theme::TEXT
+            } else {
+                crate::theme::TEXT_DIM
+            },
         );
 
         // The value, right-aligned. A stub says so instead of showing a
@@ -434,7 +458,11 @@ fn compose(settings: &Settings, text: &mut Text, output: Rect, now: Duration, de
             size * 0.95,
             (width as f32 - pad - value_w) as i32,
             text_y,
-            if reading.real { crate::theme::ACCENT } else { crate::theme::TEXT_DIM },
+            if reading.real {
+                crate::theme::ACCENT
+            } else {
+                crate::theme::TEXT_DIM
+            },
         );
         y += row;
     }
@@ -481,7 +509,10 @@ mod tests {
         let mut settings = opened();
         assert!(settings.is_visible(ms(200)));
         settings.close(ms(200));
-        assert!(settings.is_visible(ms(200)), "it vanished instead of closing");
+        assert!(
+            settings.is_visible(ms(200)),
+            "it vanished instead of closing"
+        );
         assert!(!settings.is_visible(ms(500)));
     }
 
@@ -520,7 +551,11 @@ mod tests {
         settings.press(Key::Activate, ms(10));
         settings.close(ms(20));
         settings.open(ms(30));
-        assert_eq!(settings.reveal(ms(30)), 1.0, "it animated despite reduced motion");
+        assert_eq!(
+            settings.reveal(ms(30)),
+            1.0,
+            "it animated despite reduced motion"
+        );
     }
 
     #[test]
@@ -548,7 +583,9 @@ mod tests {
         let before: Vec<String> = settings.controls.iter().map(|c| c.read().value).collect();
         settings.press(Key::Activate, T0);
         let after: Vec<String> = settings.controls.iter().map(|c| c.read().value).collect();
-        let changed: Vec<usize> = (0..before.len()).filter(|i| before[*i] != after[*i]).collect();
+        let changed: Vec<usize> = (0..before.len())
+            .filter(|i| before[*i] != after[*i])
+            .collect();
         assert_eq!(changed, [1], "activation touched {changed:?}");
     }
 
@@ -562,7 +599,10 @@ mod tests {
             seen.push(settings.controls[1].read().value.clone());
         }
         assert!(seen.contains(&"100%".to_owned()));
-        assert!(seen.contains(&"0%".to_owned()), "it stuck at full: {seen:?}");
+        assert!(
+            seen.contains(&"0%".to_owned()),
+            "it stuck at full: {seen:?}"
+        );
     }
 
     #[test]
@@ -588,7 +628,13 @@ mod tests {
         }
         let settings = opened();
         // Composing at full reveal so the alpha pass does not hide anything.
-        let canvas = compose(&settings, &mut text, Rect::from_xywh(0, 0, 1920, 1080), ms(500), 1);
+        let canvas = compose(
+            &settings,
+            &mut text,
+            Rect::from_xywh(0, 0, 1920, 1080),
+            ms(500),
+            1,
+        );
         assert!(canvas.height > 0);
         // The rows that are stubs draw a longer value string than the real one,
         // so the panel must be wide enough for it rather than clipping.
@@ -596,7 +642,10 @@ mod tests {
             .controls
             .iter()
             .filter(|c| !c.read().real)
-            .map(|c| text.measure(&format!("{} · {STUB}", c.read().value), BASE_SIZE * 0.95).0)
+            .map(|c| {
+                text.measure(&format!("{} · {STUB}", c.read().value), BASE_SIZE * 0.95)
+                    .0
+            })
             .fold(0.0_f32, f32::max);
         assert!(
             canvas.stride as f32 > widest + PAD * 2.0,
@@ -616,8 +665,16 @@ mod tests {
         let output = Rect::from_xywh(0, 0, 1920, 1080);
         let opaque = compose(&settings, &mut text, output, ms(500), 1);
         let faded = compose(&settings, &mut text, output, ms(20), 1);
-        let alpha = |c: &Canvas| c.pixels.chunks_exact(4).map(|p| u32::from(p[3])).sum::<u32>();
-        assert!(alpha(&faded) < alpha(&opaque), "the reveal did not fade the panel");
+        let alpha = |c: &Canvas| {
+            c.pixels
+                .chunks_exact(4)
+                .map(|p| u32::from(p[3]))
+                .sum::<u32>()
+        };
+        assert!(
+            alpha(&faded) < alpha(&opaque),
+            "the reveal did not fade the panel"
+        );
     }
 }
 
@@ -642,9 +699,18 @@ mod dump {
             settings.press(Key::Down, Duration::ZERO);
         }
         let at = Duration::from_millis(
-            std::env::var("SETTINGS_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+            std::env::var("SETTINGS_AT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500),
         );
-        let canvas = compose(&settings, &mut text, Rect::from_xywh(0, 0, 1920, 1080), at, 1);
+        let canvas = compose(
+            &settings,
+            &mut text,
+            Rect::from_xywh(0, 0, 1920, 1080),
+            at,
+            1,
+        );
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
         for pixel in canvas.pixels.chunks_exact(4) {
             ppm.extend_from_slice(&pixel[..3]);

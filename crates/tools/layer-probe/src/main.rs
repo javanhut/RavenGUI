@@ -51,8 +51,8 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use smithay_client_toolkit::{
@@ -62,23 +62,23 @@ mod linux {
         registry::{ProvidesRegistryState, RegistryState},
         registry_handlers,
         seat::{
+            Capability, SeatHandler, SeatState,
             keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
             pointer::{PointerEvent, PointerEventKind, PointerHandler},
-            Capability, SeatHandler, SeatState,
         },
         shell::{
+            WaylandSurface,
             wlr_layer::{
                 Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
                 LayerSurfaceConfigure,
             },
-            WaylandSurface,
         },
-        shm::{slot::SlotPool, Shm, ShmHandler},
+        shm::{Shm, ShmHandler, slot::SlotPool},
     };
     use wayland_client::{
+        Connection, QueueHandle,
         globals::registry_queue_init,
         protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-        Connection, QueueHandle,
     };
 
     /// Huginn's own colours, so the probe sits on the desktop rather than on top
@@ -203,8 +203,7 @@ Esc exits."
         let shm = Shm::bind(&globals, &qh).expect("wl_shm");
 
         let surface = compositor.create_surface(&qh);
-        let layer =
-            shell.create_layer_surface(&qh, surface, args.layer, Some("layer-probe"), None);
+        let layer = shell.create_layer_surface(&qh, surface, args.layer, Some("layer-probe"), None);
         layer.set_anchor(args.anchor);
         layer.set_keyboard_interactivity(args.interactivity);
         layer.set_exclusive_zone(args.exclusive);
@@ -251,10 +250,12 @@ Esc exits."
         if let Some(period) = args.cycle {
             let due = Arc::clone(&due);
             let conn = conn.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(period);
-                due.store(true, Ordering::SeqCst);
-                let _ = conn.roundtrip();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(period);
+                    due.store(true, Ordering::SeqCst);
+                    let _ = conn.roundtrip();
+                }
             });
         }
 
@@ -308,7 +309,8 @@ Esc exits."
             let (w, h) = (self.width.max(1), self.height.max(1));
             let stride = w as i32 * 4;
             let Ok((buffer, canvas)) =
-                self.pool.create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+                self.pool
+                    .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
             else {
                 eprintln!("probe: could not allocate a {w}x{h} buffer");
                 return;
@@ -323,7 +325,9 @@ Esc exits."
                 chunk.copy_from_slice(&color.to_le_bytes());
             }
 
-            self.layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
+            self.layer
+                .wl_surface()
+                .damage_buffer(0, 0, w as i32, h as i32);
             if buffer.attach_to(self.layer.wl_surface()).is_err() {
                 eprintln!("probe: buffer attach failed");
                 return;
@@ -407,7 +411,11 @@ Esc exits."
             _: u32,
             event: KeyEvent,
         ) {
-            println!("probe: key {:?} ({})", event.keysym, event.utf8.as_deref().unwrap_or(""));
+            println!(
+                "probe: key {:?} ({})",
+                event.keysym,
+                event.utf8.as_deref().unwrap_or("")
+            );
             if event.keysym == Keysym::Escape {
                 self.exit = true;
             }
@@ -546,10 +554,14 @@ Esc exits."
             _: wl_seat::WlSeat,
             capability: Capability,
         ) {
-            if capability == Capability::Keyboard && let Some(k) = self.keyboard.take() {
+            if capability == Capability::Keyboard
+                && let Some(k) = self.keyboard.take()
+            {
                 k.release();
             }
-            if capability == Capability::Pointer && let Some(p) = self.pointer.take() {
+            if capability == Capability::Pointer
+                && let Some(p) = self.pointer.take()
+            {
                 p.release();
             }
         }
@@ -562,7 +574,8 @@ Esc exits."
             &mut self.output_state
         }
         fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-        fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+        fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        }
         fn output_destroyed(
             &mut self,
             _: &Connection,

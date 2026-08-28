@@ -362,13 +362,25 @@ mod tests {
     }
 
     /// The action a press produces with the launcher open.
-    fn to_launcher(mods: ModifiersState, sym: u32, ch: Option<char>) -> FilterResult<Option<Action>> {
+    fn to_launcher(
+        mods: ModifiersState,
+        sym: u32,
+        ch: Option<char>,
+    ) -> FilterResult<Option<Action>> {
         resolve(KeyState::Pressed, &mods, sym, false, Some(ch), false, false)
     }
 
     /// Resolve with resize mode active.
     fn while_resizing(sym: u32) -> FilterResult<Option<Action>> {
-        resolve(KeyState::Pressed, &ModifiersState::default(), sym, false, None, false, true)
+        resolve(
+            KeyState::Pressed,
+            &ModifiersState::default(),
+            sym,
+            false,
+            None,
+            false,
+            true,
+        )
     }
 
     #[test]
@@ -404,19 +416,32 @@ mod tests {
         // A mode that held every key until dismissed is a mode you get stuck
         // in. Anything that is not an arrow falls through to what it would
         // have done, and the caller leaves the mode.
-        assert!(matches!(while_resizing(keysyms::KEY_a), FilterResult::Forward));
-        assert!(matches!(while_resizing(keysyms::KEY_space), FilterResult::Forward));
+        assert!(matches!(
+            while_resizing(keysyms::KEY_a),
+            FilterResult::Forward
+        ));
+        assert!(matches!(
+            while_resizing(keysyms::KEY_space),
+            FilterResult::Forward
+        ));
     }
 
     #[test]
     fn the_arrows_are_untouched_when_not_resizing() {
         // Or a text editor could never move its cursor.
-        assert!(forwarded(KeyState::Pressed, ModifiersState::default(), keysyms::KEY_Left));
+        assert!(forwarded(
+            KeyState::Pressed,
+            ModifiersState::default(),
+            keysyms::KEY_Left
+        ));
     }
 
     #[test]
     fn the_resize_binding_is_reachable() {
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_R), Some(Action::EnterResize));
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_R),
+            Some(Action::EnterResize)
+        );
     }
 
     #[test]
@@ -440,8 +465,14 @@ mod tests {
     fn an_open_launcher_shadows_every_compositor_binding() {
         // Including the ones that would otherwise close a window or quit the
         // session out from under the launcher.
-        for sym in [keysyms::KEY_q, keysyms::KEY_T, keysyms::KEY_Escape, keysyms::KEY_H] {
-            let FilterResult::Intercept(Some(action)) = to_launcher(super_shift(), sym, None) else {
+        for sym in [
+            keysyms::KEY_q,
+            keysyms::KEY_T,
+            keysyms::KEY_Escape,
+            keysyms::KEY_H,
+        ] {
+            let FilterResult::Intercept(Some(action)) = to_launcher(super_shift(), sym, None)
+            else {
                 panic!("{sym:#x} was not intercepted for the launcher");
             };
             assert!(
@@ -497,26 +528,49 @@ mod tests {
         // Without Super every key belongs to the focused client. A compositor
         // that swallows a bare 'q' is unusable.
         assert_eq!(intercepted(ModifiersState::default(), keysyms::KEY_q), None);
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_Q), Some(Action::CloseFocused));
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_Q),
+            Some(Action::CloseFocused)
+        );
     }
 
     #[test]
     fn the_plain_super_layer_reaches_the_application() {
         // RavenTerminal's own chords: a new tab, a pane, its help. Binding
         // these in the compositor would make them unreachable everywhere.
-        for sym in [keysyms::KEY_t, keysyms::KEY_k, keysyms::KEY_bracketright, keysyms::KEY_1] {
-            assert!(forwarded(KeyState::Pressed, super_held(), sym), "Super+{sym:#x} was eaten");
+        for sym in [
+            keysyms::KEY_t,
+            keysyms::KEY_k,
+            keysyms::KEY_bracketright,
+            keysyms::KEY_1,
+        ] {
+            assert!(
+                forwarded(KeyState::Pressed, super_held(), sym),
+                "Super+{sym:#x} was eaten"
+            );
         }
     }
 
     #[test]
     fn digits_map_to_zero_based_workspaces() {
         // Shift is held, so a US layout delivers the punctuation on the key.
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_exclam), Some(Action::Workspace(0)));
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_parenleft), Some(Action::Workspace(8)));
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_exclam),
+            Some(Action::Workspace(0))
+        );
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_parenleft),
+            Some(Action::Workspace(8))
+        );
         // A layout that keeps the digit itself under Shift works too.
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_1), Some(Action::Workspace(0)));
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_9), Some(Action::Workspace(8)));
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_1),
+            Some(Action::Workspace(0))
+        );
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_9),
+            Some(Action::Workspace(8))
+        );
     }
 
     #[test]
@@ -533,22 +587,44 @@ mod tests {
 
     #[test]
     fn arrows_move_the_focused_window() {
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_Left), Some(Action::Move(Dir::Left)));
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_Down), Some(Action::Move(Dir::Down)));
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_Left),
+            Some(Action::Move(Dir::Left))
+        );
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_Down),
+            Some(Action::Move(Dir::Down))
+        );
         // Bare arrows are how you move a cursor. They must never be swallowed.
-        assert!(forwarded(KeyState::Pressed, ModifiersState::default(), keysyms::KEY_Left));
+        assert!(forwarded(
+            KeyState::Pressed,
+            ModifiersState::default(),
+            keysyms::KEY_Left
+        ));
     }
 
     #[test]
     fn close_and_spawn_have_two_bindings_each() {
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_X), Some(Action::CloseFocused));
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_T), Some(Action::Spawn));
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_X),
+            Some(Action::CloseFocused)
+        );
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_T),
+            Some(Action::Spawn)
+        );
     }
 
     #[test]
     fn copy_and_paste_are_translated_for_a_client_that_needs_it() {
-        assert_eq!(intercepted(super_held(), keysyms::KEY_c), Some(Action::Copy));
-        assert_eq!(intercepted(super_held(), keysyms::KEY_v), Some(Action::Paste));
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_c),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_v),
+            Some(Action::Paste)
+        );
     }
 
     #[test]
@@ -557,7 +633,15 @@ mod tests {
         // which it reads as SIGINT and sends to whatever is running.
         for sym in [keysyms::KEY_c, keysyms::KEY_v] {
             assert!(matches!(
-                resolve(KeyState::Pressed, &super_held(), sym, true, None, false, false),
+                resolve(
+                    KeyState::Pressed,
+                    &super_held(),
+                    sym,
+                    true,
+                    None,
+                    false,
+                    false
+                ),
                 FilterResult::Forward
             ));
         }
@@ -567,16 +651,31 @@ mod tests {
     fn only_the_press_fires_a_binding() {
         // The filter sees both halves of a keystroke. Acting on each of them
         // runs every binding twice, which is two terminals per keystroke.
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_T), Some(Action::Spawn));
+        assert_eq!(
+            intercepted(super_shift(), keysyms::KEY_T),
+            Some(Action::Spawn)
+        );
         assert!(matches!(
-            resolve(KeyState::Released, &super_shift(), keysyms::KEY_T, false, None, false, false),
+            resolve(
+                KeyState::Released,
+                &super_shift(),
+                keysyms::KEY_T,
+                false,
+                None,
+                false,
+                false
+            ),
             FilterResult::Intercept(None)
         ));
     }
 
     #[test]
     fn a_bound_release_is_swallowed_with_its_press() {
-        assert!(!forwarded(KeyState::Released, super_shift(), keysyms::KEY_T));
+        assert!(!forwarded(
+            KeyState::Released,
+            super_shift(),
+            keysyms::KEY_T
+        ));
         assert!(forwarded(KeyState::Released, super_shift(), keysyms::KEY_z));
     }
 
@@ -612,7 +711,11 @@ mod tests {
         let orphan = BINDINGS
             .iter()
             .find(|b| !reachable.contains(&discriminant(&b.action)));
-        assert!(orphan.is_none(), "BINDINGS lists {:?}, which no key produces", orphan);
+        assert!(
+            orphan.is_none(),
+            "BINDINGS lists {:?}, which no key produces",
+            orphan
+        );
 
         assert_eq!(
             reachable.len(),
