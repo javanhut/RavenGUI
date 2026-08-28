@@ -147,7 +147,11 @@ struct WorkspaceCarousel {
 struct AppSwitcher {
     /// Index into `dock_items`, always naming a running application.
     selected: usize,
+    /// The switcher is deliberately temporary; input extends this deadline.
+    dismiss_at: std::time::Duration,
 }
+
+const APP_SWITCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Applications that drive the `Super` layer themselves.
 ///
@@ -323,7 +327,11 @@ pub(crate) struct Huginn {
     /// input, not window management: `huginn-core` is told where the strip
     /// should be, and has no interest in how many fingers said so.
     swipe: Option<crate::gesture::Swipe>,
-    /// Present between the downward gesture and the upward accept gesture.
+    /// Recognises the gesture that temporarily summons the application dock.
+    double_tap: crate::gesture::DoubleTap,
+    /// Finger count retained between a hold begin/end pair.
+    hold_fingers: Option<u32>,
+    /// Present while the temporary application switcher is visible.
     app_switcher: Option<AppSwitcher>,
     /// Which workspace [`Self::carousel_scroll`] is currently sliding for.
     ///
@@ -492,6 +500,8 @@ impl Huginn {
             carousel_scroll: crate::anim::Animated::settled(0.0),
             workspace_carousel: None,
             swipe: None,
+            double_tap: crate::gesture::DoubleTap::default(),
+            hold_fingers: None,
             app_switcher: None,
             carousel_on: None,
             focused_layer: None,
@@ -766,11 +776,7 @@ impl Huginn {
             out.extend(self.popups_of(&surface, rect));
             out.push(SceneItem::Surface(surface, rect));
         }
-        if self.app_switcher.is_some() {
-            // The downward gesture puts the desktop away. The dock above is
-            // the only application UI left on screen until a selection is
-            // accepted, so it reads as minimisation rather than an overlay.
-        } else if let Some(previews) = self.workspace_previews() {
+        if let Some(previews) = self.workspace_previews() {
             // The centre card is first because scene order is front-to-back.
             // Popups and the focus ring belong to the interactive full-size
             // desktop, not to passive workspace previews.
@@ -1062,6 +1068,25 @@ impl Huginn {
             .collect()
     }
 
+    /// Application ids for panes explicitly put in the background, on any workspace.
+    fn minimized_app_ids(&self) -> Vec<String> {
+        self.space
+            .workspaces()
+            .iter()
+            .flat_map(|workspace| workspace.windows())
+            .filter(|id| {
+                self.space
+                    .window(**id)
+                    .is_some_and(huginn_core::window::Window::is_minimized)
+            })
+            .filter_map(|id| self.windows.get(id)?.app_id())
+            .collect()
+    }
+
+    pub(crate) fn app_switcher_open(&self) -> bool {
+        self.app_switcher.is_some()
+    }
+
     /// Whether a window is covering the whole output.
     ///
     /// §4: the dock must never overlap a fullscreen window. Animating out over
@@ -1103,7 +1128,11 @@ impl Huginn {
             self.queue_redraw();
             return;
         }
-        let running = self.running_app_ids();
+        let running = if self.app_switcher.is_some() {
+            self.minimized_app_ids()
+        } else {
+            self.running_app_ids()
+        };
         self.dock_items = crate::dock::items(&self.apps, &running);
         let selected = self.app_switcher.map(|switcher| switcher.selected);
         self.dock_panel = (self.app_switcher.is_some() || self.dock.is_visible(self.uptime()))
@@ -1151,6 +1180,9 @@ impl Huginn {
             tracing::debug!("a touchpad swipe began before the last one ended");
             self.swipe_end();
         }
+        if let Some(switcher) = &mut self.app_switcher {
+            switcher.dismiss_at = self.started.elapsed() + APP_SWITCHER_TIMEOUT;
+        }
         self.swipe = Some(crate::gesture::Swipe::new(fingers));
     }
 
@@ -1182,7 +1214,10 @@ impl Huginn {
                 if let Some(&selected) = selectable.get(ordinal)
                     && self.app_switcher.is_some_and(|s| s.selected != selected)
                 {
-                    self.app_switcher = Some(AppSwitcher { selected });
+                    self.app_switcher = Some(AppSwitcher {
+                        selected,
+                        dismiss_at: self.uptime() + APP_SWITCHER_TIMEOUT,
+                    });
                     self.refresh_dock();
                 }
             } else {
@@ -1208,7 +1243,7 @@ impl Huginn {
         if let Some(direction) = swipe.vertical() {
             match direction {
                 crate::gesture::Vertical::Down if self.app_switcher.is_none() => {
-                    self.open_app_switcher();
+                    self.minimize_focused();
                 }
                 crate::gesture::Vertical::Up if self.app_switcher.is_some() => {
                     self.accept_app_switcher();
@@ -1234,32 +1269,64 @@ impl Huginn {
             .collect()
     }
 
-    /// Put the active desktop away and promote its application dock.
+    /// A stationary three-finger contact can represent each half of a double tap.
+    pub(crate) fn hold_begin(&mut self, fingers: u32) {
+        self.hold_fingers = Some(fingers);
+    }
+
+    pub(crate) fn hold_end(&mut self, cancelled: bool, time_msec: u32) {
+        let fingers = self.hold_fingers.take().unwrap_or_default();
+        if !cancelled && self.double_tap.tap(fingers, time_msec) {
+            self.open_app_switcher();
+        }
+    }
+
+    /// Tap-to-click touchpads commonly encode a three-finger tap as middle click.
+    pub(crate) fn middle_tap(&mut self, time_msec: u32) {
+        if self
+            .double_tap
+            .tap(crate::gesture::CAROUSEL_FINGERS, time_msec)
+        {
+            self.open_app_switcher();
+        }
+    }
+
+    /// Put only the highlighted pane in the background, leaving the workspace usable.
+    fn minimize_focused(&mut self) {
+        let Some(id) = self.space.minimize_focused() else {
+            return;
+        };
+        if let Some(surface) = self.windows.get(&id) {
+            surface.set_fullscreen(false);
+            surface.send_configure();
+        }
+        self.arrange();
+        self.refresh_dock();
+        self.refresh_focus();
+    }
+
+    /// Temporarily promote the minimized-application dock over the workspace.
     fn open_app_switcher(&mut self) {
-        let running = self.running_app_ids();
+        let running = self.minimized_app_ids();
         self.dock_items = crate::dock::items(&self.apps, &running);
-        let focused_app = self
-            .space
-            .focused()
-            .and_then(|id| self.windows.get(&id))
-            .and_then(WindowSurface::app_id);
-        let selected = focused_app
-            .as_deref()
-            .and_then(|app_id| {
-                self.dock_items.iter().position(|item| {
-                    item.running
-                        && item
-                            .entry
-                            .and_then(|entry| self.apps.get(entry))
-                            .is_some_and(|entry| crate::dock::matches(entry, app_id))
-                })
-            })
-            .or_else(|| self.switcher_items().into_iter().next());
+        let selected = self.switcher_items().into_iter().next();
         let Some(selected) = selected else {
             return;
         };
         self.workspace_carousel = None;
-        self.app_switcher = Some(AppSwitcher { selected });
+        self.app_switcher = Some(AppSwitcher {
+            selected,
+            dismiss_at: self.uptime() + APP_SWITCHER_TIMEOUT,
+        });
+        self.refresh_dock();
+        self.refresh_focus();
+    }
+
+    /// Close the temporary dock without restoring anything.
+    pub(crate) fn dismiss_app_switcher(&mut self) {
+        if self.app_switcher.take().is_none() {
+            return;
+        }
         self.refresh_dock();
         self.refresh_focus();
     }
@@ -1270,13 +1337,27 @@ impl Huginn {
             return;
         };
         let item = self.dock_items.get(switcher.selected).cloned();
-        if let Some(item) = item {
-            self.activate_dock_item(&item);
-            if let Some(id) = self.space.focused() {
-                let area = self.space.area();
-                let state_only_configure = self.space.window(id).is_some_and(|window| {
-                    window.mode != WindowMode::Fullscreen && window.geometry == area
+        if let Some(item) = item
+            && let Some(entry) = item.entry.and_then(|index| self.apps.get(index))
+        {
+            let minimized = self
+                .space
+                .workspaces()
+                .iter()
+                .flat_map(|workspace| workspace.windows().iter().copied())
+                .find(|id| {
+                    self.space
+                        .window(*id)
+                        .is_some_and(|window| window.is_minimized())
+                        && self
+                            .windows
+                            .get(id)
+                            .and_then(WindowSurface::app_id)
+                            .is_some_and(|app_id| crate::dock::matches(entry, &app_id))
                 });
+            if let Some(id) = minimized {
+                self.space.bring_to_active_workspace(id);
+                let area = self.space.area();
                 if let Some(window) = self.space.window_mut(id) {
                     window.fullscreen(area);
                 }
@@ -1284,10 +1365,7 @@ impl Huginn {
                     surface.set_fullscreen(true);
                 }
                 self.arrange();
-                // `arrange` sends the fullscreen state together with a changed
-                // size. A floating window already covering the area has no
-                // geometry change, so it needs this state-only configure.
-                if state_only_configure && let Some(surface) = self.windows.get(&id) {
+                if let Some(surface) = self.windows.get(&id) {
                     surface.send_configure();
                 }
                 self.refresh_focus();
@@ -1532,6 +1610,15 @@ impl Huginn {
     /// nothing, so an idle desktop still renders no frames.
     pub(crate) fn tick_animations(&mut self) {
         let now = self.uptime();
+        if self
+            .app_switcher
+            .is_some_and(|switcher| now >= switcher.dismiss_at)
+        {
+            self.dismiss_app_switcher();
+        } else if self.app_switcher.is_some() {
+            // Keep frames flowing only for the switcher's short timeout window.
+            self.queue_redraw();
+        }
         let mut finish_workspace_carousel = false;
         if let Some(carousel) = &self.workspace_carousel {
             let moving = !carousel.position.is_settled(now) || !carousel.reveal.is_settled(now);
@@ -1786,6 +1873,11 @@ impl Huginn {
             .windows()
             .iter()
             .filter(|id| self.mapped.contains(id))
+            .filter(|id| {
+                self.space
+                    .window(**id)
+                    .is_some_and(|window| !window.is_minimized())
+            })
             .filter_map(|id| {
                 let surface = self.windows.get(id)?.wl_surface()?;
                 let geometry = self.space.window(*id)?.geometry;

@@ -4,10 +4,10 @@
 //! workspace shrinks into the centre, its neighbours appear at the sides, and
 //! the row follows the fingers until they choose a workspace.
 //!
-//! Vertical motion is the application switcher: down puts the current desktop
-//! away and raises the dock in the centre; up accepts the application selected
-//! there. Once that switcher is open, horizontal motion moves through its
-//! applications instead of through workspaces.
+//! Vertical motion manages applications: down minimizes the focused pane and
+//! up accepts a highlighted minimized application. A three-finger double tap
+//! opens that temporary application switcher; horizontal motion then moves
+//! through its applications instead of through workspaces.
 //!
 //! # Why this is a type and not four lines in the input handler
 //!
@@ -49,6 +49,30 @@ const COMMIT: f64 = 16.0;
 
 /// Touchpad travel that moves the workspace row by one complete card.
 const UNITS_PER_WORKSPACE: f64 = 180.0;
+
+/// Longest gap between taps that still reads as a double tap.
+const DOUBLE_TAP_MSEC: u32 = 500;
+
+/// Recognition state for the three-finger double-tap shortcut.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DoubleTap {
+    last: Option<u32>,
+}
+
+impl DoubleTap {
+    /// Record one tap, returning true only for the second tap of a close pair.
+    pub(crate) fn tap(&mut self, fingers: u32, time_msec: u32) -> bool {
+        if fingers != CAROUSEL_FINGERS {
+            self.last = None;
+            return false;
+        }
+        let doubled = self
+            .last
+            .is_some_and(|last| time_msec.wrapping_sub(last) <= DOUBLE_TAP_MSEC);
+        self.last = (!doubled).then_some(time_msec);
+        doubled
+    }
+}
 
 /// What a swipe in progress has been decided to be.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -249,5 +273,15 @@ mod tests {
     fn vertical_direction_is_decided_from_the_fingers_motion() {
         assert_eq!(swipe(0.0, &[(0.0, 20.0)]).vertical(), Some(Vertical::Down));
         assert_eq!(swipe(0.0, &[(0.0, -20.0)]).vertical(), Some(Vertical::Up));
+    }
+
+    #[test]
+    fn three_finger_double_tap_is_bounded_and_resets() {
+        let mut taps = DoubleTap::default();
+        assert!(!taps.tap(3, 100));
+        assert!(taps.tap(3, 550));
+        assert!(!taps.tap(3, 600), "the accepted pair must reset");
+        assert!(!taps.tap(3, 1_200), "a late second tap starts a new pair");
+        assert!(taps.tap(3, 1_400));
     }
 }

@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 
 use geometry::{Dir, Rect};
 use window::{Window, WindowId, WindowMode};
-use workspace::{Layout, Workspace, WorkspaceId};
+use workspace::{Direction, Layout, Workspace, WorkspaceId};
 
 /// How many workspaces exist at startup.
 ///
@@ -135,7 +135,11 @@ impl Space {
             .windows()
             .iter()
             .copied()
-            .filter(|id| self.windows.get(id).is_some_and(|w| !w.is_floating()))
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .is_some_and(|w| !w.is_floating() && !w.is_minimized())
+            })
             .collect()
     }
 
@@ -337,6 +341,33 @@ impl Space {
         self.active_workspace().focused()
     }
 
+    /// Move focus through panes that are actually present on screen.
+    pub fn cycle_focus(&mut self, dir: Direction) -> Option<WindowId> {
+        let order: Vec<_> = self.workspaces[self.active]
+            .cycle_order()
+            .into_iter()
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .is_some_and(|window| !window.is_minimized())
+            })
+            .collect();
+        if order.is_empty() {
+            self.workspaces[self.active].set_focus(None);
+            return None;
+        }
+        let current = self
+            .focused()
+            .and_then(|focused| order.iter().position(|id| *id == focused))
+            .unwrap_or(0);
+        let next = match dir {
+            Direction::Forward => (current + 1) % order.len(),
+            Direction::Backward => (current + order.len() - 1) % order.len(),
+        };
+        self.workspaces[self.active].focus(order[next]);
+        Some(order[next])
+    }
+
     /// Switch to workspace `index`. Out-of-range indices are ignored rather
     /// than clamped, so a stray keybinding cannot silently jump to workspace 9.
     pub fn activate_workspace(&mut self, index: usize) -> bool {
@@ -358,6 +389,41 @@ impl Space {
         };
         self.workspaces[self.active].remove(id);
         self.workspaces[index].insert(id);
+        true
+    }
+
+    /// Minimize the focused pane while leaving its client alive in this workspace.
+    pub fn minimize_focused(&mut self) -> Option<WindowId> {
+        let id = self.focused()?;
+        self.windows.get_mut(&id)?.minimize();
+
+        let next = self.workspaces[self.active]
+            .windows()
+            .iter()
+            .copied()
+            .find(|candidate| {
+                *candidate != id
+                    && self
+                        .windows
+                        .get(candidate)
+                        .is_some_and(|window| !window.is_minimized())
+            });
+        self.workspaces[self.active].set_focus(next);
+        Some(id)
+    }
+
+    /// Move an existing window into the active workspace and focus it.
+    pub fn bring_to_active_workspace(&mut self, id: WindowId) -> bool {
+        if !self.windows.contains_key(&id) {
+            return false;
+        }
+        for (index, workspace) in self.workspaces.iter_mut().enumerate() {
+            if index != self.active {
+                workspace.remove(id);
+            }
+        }
+        self.workspaces[self.active].insert(id);
+        self.workspaces[self.active].focus(id);
         true
     }
 
@@ -419,7 +485,11 @@ impl Space {
             .windows()
             .iter()
             .copied()
-            .filter(|id| self.windows.get(id).is_some_and(|w| !w.is_floating()))
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .is_some_and(|w| !w.is_floating() && !w.is_minimized())
+            })
             .collect();
 
         // The tree is a cache over `tiled`, not a second source of truth, so
@@ -501,6 +571,7 @@ impl Space {
                 WindowMode::Tiled => continue,
                 WindowMode::Fullscreen => area,
                 WindowMode::Floating => win.geometry.constrain_to(area),
+                WindowMode::Minimized => continue,
             };
             if win.geometry != wanted {
                 win.geometry = wanted;
@@ -1186,5 +1257,36 @@ mod tests {
                 "letting go at {stop} focused a pane at {geometry:?}, off screen"
             );
         }
+    }
+
+    #[test]
+    fn minimizing_removes_only_the_focused_pane_from_layout() {
+        let mut s = space();
+        let first = s.open_window();
+        let second = s.open_window();
+        s.arrange();
+
+        assert_eq!(s.minimize_focused(), Some(second));
+        let changed = s.arrange();
+        assert!(s.window(second).unwrap().is_minimized());
+        assert_eq!(s.focused(), Some(first));
+        assert_eq!(
+            s.window(first).unwrap().geometry,
+            Rect::from_xywh(8, 8, 1904, 1064)
+        );
+        assert!(changed.iter().all(|(id, _)| *id != second));
+    }
+
+    #[test]
+    fn a_minimized_pane_can_be_brought_to_the_current_workspace() {
+        let mut s = space();
+        let pane = s.open_window();
+        s.minimize_focused();
+        s.activate_workspace(2);
+
+        assert!(s.bring_to_active_workspace(pane));
+        assert_eq!(s.active_workspace().windows(), &[pane]);
+        assert_eq!(s.focused(), Some(pane));
+        assert!(!s.workspaces()[0].windows().contains(&pane));
     }
 }

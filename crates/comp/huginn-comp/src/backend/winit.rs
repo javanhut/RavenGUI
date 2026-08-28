@@ -388,6 +388,7 @@ impl Nested {
                 let settings_open = self.state.settings.is_open();
                 let resizing = self.state.resizing;
                 let locked = self.state.is_locked();
+                let switcher_open = self.state.app_switcher_open();
                 let action = self
                     .keyboard
                     .input::<Option<Action>, _>(
@@ -414,6 +415,7 @@ impl Nested {
                                         settings_open,
                                         resizing,
                                         locked,
+                                        switcher_open,
                                     },
                                 )
                             }
@@ -452,16 +454,10 @@ impl Nested {
                 return;
             }
             Action::FocusNext => {
-                state
-                    .space
-                    .active_workspace_mut()
-                    .cycle_focus(Direction::Forward);
+                state.space.cycle_focus(Direction::Forward);
             }
             Action::FocusPrev => {
-                state
-                    .space
-                    .active_workspace_mut()
-                    .cycle_focus(Direction::Backward);
+                state.space.cycle_focus(Direction::Backward);
             }
             Action::PromoteFocused => {
                 state.space.active_workspace_mut().promote_focused();
@@ -520,6 +516,7 @@ impl Nested {
             }
             Action::OpenLauncher => state.open_launcher(),
             Action::Launcher(key) => state.launcher_key(key),
+            Action::DismissSwitcher => state.dismiss_app_switcher(),
             Action::Spawn => {
                 state.launch(None, &[state.terminal_command().to_owned()]);
             }

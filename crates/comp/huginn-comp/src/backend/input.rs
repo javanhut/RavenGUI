@@ -12,8 +12,8 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
-        GestureSwipeUpdateEvent, InputBackend, InputEvent, PointerAxisEvent, PointerButtonEvent,
-        PointerMotionEvent,
+        GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, PointerAxisEvent,
+        PointerButtonEvent, PointerMotionEvent,
     },
     input::pointer::{AxisFrame, ButtonEvent, MotionEvent},
     utils::{Logical, Point, SERIAL_COUNTER, Size},
@@ -50,6 +50,10 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
         // The end event's `cancelled` is deliberately not read; see
         // `Huginn::swipe_end`.
         InputEvent::GestureSwipeEnd { .. } => state.swipe_end(),
+        InputEvent::GestureHoldBegin { event } => state.hold_begin(event.fingers()),
+        InputEvent::GestureHoldEnd { event } => {
+            state.hold_end(event.cancelled(), event.time_msec());
+        }
         _ => {}
     }
 }
@@ -85,6 +89,12 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
 fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     let serial = SERIAL_COUNTER.next_serial();
     let button_state = event.state();
+
+    // Tap-to-click touchpads encode three fingers as a middle-button press.
+    const BTN_MIDDLE: u32 = 0x112;
+    if button_state == ButtonState::Pressed && event.button_code() == BTN_MIDDLE {
+        state.middle_tap(event.time_msec());
+    }
 
     // Locked: the click reaches the lock screen, through the ordinary pointer
     // path at the bottom of this function, and nothing else. Everything skipped

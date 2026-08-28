@@ -219,6 +219,12 @@ impl Workspace {
         }
     }
 
+    /// Set focus to a known member, or clear it when no visible member remains.
+    pub(crate) fn set_focus(&mut self, window: Option<WindowId>) {
+        debug_assert!(window.is_none_or(|id| self.windows.contains(&id)));
+        self.focus = window;
+    }
+
     /// Move focus one window in `dir`, wrapping around.
     ///
     /// Walks [`Self::cycle_order`], which is screen order rather than the order
@@ -249,7 +255,7 @@ impl Workspace {
     /// Floating windows are appended rather than dropped. Cycling over the tree
     /// alone would strand them — a floating window would be one no key could
     /// ever reach, which is a worse failure than visiting it out of position.
-    fn cycle_order(&self) -> Vec<WindowId> {
+    pub(crate) fn cycle_order(&self) -> Vec<WindowId> {
         let mut order = self.tiles.windows();
         order.extend(
             self.windows
