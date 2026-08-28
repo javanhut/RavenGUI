@@ -202,6 +202,10 @@ spawned.
 | Gesture | Does |
 |---|---|
 | three fingers sideways | preview and switch between workspaces |
+| three fingers down | minimize the focused pane without closing it |
+| three-finger double tap | temporarily show minimized applications in a centered dock |
+| sideways while the centered dock is open | highlight a minimized application |
+| three fingers up while the centered dock is open | restore the highlighted application fullscreen in the current workspace |
 
 The current workspace shrinks into a centred card while the workspaces beside
 it appear as narrow, dimmed side cards. The row follows the fingers and settles
@@ -216,9 +220,10 @@ gestures at all today — they are not being taken away from you by this binding
 they were never delivered. Two-finger scrolling is unaffected: libinput reports
 it as an axis event rather than a gesture, and it is forwarded as normal.
 
-A three-finger swipe that goes *vertically* is currently ignored, and stays
-ignored for its whole length even if it later drifts sideways. That axis is
-deliberately left free.
+The centered dock dismisses itself after four seconds without a choice; an
+`Escape` press dismisses it immediately. A vertical swipe stays vertical for
+its whole length even if it later drifts sideways, so minimizing never jerks
+the workspace carousel partway across the screen.
 
 ### The `Super` rule
 

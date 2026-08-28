@@ -84,6 +84,8 @@ pub(crate) enum Action {
     /// there is no surface to focus and nothing to forward to. While it is
     /// open the keymap stops resolving chords entirely.
     Launcher(crate::launcher::Key),
+    /// Dismiss the temporary minimized-application switcher.
+    DismissSwitcher,
 }
 
 /// What the compositor is already doing, which decides what a key means.
@@ -109,6 +111,8 @@ pub(crate) struct Modes {
     /// The session is locked. Nothing resolves; every key is the lock
     /// screen's.
     pub locked: bool,
+    /// The centered minimized-application dock owns input until dismissed.
+    pub switcher_open: bool,
 }
 
 /// One row of the keybinding overlay, and one clause of the startup log line.
@@ -262,6 +266,11 @@ pub(crate) fn resolve(
     // typed, and the way out would be the power button.
     if mode.locked {
         return FilterResult::Forward;
+    }
+
+    if mode.switcher_open {
+        let action = (sym == keysyms::KEY_Escape).then_some(Action::DismissSwitcher);
+        return FilterResult::Intercept(action.and_then(|action| pressed(key_state, action)));
     }
 
     // Quick settings takes everything, for the same reason the launcher does:
@@ -659,6 +668,32 @@ mod tests {
                     launcher: Some(Some('a')),
                     ..Modes::default()
                 },
+            ),
+            FilterResult::Intercept(None)
+        ));
+    }
+
+    #[test]
+    fn escape_dismisses_the_application_switcher_and_other_keys_are_swallowed() {
+        let mode = Modes {
+            switcher_open: true,
+            ..Modes::default()
+        };
+        assert!(matches!(
+            resolve(
+                KeyState::Pressed,
+                &ModifiersState::default(),
+                keysyms::KEY_Escape,
+                mode,
+            ),
+            FilterResult::Intercept(Some(Action::DismissSwitcher))
+        ));
+        assert!(matches!(
+            resolve(
+                KeyState::Pressed,
+                &ModifiersState::default(),
+                keysyms::KEY_a,
+                mode,
             ),
             FilterResult::Intercept(None)
         ));

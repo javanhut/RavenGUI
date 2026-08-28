@@ -32,6 +32,8 @@ pub enum WindowMode {
     Floating,
     /// Covers its output entirely, above everything except layer-shell overlays.
     Fullscreen,
+    /// Kept alive but absent from layout and rendering until explicitly restored.
+    Minimized,
 }
 
 /// Size hints a client advertised. A client may ask; the layout decides.
@@ -103,6 +105,16 @@ impl Window {
     /// rather than a departure from it.
     pub const fn is_floating(&self) -> bool {
         matches!(self.mode, WindowMode::Floating)
+    }
+
+    /// Whether this window currently participates in the workspace layout.
+    pub const fn is_minimized(&self) -> bool {
+        matches!(self.mode, WindowMode::Minimized)
+    }
+
+    /// Put the window in the background without closing its client.
+    pub fn minimize(&mut self) {
+        self.mode = WindowMode::Minimized;
     }
 
     /// Enter fullscreen over `area`, remembering where to return to.
