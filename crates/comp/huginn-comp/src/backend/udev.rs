@@ -226,6 +226,7 @@ pub(crate) fn run() -> Result<()> {
     // here for the same reason XWayland is: it only registers an event source,
     // and everything it does happens later, from the loop.
     crate::appwatch::start::<Udev>(&handle);
+    crate::fileindex::start::<Udev>(&handle, &mut state);
 
     match EGLDevice::device_for_display(renderer.egl_context().display())
         .and_then(|device| device.try_get_render_node())
@@ -941,39 +942,36 @@ impl Udev {
         // before `render_frame` takes the renderer. `None` — no panel open, no
         // shader, no buffer — falls through to the path this backend has always
         // taken, so an ordinary frame costs exactly what it did before.
+        //
+        // The scene is split once: `behind` is what gets blurred into the
+        // texture, and it is also drawn sharp beneath the blur, since the blur
+        // is cropped to the panel and the rest of the screen still has to
+        // show something.
+        let (front, behind) =
+            render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref());
         let radius = self.state.blur_radius();
-        let blurred = if radius > 0.0 {
-            let size = self
-                .screens
-                .get(&crtc)
-                .and_then(|screen| screen.output.current_mode())
-                .map(|mode| mode.size)
-                .unwrap_or_default();
-            let (_, behind) =
-                render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref());
-            self.blur.as_mut().and_then(|blur| {
-                blur.pass(
-                    &mut self.renderer,
-                    &behind,
-                    size,
-                    self.state.scale.fractional(),
-                    radius,
-                )
-            })
-        } else {
-            None
+        let blurred = match self.state.blur_rect() {
+            Some(rect) if radius > 0.0 => {
+                let size = self
+                    .screens
+                    .get(&crtc)
+                    .and_then(|screen| screen.output.current_mode())
+                    .map(|mode| mode.size)
+                    .unwrap_or_default();
+                let scale = self.state.scale.fractional();
+                self.blur
+                    .as_mut()
+                    .and_then(|blur| blur.pass(&mut self.renderer, &behind, size, scale, radius))
+                    .and_then(|element| render::blur_element(element, rect, scale))
+            }
+            _ => None,
         };
 
-        let mut elements = match &blurred {
-            Some(_) => {
-                render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref()).0
-            }
-            None => render::elements(&mut self.renderer, &self.state, self.cursor.as_ref()),
-        };
-        // Front to back, so the blurred desktop goes on the end.
-        if let Some(element) = blurred {
-            elements.push(crate::render::HuginnElement::Blur(element));
-        }
+        // Front to back: the panels, then the blurred patch under them, then
+        // the desktop.
+        let mut elements = front;
+        elements.extend(blurred);
+        elements.extend(behind);
 
         let Some(screen) = self.screens.get_mut(&crtc) else {
             return;

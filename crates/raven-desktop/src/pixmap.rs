@@ -49,6 +49,108 @@ impl Pixmap {
         let at = ((y * self.width + x) * 4) as usize;
         self.data.get(at..at + 4)?.try_into().ok()
     }
+
+    /// The icon's dominant hue in degrees, or `None` if it has no colour
+    /// worth speaking of — a grey or black-and-white icon.
+    ///
+    /// Each pixel votes with its saturation and its coverage, so a coloured
+    /// icon with a white background (or the antialiased grey of its edges)
+    /// still answers with its brand colour, not a wash of the two. Hues are
+    /// averaged as vectors on the colour wheel: red is at 0° and at 360°,
+    /// and averaging the numbers would put a red icon at green.
+    pub fn hue(&self) -> Option<f32> {
+        let (mut x, mut y, mut weight) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for pixel in self.data.chunks_exact(4) {
+            let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+            if a == 0 {
+                continue;
+            }
+            let (h, s) = hue_saturation(unpremultiply([r, g, b], a));
+            let w = s * f32::from(a) / 255.0;
+            x += h.to_radians().cos() * w;
+            y += h.to_radians().sin() * w;
+            weight += w;
+        }
+        // Under a tenth of the coverage carrying colour is a monochrome
+        // icon with a coloured speck; the speck must not tint the whole.
+        let coverage: f32 = self
+            .data
+            .chunks_exact(4)
+            .map(|p| f32::from(p[3]) / 255.0)
+            .sum();
+        if weight < coverage * 0.1 || weight == 0.0 {
+            return None;
+        }
+        Some(y.atan2(x).to_degrees().rem_euclid(360.0))
+    }
+
+    /// The same shape, repainted in a vertical gradient from `top` to
+    /// `bottom` (straight RGB), with the original's light and dark kept as
+    /// light and dark of the tint.
+    ///
+    /// The shape is the alpha channel — every icon has one — and the detail
+    /// is luminance, so a glyph keeps its highlights and its dark strokes
+    /// while losing every colour but the one it is given. That is what turns
+    /// a shelf of clashing brand artwork into one family.
+    pub fn tinted(&self, top: [u8; 3], bottom: [u8; 3]) -> Pixmap {
+        /// How much of the tint's brightness the darkest stroke keeps.
+        /// Zero would render dark detail as holes; one would flatten the
+        /// icon to a silhouette.
+        const FLOOR: f32 = 0.42;
+        let mut data = Vec::with_capacity(self.data.len());
+        let rows = self.height.max(1) as f32;
+        for (i, pixel) in self.data.chunks_exact(4).enumerate() {
+            let a = pixel[3];
+            if a == 0 {
+                data.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            let t = (i as u32 / self.width.max(1)) as f32 / rows;
+            let [r, g, b] = unpremultiply([pixel[0], pixel[1], pixel[2]], a);
+            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let level = FLOOR + (1.0 - FLOOR) * lum;
+            let alpha = f32::from(a) / 255.0;
+            for channel in 0..3 {
+                let from = f32::from(top[channel]);
+                let to = f32::from(bottom[channel]);
+                let tint = from + (to - from) * t;
+                data.push((tint * level * alpha).round().clamp(0.0, 255.0) as u8);
+            }
+            data.push(a);
+        }
+        Pixmap {
+            data,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+/// Straight RGB in 0..=1 from premultiplied bytes.
+fn unpremultiply([r, g, b]: [u8; 3], a: u8) -> [f32; 3] {
+    let a = f32::from(a);
+    [r, g, b].map(|c| (f32::from(c) / a).min(1.0))
+}
+
+/// Hue in degrees and saturation in 0..=1 of a straight RGB colour.
+fn hue_saturation([r, g, b]: [f32; 3]) -> (f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = max - min;
+    if chroma < 1e-3 {
+        return (0.0, 0.0);
+    }
+    let hue = if max == r {
+        60.0 * ((g - b) / chroma).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / chroma + 2.0)
+    } else {
+        60.0 * ((r - g) / chroma + 4.0)
+    };
+    // Saturation as HSV's: chroma over value. This is the "how coloured is
+    // it" that matters for voting — a dark red and a bright red should
+    // count alike, and HSL's saturation would rate a near-black pixel high.
+    (hue, chroma / max)
 }
 
 /// What a cache entry was keyed on.
@@ -212,6 +314,70 @@ fn from_png(bytes: &[u8], size: u32) -> Option<tiny_skia::Pixmap> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_red_icon_says_it_is_red_and_a_grey_one_says_nothing() {
+        let red = Pixmap {
+            data: [255, 0, 0, 255].repeat(4),
+            width: 2,
+            height: 2,
+        };
+        let hue = red.hue().expect("red has a hue");
+        assert!(!(5.0..=355.0).contains(&hue), "hue was {hue}");
+        let grey = Pixmap {
+            data: [128, 128, 128, 255].repeat(4),
+            width: 2,
+            height: 2,
+        };
+        assert_eq!(grey.hue(), None);
+    }
+
+    #[test]
+    fn two_reds_either_side_of_zero_average_to_red_not_green() {
+        // 350° and 10°: the numeric mean is 180°, which is cyan.
+        let data: Vec<u8> = [[255, 0, 42, 255], [255, 42, 0, 255]].concat();
+        let p = Pixmap {
+            data,
+            width: 2,
+            height: 1,
+        };
+        let hue = p.hue().expect("has a hue");
+        assert!(!(5.0..=355.0).contains(&hue), "hue was {hue}");
+    }
+
+    #[test]
+    fn tinting_keeps_the_shape_and_replaces_the_colour() {
+        // A green pixel beside an empty one, tinted blue: the empty one
+        // stays empty, the green one becomes blue, and it is still
+        // premultiplied — the tint scaled by its alpha.
+        let p = Pixmap {
+            data: vec![0, 128, 0, 128, 0, 0, 0, 0],
+            width: 2,
+            height: 1,
+        };
+        let t = p.tinted([0, 0, 255], [0, 0, 255]);
+        assert_eq!(t.pixel(1, 0), Some([0, 0, 0, 0]));
+        let [r, g, b, a] = t.pixel(0, 0).unwrap();
+        assert_eq!(a, 128);
+        assert_eq!((r, g), (0, 0));
+        assert!(b > 0 && b <= 128, "blue was {b}, not premultiplied");
+    }
+
+    #[test]
+    fn dark_detail_stays_visible_after_tinting() {
+        // A black pixel is a stroke, not a hole: it must keep some of the
+        // tint rather than vanishing into the background.
+        let p = Pixmap {
+            data: vec![0, 0, 0, 255],
+            width: 1,
+            height: 1,
+        };
+        let [r, _, _, _] = p
+            .tinted([255, 255, 255], [255, 255, 255])
+            .pixel(0, 0)
+            .unwrap();
+        assert!(r > 60, "the stroke went black: {r}");
+    }
+
     use super::*;
 
     /// A scratch file that removes itself.

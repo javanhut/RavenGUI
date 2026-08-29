@@ -68,8 +68,18 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     // about the compositor's own drawing, which does not go through the scene.
     if !state.is_locked() {
         state.dock_pointer_moved();
+        state.launcher_pointer_moved();
     }
-    let under = state.surface_under(location);
+    // The launcher is compositor-drawn, so no client is under the pointer
+    // while it is there as far as the scene knows — but a window behind the
+    // panel is, and it must not be told about a pointer the user sees as
+    // being on the panel. Leaving the client is what stops its hover
+    // effects tracking a pointer that is not on it.
+    let under = if state.launcher_covers_pointer() {
+        None
+    } else {
+        state.surface_under(location)
+    };
     let pointer = state.pointer();
     pointer.motion(
         state,
@@ -138,6 +148,19 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     let on_popup = state
         .surface_under(state.pointer_location)
         .is_some_and(|(surface, _)| state.is_popup(&surface));
+    // The launcher, while it is open, takes the primary click the way it
+    // takes every key: on the panel it launches, off the panel it dismisses.
+    // Asked before the dock, which the panel is drawn over. Other buttons
+    // fall through unchanged — a right click has no meaning here, and
+    // swallowing it would make the pointer feel dead.
+    const BTN_LEFT: u32 = 0x110;
+    if button_state == ButtonState::Pressed
+        && event.button_code() == BTN_LEFT
+        && state.launcher_click()
+    {
+        return;
+    }
+
     // The dock is compositor-drawn, so it is not under the pointer as far as
     // any client is concerned. It has to be asked first, or a click on it
     // falls through to whatever window is behind it.

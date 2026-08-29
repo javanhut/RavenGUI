@@ -144,13 +144,18 @@ impl Frecency {
 
     /// The decayed score for `path` at `now`. Zero if never launched.
     pub fn score(&self, path: &Path, now: u64) -> f64 {
-        let Some(record) = self.records.get(path) else {
-            return 0.0;
-        };
-        // A clock that went backwards must not amplify a score. Saturating to
-        // zero elapsed means the score is simply not decayed.
-        let elapsed = now.saturating_sub(record.updated) as f64;
-        record.score * 0.5_f64.powf(elapsed / HALF_LIFE_SECS)
+        self.records
+            .get(path)
+            .map_or(0.0, |record| record.decayed(now))
+    }
+
+    /// When `path` was last launched, in unix seconds. `None` if never.
+    ///
+    /// Frecency answers "what do you use"; this answers "what did you just
+    /// use", which is a different list — a tool run once a minute ago sits
+    /// nowhere near the top by score but is the likeliest thing to want back.
+    pub fn last_used(&self, path: &Path) -> Option<u64> {
+        self.records.get(path).map(|r| r.updated)
     }
 
     /// How many applications have ever been launched.
@@ -161,7 +166,138 @@ impl Frecency {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Forget every application whose score at `now` has decayed below
+    /// [`PRUNE_BELOW`].
+    ///
+    /// Decay never reaches zero, so without this the file on disk would keep
+    /// every application ever launched. A score that small is also below
+    /// anything the ranking can tell apart from "never used", so nothing the
+    /// user can see changes — except that a one-off launch from last year no
+    /// longer counts as "recent" for the launcher's Recent rows either, which
+    /// is what anyone would expect of it.
+    pub fn prune(&mut self, now: u64) {
+        self.records
+            .retain(|_, record| record.decayed(now) >= PRUNE_BELOW);
+    }
+
+    /// The on-disk form: one `updated\tscore\tpath` line per application.
+    ///
+    /// Text rather than a serialisation crate because there is nothing to
+    /// serialise but three columns, and a file the user can read and repair
+    /// with a text editor is worth more than a schema. Tab-separated because
+    /// a `.desktop` path can contain spaces but not, in practice, a tab; the
+    /// path is last so that it can be anything at all. Lines are sorted so
+    /// that two saves of the same state produce the same bytes.
+    pub fn to_text(&self) -> String {
+        let mut lines: Vec<String> = self
+            .records
+            .iter()
+            .map(|(path, record)| {
+                format!(
+                    "{}\t{}\t{}\n",
+                    record.updated,
+                    record.score,
+                    path.to_string_lossy()
+                )
+            })
+            .collect();
+        lines.sort();
+        lines.concat()
+    }
+
+    /// Read back what [`Frecency::to_text`] wrote.
+    ///
+    /// Forgiving on purpose: a blank line, a comment, a line with the wrong
+    /// number of columns, a score that is not a number — each is skipped, not
+    /// fatal. The file is a cache of habits, and losing one line of it is
+    /// nothing compared to losing all of it because one line was odd. A
+    /// negative or non-finite score is dropped too, since [`Frecency::record`]
+    /// could never have written one and it would otherwise poison the ranking.
+    pub fn parse(text: &str) -> Self {
+        let mut records = HashMap::new();
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.splitn(3, '\t');
+            let (Some(updated), Some(score), Some(path)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let (Ok(updated), Ok(score)) =
+                (updated.trim().parse::<u64>(), score.trim().parse::<f64>())
+            else {
+                continue;
+            };
+            if !score.is_finite() || score < 0.0 || path.is_empty() {
+                continue;
+            }
+            records.insert(PathBuf::from(path), Record { score, updated });
+        }
+        Self { records }
+    }
+
+    /// Load from `path`, treating a missing file as an empty history.
+    ///
+    /// A file that cannot be read for any other reason is an error, so that
+    /// the caller can log it; but the caller should still start with an empty
+    /// history rather than refuse to run, and this is shaped to make that the
+    /// obvious thing to write.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Self::parse(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write to `path`, creating its directory, without ever leaving a
+    /// half-written file behind.
+    ///
+    /// Written to a sibling temporary file and renamed over the target, since
+    /// a rename is atomic on every filesystem this runs on and a truncate-then-
+    /// write is not: a crash or a power cut between the two would leave an
+    /// empty file, and an empty file is every habit forgotten. The temporary
+    /// file carries the process id so that two compositors sharing a home
+    /// directory cannot trample each other's half-written file.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "frecency".to_owned());
+        let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+        let result =
+            std::fs::write(&temp, self.to_text()).and_then(|()| std::fs::rename(&temp, path));
+        if result.is_err() {
+            // Best effort: the error being reported is the interesting one.
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
 }
+
+impl Record {
+    /// The score decayed from `updated` to `now`.
+    fn decayed(self, now: u64) -> f64 {
+        // A clock that went backwards must not amplify a score. Saturating to
+        // zero elapsed means the score is simply not decayed.
+        let elapsed = now.saturating_sub(self.updated) as f64;
+        self.score * 0.5_f64.powf(elapsed / HALF_LIFE_SECS)
+    }
+}
+
+/// Below this decayed score a record is dropped on [`Frecency::prune`].
+///
+/// One launch takes a little over six half-lives — three months — to fall
+/// this far, which is long past the point where it could move anything in
+/// the ranking.
+const PRUNE_BELOW: f64 = 0.01;
 
 /// Rank `entries` against `query`, best first.
 ///
@@ -251,7 +387,12 @@ fn best_match(entry: &Entry, query: &str) -> Option<(Quality, Field)> {
 
 /// How well `query` matches `text`, if at all.
 fn match_text(text: &str, query: &str) -> Option<Quality> {
-    let text = text.to_lowercase();
+    match_lowercase(&text.to_lowercase(), query)
+}
+
+/// [`match_text`] for a `text` already lowercased — for an index that
+/// lowercases each name once rather than on every keystroke.
+pub(crate) fn match_lowercase(text: &str, query: &str) -> Option<Quality> {
     if text == query {
         return Some(Quality::Exact);
     }
@@ -267,7 +408,7 @@ fn match_text(text: &str, query: &str) -> Option<Quality> {
     {
         return Some(Quality::WordPrefix);
     }
-    is_subsequence(&text, query).then_some(Quality::Subsequence)
+    is_subsequence(text, query).then_some(Quality::Subsequence)
 }
 
 /// Whether every character of `query` appears in `text`, in order.
@@ -295,6 +436,7 @@ mod tests {
             terminal: false,
             startup_wm_class: None,
             path: PathBuf::from(format!("/apps/{name}.desktop")),
+            actions: Vec::new(),
         }
     }
 
@@ -557,6 +699,97 @@ mod tests {
         let once = search(&apps, "e", &Frecency::new(), NOW);
         let twice = search(&apps, "e", &Frecency::new(), NOW);
         assert_eq!(names(&once, &apps), names(&twice, &apps));
+    }
+
+    #[test]
+    fn frecency_survives_a_trip_through_its_text_form() {
+        let a = Path::new("/apps/a.desktop");
+        let b = Path::new("/apps/with space.desktop");
+        let mut before = Frecency::new();
+        before.record(a, NOW - 3 * DAY);
+        before.record(a, NOW);
+        before.record(b, NOW - DAY);
+
+        let after = Frecency::parse(&before.to_text());
+        assert_eq!(after.len(), 2);
+        for path in [a, b] {
+            assert_eq!(after.last_used(path), before.last_used(path));
+            assert!((after.score(path, NOW) - before.score(path, NOW)).abs() < 1e-9);
+        }
+        // And the text is the same both times, so a save never rewrites
+        // bytes it does not need to.
+        assert_eq!(after.to_text(), before.to_text());
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped_rather_than_fatal() {
+        let text = "\
+\n\
+# a comment\n\
+not a number\t1.0\t/apps/bad-time.desktop\n\
+1700000000\tabc\t/apps/bad-score.desktop\n\
+1700000000\t1.0\n\
+1700000000\t-1.0\t/apps/negative.desktop\n\
+1700000000\tNaN\t/apps/nan.desktop\n\
+1700000000\t2.5\t/apps/good.desktop\r\n\
+   \n";
+        let frecency = Frecency::parse(text);
+        assert_eq!(frecency.len(), 1, "{:?}", frecency);
+        let good = Path::new("/apps/good.desktop");
+        assert_eq!(frecency.last_used(good), Some(NOW));
+        assert!((frecency.score(good, NOW) - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pruning_forgets_what_has_decayed_to_nothing() {
+        let old = Path::new("/apps/old.desktop");
+        let recent = Path::new("/apps/recent.desktop");
+        let mut frecency = Frecency::new();
+        frecency.record(old, NOW - 365 * DAY);
+        frecency.record(recent, NOW - 20 * DAY);
+
+        frecency.prune(NOW);
+        assert_eq!(frecency.last_used(old), None, "a year-old launch was kept");
+        assert!(
+            frecency.last_used(recent).is_some(),
+            "a recent one was lost"
+        );
+        assert!(!frecency.to_text().contains("old.desktop"));
+    }
+
+    #[test]
+    fn saving_and_loading_go_through_the_filesystem_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "raven-frecency-test-{}-{}",
+            std::process::id(),
+            NOW
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The directory does not exist yet: save must create it.
+        let file = dir.join("state").join("frecency");
+
+        assert!(
+            Frecency::load(&file)
+                .expect("missing is not an error")
+                .is_empty(),
+            "a missing file is an empty history"
+        );
+
+        let path = Path::new("/apps/x.desktop");
+        let mut frecency = Frecency::new();
+        frecency.record(path, NOW);
+        frecency.save(&file).expect("save");
+
+        let loaded = Frecency::load(&file).expect("load");
+        assert_eq!(loaded.last_used(path), Some(NOW));
+
+        // No temporary file left beside the real one.
+        let siblings: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, vec![std::ffi::OsString::from("frecency")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

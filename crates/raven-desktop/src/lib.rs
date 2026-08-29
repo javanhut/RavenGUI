@@ -22,12 +22,16 @@
 /// exactly the sort of thing that drifts apart.
 pub(crate) const DEFAULT_DATA_DIRS: &str = "/usr/local/share:/usr/share";
 
+pub mod calc;
 pub mod entry;
+pub mod files;
 pub mod icon;
 pub mod pixmap;
 pub mod search;
 
+pub use calc::calculate;
 pub use entry::{Entry, Skipped, directories};
+pub use files::FileIndex;
 pub use icon::Icons;
 pub use pixmap::{Pixmap, Pixmaps};
 pub use search::{Frecency, Hit, Quality, search};

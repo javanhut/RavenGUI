@@ -91,6 +91,24 @@ pub fn shadows(seen: &mut std::collections::HashSet<std::ffi::OsString>, path: &
     }
 }
 
+/// One of an application's `[Desktop Action …]` groups: a second way to
+/// start it, like a browser's "New Incognito Window".
+///
+/// Only what the launcher shows and runs. An action is not an [`Entry`] —
+/// it has no categories, no keywords, and is not searched for on its own —
+/// so it does not pretend to be one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Action {
+    /// The group's identifier, as listed in `Actions=`.
+    pub id: String,
+    /// `Name`. What the menu shows.
+    pub name: String,
+    /// `Exec`, still holding its field codes. Use [`Entry::action_argv`].
+    pub exec: String,
+    /// `Icon`, if the action has its own.
+    pub icon: Option<String>,
+}
+
 /// One installed application, as a launcher cares about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -118,6 +136,13 @@ pub struct Entry {
     pub startup_wm_class: Option<String>,
     /// Where this came from. Kept for cache invalidation and for diagnostics.
     pub path: PathBuf,
+    /// The entry's `Actions`, in the order `Actions=` lists them.
+    ///
+    /// Only groups that key names are read: the spec says an action group
+    /// not listed there is to be ignored, and honouring that is also what
+    /// stops a stray group from adding a way to run something the entry
+    /// never advertised.
+    pub actions: Vec<Action>,
 }
 
 /// Why an entry was skipped rather than listed.
@@ -175,6 +200,23 @@ pub fn parse(text: &str, path: &Path, current_desktop: &[String]) -> Result<Entr
         return Err(Skipped::Incomplete);
     }
 
+    let actions = semicolon_list(fields.get("Actions"))
+        .into_iter()
+        .filter_map(|id| {
+            let group = group(text, &format!("Desktop Action {id}"));
+            let (name, exec) = (group.get("Name")?, group.get("Exec")?);
+            if name.is_empty() || exec.is_empty() {
+                return None;
+            }
+            Some(Action {
+                id,
+                name: name.clone(),
+                exec: exec.clone(),
+                icon: group.get("Icon").cloned(),
+            })
+        })
+        .collect();
+
     Ok(Entry {
         name: name.clone(),
         comment: fields.get("Comment").cloned(),
@@ -186,6 +228,7 @@ pub fn parse(text: &str, path: &Path, current_desktop: &[String]) -> Result<Entr
         terminal: is_true(fields.get("Terminal")),
         startup_wm_class: fields.get("StartupWMClass").cloned(),
         path: path.to_owned(),
+        actions,
     })
 }
 
@@ -206,7 +249,20 @@ impl Entry {
     /// or a semicolon can never introduce another. That ordering is the whole
     /// safety property; reversing it is the classic launcher injection bug.
     pub fn argv(&self, targets: &[String]) -> Option<Vec<String>> {
-        let words = split_exec(&self.exec)?;
+        self.expand(&self.exec, targets)
+    }
+
+    /// The argument vector for one of this entry's [`Action`]s.
+    ///
+    /// Field codes resolve exactly as for [`Entry::argv`] — `%c` and `%i`
+    /// are still the application's name and icon, which is what the spec
+    /// says they mean wherever they appear in the file.
+    pub fn action_argv(&self, action: &Action, targets: &[String]) -> Option<Vec<String>> {
+        self.expand(&action.exec, targets)
+    }
+
+    fn expand(&self, exec: &str, targets: &[String]) -> Option<Vec<String>> {
+        let words = split_exec(exec)?;
         let mut argv = Vec::with_capacity(words.len());
 
         for word in words {
@@ -243,6 +299,11 @@ impl Entry {
 /// `[Desktop Action Foo]` groups afterwards, and reading their keys as if they
 /// were the entry's own would let an action's `Exec` masquerade as the app's.
 fn desktop_entry_group(text: &str) -> HashMap<String, String> {
+    group(text, "Desktop Entry")
+}
+
+/// The key/value pairs of the group headed `[name]`, and no other.
+fn group(text: &str, name: &str) -> HashMap<String, String> {
     let mut fields = HashMap::new();
     let mut inside = false;
 
@@ -252,7 +313,7 @@ fn desktop_entry_group(text: &str) -> HashMap<String, String> {
             continue;
         }
         if let Some(group) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            inside = group == "Desktop Entry";
+            inside = group == name;
             continue;
         }
         if !inside {
@@ -405,6 +466,7 @@ mod tests {
             terminal: false,
             startup_wm_class: None,
             path: PathBuf::from("/usr/share/applications/raven-terminal.desktop"),
+            actions: Vec::new(),
         }
     }
 
@@ -508,6 +570,63 @@ Exec=/bin/impostor
         let e = parse(text, Path::new("/x.desktop"), &[]).expect("parses");
         assert_eq!(e.name, "Real");
         assert_eq!(e.argv(&[]).expect("runnable"), ["/bin/real"]);
+    }
+
+    #[test]
+    fn listed_actions_are_read_and_unlisted_ones_are_not() {
+        let text = "\
+[Desktop Entry]
+Type=Application
+Name=Browser
+Exec=/bin/browser %U
+Icon=browser
+Actions=new-window;incognito;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/bin/browser --new-window
+
+[Desktop Action incognito]
+Name=New Incognito Window
+Exec=/bin/browser --incognito %U
+Icon=browser-incognito
+
+[Desktop Action unlisted]
+Name=Not Advertised
+Exec=/bin/browser --secret
+";
+        let e = parse(text, Path::new("/x.desktop"), &[]).expect("parses");
+        let names: Vec<&str> = e.actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["New Window", "New Incognito Window"]);
+        assert_eq!(e.actions[1].icon.as_deref(), Some("browser-incognito"));
+        // Field codes in an action resolve like the entry's own.
+        assert_eq!(
+            e.action_argv(&e.actions[1], &[]).expect("runnable"),
+            ["/bin/browser", "--incognito"]
+        );
+        // And the application's own argv is untouched by any of it.
+        assert_eq!(e.argv(&[]).expect("runnable"), ["/bin/browser"]);
+    }
+
+    #[test]
+    fn an_action_missing_its_exec_is_dropped_not_the_entry() {
+        let text = "\
+[Desktop Entry]
+Type=Application
+Name=App
+Exec=/bin/app
+Actions=broken;fine;
+
+[Desktop Action broken]
+Name=Broken
+
+[Desktop Action fine]
+Name=Fine
+Exec=/bin/app --fine
+";
+        let e = parse(text, Path::new("/x.desktop"), &[]).expect("parses");
+        assert_eq!(e.actions.len(), 1);
+        assert_eq!(e.actions[0].id, "fine");
     }
 
     #[test]
