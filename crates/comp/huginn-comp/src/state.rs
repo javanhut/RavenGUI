@@ -2505,6 +2505,19 @@ impl Huginn {
     }
 
     /// Keep the handle that asks the file indexer for an early walk.
+    /// Hand the quick settings row its BlueZ client. From [`crate::bluetooth::start`].
+    pub(crate) fn set_bluetooth(&mut self, backend: Box<dyn crate::bluetooth::Backend>) {
+        self.settings.set_bluetooth(backend);
+    }
+
+    /// The BlueZ thread changed something. Only the panel shows it, so
+    /// there is nothing to do unless the panel is up.
+    pub(crate) fn bluetooth_changed(&mut self) {
+        if self.settings_panel.is_some() {
+            self.refresh_settings();
+        }
+    }
+
     pub(crate) fn set_file_index_requests(&mut self, requests: crate::fileindex::Requests) {
         self.file_index_requests = Some(requests);
     }

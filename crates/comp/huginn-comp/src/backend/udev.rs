@@ -227,6 +227,8 @@ pub(crate) fn run() -> Result<()> {
     // and everything it does happens later, from the loop.
     crate::appwatch::start::<Udev>(&handle);
     crate::fileindex::start::<Udev>(&handle, &mut state);
+    // BlueZ, for the quick settings row. Same shape: a thread and a wake-up.
+    crate::bluetooth::start::<Udev>(&handle, &mut state);
 
     match EGLDevice::device_for_display(renderer.egl_context().display())
         .and_then(|device| device.try_get_render_node())

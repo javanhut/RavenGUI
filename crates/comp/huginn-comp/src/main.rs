@@ -17,6 +17,7 @@ mod audio;
 #[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
+mod bluetooth;
 mod blur;
 #[cfg(target_os = "linux")]
 mod canvas;
