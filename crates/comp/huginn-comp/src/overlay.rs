@@ -37,7 +37,7 @@ const BG: [u8; 4] = crate::theme::BACKGROUND
 const BORDER: [u8; 4] = crate::theme::BORDER.to_rgba_bytes();
 
 const TITLE: &str = "Huginn keybindings";
-const FOOTER: &str = "Super+Shift+H closes this. Plain Super belongs to the focused application.";
+const FOOTER: &str = "Super+Ctrl+H closes this. Plain Super belongs to the focused application.";
 
 /// The keybinding overlay.
 #[derive(Debug)]

@@ -404,7 +404,7 @@ pub(crate) struct Huginn {
     /// Whether the arrows are currently resizing the focused window.
     ///
     /// A mode rather than a chord because resizing is done by feel: you press
-    /// an arrow several times and watch. `Super`+`Shift`+arrows is already
+    /// an arrow several times and watch. `Super`+`Ctrl`+arrows is already
     /// taken by moving a window between tiles, and overloading it would make
     /// the two indistinguishable.
     pub(crate) resizing: bool,

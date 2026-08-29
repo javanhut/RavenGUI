@@ -197,7 +197,7 @@ and its stage summary reports on each.
 
 | Named in | Expects | Missing means |
 |---|---|---|
-| `theme::TERMINAL`, `dock::PINNED` | `raven-terminal` on `$PATH` | `Super`+`Shift`+`T` does nothing and the dock's one pinned item is dead — the desktop can launch no process at all |
+| `theme::TERMINAL`, `dock::PINNED` | `raven-terminal` on `$PATH` | `Super`+`Ctrl`+`T` does nothing and the dock's one pinned item is dead — the desktop can launch no process at all |
 | `launcher::scan_applications` | `.desktop` files in `$XDG_DATA_DIRS/applications` | the launcher opens and enumerates nothing |
 | `pointer::Cursor::load` | an xcursor theme at `$XCURSOR_THEME`, default `default` | no pointer is drawn over the dock, launcher or background — clients that set their own still show one, so it reads as a rendering bug |
 | `theme::ICON_THEME` | the `breeze-dark` icon theme | every dock and launcher icon draws blank |
@@ -295,12 +295,12 @@ top panel with workspace pips, receives workspace state over `raven_shell_v1`,
 and switches workspaces when a pip is clicked.
 
 The focused window wears a ring in the same accent the panel uses, and
-`Super`+`Shift`+arrows move it between tiles. Neighbours are found by position
+`Super`+`Ctrl`+arrows move it between tiles. Neighbours are found by position
 rather than by tile order — with one window beside a split stack the two disagree
 — and a direction with nothing squarely that way does nothing rather than
 sending the window off diagonally.
 
-`Super`+`Shift`+`H` draws the keybinding list over everything, and pressing it
+`Super`+`Ctrl`+`H` draws the keybinding list over everything, and pressing it
 again takes it away. The compositor renders it itself, with a bitmap font it
 carries in the binary — the shell is a separate process precisely so it can
 crash, and a help screen that vanishes along with the panel would be missing
@@ -308,7 +308,7 @@ exactly when it is wanted. Both the overlay and the line the compositor logs at
 startup are built from one table next to the keymap, and a test walks the
 keysym space to prove no binding has been added without a row in it.
 
-Window management lives on the `Super`+`Shift` layer. Plain `Super` belongs to
+Window management lives on the `Super`+`Ctrl` layer. Plain `Super` belongs to
 applications: RavenTerminal uses it as its own leader, and a chord the
 compositor intercepts never reaches a client at all. The exception is
 `Super`+`C` and `Super`+`V`, which the compositor translates rather than

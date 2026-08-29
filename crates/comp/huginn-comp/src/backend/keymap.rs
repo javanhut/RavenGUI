@@ -6,7 +6,7 @@
 //!
 //! # Which layer belongs to whom
 //!
-//! Window management lives on `Super`+`Shift`. The plain `Super` layer belongs
+//! Window management lives on `Super`+`Ctrl`. The plain `Super` layer belongs
 //! to applications: RavenTerminal uses it as its own leader — `Super`+`T` for a
 //! tab, `Super`+`[`/`]` for panes, `Super`+`C` to copy — the way `Cmd` works on
 //! macOS. A compositor that takes the whole `Super` layer leaves those chords
@@ -52,7 +52,7 @@ pub(crate) enum Action {
     Paste,
     /// Lock the session.
     ///
-    /// On plain `Super` rather than `Super`+`Shift`, breaking this module's own
+    /// On plain `Super` rather than `Super`+`Ctrl`, breaking this module's own
     /// rule, because `Super`+`L` is what a person coming from any other desktop
     /// will press and a lock chord that is nearly right is a lock chord that
     /// leaves machines unlocked.
@@ -156,7 +156,7 @@ pub(crate) struct Binding {
 pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         action: Action::Spawn,
-        chord: "Super+Shift+E / T",
+        chord: "Super+Ctrl+E / T",
         description: "open a terminal",
     },
     Binding {
@@ -166,42 +166,42 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         action: Action::CloseFocused,
-        chord: "Super+Shift+Q / X",
+        chord: "Super+Ctrl+Q / X",
         description: "close the focused window",
     },
     Binding {
         action: Action::FocusNext,
-        chord: "Super+Shift+J",
+        chord: "Super+Ctrl+J",
         description: "focus the next window",
     },
     Binding {
         action: Action::FocusPrev,
-        chord: "Super+Shift+K",
+        chord: "Super+Ctrl+K",
         description: "focus the previous window",
     },
     Binding {
         action: Action::Move(Dir::Left),
-        chord: "Super+Shift+arrows",
+        chord: "Super+Ctrl+arrows",
         description: "move the focused window between tiles",
     },
     Binding {
         action: Action::PromoteFocused,
-        chord: "Super+Shift+Return",
+        chord: "Super+Ctrl+Return",
         description: "swap the focused window into the first tile",
     },
     Binding {
         action: Action::ToggleCarousel,
-        chord: "Super+Shift+C",
+        chord: "Super+Ctrl+C",
         description: "open or accept the workspace carousel",
     },
     Binding {
         action: Action::EnterResize,
-        chord: "Super+Shift+R",
+        chord: "Super+Ctrl+R",
         description: "resize the focused window with the arrows",
     },
     Binding {
         action: Action::Workspace(0),
-        chord: "Super+Shift+1..9",
+        chord: "Super+Ctrl+1..9",
         description: "go to a workspace",
     },
     Binding {
@@ -221,27 +221,27 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         action: Action::OpenLauncher,
-        chord: "Super+Shift+Space",
+        chord: "Super+Ctrl+Space",
         description: "open the application launcher",
     },
     Binding {
         action: Action::OpenPinned,
-        chord: "Super+Shift+A",
+        chord: "Super+Ctrl+A",
         description: "open the pinned applications",
     },
     Binding {
         action: Action::OpenSettings,
-        chord: "Super+Shift+S",
+        chord: "Super+Ctrl+S",
         description: "open quick settings",
     },
     Binding {
         action: Action::ToggleHelp,
-        chord: "Super+Shift+H",
+        chord: "Super+Ctrl+H",
         description: "show or hide this list",
     },
     Binding {
         action: Action::Quit,
-        chord: "Super+Shift+Esc",
+        chord: "Super+Ctrl+Esc",
         description: "quit the compositor",
     },
     Binding {
@@ -284,7 +284,7 @@ pub(crate) fn resolve(
     // Locked, so there are no bindings at all: every key belongs to the lock
     // screen. First, before the modes below, and that ordering is load-bearing
     // twice over. A window-management chord resolved here would act on the
-    // session the lock exists to hold — `Super`+`Shift`+`Q` would close a
+    // session the lock exists to hold — `Super`+`Ctrl`+`Q` would close a
     // window nobody can see. And the launcher branch further down swallows
     // *everything* when it is open, so a session locked with the launcher up
     // would forward not one keystroke to the lock screen: no password could be
@@ -354,7 +354,11 @@ pub(crate) fn resolve(
     }
 
     // Plain Super is the application's, with two things taken out of it.
-    if !modifiers.shift {
+    // Ctrl is the compositor's modifier rather than Shift because Ctrl
+    // leaves the keysym alone: `Super`+`Shift`+`1` arrives as `!` on a US
+    // layout and as `1` on others, and every letter arrives capitalised,
+    // whereas `Super`+`Ctrl`+`1` is `1` everywhere.
+    if !modifiers.ctrl {
         // Locking is checked before the client's claim, not after. See
         // [`Action::Lock`]: this is the one chord that must mean the same thing
         // whatever is focused.
@@ -379,8 +383,8 @@ pub(crate) fn resolve(
         keysyms::KEY_a | keysyms::KEY_A => Action::OpenPinned,
         keysyms::KEY_s | keysyms::KEY_S => Action::OpenSettings,
         keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
-        // Shift is what separates this from `Super`+`C`, which is copy: the
-        // branch above returns before this one whenever shift is not held.
+        // Ctrl is what separates this from `Super`+`C`, which is copy: the
+        // branch above returns before this one whenever Ctrl is not held.
         keysyms::KEY_c | keysyms::KEY_C => Action::ToggleCarousel,
         keysyms::KEY_h | keysyms::KEY_H => Action::ToggleHelp,
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
@@ -393,9 +397,9 @@ pub(crate) fn resolve(
         keysyms::KEY_Up => Action::Move(Dir::Up),
         keysyms::KEY_Down => Action::Move(Dir::Down),
         keysyms::KEY_Escape => Action::Quit,
-        // Adding Ctrl sends the window there instead of going there yourself.
+        // Adding Shift sends the window there instead of going there yourself.
         sym => match workspace_index(sym) {
-            Some(i) if modifiers.ctrl => Action::SendToWorkspace(i),
+            Some(i) if modifiers.shift => Action::SendToWorkspace(i),
             Some(i) => Action::Workspace(i),
             None => return FilterResult::Forward,
         },
@@ -426,9 +430,9 @@ fn pressed(key_state: KeyState, action: Action) -> Option<Action> {
 
 /// The zero-based workspace a digit key names, however the layout shifts it.
 ///
-/// Shift is held for every compositor binding, so on a US layout the digit row
-/// arrives as punctuation. Both are accepted: a layout that keeps digits under
-/// Shift is no less entitled to nine workspaces.
+/// Shift is held to send a window to a workspace, so on a US layout the digit
+/// row then arrives as punctuation. Both are accepted: a layout that keeps
+/// digits under Shift is no less entitled to nine workspaces.
 fn workspace_index(sym: u32) -> Option<usize> {
     const SHIFTED: [u32; 9] = [
         keysyms::KEY_exclam,
@@ -474,10 +478,10 @@ mod tests {
         }
     }
 
-    fn super_shift() -> ModifiersState {
+    fn super_ctrl() -> ModifiersState {
         ModifiersState {
             logo: true,
-            shift: true,
+            ctrl: true,
             ..Default::default()
         }
     }
@@ -575,11 +579,11 @@ mod tests {
     #[test]
     fn a_locked_session_resolves_no_bindings() {
         for (mods, sym) in [
-            (super_shift(), keysyms::KEY_q),      // would close a window
-            (super_shift(), keysyms::KEY_space),  // would open the launcher
-            (super_held(), keysyms::KEY_l),       // would lock again
-            (super_held(), keysyms::KEY_c),       // would send the client Ctrl+C
-            (super_shift(), keysyms::KEY_Escape), // would quit the compositor
+            (super_ctrl(), keysyms::KEY_q),      // would close a window
+            (super_ctrl(), keysyms::KEY_space),  // would open the launcher
+            (super_held(), keysyms::KEY_l),      // would lock again
+            (super_held(), keysyms::KEY_c),      // would send the client Ctrl+C
+            (super_ctrl(), keysyms::KEY_Escape), // would quit the compositor
         ] {
             assert!(
                 matches!(while_locked(mods, sym, None), FilterResult::Forward),
@@ -601,7 +605,7 @@ mod tests {
 
     #[test]
     fn resize_mode_takes_the_bare_arrows() {
-        // Bare, not Super+Shift+arrows — that chord already moves a window
+        // Bare, not Super+Ctrl+arrows — that chord already moves a window
         // between tiles, and overloading it would make the two
         // indistinguishable.
         for (sym, dir) in [
@@ -655,7 +659,7 @@ mod tests {
     #[test]
     fn the_resize_binding_is_reachable() {
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_R),
+            intercepted(super_ctrl(), keysyms::KEY_R),
             Some(Action::EnterResize)
         );
     }
@@ -668,7 +672,7 @@ mod tests {
             (ModifiersState::default(), keysyms::KEY_a, Some('a')),
             (ModifiersState::default(), keysyms::KEY_1, Some('1')),
             (super_held(), keysyms::KEY_c, Some('c')),
-            (super_shift(), keysyms::KEY_q, Some('q')),
+            (super_ctrl(), keysyms::KEY_q, Some('q')),
         ] {
             assert!(
                 matches!(to_launcher(mods, sym, ch), FilterResult::Intercept(_)),
@@ -687,8 +691,7 @@ mod tests {
             keysyms::KEY_Escape,
             keysyms::KEY_H,
         ] {
-            let FilterResult::Intercept(Some(action)) = to_launcher(super_shift(), sym, None)
-            else {
+            let FilterResult::Intercept(Some(action)) = to_launcher(super_ctrl(), sym, None) else {
                 panic!("{sym:#x} was not intercepted for the launcher");
             };
             assert!(
@@ -702,7 +705,7 @@ mod tests {
     fn escape_always_reaches_the_launcher_as_dismiss() {
         // The only way out. If a binding ever shadowed this the launcher would
         // have the keyboard and no exit.
-        for mods in [ModifiersState::default(), super_held(), super_shift()] {
+        for mods in [ModifiersState::default(), super_held(), super_ctrl()] {
             assert!(
                 matches!(
                     to_launcher(mods, keysyms::KEY_Escape, None),
@@ -714,9 +717,9 @@ mod tests {
     }
 
     #[test]
-    fn super_shift_a_opens_the_pinned_panel_and_the_panel_takes_every_key() {
+    fn super_ctrl_a_opens_the_pinned_panel_and_the_panel_takes_every_key() {
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_a),
+            intercepted(super_ctrl(), keysyms::KEY_a),
             Some(Action::OpenPinned)
         );
         // Plain Super+A stays the application's.
@@ -726,16 +729,26 @@ mod tests {
             ..Modes::default()
         };
         // Escape is the way out, and a compositor chord does not shadow it.
-        for mods in [ModifiersState::default(), super_held(), super_shift()] {
+        for mods in [ModifiersState::default(), super_held(), super_ctrl()] {
             assert!(matches!(
                 resolve(KeyState::Pressed, &mods, keysyms::KEY_Escape, mode),
                 FilterResult::Intercept(Some(Action::Pinned(crate::pinned::Key::Dismiss)))
             ));
         }
-        // Shift+arrow arrives as a move, not as a window-management chord.
+        // Shift+arrow arrives as a move, and Super+Ctrl+arrow — the
+        // window-management chord — reaches the panel too rather than moving
+        // a window under it.
+        let shift = ModifiersState {
+            shift: true,
+            ..Default::default()
+        };
         assert!(matches!(
-            resolve(KeyState::Pressed, &super_shift(), keysyms::KEY_Left, mode),
+            resolve(KeyState::Pressed, &shift, keysyms::KEY_Left, mode),
             FilterResult::Intercept(Some(Action::Pinned(crate::pinned::Key::Move(Dir::Left))))
+        ));
+        assert!(matches!(
+            resolve(KeyState::Pressed, &super_ctrl(), keysyms::KEY_Left, mode),
+            FilterResult::Intercept(Some(Action::Pinned(crate::pinned::Key::Left)))
         ));
         // A letter it has no use for is swallowed rather than forwarded.
         assert!(matches!(
@@ -796,18 +809,18 @@ mod tests {
     #[test]
     fn the_launcher_binding_is_reachable_when_it_is_closed() {
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_space),
+            intercepted(super_ctrl(), keysyms::KEY_space),
             Some(Action::OpenLauncher)
         );
     }
 
     #[test]
-    fn bindings_need_super_and_shift() {
+    fn bindings_need_super_and_ctrl() {
         // Without Super every key belongs to the focused client. A compositor
         // that swallows a bare 'q' is unusable.
         assert_eq!(intercepted(ModifiersState::default(), keysyms::KEY_q), None);
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_Q),
+            intercepted(super_ctrl(), keysyms::KEY_Q),
             Some(Action::CloseFocused)
         );
     }
@@ -831,28 +844,20 @@ mod tests {
 
     #[test]
     fn digits_map_to_zero_based_workspaces() {
-        // Shift is held, so a US layout delivers the punctuation on the key.
+        // Ctrl leaves the digit a digit, on every layout.
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_exclam),
+            intercepted(super_ctrl(), keysyms::KEY_1),
             Some(Action::Workspace(0))
         );
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_parenleft),
-            Some(Action::Workspace(8))
-        );
-        // A layout that keeps the digit itself under Shift works too.
-        assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_1),
-            Some(Action::Workspace(0))
-        );
-        assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_9),
+            intercepted(super_ctrl(), keysyms::KEY_9),
             Some(Action::Workspace(8))
         );
     }
 
     #[test]
-    fn ctrl_sends_the_window_instead_of_following_it() {
+    fn shift_sends_the_window_instead_of_following_it() {
+        // With Shift held a US layout delivers the punctuation on the key...
         assert_eq!(
             intercepted(super_ctrl_shift(), keysyms::KEY_exclam),
             Some(Action::SendToWorkspace(0))
@@ -861,16 +866,43 @@ mod tests {
             intercepted(super_ctrl_shift(), keysyms::KEY_at),
             Some(Action::SendToWorkspace(1))
         );
+        // ...and a layout that keeps the digit under Shift works too.
+        assert_eq!(
+            intercepted(super_ctrl_shift(), keysyms::KEY_9),
+            Some(Action::SendToWorkspace(8))
+        );
+    }
+
+    #[test]
+    fn super_shift_alone_is_the_applications() {
+        // The layer the compositor used to live on. Everything on it now
+        // reaches the client, so a terminal may bind Super+Shift+T itself.
+        let super_shift = ModifiersState {
+            logo: true,
+            shift: true,
+            ..Default::default()
+        };
+        for sym in [
+            keysyms::KEY_T,
+            keysyms::KEY_Q,
+            keysyms::KEY_space,
+            keysyms::KEY_exclam,
+        ] {
+            assert!(
+                forwarded(KeyState::Pressed, super_shift, sym),
+                "Super+Shift+{sym:#x} was eaten"
+            );
+        }
     }
 
     #[test]
     fn arrows_move_the_focused_window() {
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_Left),
+            intercepted(super_ctrl(), keysyms::KEY_Left),
             Some(Action::Move(Dir::Left))
         );
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_Down),
+            intercepted(super_ctrl(), keysyms::KEY_Down),
             Some(Action::Move(Dir::Down))
         );
         // Bare arrows are how you move a cursor. They must never be swallowed.
@@ -884,31 +916,31 @@ mod tests {
     #[test]
     fn close_and_spawn_have_two_bindings_each() {
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_X),
+            intercepted(super_ctrl(), keysyms::KEY_X),
             Some(Action::CloseFocused)
         );
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_T),
+            intercepted(super_ctrl(), keysyms::KEY_T),
             Some(Action::Spawn)
         );
     }
 
     #[test]
     fn the_carousel_chord_is_not_swallowed_by_copy() {
-        // Super+Shift+C must reach the carousel in both sym forms, and must do
+        // Super+Ctrl+C must reach the carousel in both sym forms, and must do
         // so even when the focused client owns the Super layer -- the copy
-        // branch consults `focus_owns_super`, the shift layer must not.
+        // branch consults `focus_owns_super`, the Ctrl layer must not.
         for sym in [keysyms::KEY_c, keysyms::KEY_C] {
             assert_eq!(
-                intercepted(super_shift(), sym),
+                intercepted(super_ctrl(), sym),
                 Some(Action::ToggleCarousel),
-                "Super+Shift+C resolved to something other than the carousel"
+                "Super+Ctrl+C resolved to something other than the carousel"
             );
             assert!(
                 matches!(
                     resolve(
                         KeyState::Pressed,
-                        &super_shift(),
+                        &super_ctrl(),
                         sym,
                         Modes {
                             focus_owns_super: true,
@@ -917,7 +949,7 @@ mod tests {
                     ),
                     FilterResult::Intercept(Some(Action::ToggleCarousel))
                 ),
-                "a terminal must not keep Super+Shift+C"
+                "a terminal must not keep Super+Ctrl+C"
             );
         }
     }
@@ -959,13 +991,13 @@ mod tests {
         // The filter sees both halves of a keystroke. Acting on each of them
         // runs every binding twice, which is two terminals per keystroke.
         assert_eq!(
-            intercepted(super_shift(), keysyms::KEY_T),
+            intercepted(super_ctrl(), keysyms::KEY_T),
             Some(Action::Spawn)
         );
         assert!(matches!(
             resolve(
                 KeyState::Released,
-                &super_shift(),
+                &super_ctrl(),
                 keysyms::KEY_T,
                 Modes::default(),
             ),
@@ -975,17 +1007,13 @@ mod tests {
 
     #[test]
     fn a_bound_release_is_swallowed_with_its_press() {
-        assert!(!forwarded(
-            KeyState::Released,
-            super_shift(),
-            keysyms::KEY_T
-        ));
-        assert!(forwarded(KeyState::Released, super_shift(), keysyms::KEY_z));
+        assert!(!forwarded(KeyState::Released, super_ctrl(), keysyms::KEY_T));
+        assert!(forwarded(KeyState::Released, super_ctrl(), keysyms::KEY_z));
     }
 
     #[test]
     fn unbound_keys_reach_the_client() {
-        assert_eq!(intercepted(super_shift(), keysyms::KEY_z), None);
+        assert_eq!(intercepted(super_ctrl(), keysyms::KEY_z), None);
     }
 
     /// Every action the keymap can produce is written down in `BINDINGS`, and
@@ -1002,7 +1030,7 @@ mod tests {
         use std::mem::discriminant;
 
         let mut reachable = HashSet::new();
-        for mods in [super_held(), super_shift(), super_ctrl_shift()] {
+        for mods in [super_held(), super_ctrl(), super_ctrl_shift()] {
             for sym in 0..=u32::from(u16::MAX) {
                 if let Some(action) = intercepted(mods, sym) {
                     reachable.insert(discriminant(&action));
