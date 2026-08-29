@@ -1601,15 +1601,27 @@ impl Huginn {
     /// Tell the dock where the pointer went.
     pub(crate) fn dock_pointer_moved(&mut self) {
         let now = self.uptime();
-        let over_dock = self
-            .dock_rect()
-            .is_some_and(|rect| rect.contains(self.pointer_point()));
+        let pointer = self.pointer_point();
+        let over_dock = self.dock_rect().is_some_and(|rect| rect.contains(pointer));
+        // While the strip is travelling, its destination is an approach area.
+        // Without this, moving upward from the reveal edge can leave both the
+        // narrow edge band and the dock's still-moving rectangle, which
+        // immediately reverses the reveal before the pointer can reach an
+        // icon. Actual item hover below still uses `over_dock`, so previews do
+        // not appear ahead of the visible strip.
+        let approaching_dock = self.app_switcher.is_none()
+            && self.dock.is_animating(now)
+            && crate::dock::placement(self.output_area, self.dock_items.len().max(1), 1.0)
+                .contains(pointer);
         let motion = self.settings.motion();
         let y = self.pointer_location.y.round() as i32;
-        if self
-            .dock
-            .pointer_moved(y, self.output_area, over_dock, now, motion)
-        {
+        if self.dock.pointer_moved(
+            y,
+            self.output_area,
+            over_dock || approaching_dock,
+            now,
+            motion,
+        ) {
             self.refresh_dock();
         }
         // Pictures of the hovered application's windows. Only the ordinary
@@ -2212,6 +2224,13 @@ impl Huginn {
             self.queue_redraw();
         }
         if self.dock.is_animating(now) {
+            // The dock's rectangle moves while it reveals and hides. Pointer
+            // input may be completely still during that motion, so relying on
+            // the input backend to call `dock_pointer_moved` leaves
+            // `dock_hover` describing the dock's old position. Re-hit-test the
+            // stationary pointer on every animation frame so a tile that moves
+            // underneath it can start its preview delay.
+            self.dock_pointer_moved();
             self.refresh_dock();
         }
         if self.launcher.is_animating(now) {
