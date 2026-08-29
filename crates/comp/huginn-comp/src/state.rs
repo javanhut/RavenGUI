@@ -444,6 +444,11 @@ pub(crate) struct Huginn {
 
     /// The application launcher, and the index it searches.
     pub(crate) launcher: crate::launcher::Launcher,
+    /// A way to ask [`crate::fileindex`] for a walk ahead of schedule, and
+    /// when the last index arrived, so the asking is only done for a stale
+    /// one. Both absent when the indexer never started.
+    file_index_requests: Option<crate::fileindex::Requests>,
+    file_index_built: Option<Instant>,
     /// The launcher's pixels, redrawn when its state changes rather than every
     /// frame — a search field repainted at the refresh rate is how one ends up
     /// feeling slower than the typing that drives it.
@@ -620,9 +625,11 @@ impl Huginn {
             volume_panel: None,
             started: std::time::Instant::now(),
             launcher: crate::launcher::Launcher::default(),
+            file_index_requests: None,
+            file_index_built: None,
             launcher_panel: None,
             apps: crate::launcher::scan_applications(),
-            frecency: raven_desktop::Frecency::default(),
+            frecency: load_frecency(),
             icons: raven_desktop::Icons::discover(crate::theme::ICON_THEME),
             pixmaps: raven_desktop::Pixmaps::new(),
             text: crate::text::Text::new(),
@@ -2034,6 +2041,17 @@ impl Huginn {
         if let Some(path) = entry_path {
             let now = self.now();
             self.frecency.record(&path, now);
+            // Saved on every launch rather than at exit: a compositor does not
+            // reliably get an exit, and the file is a few hundred bytes. The
+            // prune is here too, since this is the one time the file is
+            // rewritten and a score cannot fall below the threshold between
+            // two launches without being written here.
+            self.frecency.prune(now);
+            if let Some(file) = frecency_path()
+                && let Err(e) = self.frecency.save(&file)
+            {
+                tracing::warn!("could not save launch history to {}: {e}", file.display());
+            }
         }
         // The answer is not used here: a desktop entry that will not run is a
         // line in the log, not something the launcher can do anything about.
@@ -2075,6 +2093,7 @@ impl Huginn {
     /// the screen because the dock happens to be hidden is motion the eye
     /// cannot follow. Without one it grows in place from the centre.
     pub(crate) fn open_launcher(&mut self) {
+        self.request_file_index_if_stale();
         let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
         let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
         self.launcher
@@ -2088,14 +2107,83 @@ impl Huginn {
         let outcome = self
             .launcher
             .press(key, &self.apps, &self.frecency, now, clock, motion);
+        self.act_on_launcher(outcome);
+    }
+
+    /// The pointer, as a pixel of the launcher's canvas, when it is over the
+    /// open launcher. `None` when the launcher is closed, closing, or the
+    /// pointer is somewhere else.
+    ///
+    /// Goes through the same [`crate::launcher::placement`] the scene draws
+    /// the panel with, at the same reveal, so what the pointer is over is
+    /// what is on screen — including during the opening motion, when the
+    /// panel is smaller than its canvas and off to one side of centre.
+    fn launcher_canvas_point(&self) -> Option<huginn_core::geometry::Point> {
+        if !self.launcher.is_open() {
+            return None;
+        }
+        let panel = self.launcher_panel.as_ref()?;
+        let placed = crate::launcher::placement(
+            self.output_area,
+            panel.size(),
+            self.launcher.origin(),
+            self.launcher.reveal(self.uptime()),
+        );
+        self.launcher
+            .layout()
+            .canvas_point(placed, self.pointer_point())
+    }
+
+    /// Whether the open launcher is under the pointer.
+    ///
+    /// The launcher is compositor-drawn, so as far as any client knows the
+    /// pointer is over whatever window is behind it. The input backend asks
+    /// this before forwarding motion, so a window under the panel is not told
+    /// about a pointer that is, to the user's eye, on the panel.
+    pub(crate) fn launcher_covers_pointer(&self) -> bool {
+        self.launcher_canvas_point().is_some()
+    }
+
+    /// Tell the launcher where the pointer went: the highlight follows it.
+    pub(crate) fn launcher_pointer_moved(&mut self) {
+        let Some(point) = self.launcher_canvas_point() else {
+            return;
+        };
+        let outcome = self.launcher.hover(point);
+        self.act_on_launcher(outcome);
+    }
+
+    /// A press while the launcher is open. Returns whether it was taken.
+    ///
+    /// On the panel, the click goes to the launcher, which launches what it
+    /// landed on. Anywhere else it dismisses the launcher, as Escape would:
+    /// clicking away is the universal gesture for "not this", and a panel
+    /// that stayed up over a window the user had just clicked into would be
+    /// in the way of exactly the thing they turned to. Either way the click
+    /// is swallowed rather than forwarded — it was aimed at the launcher, or
+    /// at getting rid of it, and not at whatever happens to be behind.
+    pub(crate) fn launcher_click(&mut self) -> bool {
+        if !self.launcher.is_open() {
+            return false;
+        }
+        match self.launcher_canvas_point() {
+            Some(point) => {
+                let (clock, motion) = (self.uptime(), self.settings.motion());
+                let outcome = self.launcher.click(point, &self.apps, clock, motion);
+                self.act_on_launcher(outcome);
+            }
+            None => self.launcher_key(crate::launcher::Key::Dismiss),
+        }
+        true
+    }
+
+    /// Do what the launcher asked for after a key or a click: run what it
+    /// chose, and redraw it when it changed. One place for both, so a mouse
+    /// launch and a keyboard launch cannot be credited differently.
+    fn act_on_launcher(&mut self, outcome: crate::launcher::Outcome) {
         match outcome {
-            crate::launcher::Outcome::Launch(argv) => {
-                let path = self
-                    .apps
-                    .iter()
-                    .find(|e| e.argv(&[]).as_deref() == Some(argv.as_slice()))
-                    .map(|e| e.path.clone());
-                self.launch(path, &argv);
+            crate::launcher::Outcome::Launch { entry, argv } => {
+                self.launch(entry, &argv);
                 self.refresh_launcher();
             }
             crate::launcher::Outcome::Dismissed | crate::launcher::Outcome::Redraw => {
@@ -2185,6 +2273,29 @@ impl Huginn {
     /// ordinary path unchanged for the overwhelming majority of frames.
     pub(crate) fn blur_radius(&self) -> f32 {
         crate::blur::radius_for(self.launcher.reveal(self.uptime()))
+    }
+
+    /// Where on the output the blurred desktop shows through: the launcher
+    /// panel's placement, inset by its corner radius. See
+    /// [`crate::launcher::blur_rect`] for why the inset.
+    ///
+    /// The whole desktop is blurred into the texture regardless — the blur
+    /// kernel needs the pixels past the panel's edge to soften the ones just
+    /// inside it — but only this much of the texture is drawn. `None` when
+    /// there is no panel, or it is still too small to blur, and the renderer
+    /// draws the desktop sharp.
+    ///
+    /// Computed from the same placement [`Huginn::scene`] pushes, so the blur
+    /// cannot drift from the panel as it animates.
+    pub(crate) fn blur_rect(&self) -> Option<Rect> {
+        let panel = self.launcher_panel.as_ref()?;
+        let reveal = self.launcher.reveal(self.uptime());
+        crate::launcher::blur_rect(crate::launcher::placement(
+            self.output_area,
+            panel.size(),
+            self.launcher.origin(),
+            reveal,
+        ))
     }
 
     /// Advance anything that is animating, and ask for another frame if it is
@@ -2393,6 +2504,36 @@ impl Huginn {
         self.refresh_dock();
     }
 
+    /// Keep the handle that asks the file indexer for an early walk.
+    pub(crate) fn set_file_index_requests(&mut self, requests: crate::fileindex::Requests) {
+        self.file_index_requests = Some(requests);
+    }
+
+    /// Ask for a new file index if the one in hand is old enough to be
+    /// missing something. Never waits: the worker walks when it gets to it,
+    /// and a worker that is gone is a launcher that searches what it has.
+    fn request_file_index_if_stale(&mut self) {
+        if !crate::fileindex::should_refresh(self.file_index_built, Instant::now()) {
+            return;
+        }
+        if let Some(requests) = &self.file_index_requests {
+            let _ = requests.send(crate::fileindex::WalkNow);
+        }
+    }
+
+    /// Take a freshly built file index from [`crate::fileindex`].
+    pub(crate) fn set_file_index(&mut self, index: raven_desktop::FileIndex) {
+        self.file_index_built = Some(Instant::now());
+        self.launcher.set_files(std::sync::Arc::new(index));
+        // The launcher may be open on a query whose file results just
+        // changed; a closed one picks the index up when it opens.
+        if self.launcher.is_open() {
+            let now = self.now();
+            self.launcher.reindex(&self.apps, &self.frecency, now);
+            self.refresh_launcher();
+        }
+    }
+
     /// Redraw the launcher's panel, or drop it when it is closed.
     ///
     /// Called whenever the launcher's state changes rather than on every
@@ -2400,7 +2541,7 @@ impl Huginn {
     /// which is cheap once per keystroke and wasteful sixty times a second.
     pub(crate) fn refresh_launcher(&mut self) {
         self.launcher_panel = self.launcher.is_visible(self.uptime()).then(|| {
-            crate::launcher::render(
+            let (panel, layout) = crate::launcher::render(
                 &self.launcher,
                 &self.apps,
                 &mut self.text,
@@ -2408,7 +2549,11 @@ impl Huginn {
                 &mut self.pixmaps,
                 self.output_area,
                 self.scale.advertised,
-            )
+            );
+            // The pointer hit-tests against where this redraw put things,
+            // so the layout and the pixels change together.
+            self.launcher.set_layout(layout);
+            panel
         });
         self.queue_redraw();
     }
@@ -3580,6 +3725,89 @@ pub(crate) fn layer_state(surface: &LayerSurface) -> Option<LayerRequest> {
             _ => Interactivity::None,
         },
     })
+}
+
+/// Where the launch history lives: `$XDG_STATE_HOME/raven/frecency`, or
+/// `~/.local/state/raven/frecency` when the variable is unset.
+///
+/// State rather than cache or config: it is not regenerable from anything
+/// else (a cache is), and it is not something the user edits to change the
+/// desktop's behaviour (a config is). It is what the basedir specification
+/// calls state — "history", by name, in its own list of examples. `None` only
+/// when there is no `HOME` either, in which case there is nowhere sensible to
+/// put it and the session simply forgets on exit, as it always did.
+fn frecency_path() -> Option<std::path::PathBuf> {
+    frecency_path_in(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// [`frecency_path`] with the environment as parameters, for testing.
+///
+/// An empty `$XDG_STATE_HOME` counts as unset, which is what the basedir
+/// specification says and what a shell that exported it blank will have done
+/// by accident.
+fn frecency_path_in(
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let base = match xdg_state_home {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::Path::new(home?).join(".local/state"),
+    };
+    Some(base.join("raven/frecency"))
+}
+
+/// The launch history from the last session, or an empty one.
+///
+/// Fail-soft in both directions: a missing file is a fresh install and an
+/// unreadable one is a line in the log, and neither stops the compositor. The
+/// worst that happens is a launcher that has forgotten what you use.
+fn load_frecency() -> raven_desktop::Frecency {
+    let Some(file) = frecency_path() else {
+        return raven_desktop::Frecency::new();
+    };
+    match raven_desktop::Frecency::load(&file) {
+        Ok(frecency) => frecency,
+        Err(e) => {
+            tracing::warn!("could not load launch history from {}: {e}", file.display());
+            raven_desktop::Frecency::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod frecency_tests {
+    use super::frecency_path_in;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_history_lives_under_the_xdg_state_directory() {
+        assert_eq!(
+            frecency_path_in(Some(OsStr::new("/state")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/state/raven/frecency"))
+        );
+    }
+
+    #[test]
+    fn an_unset_or_blank_state_home_falls_back_to_dot_local() {
+        let expected = Some(PathBuf::from("/home/u/.local/state/raven/frecency"));
+        assert_eq!(
+            frecency_path_in(None, Some(OsStr::new("/home/u"))),
+            expected
+        );
+        assert_eq!(
+            frecency_path_in(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            expected
+        );
+    }
+
+    #[test]
+    fn with_no_home_at_all_there_is_nowhere_to_save() {
+        assert_eq!(frecency_path_in(None, None), None);
+    }
 }
 
 #[cfg(test)]

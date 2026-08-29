@@ -9,7 +9,11 @@
 //! # How
 //!
 //! The scene's windows are rendered into an offscreen texture, that texture is
-//! drawn full-screen through a Gaussian shader, and the panels go on top. Two
+//! drawn through a Gaussian shader, cropped to the panel's rectangle (see
+//! `render::blur_element`) over the sharp desktop, and the panel goes on top.
+//! The whole output is blurred even though only the patch under the panel is
+//! shown, because the kernel needs the pixels past the panel's edge to soften
+//! the ones just inside it. Two
 //! passes — horizontal then vertical — because a separable Gaussian costs
 //! `2n` samples per pixel where the naive square costs `n²`: at a 24-pixel
 //! radius that is 98 samples against 2401, which is the difference between a

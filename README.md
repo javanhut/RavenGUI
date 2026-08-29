@@ -227,11 +227,12 @@ symlink into `/usr/share/wallpaper` counts. The greeter dims its copy so a
 password field stays readable on it; huginn does not, having no text of its
 own to keep legible.
 
-`Entry::terminal` is parsed from `Terminal=true` and currently read by nothing —
-`Huginn::launch` hands `Entry::argv` to `Command::spawn` either way, so an entry
-carrying that key execs a bare TUI with no controlling terminal and silently
-does nothing. Until that is honoured, an entry for a terminal program has to
-name a terminal in its own `Exec=`.
+`Terminal=true` entries — and their desktop actions — are launched inside
+`theme::TERMINAL` as `raven-terminal -e <command...>`, resolved through the
+terminal's own desktop entry when one is installed and the bare binary on
+`$PATH` when not. The `-e` flag is an assumption (`launcher::in_terminal`
+documents it); a terminal that spells it differently silently breaks every TUI
+entry.
 
 ## Building
 

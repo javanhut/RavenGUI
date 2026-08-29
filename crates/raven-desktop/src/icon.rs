@@ -196,6 +196,27 @@ impl Icons {
             .find_map(|base| first_existing(base, name))
     }
 
+    /// Find the `-symbolic` variant of `name`, or `None` when the theme has
+    /// no such file.
+    ///
+    /// Symbolic icons are flat monochrome glyphs designed to be recoloured,
+    /// which is exactly what a tinting caller wants: tinting a full-colour
+    /// icon with an opaque square background produces a filled square, and
+    /// nothing else. This deliberately does not fall back to the plain icon —
+    /// callers that can use either try this first and then [`Icons::find`],
+    /// while callers that want the coloured artwork (the dock) never come
+    /// here at all. Absolute paths have no symbolic variant by construction.
+    pub fn find_symbolic(&self, name: &str, size: u32, scale: u32) -> Option<PathBuf> {
+        if name.starts_with('/') {
+            return None;
+        }
+        let name = strip_known_extension(name);
+        if name.ends_with("-symbolic") {
+            return self.find(name, size, scale);
+        }
+        self.find(&format!("{name}-symbolic"), size, scale)
+    }
+
     /// The preferred theme, everything it inherits, then hicolor.
     ///
     /// Breadth-first with a seen-set: theme inheritance is a graph and real
@@ -534,6 +555,48 @@ Context=Applications
         tree.theme("hicolor", HICOLOR)
             .icon("hicolor/scalable/apps/app.svg");
         assert!(tree.icons("hicolor").find("app.png", 48, 1).is_some());
+    }
+
+    #[test]
+    fn a_name_without_a_symbolic_variant_has_no_symbolic_icon() {
+        // The launcher asks for the symbolic variant first and then falls
+        // back to the coloured one, so a missing variant must be None rather
+        // than the coloured icon under another name.
+        let tree = Tree::new("no-symbolic");
+        tree.theme("hicolor", HICOLOR)
+            .icon("hicolor/48x48/apps/app.png");
+        let icons = tree.icons("hicolor");
+        assert_eq!(icons.find_symbolic("app", 48, 1), None);
+        assert!(icons.find("app", 48, 1).is_some());
+    }
+
+    #[test]
+    fn a_symbolic_variant_is_found_when_the_theme_has_one() {
+        let tree = Tree::new("has-symbolic");
+        tree.theme("hicolor", HICOLOR)
+            .icon("hicolor/48x48/apps/app.png")
+            .icon("hicolor/scalable/apps/app-symbolic.svg");
+        let found = tree.icons("hicolor").find_symbolic("app", 48, 1);
+        assert_eq!(
+            found.as_deref(),
+            Some(
+                tree.0
+                    .join("hicolor/scalable/apps/app-symbolic.svg")
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn a_name_already_ending_in_symbolic_is_not_doubled() {
+        let tree = Tree::new("double-symbolic");
+        tree.theme("hicolor", HICOLOR)
+            .icon("hicolor/scalable/apps/app-symbolic.svg");
+        assert!(
+            tree.icons("hicolor")
+                .find_symbolic("app-symbolic", 48, 1)
+                .is_some()
+        );
     }
 
     #[test]

@@ -62,8 +62,31 @@ render_elements! {
     Cursor = MemoryRenderBufferRenderElement<GlesRenderer>,
     /// One edge of the ring around the focused window.
     Ring = SolidColorRenderElement,
-    /// The desktop, already drawn and blurred into a texture.
-    Blur = TextureShaderElement,
+    /// The desktop, already drawn and blurred into a texture, cropped to the
+    /// panel that wants it. See [`blur_element`].
+    Blur = CropRenderElement<TextureShaderElement>,
+}
+
+/// The blurred desktop, cut down to `rect` — the logical region under a
+/// panel — so it goes on top of the sharp desktop and under the panel.
+///
+/// The blur texture is the whole output; the crop is what turns "the desktop
+/// is blurred" into "the desktop is blurred *behind the launcher*". The rest
+/// of the screen keeps its sharp pixels from the ordinary elements drawn
+/// beneath, which is also why the blur can go in the middle of a front-to-back
+/// list rather than replacing the back of it.
+///
+/// `None` if the crop meets nothing, which happens when the rectangle is off
+/// the output entirely; a blur that draws nothing is not worth an element.
+pub(crate) fn blur_element(
+    blurred: TextureShaderElement,
+    rect: huginn_core::geometry::Rect,
+    scale: f64,
+) -> Option<HuginnElement> {
+    let crop =
+        Rectangle::<i32, Logical>::new((rect.x(), rect.y()).into(), (rect.w(), rect.h()).into())
+            .to_physical_precise_round(scale);
+    CropRenderElement::from_element(blurred, scale, crop).map(HuginnElement::Blur)
 }
 
 /// The scene split at the blur boundary: what goes over a blurred desktop,

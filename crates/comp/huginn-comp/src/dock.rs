@@ -594,10 +594,7 @@ pub(crate) fn preview_row(
     }
     let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
     let gap = MARGIN * 2.0 * scale;
-    let (max_w, max_h) = (
-        output.w() as f32 * PREVIEW,
-        output.h() as f32 * PREVIEW,
-    );
+    let (max_w, max_h) = (output.w() as f32 * PREVIEW, output.h() as f32 * PREVIEW);
     let mut sizes: Vec<(f32, f32)> = windows
         .iter()
         .map(|&(w, h)| {
@@ -632,7 +629,12 @@ pub(crate) fn preview_row(
     sizes
         .iter()
         .map(|&(w, h)| {
-            let rect = Rect::from_xywh(x as i32, (bottom - h) as i32, (w as i32).max(1), (h as i32).max(1));
+            let rect = Rect::from_xywh(
+                x as i32,
+                (bottom - h) as i32,
+                (w as i32).max(1),
+                (h as i32).max(1),
+            );
             x += w + gap;
             rect
         })
@@ -709,6 +711,7 @@ mod tests {
             terminal: false,
             startup_wm_class: wm_class.map(str::to_owned),
             path: PathBuf::from(format!("/apps/{stem}.desktop")),
+            actions: Vec::new(),
         }
     }
 
@@ -865,7 +868,10 @@ mod tests {
         // Firefox minimized first, but the terminal is pinned and comes first.
         let items = window_items(
             &apps(),
-            &[(f, "Navigator".to_owned()), (t, "raven-terminal".to_owned())],
+            &[
+                (f, "Navigator".to_owned()),
+                (t, "raven-terminal".to_owned()),
+            ],
         );
         let order: Vec<Option<WindowId>> = items.iter().map(|i| i.window).collect();
         assert_eq!(order, vec![None, Some(t), Some(f)]);
@@ -882,11 +888,17 @@ mod tests {
         let dock = centred_placement(SCREEN, 4);
         let anchor = dock.x() + dock.w() / 2;
         let frame = preview_row(&[(1600, 900)], anchor, dock, SCREEN, 0)[0];
-        assert!(frame.y() + frame.h() < dock.y(), "the preview overlaps the strip");
+        assert!(
+            frame.y() + frame.h() < dock.y(),
+            "the preview overlaps the strip"
+        );
         assert!(frame.w() <= (SCREEN.w() as f32 * PREVIEW) as i32);
         assert!(frame.h() <= (SCREEN.h() as f32 * PREVIEW) as i32);
         let aspect = frame.w() as f32 / frame.h() as f32;
-        assert!((aspect - 16.0 / 9.0).abs() < 0.02, "aspect drifted to {aspect}");
+        assert!(
+            (aspect - 16.0 / 9.0).abs() < 0.02,
+            "aspect drifted to {aspect}"
+        );
         let centre = frame.x() + frame.w() / 2;
         assert!((centre - anchor).abs() <= 1, "not centred on the anchor");
     }
@@ -902,11 +914,24 @@ mod tests {
     #[test]
     fn a_row_stands_on_one_line_and_does_not_overlap() {
         let dock = placement(SCREEN, 6, 1.0);
-        let row = preview_row(&[(1600, 900), (600, 1000), (800, 800)], 960, dock, SCREEN, 0);
+        let row = preview_row(
+            &[(1600, 900), (600, 1000), (800, 800)],
+            960,
+            dock,
+            SCREEN,
+            0,
+        );
         assert_eq!(row.len(), 3);
         for pair in row.windows(2) {
-            assert!(pair[0].x() + pair[0].w() < pair[1].x(), "thumbnails overlap");
-            assert_eq!(pair[0].y() + pair[0].h(), pair[1].y() + pair[1].h(), "bottoms differ");
+            assert!(
+                pair[0].x() + pair[0].w() < pair[1].x(),
+                "thumbnails overlap"
+            );
+            assert_eq!(
+                pair[0].y() + pair[0].h(),
+                pair[1].y() + pair[1].h(),
+                "bottoms differ"
+            );
         }
         assert!(row.iter().all(|r| r.y() + r.h() < dock.y()));
     }
@@ -930,7 +955,10 @@ mod tests {
         assert!(last.x() + last.w() <= SCREEN.w());
         assert!(row[0].x() >= 0);
         let widths: Vec<i32> = row.iter().map(|r| r.w()).collect();
-        assert!(widths.iter().all(|w| (w - widths[0]).abs() <= 1), "unequal shrink: {widths:?}");
+        assert!(
+            widths.iter().all(|w| (w - widths[0]).abs() <= 1),
+            "unequal shrink: {widths:?}"
+        );
     }
 
     #[test]
@@ -939,7 +967,11 @@ mod tests {
         let plain = preview_row(&[(1600, 900)], 960, dock, SCREEN, 0)[0];
         let lifted = preview_row(&[(1600, 900)], 960, dock, SCREEN, 30)[0];
         assert_eq!(plain.y() - lifted.y(), 30);
-        assert_eq!(plain.h(), lifted.h(), "the picture itself should not shrink");
+        assert_eq!(
+            plain.h(),
+            lifted.h(),
+            "the picture itself should not shrink"
+        );
     }
 
     #[test]

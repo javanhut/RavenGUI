@@ -115,6 +115,7 @@ pub(crate) fn run() -> Result<()> {
     // here for the same reason XWayland is: it only registers an event source,
     // and everything it does happens later, from the loop.
     crate::appwatch::start::<Nested>(&handle);
+    crate::fileindex::start::<Nested>(&handle, &mut state);
 
     // Tell clients which GPU to allocate on and which formats we can import.
     // Failing here is not fatal — clients simply stay on shm — so every branch
@@ -303,14 +304,22 @@ impl Nested {
         // works", and every one of them falls through to the path below
         // unchanged. That is deliberate: the overwhelming majority of frames
         // take exactly the code they took before the blur existed.
-        let blurred = if radius > 0.0 {
+        //
+        // The scene is split once: `behind` is blurred into the texture, and
+        // also drawn sharp beneath the blur, which is cropped to the panel.
+        let (front, behind) = {
             let renderer = self.backend.renderer();
-            let (_, behind) = render::elements_split(renderer, &self.state, self.cursor.as_ref());
-            self.blur
-                .as_mut()
-                .and_then(|blur| blur.pass(renderer, &behind, size, scale, radius))
-        } else {
-            None
+            render::elements_split(renderer, &self.state, self.cursor.as_ref())
+        };
+        let blurred = match self.state.blur_rect() {
+            Some(rect) if radius > 0.0 => {
+                let renderer = self.backend.renderer();
+                self.blur
+                    .as_mut()
+                    .and_then(|blur| blur.pass(renderer, &behind, size, scale, radius))
+                    .and_then(|element| render::blur_element(element, rect, scale))
+            }
+            _ => None,
         };
 
         {
@@ -324,13 +333,12 @@ impl Nested {
             crate::dmabuf::import_pending(renderer, &mut self.state);
 
             // Geometry comes from huginn-core; stacking order and the cursor
-            // come from render::elements, shared with the udev backend.
-            let elements = match &blurred {
-                // The desktop is already drawn, blurred, in one texture; only
-                // what sits above the blur is still to draw.
-                Some(_) => render::elements_split(renderer, &self.state, self.cursor.as_ref()).0,
-                None => render::elements(renderer, &self.state, self.cursor.as_ref()),
-            };
+            // come from render::elements_split, shared with the udev backend.
+            // Front to back: the panels, the blurred patch under them, the
+            // desktop.
+            let mut elements = front;
+            elements.extend(blurred);
+            elements.extend(behind);
 
             let mut frame = renderer
                 .render(&mut framebuffer, size, Transform::Flipped180)
@@ -338,16 +346,6 @@ impl Nested {
             frame
                 .clear(CLEAR, &[damage])
                 .map_err(|e| anyhow::anyhow!("clearing frame: {e}"))?;
-            // The blurred desktop goes down first, then everything above it.
-            if let Some(element) = &blurred {
-                draw_render_elements::<GlesRenderer, _, _>(
-                    &mut frame,
-                    scale,
-                    std::slice::from_ref(element),
-                    &[damage],
-                )
-                .map_err(|e| anyhow::anyhow!("drawing the blurred desktop: {e}"))?;
-            }
             draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &[damage])
                 .map_err(|e| anyhow::anyhow!("drawing: {e}"))?;
             // The returned SyncPoint is discarded deliberately: the host
