@@ -116,6 +116,8 @@ pub(crate) fn run() -> Result<()> {
     // and everything it does happens later, from the loop.
     crate::appwatch::start::<Nested>(&handle);
     crate::fileindex::start::<Nested>(&handle, &mut state);
+    // BlueZ, for the quick settings row. Same shape: a thread and a wake-up.
+    crate::bluetooth::start::<Nested>(&handle, &mut state);
 
     // Tell clients which GPU to allocate on and which formats we can import.
     // Failing here is not fatal — clients simply stay on shm — so every branch

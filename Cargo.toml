@@ -51,6 +51,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+# BlueZ, for the quick settings Bluetooth row. Blocking API only: the
+# connection runs its executor on a thread of its own, and the compositor
+# talks to it from a thread of its own too, so no async runtime enters the
+# frame loop.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 # Text shaping, layout and rasterization for the compositor-drawn shell.
 # `default-features = false` drops fontconfig, which would put a C library on
 # the critical path of a distro that ships almost no GUI dependencies; fontdb

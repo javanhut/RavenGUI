@@ -193,6 +193,17 @@ through `wpctl`, so it needs PipeWire, and the slider says "not connected" when
 there is none. The same level is a row in quick settings (`Super+Shift+S`),
 where the left and right arrows step it and `Return` mutes.
 
+The Bluetooth row in the same panel talks to BlueZ over D-Bus (it needs
+`bluetoothd` running; without it the row says "not connected"). `Return` on
+the row toggles the radio. The arrows step through what the row could be
+instead — Off, On, each paired device, and Scan — shown with a question mark,
+and `Return` applies it: a paired device connects, a connected one
+disconnects, Scan lists what is in range as it is found and `Return` on a
+new device pairs it, marks it trusted and connects. When pairing wants a
+six-digit number confirmed the row shows it; `Return` is yes, moving off the
+row is no. The row cannot type a PIN, so a device that insists on one needs
+`roostbar bt pair` or `bluetoothctl`. Leaving the row stops a scan.
+
 The session also locks itself after a period with no input — ten minutes by
 default, changed or turned off from the "Lock when idle" row in quick settings
 (`Super+Shift+S`). Every input event counts as presence, including one that

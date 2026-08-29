@@ -7,11 +7,13 @@
 //!
 //! # Backends
 //!
-//! Wi-Fi and Bluetooth talk to NetworkManager and BlueZ over D-Bus, which is a
-//! large dependency surface and hardware to test against. Each control sits
-//! behind a trait here with a fake implementation, so the panel can be built
-//! and judged before any of that exists — and so the real ones swap in without
-//! the UI changing. What is fake says so on screen rather than pretending.
+//! Wi-Fi talks to NetworkManager and Bluetooth to BlueZ, both over D-Bus,
+//! which is a large dependency surface and hardware to test against. Each
+//! control sits behind a trait here with a fake implementation, so the panel
+//! can be built and judged before any of that exists — and so the real ones
+//! swap in without the UI changing. Bluetooth is wired up, through
+//! [`crate::bluetooth`]; Wi-Fi is not yet. What is fake says so on screen
+//! rather than pretending.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -281,25 +283,217 @@ impl Control for WiFi {
     }
 }
 
-/// Bluetooth. A stub until BlueZ is wired up over D-Bus.
+/// Bluetooth, through [`crate::bluetooth`].
+///
+/// One row that is a switch, a list and a question, because the panel is
+/// rows and nothing else. Return on the row as it stands toggles the radio.
+/// The arrows step through what the row could become instead — Off, On,
+/// each device BlueZ knows, and Scan — shown with a question mark the way
+/// the Power row shows its choice, and Return applies it: a device is
+/// connected, or disconnected if it was, or paired first if it never has
+/// been. While a scan runs the list grows as devices are found. When
+/// pairing needs a number confirmed, the row shows the number and Return
+/// is yes; moving off the row is no.
 #[derive(Debug)]
-struct Bluetooth {
-    on: bool,
+struct BluetoothRow {
+    backend: Box<dyn crate::bluetooth::Backend>,
+    /// Which choice the arrows have stepped to, if any. `None` shows the
+    /// reading; `Some` shows a candidate waiting for Return.
+    cursor: Option<usize>,
 }
 
-impl Control for Bluetooth {
+/// What the arrows can step the Bluetooth row to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BtChoice {
+    Off,
+    On,
+    Device(crate::bluetooth::Device),
+    Scan,
+    StopScan,
+}
+
+impl BtChoice {
+    fn label(&self) -> String {
+        match self {
+            Self::Off => "Off".to_owned(),
+            Self::On => "On".to_owned(),
+            Self::Device(d) => d.name.clone(),
+            Self::Scan => "Scan".to_owned(),
+            Self::StopScan => "Stop scan".to_owned(),
+        }
+    }
+}
+
+/// The most of a device name that fits on the right of a row.
+const BT_NAME_CHARS: usize = 22;
+
+fn shorten(name: &str) -> String {
+    if name.chars().count() <= BT_NAME_CHARS {
+        return name.to_owned();
+    }
+    let mut short: String = name.chars().take(BT_NAME_CHARS - 1).collect();
+    short.push('…');
+    short
+}
+
+impl BluetoothRow {
+    fn new(backend: Box<dyn crate::bluetooth::Backend>) -> Self {
+        Self {
+            backend,
+            cursor: None,
+        }
+    }
+
+    fn choices(&self, state: &crate::bluetooth::State) -> Vec<BtChoice> {
+        if !state.available {
+            return Vec::new();
+        }
+        let mut choices = vec![BtChoice::Off, BtChoice::On];
+        // Paired devices are always worth offering; unpaired ones only while
+        // a scan is finding them, so the list is not a memory of every
+        // phone that ever walked past.
+        choices.extend(
+            state
+                .devices
+                .iter()
+                .filter(|d| d.paired || state.discovering)
+                .cloned()
+                .map(BtChoice::Device),
+        );
+        choices.push(if state.discovering {
+            BtChoice::StopScan
+        } else {
+            BtChoice::Scan
+        });
+        choices
+    }
+
+    /// What the row says with nothing stepped or pending.
+    fn reading(state: &crate::bluetooth::State) -> String {
+        if !state.powered {
+            return "Off".to_owned();
+        }
+        if let Some(connected) = state.devices.iter().find(|d| d.connected) {
+            return shorten(&connected.name);
+        }
+        if state.discovering {
+            return "Scanning…".to_owned();
+        }
+        "On".to_owned()
+    }
+}
+
+impl Control for BluetoothRow {
     fn label(&self) -> &str {
         "Bluetooth"
     }
     fn read(&self) -> Reading {
-        Reading {
-            value: if self.on { "On" } else { "Off" }.to_owned(),
-            real: false,
+        use crate::bluetooth::Prompt;
+        let state = self.backend.state();
+        if !state.available {
+            return Reading {
+                value: "Off".to_owned(),
+                real: false,
+            };
         }
+        let value = match (&state.prompt, &state.busy, &state.error, self.cursor) {
+            (Some(Prompt::Confirm { passkey, .. }), ..) => format!("Confirm {passkey:06}?"),
+            (Some(Prompt::Display { passkey, device }), ..) => {
+                format!("Type {passkey:06} on {}", shorten(device))
+            }
+            (None, Some(busy), ..) => format!("{busy}…"),
+            (None, None, Some(error), _) => shorten(error),
+            (None, None, None, Some(cursor)) => match self.choices(&state).get(cursor) {
+                Some(choice) => format!("{}?", shorten(&choice.label())),
+                None => Self::reading(&state),
+            },
+            (None, None, None, None) => Self::reading(&state),
+        };
+        Reading { value, real: true }
     }
     fn activate(&mut self) -> bool {
-        self.on = !self.on;
+        use crate::bluetooth::{Command, Prompt};
+        let state = self.backend.state();
+        if !state.available {
+            return false;
+        }
+        match state.prompt {
+            Some(Prompt::Confirm { .. }) => {
+                self.backend.answer(true);
+                return true;
+            }
+            // Nothing to say to a number one has to type elsewhere.
+            Some(Prompt::Display { .. }) => return false,
+            None => {}
+        }
+        if state.busy.is_some() {
+            return false;
+        }
+        if state.error.is_some() {
+            self.backend.send(Command::ClearError);
+            self.cursor = None;
+            return true;
+        }
+        let command = match self
+            .cursor
+            .take()
+            .and_then(|c| self.choices(&state).into_iter().nth(c))
+        {
+            None => Command::Power(!state.powered),
+            Some(BtChoice::Off) => Command::Power(false),
+            Some(BtChoice::On) => Command::Power(true),
+            Some(BtChoice::Scan) => Command::Scan(true),
+            Some(BtChoice::StopScan) => Command::Scan(false),
+            Some(BtChoice::Device(d)) if d.connected => Command::Disconnect(d.path),
+            Some(BtChoice::Device(d)) if d.paired => Command::Connect(d.path),
+            Some(BtChoice::Device(d)) => Command::Pair(d.path),
+        };
+        self.backend.send(command);
         true
+    }
+    fn adjust(&mut self, delta: i32) -> bool {
+        let state = self.backend.state();
+        if state.prompt.is_some() || state.busy.is_some() {
+            return false;
+        }
+        if state.error.is_some() {
+            self.backend.send(crate::bluetooth::Command::ClearError);
+        }
+        let choices = self.choices(&state);
+        if choices.is_empty() {
+            return false;
+        }
+        let len = choices.len() as i32;
+        // From the reading, Right goes to the first choice and Left to the
+        // last; after that the arrows wrap, so a long list is never a long
+        // way back.
+        let next = match self.cursor {
+            None if delta > 0 => (delta - 1).rem_euclid(len),
+            None => delta.rem_euclid(len),
+            Some(c) => (c as i32 + delta).rem_euclid(len),
+        };
+        self.cursor = Some(next as usize);
+        true
+    }
+    fn disarm(&mut self) -> bool {
+        use crate::bluetooth::{Command, Prompt};
+        let state = self.backend.state();
+        let mut stood_down = self.cursor.take().is_some();
+        if let Some(Prompt::Confirm { .. }) = state.prompt {
+            self.backend.answer(false);
+            stood_down = true;
+        }
+        if state.error.is_some() {
+            self.backend.send(Command::ClearError);
+            stood_down = true;
+        }
+        // A scan only makes sense with the list in front of somebody; leaving
+        // the row leaves the list.
+        if state.discovering {
+            self.backend.send(Command::Scan(false));
+            stood_down = true;
+        }
+        stood_down
     }
 }
 
@@ -640,13 +834,23 @@ impl Settings {
                 }),
                 Box::new(Brightness { percent: 75 }),
                 Box::new(WiFi { on: true }),
-                Box::new(Bluetooth { on: false }),
+                Box::new(BluetoothRow::new(Box::new(crate::bluetooth::Unavailable))),
                 // Last, so that stepping down through the panel arrives at it
                 // deliberately and a stray Return on the first row is a mute,
                 // not a shutdown.
                 Box::new(PowerRow::new(power)),
             ],
             reveal: Animated::settled(0.0),
+        }
+    }
+}
+
+impl Settings {
+    /// Give the Bluetooth row something real to talk to. Called once the
+    /// BlueZ thread is up, which is after the panel exists.
+    pub(crate) fn set_bluetooth(&mut self, backend: Box<dyn crate::bluetooth::Backend>) {
+        if let Some(row) = self.controls.iter_mut().find(|c| c.label() == "Bluetooth") {
+            *row = Box::new(BluetoothRow::new(backend));
         }
     }
 }
@@ -1149,8 +1353,9 @@ mod tests {
             .filter(|c| !c.read().real)
             .map(|c| c.label())
             .collect();
-        // Volume is on the list only because a default panel has a silent
-        // mixer behind it; on a machine with PipeWire the row is real.
+        // Volume and Bluetooth are on the list only because a default panel
+        // has a silent mixer and no BlueZ thread behind it; on a machine
+        // with PipeWire and bluetoothd those rows are real.
         assert_eq!(stubs, ["Volume", "Brightness", "Wi-Fi", "Bluetooth"]);
     }
 
@@ -1510,6 +1715,288 @@ mod tests {
             alpha(&faded) < alpha(&opaque),
             "the reveal did not fade the panel"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bluetooth
+    // -----------------------------------------------------------------------
+
+    /// A BlueZ that remembers what it was asked, for the row's tests.
+    #[derive(Debug, Default)]
+    struct FakeBluetooth {
+        state: std::rc::Rc<std::cell::RefCell<crate::bluetooth::State>>,
+        sent: std::rc::Rc<std::cell::RefCell<Vec<crate::bluetooth::Command>>>,
+        answers: std::rc::Rc<std::cell::RefCell<Vec<bool>>>,
+    }
+
+    impl crate::bluetooth::Backend for FakeBluetooth {
+        fn state(&self) -> crate::bluetooth::State {
+            self.state.borrow().clone()
+        }
+        fn send(&self, command: crate::bluetooth::Command) {
+            self.sent.borrow_mut().push(command);
+        }
+        fn answer(&self, yes: bool) {
+            self.answers.borrow_mut().push(yes);
+        }
+    }
+
+    fn bt_device(name: &str, paired: bool, connected: bool) -> crate::bluetooth::Device {
+        crate::bluetooth::Device {
+            path: zbus::zvariant::OwnedObjectPath::try_from(format!(
+                "/org/bluez/hci0/dev_{}",
+                name.replace(' ', "_")
+            ))
+            .unwrap(),
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
+            name: name.to_owned(),
+            paired,
+            trusted: paired,
+            connected,
+        }
+    }
+
+    /// A panel whose Bluetooth row talks to `fake`, opened and stepped to it.
+    fn bluetooth_panel(fake: &FakeBluetooth) -> Settings {
+        let mut settings = opened();
+        settings.set_bluetooth(Box::new(FakeBluetooth {
+            state: fake.state.clone(),
+            sent: fake.sent.clone(),
+            answers: fake.answers.clone(),
+        }));
+        select(&mut settings, "Bluetooth");
+        settings
+    }
+
+    fn bt_value(settings: &Settings) -> String {
+        settings.controls[index_of(settings, "Bluetooth")]
+            .read()
+            .value
+    }
+
+    #[test]
+    fn a_bluetooth_row_with_a_backend_is_real() {
+        let fake = FakeBluetooth::default();
+        fake.state.borrow_mut().available = true;
+        let settings = bluetooth_panel(&fake);
+        let row = &settings.controls[index_of(&settings, "Bluetooth")];
+        assert!(row.read().real);
+        assert_eq!(row.read().value, "Off");
+    }
+
+    #[test]
+    fn a_backend_with_no_bluez_stays_a_stub() {
+        let fake = FakeBluetooth::default();
+        let settings = bluetooth_panel(&fake);
+        assert!(
+            !settings.controls[index_of(&settings, "Bluetooth")]
+                .read()
+                .real
+        );
+    }
+
+    #[test]
+    fn return_on_the_reading_toggles_the_radio() {
+        let fake = FakeBluetooth::default();
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+        }
+        let mut settings = bluetooth_panel(&fake);
+        assert_eq!(bt_value(&settings), "On");
+        settings.press(Key::Activate, T0);
+        assert_eq!(
+            fake.sent.borrow().as_slice(),
+            [crate::bluetooth::Command::Power(false)]
+        );
+    }
+
+    #[test]
+    fn the_connected_device_is_the_reading() {
+        let fake = FakeBluetooth::default();
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+            s.devices = vec![bt_device("Headphones", true, true)];
+        }
+        let settings = bluetooth_panel(&fake);
+        assert_eq!(bt_value(&settings), "Headphones");
+    }
+
+    #[test]
+    fn the_arrows_step_through_off_on_devices_and_scan_then_wrap() {
+        let fake = FakeBluetooth::default();
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+            s.devices = vec![
+                bt_device("Headphones", true, false),
+                // Not paired and no scan running: not offered.
+                bt_device("Stranger", false, false),
+            ];
+        }
+        let mut settings = bluetooth_panel(&fake);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            settings.press(Key::Right, T0);
+            seen.push(bt_value(&settings));
+        }
+        assert_eq!(seen, ["Off?", "On?", "Headphones?", "Scan?", "Off?"]);
+        settings.press(Key::Left, T0);
+        assert_eq!(bt_value(&settings), "Scan?");
+    }
+
+    #[test]
+    fn return_on_a_paired_device_connects_it_and_on_a_connected_one_disconnects() {
+        let fake = FakeBluetooth::default();
+        let paired = bt_device("Headphones", true, false);
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+            s.devices = vec![paired.clone()];
+        }
+        let mut settings = bluetooth_panel(&fake);
+        for _ in 0..3 {
+            settings.press(Key::Right, T0);
+        }
+        assert_eq!(bt_value(&settings), "Headphones?");
+        settings.press(Key::Activate, T0);
+        assert_eq!(
+            fake.sent.borrow().last(),
+            Some(&crate::bluetooth::Command::Connect(paired.path.clone()))
+        );
+        // Applied: the row is back to its reading, not still asking.
+        assert_eq!(bt_value(&settings), "On");
+
+        fake.state.borrow_mut().devices[0].connected = true;
+        for _ in 0..3 {
+            settings.press(Key::Right, T0);
+        }
+        settings.press(Key::Activate, T0);
+        assert_eq!(
+            fake.sent.borrow().last(),
+            Some(&crate::bluetooth::Command::Disconnect(paired.path))
+        );
+    }
+
+    #[test]
+    fn scanning_offers_what_it_finds_and_return_on_a_new_device_pairs_it() {
+        let fake = FakeBluetooth::default();
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+        }
+        let mut settings = bluetooth_panel(&fake);
+        for _ in 0..3 {
+            settings.press(Key::Right, T0);
+        }
+        assert_eq!(bt_value(&settings), "Scan?");
+        settings.press(Key::Activate, T0);
+        assert_eq!(
+            fake.sent.borrow().last(),
+            Some(&crate::bluetooth::Command::Scan(true))
+        );
+
+        // The thread reports the scan running and a device found.
+        let found = bt_device("New Keyboard", false, false);
+        {
+            let mut s = fake.state.borrow_mut();
+            s.discovering = true;
+            s.devices = vec![found.clone()];
+        }
+        assert_eq!(bt_value(&settings), "Scanning…");
+        for _ in 0..3 {
+            settings.press(Key::Right, T0);
+        }
+        assert_eq!(bt_value(&settings), "New Keyboard?");
+        settings.press(Key::Right, T0);
+        assert_eq!(bt_value(&settings), "Stop scan?");
+        settings.press(Key::Left, T0);
+        settings.press(Key::Activate, T0);
+        assert_eq!(
+            fake.sent.borrow().last(),
+            Some(&crate::bluetooth::Command::Pair(found.path))
+        );
+    }
+
+    #[test]
+    fn a_confirmation_is_answered_yes_by_return_and_no_by_leaving() {
+        let fake = FakeBluetooth::default();
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+            s.prompt = Some(crate::bluetooth::Prompt::Confirm {
+                device: "Phone".to_owned(),
+                passkey: 4242,
+            });
+        }
+        let mut settings = bluetooth_panel(&fake);
+        assert_eq!(bt_value(&settings), "Confirm 004242?");
+        // The arrows do nothing while a question is open.
+        assert_eq!(settings.press(Key::Right, T0), Outcome::Unchanged);
+        settings.press(Key::Activate, T0);
+        assert_eq!(fake.answers.borrow().as_slice(), [true]);
+
+        settings.press(Key::Up, T0);
+        assert_eq!(fake.answers.borrow().as_slice(), [true, false]);
+    }
+
+    #[test]
+    fn leaving_the_row_stops_a_scan() {
+        let fake = FakeBluetooth::default();
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+            s.discovering = true;
+        }
+        let mut settings = bluetooth_panel(&fake);
+        settings.press(Key::Up, T0);
+        assert_eq!(
+            fake.sent.borrow().as_slice(),
+            [crate::bluetooth::Command::Scan(false)]
+        );
+    }
+
+    #[test]
+    fn busy_and_error_show_in_place_of_the_reading() {
+        let fake = FakeBluetooth::default();
+        {
+            let mut s = fake.state.borrow_mut();
+            s.available = true;
+            s.powered = true;
+            s.busy = Some("Pairing Headphones".to_owned());
+        }
+        let mut settings = bluetooth_panel(&fake);
+        assert_eq!(bt_value(&settings), "Pairing Headphones…");
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Unchanged);
+
+        {
+            let mut s = fake.state.borrow_mut();
+            s.busy = None;
+            s.error = Some("Failed: page-timeout".to_owned());
+        }
+        assert_eq!(bt_value(&settings), "Failed: page-timeout");
+        settings.press(Key::Activate, T0);
+        assert_eq!(
+            fake.sent.borrow().last(),
+            Some(&crate::bluetooth::Command::ClearError)
+        );
+    }
+
+    #[test]
+    fn long_device_names_are_shortened_to_fit_the_row() {
+        let long = "A Very Long Bluetooth Speaker Name Indeed";
+        let short = shorten(long);
+        assert!(short.chars().count() <= BT_NAME_CHARS);
+        assert!(short.ends_with('…'));
+        assert_eq!(shorten("Short"), "Short");
     }
 }
 
