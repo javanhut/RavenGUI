@@ -1069,6 +1069,7 @@ impl Udev {
         // Read before the filter borrows the state.
         let launcher_open = self.state.launcher.is_open();
         let settings_open = self.state.settings.is_open();
+        let pinned_open = self.state.pinned.is_open();
         let resizing = self.state.resizing;
         let locked = self.state.is_locked();
         let switcher_open = self.state.app_switcher_open();
@@ -1096,6 +1097,7 @@ impl Udev {
                                 focus_owns_super: owns_super,
                                 launcher,
                                 settings_open,
+                                pinned_open,
                                 resizing,
                                 locked,
                                 switcher_open,
@@ -1178,6 +1180,8 @@ impl Udev {
                 }
             }
             Action::OpenLauncher => state.open_launcher(),
+            Action::OpenPinned => state.open_pinned(),
+            Action::Pinned(key) => state.pinned_key(key),
             Action::Launcher(key) => state.launcher_key(key),
             Action::DismissSwitcher => state.dismiss_app_switcher(),
             Action::Volume(key) => {

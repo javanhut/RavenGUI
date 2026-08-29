@@ -69,13 +69,14 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     if !state.is_locked() {
         state.dock_pointer_moved();
         state.launcher_pointer_moved();
+        state.pinned_pointer_moved();
     }
     // The launcher is compositor-drawn, so no client is under the pointer
     // while it is there as far as the scene knows — but a window behind the
     // panel is, and it must not be told about a pointer the user sees as
     // being on the panel. Leaving the client is what stops its hover
     // effects tracking a pointer that is not on it.
-    let under = if state.launcher_covers_pointer() {
+    let under = if state.launcher_covers_pointer() || state.pinned_covers_pointer() {
         None
     } else {
         state.surface_under(location)
@@ -156,7 +157,7 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     const BTN_LEFT: u32 = 0x110;
     if button_state == ButtonState::Pressed
         && event.button_code() == BTN_LEFT
-        && state.launcher_click()
+        && (state.launcher_click() || state.pinned_click())
     {
         return;
     }

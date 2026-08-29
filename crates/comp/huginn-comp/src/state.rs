@@ -453,6 +453,12 @@ pub(crate) struct Huginn {
     /// frame — a search field repainted at the refresh rate is how one ends up
     /// feeling slower than the typing that drives it.
     launcher_panel: Option<crate::canvas::Panel>,
+    /// The pinned panel, the pins it shows, and its pixels. The pins are
+    /// held here rather than in the panel because three things write them:
+    /// the panel, the launcher's menu, and quick settings.
+    pub(crate) pinned: crate::pinned::Pinned,
+    pub(crate) pins: crate::pins::Pins,
+    pinned_panel: Option<crate::canvas::Panel>,
     /// Installed applications, scanned once at startup.
     pub(crate) apps: Vec<raven_desktop::Entry>,
     /// How often each application has been launched.
@@ -540,7 +546,7 @@ impl Huginn {
         // that relies on clicking — including Muninn's workspace pips.
         seat.add_pointer();
 
-        Self {
+        let mut huginn = Self {
             compositor_state: CompositorState::new::<Self>(dh),
             xdg_shell_state: XdgShellState::new::<Self>(dh),
             layer_shell_state: WlrLayerShellState::new::<Self>(dh),
@@ -628,13 +634,22 @@ impl Huginn {
             file_index_requests: None,
             file_index_built: None,
             launcher_panel: None,
+            pinned: crate::pinned::Pinned::default(),
+            pins: load_pins(),
+            pinned_panel: None,
             apps: crate::launcher::scan_applications(),
             frecency: load_frecency(),
             icons: raven_desktop::Icons::discover(crate::theme::ICON_THEME),
             pixmaps: raven_desktop::Pixmaps::new(),
             text: crate::text::Text::new(),
             display: dh.clone(),
-        }
+        };
+        // The rows in quick settings are where the pinned panel's layout is
+        // changed, so they start from what the file said.
+        huginn
+            .settings
+            .set_pins_layout(huginn.pins.position(), huginn.pins.orientation());
+        huginn
     }
 
     /// Show or hide the keybinding overlay.
@@ -811,6 +826,7 @@ impl Huginn {
         //                    on screen, which includes the panels
         //   volume slider  - a key was just pressed; the answer goes on top
         //   launcher       - over the dock it grew out of
+        //   pinned         - likewise
         //   settings       - likewise
         //   ---- blur boundary ----
         //   dock           - part of the desktop, so it blurs with it
@@ -842,6 +858,19 @@ impl Huginn {
                     self.output_area,
                     panel.size(),
                     self.launcher.origin(),
+                    reveal,
+                ),
+                reveal.clamp(0.0, 1.0),
+            ));
+        }
+        if let Some(panel) = &self.pinned_panel {
+            let reveal = self.pinned.reveal(self.uptime());
+            out.push(SceneItem::Overlay(
+                panel.buffer(),
+                crate::pinned::placement(
+                    self.output_area,
+                    panel.size(),
+                    self.pinned.position(),
                     reveal,
                 ),
                 reveal.clamp(0.0, 1.0),
@@ -1105,6 +1134,14 @@ impl Huginn {
         let dismissed = self.settings.press(crate::settings::Key::Dismiss, now);
         if dismissed == crate::settings::Outcome::Dismissed {
             self.refresh_settings();
+        }
+        // The pinned panel too: it takes every key, and a locked session
+        // must not come back with a panel that swallows the first thing
+        // typed at it.
+        if self.pinned.is_open() {
+            let motion = self.settings.motion();
+            self.pinned.close(now, motion);
+            self.refresh_pinned();
         }
         self.lock = Some(Lock::default());
         self.refresh_focus();
@@ -2096,6 +2133,7 @@ impl Huginn {
         self.request_file_index_if_stale();
         let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
         let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
+        self.launcher.set_pinned(self.pins.paths().to_vec());
         self.launcher
             .open(&self.apps, &self.frecency, now, origin, clock, motion);
         self.refresh_launcher();
@@ -2189,8 +2227,142 @@ impl Huginn {
             crate::launcher::Outcome::Dismissed | crate::launcher::Outcome::Redraw => {
                 self.refresh_launcher();
             }
+            crate::launcher::Outcome::TogglePin { entry } => {
+                self.toggle_pin(&entry);
+                self.refresh_launcher();
+            }
             crate::launcher::Outcome::Unchanged => {}
         }
+    }
+
+    /// Pin `entry`, or unpin it if it is, and tell everyone who shows pins.
+    fn toggle_pin(&mut self, entry: &std::path::Path) {
+        let pinned = self.pins.toggle(entry);
+        tracing::info!(entry = %entry.display(), pinned, "pin toggled");
+        self.pins_changed();
+    }
+
+    /// The pin list or its layout changed: save it, and bring every view of
+    /// it up to date — the launcher's menu label, the pinned panel's items.
+    fn pins_changed(&mut self) {
+        self.save_pins();
+        self.launcher.set_pinned(self.pins.paths().to_vec());
+        let clock = self.uptime();
+        if self.pinned.is_visible(clock) {
+            self.pinned.refresh(&self.apps, &self.pins);
+            self.refresh_pinned();
+        }
+    }
+
+    /// Write the pins beside the launch history. Saved on every change
+    /// rather than at exit, for the reason the history is.
+    fn save_pins(&self) {
+        if let Some(file) = pins_path()
+            && let Err(e) = self.pins.save(&file)
+        {
+            tracing::warn!("could not save pins to {}: {e}", file.display());
+        }
+    }
+
+    /// Open the pinned panel where quick settings put it.
+    pub(crate) fn open_pinned(&mut self) {
+        let (clock, motion) = (self.uptime(), self.settings.motion());
+        self.pinned.open(&self.apps, &self.pins, clock, motion);
+        self.refresh_pinned();
+    }
+
+    /// Apply a keystroke to the pinned panel, and act on what it asks for.
+    pub(crate) fn pinned_key(&mut self, key: crate::pinned::Key) {
+        let (clock, motion) = (self.uptime(), self.settings.motion());
+        let outcome = self
+            .pinned
+            .press(key, &self.apps, &mut self.pins, clock, motion);
+        self.act_on_pinned(outcome);
+    }
+
+    /// The pointer, as a pixel of the pinned panel's canvas, when it is over
+    /// the open panel. See [`Huginn::launcher_canvas_point`].
+    fn pinned_canvas_point(&self) -> Option<huginn_core::geometry::Point> {
+        if !self.pinned.is_open() {
+            return None;
+        }
+        let panel = self.pinned_panel.as_ref()?;
+        let placed = crate::pinned::placement(
+            self.output_area,
+            panel.size(),
+            self.pinned.position(),
+            self.pinned.reveal(self.uptime()),
+        );
+        self.pinned
+            .layout()
+            .canvas_point(placed, self.pointer_point())
+    }
+
+    /// Whether the open pinned panel is under the pointer.
+    pub(crate) fn pinned_covers_pointer(&self) -> bool {
+        self.pinned_canvas_point().is_some()
+    }
+
+    /// Tell the pinned panel where the pointer went.
+    pub(crate) fn pinned_pointer_moved(&mut self) {
+        let Some(point) = self.pinned_canvas_point() else {
+            return;
+        };
+        let outcome = self.pinned.hover(point);
+        self.act_on_pinned(outcome);
+    }
+
+    /// A press while the pinned panel is open. Returns whether it was
+    /// taken: on the panel it opens what it landed on, anywhere else it
+    /// dismisses the panel, as Escape would.
+    pub(crate) fn pinned_click(&mut self) -> bool {
+        if !self.pinned.is_open() {
+            return false;
+        }
+        match self.pinned_canvas_point() {
+            Some(point) => {
+                let (clock, motion) = (self.uptime(), self.settings.motion());
+                let outcome = self
+                    .pinned
+                    .click(point, &self.apps, &mut self.pins, clock, motion);
+                self.act_on_pinned(outcome);
+            }
+            None => self.pinned_key(crate::pinned::Key::Dismiss),
+        }
+        true
+    }
+
+    /// Do what the pinned panel asked for after a key or a click.
+    fn act_on_pinned(&mut self, outcome: crate::pinned::Outcome) {
+        match outcome {
+            crate::pinned::Outcome::Launch { entry, argv } => {
+                self.launch(Some(entry), &argv);
+                self.refresh_pinned();
+            }
+            crate::pinned::Outcome::Changed => self.pins_changed(),
+            crate::pinned::Outcome::Dismissed | crate::pinned::Outcome::Redraw => {
+                self.refresh_pinned();
+            }
+            crate::pinned::Outcome::Unchanged => {}
+        }
+    }
+
+    /// Redraw the pinned panel, or drop it when it is closed.
+    pub(crate) fn refresh_pinned(&mut self) {
+        self.pinned_panel = self.pinned.is_visible(self.uptime()).then(|| {
+            let (panel, layout) = crate::pinned::render(
+                &self.pinned,
+                &self.apps,
+                &mut self.text,
+                &self.icons,
+                &mut self.pixmaps,
+                self.output_area,
+                self.scale.advertised,
+            );
+            self.pinned.set_layout(layout);
+            panel
+        });
+        self.queue_redraw();
     }
 
     /// Act on a dock item that was clicked.
@@ -2264,6 +2436,7 @@ impl Huginn {
         usize::from(self.help.is_some())
             + usize::from(self.volume_panel.is_some())
             + usize::from(self.launcher_panel.is_some())
+            + usize::from(self.pinned_panel.is_some())
             + usize::from(self.settings_panel.is_some())
     }
 
@@ -2272,7 +2445,8 @@ impl Huginn {
     /// Zero when no panel is open, which is what lets the renderer take the
     /// ordinary path unchanged for the overwhelming majority of frames.
     pub(crate) fn blur_radius(&self) -> f32 {
-        crate::blur::radius_for(self.launcher.reveal(self.uptime()))
+        let clock = self.uptime();
+        crate::blur::radius_for(self.launcher.reveal(clock).max(self.pinned.reveal(clock)))
     }
 
     /// Where on the output the blurred desktop shows through: the launcher
@@ -2288,13 +2462,23 @@ impl Huginn {
     /// Computed from the same placement [`Huginn::scene`] pushes, so the blur
     /// cannot drift from the panel as it animates.
     pub(crate) fn blur_rect(&self) -> Option<Rect> {
-        let panel = self.launcher_panel.as_ref()?;
-        let reveal = self.launcher.reveal(self.uptime());
-        crate::launcher::blur_rect(crate::launcher::placement(
+        let clock = self.uptime();
+        if let Some(panel) = self.launcher_panel.as_ref() {
+            return crate::launcher::blur_rect(crate::launcher::placement(
+                self.output_area,
+                panel.size(),
+                self.launcher.origin(),
+                self.launcher.reveal(clock),
+            ));
+        }
+        // The pinned panel is drawn with the launcher's corners, so its
+        // blur is inset the same way.
+        let panel = self.pinned_panel.as_ref()?;
+        crate::launcher::blur_rect(crate::pinned::placement(
             self.output_area,
             panel.size(),
-            self.launcher.origin(),
-            reveal,
+            self.pinned.position(),
+            self.pinned.reveal(clock),
         ))
     }
 
@@ -2368,6 +2552,12 @@ impl Huginn {
             // panel itself does not need recomposing — but a frame still has
             // to be asked for, or the motion happens with nothing drawing it.
             self.queue_redraw();
+        }
+        if self.pinned.is_animating(now) {
+            self.queue_redraw();
+        } else if self.pinned_panel.is_some() && !self.pinned.is_visible(now) {
+            // The close animation has ended; the pixels can go.
+            self.refresh_pinned();
         }
         if self.focus_ring_is_animating(now) {
             // Same shape as the launcher: the alpha is read at draw time, so
@@ -2466,6 +2656,13 @@ impl Huginn {
         if self.volume.borrow().is_visible(now) {
             self.refresh_volume();
         }
+        // The pinned rows may just have been stepped. The rows own the
+        // value; the pins take a copy, and the file and the panel follow.
+        let position = self.settings.pins_position();
+        let orientation = self.settings.pins_orientation();
+        if self.pins.set_position(position) | self.pins.set_orientation(orientation) {
+            self.pins_changed();
+        }
         self.queue_redraw();
     }
 
@@ -2498,6 +2695,11 @@ impl Huginn {
             self.launcher.reindex(&self.apps, &self.frecency, now);
         }
         self.refresh_launcher();
+        // The pinned panel holds indices into the same list.
+        if self.pinned.is_visible(self.uptime()) {
+            self.pinned.refresh(&self.apps, &self.pins);
+            self.refresh_pinned();
+        }
 
         // The dock reads the same list, and a removed application must stop
         // being clickable rather than launch whatever took its index.
@@ -3770,6 +3972,27 @@ fn frecency_path_in(
         _ => std::path::Path::new(home?).join(".local/state"),
     };
     Some(base.join("raven/frecency"))
+}
+
+/// Where the pins live: beside the launch history, as `raven/pins`. State
+/// for the reason the history is — see [`frecency_path`] and
+/// [`crate::pins`].
+fn pins_path() -> Option<std::path::PathBuf> {
+    frecency_path().map(|history| history.with_file_name("pins"))
+}
+
+/// The pins from the last session, or none. Fail-soft, as the history is.
+fn load_pins() -> crate::pins::Pins {
+    let Some(file) = pins_path() else {
+        return crate::pins::Pins::new();
+    };
+    match crate::pins::Pins::load(&file) {
+        Ok(pins) => pins,
+        Err(e) => {
+            tracing::warn!("could not load pins from {}: {e}", file.display());
+            crate::pins::Pins::new()
+        }
+    }
 }
 
 /// The launch history from the last session, or an empty one.
