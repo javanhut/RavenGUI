@@ -158,6 +158,105 @@ impl Animated {
     }
 }
 
+/// A value pulled towards its target by a critically damped spring.
+///
+/// Where [`Animated`] is a curve played over a fixed duration, this is a
+/// physical model: it has a velocity, and when it is retargeted mid-flight
+/// it *keeps* that velocity. A tile sent somewhere else while still moving
+/// bends towards the new place; a curve restarted from its current position
+/// would stop dead and set off again, and the eye catches the kink.
+///
+/// Critically damped — no overshoot — because it moves window rectangles,
+/// and a rectangle that overshoots is a window briefly drawn larger than its
+/// pane. Written in closed form rather than integrated per frame, for the
+/// same reason as [`Curve::Spring`]: a dropped frame cannot change where it
+/// ends up.
+///
+/// With damping ratio 1 the motion is `target + (c1 + c2·t)·e^(−ω·t)`, where
+/// `ω = √stiffness`, `c1` is the starting offset and `c2 = v0 + ω·c1`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Spring {
+    target: f32,
+    /// Offset from the target when the current flight began.
+    c1: f32,
+    /// Velocity term when the current flight began.
+    c2: f32,
+    omega: f32,
+    started: Duration,
+}
+
+impl Spring {
+    /// How close, in value and in velocity, counts as arrived. A tenth of a
+    /// pixel: closer than that and the rounding to a pixel has already
+    /// stopped changing.
+    const EPSILON: f32 = 0.1;
+
+    /// At rest at `value`, with a spring of `stiffness` for when it moves.
+    pub(crate) fn at_rest(value: f32, stiffness: f32) -> Self {
+        Self {
+            target: value,
+            c1: 0.0,
+            c2: 0.0,
+            omega: stiffness.max(f32::EPSILON).sqrt(),
+            started: Duration::ZERO,
+        }
+    }
+
+    /// Pull towards `target` from wherever it is now, keeping its velocity.
+    pub(crate) fn pull_to(&mut self, target: f32, now: Duration) {
+        let (value, velocity) = self.state(now);
+        self.c1 = value - target;
+        self.c2 = velocity + self.omega * self.c1;
+        self.target = target;
+        self.started = now;
+    }
+
+    /// Put it at `target` immediately, at rest. What reduced motion does.
+    pub(crate) fn jump_to(&mut self, target: f32) {
+        self.target = target;
+        self.c1 = 0.0;
+        self.c2 = 0.0;
+    }
+
+    /// Move the value and its target together, without disturbing the
+    /// motion — the window was carried, not sent somewhere.
+    pub(crate) fn shift(&mut self, by: f32) {
+        self.target += by;
+    }
+
+    fn state(&self, now: Duration) -> (f32, f32) {
+        let t = now.saturating_sub(self.started).as_secs_f32();
+        let decay = (-self.omega * t).exp();
+        let value = self.target + (self.c1 + self.c2 * t) * decay;
+        let velocity = (self.c2 - self.omega * (self.c1 + self.c2 * t)) * decay;
+        (value, velocity)
+    }
+
+    /// Where it is at `now`.
+    pub(crate) fn value(&self, now: Duration) -> f32 {
+        if self.is_settled(now) {
+            return self.target;
+        }
+        self.state(now).0
+    }
+
+    /// Where it is heading.
+    pub(crate) fn target(&self) -> f32 {
+        self.target
+    }
+
+    /// Whether it has come to rest. Both the offset and the velocity have to
+    /// be negligible: a spring passing through its target at speed is not
+    /// there yet.
+    pub(crate) fn is_settled(&self, now: Duration) -> bool {
+        if self.c1 == 0.0 && self.c2 == 0.0 {
+            return true;
+        }
+        let (value, velocity) = self.state(now);
+        (value - self.target).abs() < Self::EPSILON && velocity.abs() < Self::EPSILON
+    }
+}
+
 /// How long the launcher takes to appear. §4: "~150ms, ease-out".
 pub(crate) const LAUNCHER_OPEN: Duration = Duration::from_millis(150);
 
@@ -339,6 +438,69 @@ mod tests {
         let mut value = Animated::settled(0.0);
         value.animate_to(1.0, Duration::ZERO, SECOND, Curve::Spring);
         assert!((value.value(at(10_000)) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_spring_arrives_without_overshooting() {
+        let mut spring = Spring::at_rest(0.0, 800.0);
+        spring.pull_to(100.0, Duration::ZERO);
+        let mut last = 0.0;
+        for ms in (0..1_000).step_by(5) {
+            let value = spring.value(at(ms));
+            assert!(
+                value >= last - 1e-3,
+                "went backwards at {ms}ms: {last} -> {value}"
+            );
+            assert!(value <= 100.0 + 1e-3, "overshot at {ms}ms: {value}");
+            last = value;
+        }
+        assert!(spring.is_settled(SECOND));
+        assert_eq!(spring.value(SECOND), 100.0);
+    }
+
+    #[test]
+    fn a_spring_of_niris_stiffness_settles_in_a_few_hundred_milliseconds() {
+        // Stiffness 800 is what niri moves windows with; it should be over
+        // by the time an ease-out of the same purpose would be, not linger.
+        let mut spring = Spring::at_rest(0.0, 800.0);
+        spring.pull_to(1_000.0, Duration::ZERO);
+        assert!(!spring.is_settled(at(100)));
+        assert!(spring.is_settled(at(600)), "still moving at 600ms");
+    }
+
+    #[test]
+    fn retargeting_a_spring_keeps_its_velocity() {
+        // The reason for a spring at all. Sent back the way it came while
+        // moving fast, it must carry on past the retarget point before
+        // turning, rather than stopping dead.
+        let mut spring = Spring::at_rest(0.0, 800.0);
+        spring.pull_to(100.0, Duration::ZERO);
+        let midway = spring.value(at(20));
+        spring.pull_to(0.0, at(20));
+        assert!((spring.value(at(20)) - midway).abs() < 1e-3, "it jumped");
+        assert!(
+            spring.value(at(25)) > midway,
+            "it stopped dead instead of carrying its momentum"
+        );
+        assert!(spring.value(at(300)) < midway, "it never turned back");
+    }
+
+    #[test]
+    fn shifting_a_spring_moves_it_without_restarting() {
+        let mut spring = Spring::at_rest(0.0, 800.0);
+        spring.pull_to(100.0, Duration::ZERO);
+        let before = spring.value(at(30));
+        spring.shift(-40.0);
+        assert!((spring.value(at(30)) - (before - 40.0)).abs() < 1e-3);
+        assert_eq!(spring.target(), 60.0);
+    }
+
+    #[test]
+    fn a_spring_that_jumps_is_at_rest() {
+        let mut spring = Spring::at_rest(0.0, 800.0);
+        spring.jump_to(50.0);
+        assert!(spring.is_settled(Duration::ZERO));
+        assert_eq!(spring.value(Duration::ZERO), 50.0);
     }
 
     #[test]

@@ -30,12 +30,12 @@ use smithay::{
             render_elements,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
-            utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
+            utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
         },
         gles::{GlesRenderer, element::TextureShaderElement},
     },
     input::pointer::{CursorImageAttributes, CursorImageStatus},
-    utils::{Logical, Point},
+    utils::{Logical, Point, Rectangle},
     wayland::compositor::with_states,
 };
 
@@ -54,6 +54,9 @@ render_elements! {
     Surface = WaylandSurfaceRenderElement<GlesRenderer>,
     /// A client surface transformed as part of a workspace preview card.
     Workspace = RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
+    /// A client surface drawn 1:1 and cropped to a rectangle still on its
+    /// way somewhere: a tile mid-resize.
+    Clipped = CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     WorkspaceCard = RelocateRenderElement<RescaleRenderElement<SolidColorRenderElement>>,
     /// The cursor, when no client has supplied its own.
     Cursor = MemoryRenderBufferRenderElement<GlesRenderer>,
@@ -162,7 +165,31 @@ pub(crate) fn elements(
                 .into_iter()
                 .map(HuginnElement::Surface),
             ),
-            SceneItem::WorkspaceSurface(surface, rect, transform) => {
+            SceneItem::Clipped(surface, rect, clip, alpha) => {
+                // Cropped, not scaled: the content stays at its natural size
+                // and the moving edge cuts it off. See `crate::motion`.
+                let crop = Rectangle::<i32, Logical>::new(
+                    (clip.x(), clip.y()).into(),
+                    (clip.w(), clip.h()).into(),
+                )
+                .to_physical_precise_round(scale);
+                out.extend(
+                    render_elements_from_surface_tree(
+                        renderer,
+                        &surface,
+                        Point::<i32, Logical>::from((rect.x(), rect.y()))
+                            .to_physical_precise_round::<f64, i32>(scale),
+                        scale,
+                        alpha,
+                        Kind::Unspecified,
+                    )
+                    .into_iter()
+                    .filter_map(|element| CropRenderElement::from_element(element, scale, crop))
+                    .map(HuginnElement::Clipped),
+                );
+            }
+            SceneItem::WorkspaceSurface(surface, rect, transform)
+            | SceneItem::Preview(surface, rect, transform) => {
                 let origin = Point::<i32, Logical>::from((rect.x(), rect.y()))
                     .to_physical_precise_round::<f64, i32>(scale);
                 let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))

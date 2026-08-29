@@ -39,6 +39,14 @@ const EDGE_BAND: i32 = 4;
 /// How long the dock takes to spring up.
 const REVEAL: Duration = Duration::from_millis(260);
 
+/// How long the pointer must rest on a tile before its windows are pictured.
+///
+/// Longer than [`HOVER_DELAY`]: the pointer crosses tiles on its way to the
+/// one it wants, and a picture for each of them on the way is a flicker, not
+/// a preview. Once one is up, moving to the next tile switches at once — the
+/// delay is for arriving at the dock, not for browsing along it.
+pub(crate) const PREVIEW_DELAY: Duration = Duration::from_millis(400);
+
 /// One thing in the strip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Item {
@@ -358,6 +366,13 @@ const MARGIN: f32 = 12.0;
 const ALPHA: u8 = 0xE6;
 /// Text size of the switcher's title caption at a 1080p output.
 const CAPTION_SIZE: f32 = 14.0;
+/// The most of the screen, each way, the switcher's thumbnail may take.
+///
+/// Big enough to recognise a page by; small enough that the strip beneath it
+/// is still the thing you are looking at.
+const PREVIEW: f32 = 0.32;
+/// Border around the thumbnail at a 1080p output.
+const PREVIEW_BORDER: f32 = 6.0;
 
 /// The dock's rectangle on `output` at the current reveal.
 ///
@@ -477,16 +492,21 @@ pub(crate) fn render(
     Panel::from_canvas(&canvas, density)
 }
 
-/// The selected window's title, as a small pill to sit under the switcher.
+/// A window's title, as a small pill to sit under its thumbnail, no wider
+/// than `max_width` logical pixels.
 ///
-/// Separate from the strip rather than a row inside it: the strip's rectangle
-/// is what [`Dock::item_at`] recovers the icon pitch from, and the renderer
-/// scales the panel to that rectangle, so growing the strip would squash the
-/// icons and misplace clicks. A second panel costs nothing and disturbs
-/// neither.
+/// A separate panel rather than part of the thumbnail's backing: the backing
+/// is sized to the picture, and the renderer scales each panel to its own
+/// rectangle, so text drawn into it would stretch with the picture.
 ///
 /// `None` when there is no font to draw with, or nothing to say.
-pub(crate) fn caption(text: &mut Text, title: &str, output: Rect, density: u32) -> Option<Panel> {
+pub(crate) fn caption(
+    text: &mut Text,
+    title: &str,
+    max_width: i32,
+    output: Rect,
+    density: u32,
+) -> Option<Panel> {
     if !text.is_usable() || title.is_empty() {
         return None;
     }
@@ -495,8 +515,8 @@ pub(crate) fn caption(text: &mut Text, title: &str, output: Rect, density: u32) 
     let size = CAPTION_SIZE * scale;
     let pad = GAP * scale;
     // Long titles are cut rather than wrapped: the pill is a label, not a
-    // document, and it must not grow wider than the screen.
-    let max_w = output.w() as f32 * density as f32 * 0.6;
+    // document, and it must not grow wider than what it labels.
+    let max_w = (max_width as f32 * density as f32 - pad * 2.0).max(size * 2.0);
     let mut title = title.to_owned();
     let (mut w, h) = text.measure(&title, size);
     while w > max_w && title.chars().count() > 1 {
@@ -532,16 +552,125 @@ pub(crate) fn caption(text: &mut Text, title: &str, output: Rect, density: u32) 
     Some(Panel::from_canvas(&canvas, density))
 }
 
-/// Where the caption goes: centred under `dock`, a margin below it.
-pub(crate) fn caption_placement(panel: &Panel, dock: Rect, output: Rect) -> Rect {
+/// Where a caption goes: centred under `above`, a half margin below it.
+pub(crate) fn caption_placement(panel: &Panel, above: Rect, output: Rect) -> Rect {
     let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
     let (w, h) = panel.size();
     Rect::from_xywh(
-        dock.x() + (dock.w() - w) / 2,
-        dock.y() + dock.h() + (MARGIN * scale) as i32,
+        above.x() + (above.w() - w) / 2,
+        above.y() + above.h() + (MARGIN * scale * 0.5) as i32,
         w,
         h,
     )
+}
+
+/// How much room a caption needs under a thumbnail's backing: its own height
+/// plus the half margin [`caption_placement`] leaves.
+pub(crate) fn caption_room(panel: &Panel, output: Rect) -> i32 {
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
+    panel.size().1 + (MARGIN * scale * 0.5) as i32
+}
+
+/// Where a row of thumbnails goes, for windows of the given sizes.
+///
+/// Above the strip, the row centred on `anchor_x` — the highlighted tile in the
+/// switcher, the hovered one in the dock — and pushed back inside the screen
+/// if that would put it off an edge. Each thumbnail keeps its window's aspect
+/// and is no larger than [`PREVIEW`] of the screen each way; a row too wide
+/// for the screen is shrunk as a whole, so its members stay comparable.
+///
+/// Bottom-aligned rather than centred: a landscape and a portrait window side
+/// by side should stand on one line, like things on a shelf. `reserve` is
+/// room left under that line, for captions.
+pub(crate) fn preview_row(
+    windows: &[(i32, i32)],
+    anchor_x: i32,
+    dock: Rect,
+    output: Rect,
+    reserve: i32,
+) -> Vec<Rect> {
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
+    let gap = MARGIN * 2.0 * scale;
+    let (max_w, max_h) = (
+        output.w() as f32 * PREVIEW,
+        output.h() as f32 * PREVIEW,
+    );
+    let mut sizes: Vec<(f32, f32)> = windows
+        .iter()
+        .map(|&(w, h)| {
+            let (ww, wh) = (w.max(1) as f32, h.max(1) as f32);
+            let fit = (max_w / ww).min(max_h / wh);
+            (ww * fit, wh * fit)
+        })
+        .collect();
+    let row_w = |sizes: &[(f32, f32)]| {
+        sizes.iter().map(|s| s.0).sum::<f32>() + gap * (sizes.len() - 1) as f32
+    };
+    let room = output.w() as f32 - gap * 2.0;
+    let total = row_w(&sizes);
+    if total > room {
+        // The gaps stay as they are; only the pictures give way.
+        let gaps = gap * (sizes.len() - 1) as f32;
+        let shrink = ((room - gaps) / (total - gaps)).max(0.05);
+        for size in &mut sizes {
+            size.0 *= shrink;
+            size.1 *= shrink;
+        }
+    }
+    let total = row_w(&sizes);
+    // `min` then `max` rather than `clamp`: after shrinking, the two bounds
+    // meet, and rounding can put them a hair the wrong way round, which
+    // `clamp` treats as a panic rather than an answer.
+    let left = (anchor_x as f32 - total / 2.0)
+        .min((output.x() + output.w()) as f32 - gap - total)
+        .max(output.x() as f32 + gap);
+    let bottom = dock.y() as f32 - gap - reserve.max(0) as f32;
+    let mut x = left;
+    sizes
+        .iter()
+        .map(|&(w, h)| {
+            let rect = Rect::from_xywh(x as i32, (bottom - h) as i32, (w as i32).max(1), (h as i32).max(1));
+            x += w + gap;
+            rect
+        })
+        .collect()
+}
+
+/// The backing's rectangle: `frame` plus a border on every side.
+pub(crate) fn preview_backing(frame: Rect, output: Rect) -> Rect {
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
+    let border = (PREVIEW_BORDER * scale) as i32;
+    Rect::from_xywh(
+        frame.x() - border,
+        frame.y() - border,
+        frame.w() + border * 2,
+        frame.h() + border * 2,
+    )
+}
+
+/// The backing drawn behind the thumbnail, to the size [`preview_backing`]
+/// gives it at `density`.
+pub(crate) fn preview_frame(frame: Rect, output: Rect, density: u32) -> Panel {
+    let density = density.max(1);
+    let backing = preview_backing(frame, output);
+    let (w, h) = (
+        (backing.w() as u32 * density) as usize,
+        (backing.h() as u32 * density) as usize,
+    );
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
+    let mut canvas = Canvas::new(w.max(1), h.max(1));
+    canvas.fill_rounded(
+        0,
+        0,
+        w,
+        h,
+        PREVIEW_BORDER * scale * 1.5,
+        crate::theme::BACKGROUND.with_alpha(ALPHA),
+    );
+    Panel::from_canvas(&canvas, density)
 }
 
 /// A grid of squares, for the launcher button.
@@ -746,6 +875,82 @@ mod tests {
     fn a_window_of_an_unknown_application_makes_no_tile() {
         let items = window_items(&apps(), &[(ids().0, "mystery".to_owned())]);
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn the_preview_sits_above_the_switcher_and_keeps_the_aspect() {
+        let dock = centred_placement(SCREEN, 4);
+        let anchor = dock.x() + dock.w() / 2;
+        let frame = preview_row(&[(1600, 900)], anchor, dock, SCREEN, 0)[0];
+        assert!(frame.y() + frame.h() < dock.y(), "the preview overlaps the strip");
+        assert!(frame.w() <= (SCREEN.w() as f32 * PREVIEW) as i32);
+        assert!(frame.h() <= (SCREEN.h() as f32 * PREVIEW) as i32);
+        let aspect = frame.w() as f32 / frame.h() as f32;
+        assert!((aspect - 16.0 / 9.0).abs() < 0.02, "aspect drifted to {aspect}");
+        let centre = frame.x() + frame.w() / 2;
+        assert!((centre - anchor).abs() <= 1, "not centred on the anchor");
+    }
+
+    #[test]
+    fn a_tall_window_is_limited_by_height_rather_than_width() {
+        let dock = centred_placement(SCREEN, 4);
+        let frame = preview_row(&[(600, 1000)], dock.x(), dock, SCREEN, 0)[0];
+        assert_eq!(frame.h(), (SCREEN.h() as f32 * PREVIEW) as i32);
+        assert!(frame.w() < frame.h());
+    }
+
+    #[test]
+    fn a_row_stands_on_one_line_and_does_not_overlap() {
+        let dock = placement(SCREEN, 6, 1.0);
+        let row = preview_row(&[(1600, 900), (600, 1000), (800, 800)], 960, dock, SCREEN, 0);
+        assert_eq!(row.len(), 3);
+        for pair in row.windows(2) {
+            assert!(pair[0].x() + pair[0].w() < pair[1].x(), "thumbnails overlap");
+            assert_eq!(pair[0].y() + pair[0].h(), pair[1].y() + pair[1].h(), "bottoms differ");
+        }
+        assert!(row.iter().all(|r| r.y() + r.h() < dock.y()));
+    }
+
+    #[test]
+    fn a_row_anchored_at_the_edge_stays_on_screen() {
+        let dock = placement(SCREEN, 6, 1.0);
+        let row = preview_row(&[(1600, 900), (1600, 900)], 10, dock, SCREEN, 0);
+        assert!(row[0].x() >= 0, "ran off the left edge");
+        let row = preview_row(&[(1600, 900), (1600, 900)], 1910, dock, SCREEN, 0);
+        let last = row[1];
+        assert!(last.x() + last.w() <= SCREEN.w(), "ran off the right edge");
+    }
+
+    #[test]
+    fn a_row_too_wide_for_the_screen_shrinks_as_a_whole() {
+        let dock = placement(SCREEN, 6, 1.0);
+        let wide: Vec<(i32, i32)> = (0..6).map(|_| (1600, 900)).collect();
+        let row = preview_row(&wide, 960, dock, SCREEN, 0);
+        let last = row[5];
+        assert!(last.x() + last.w() <= SCREEN.w());
+        assert!(row[0].x() >= 0);
+        let widths: Vec<i32> = row.iter().map(|r| r.w()).collect();
+        assert!(widths.iter().all(|w| (w - widths[0]).abs() <= 1), "unequal shrink: {widths:?}");
+    }
+
+    #[test]
+    fn reserved_room_lifts_the_row() {
+        let dock = placement(SCREEN, 6, 1.0);
+        let plain = preview_row(&[(1600, 900)], 960, dock, SCREEN, 0)[0];
+        let lifted = preview_row(&[(1600, 900)], 960, dock, SCREEN, 30)[0];
+        assert_eq!(plain.y() - lifted.y(), 30);
+        assert_eq!(plain.h(), lifted.h(), "the picture itself should not shrink");
+    }
+
+    #[test]
+    fn the_backing_surrounds_the_frame() {
+        let frame = Rect::from_xywh(100, 100, 300, 200);
+        let backing = preview_backing(frame, SCREEN);
+        assert!(backing.x() < frame.x() && backing.y() < frame.y());
+        assert!(backing.x() + backing.w() > frame.x() + frame.w());
+        assert!(backing.y() + backing.h() > frame.y() + frame.h());
+        let panel = preview_frame(frame, SCREEN, 1);
+        assert_eq!(panel.size(), (backing.w(), backing.h()));
     }
 
     #[test]

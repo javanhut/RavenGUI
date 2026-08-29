@@ -111,6 +111,16 @@ pub(crate) enum SceneItem<'a> {
     /// switcher. The transform is applied to the whole workspace coordinate
     /// system, so every window keeps its place inside the card.
     WorkspaceSurface(WlSurface, Rect, WorkspacePreview),
+    /// A minimized window shown small above the application switcher, so the
+    /// tiles of one application can be told apart by what is in them. Drawn
+    /// like a workspace card's window, but invisible to hit testing: it is a
+    /// picture of a window, not the window.
+    Preview(WlSurface, Rect, WorkspacePreview),
+    /// A window mid-resize: the surface at its natural size with its origin
+    /// at the first rectangle, cropped to the second, at an alpha. Content
+    /// stays 1:1 while the edge moves — see [`crate::motion`] for why that
+    /// beats scaling it.
+    Clipped(WlSurface, Rect, Rect, f32),
     /// Opaque backing for a workspace card, so empty space and empty
     /// workspaces still read as physical cards rather than holes in the row.
     WorkspaceCard(&'a SolidColorBuffer, WorkspacePreview),
@@ -140,6 +150,19 @@ struct WorkspaceCarousel {
     position: crate::anim::Animated,
     reveal: crate::anim::Animated,
     closing: bool,
+}
+
+/// One thumbnail above the dock: the switcher's highlighted window, or a
+/// window of the application under the pointer.
+#[derive(Debug)]
+struct DockPreview {
+    window: huginn_core::window::WindowId,
+    /// Where the window is drawn, scaled to fit; logical pixels.
+    frame: Rect,
+    /// A backing drawn a little larger than `frame`.
+    panel: crate::canvas::Panel,
+    /// The window's title, to sit under the backing.
+    caption: Option<crate::canvas::Panel>,
 }
 
 /// The dock promoted to the centre of the screen for gesture navigation.
@@ -393,8 +416,15 @@ pub(crate) struct Huginn {
     /// The dock, and its rendered strip.
     pub(crate) dock: crate::dock::Dock,
     dock_panel: Option<crate::canvas::Panel>,
-    /// The switcher's title pill under the strip; only while it is open.
-    dock_caption: Option<crate::canvas::Panel>,
+    /// Thumbnails above the strip: the switcher's highlighted window, or every
+    /// window of the application the pointer is over.
+    dock_previews: Vec<DockPreview>,
+    /// Which dock item the pointer is over, so a change of item — and only
+    /// that — rebuilds the thumbnails.
+    dock_hover: Option<usize>,
+    /// When the pointer arrived on [`Self::dock_hover`], while its pictures
+    /// are still waiting out [`crate::dock::PREVIEW_DELAY`].
+    dock_hover_since: Option<std::time::Duration>,
     /// The items the strip currently holds, so a click can be resolved against
     /// the same list that was drawn.
     dock_items: Vec<crate::dock::Item>,
@@ -444,6 +474,13 @@ pub(crate) struct Huginn {
     focus_ring: [SolidColorBuffer; 4],
     workspace_card: SolidColorBuffer,
     focus_ring_at: Option<[Rect; 4]>,
+    /// Windows whose drawn rectangle is still on its way to the layout's.
+    ///
+    /// A relayout moves the layout's rectangles at once; these are what the
+    /// screen shows in the meantime, easing after them. See [`crate::motion`]
+    /// for why this is the compositor's job and not the client's. Emptied as
+    /// each arrives, so an idle desktop holds none.
+    motions: HashMap<WindowId, crate::motion::Motion>,
     /// Which window the ring was last shown on, and when it appeared. The
     /// ring is a cue that focus *moved*, not a permanent frame: it is shown
     /// when the focused window changes and fades out shortly after. Tracked
@@ -561,6 +598,7 @@ impl Huginn {
                 crate::theme::BACKGROUND.to_rgba_f32(),
             ),
             focus_ring_at: None,
+            motions: HashMap::new(),
             focus_ring_shown: None,
             help: None,
             wallpaper: crate::wallpaper::Wallpaper::installed(),
@@ -569,7 +607,9 @@ impl Huginn {
             socket: String::new(),
             dock: crate::dock::Dock::default(),
             dock_panel: None,
-            dock_caption: None,
+            dock_previews: Vec::new(),
+            dock_hover: None,
+            dock_hover_since: None,
             dock_items: Vec::new(),
             settings: crate::settings::Settings::new(volume.clone()),
             settings_panel: None,
@@ -809,10 +849,7 @@ impl Huginn {
             && let Some(rect) = self.dock_rect()
         {
             out.push(SceneItem::Overlay(panel.buffer(), rect, 1.0));
-            if let Some(caption) = &self.dock_caption {
-                let below = crate::dock::caption_placement(caption, rect, self.output_area);
-                out.push(SceneItem::Overlay(caption.buffer(), below, 1.0));
-            }
+            out.extend(self.dock_preview_items());
         }
         // A panel's own menu belongs directly on top of the panel, not on top
         // of everything, so each layer surface carries its popups with it.
@@ -874,11 +911,7 @@ impl Huginn {
                     .into_iter()
                     .map(|(b, r, a)| SceneItem::Ring(b, r, a)),
             );
-            out.extend(
-                self.render_list()
-                    .into_iter()
-                    .map(|(surface, r)| SceneItem::Surface(surface, r)),
-            );
+            out.extend(self.window_items());
         }
         // Top-layer panels displaced by a fullscreen window: behind it, but
         // still above everything else, so the rest of the desktop is unchanged.
@@ -906,10 +939,13 @@ impl Huginn {
     /// the focus ring has none.
     pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (WlSurface, Rect)> {
         self.scene().into_iter().filter_map(|item| match item {
-            SceneItem::Surface(surface, rect) | SceneItem::WorkspaceSurface(surface, rect, _) => {
-                Some((surface, rect))
-            }
-            SceneItem::Ring(..) | SceneItem::Overlay(..) | SceneItem::WorkspaceCard(..) => None,
+            SceneItem::Surface(surface, rect)
+            | SceneItem::WorkspaceSurface(surface, rect, _)
+            | SceneItem::Clipped(surface, rect, _, _) => Some((surface, rect)),
+            SceneItem::Preview(..)
+            | SceneItem::Ring(..)
+            | SceneItem::Overlay(..)
+            | SceneItem::WorkspaceCard(..) => None,
         })
     }
 
@@ -923,6 +959,13 @@ impl Huginn {
     /// waiting for the buffer that callback would have produced.
     pub(crate) fn frame_surfaces(&self) -> Vec<(WlSurface, Rect)> {
         let mut out: Vec<(WlSurface, Rect)> = self.scene_surfaces().collect();
+        // The switcher's thumbnail is a picture, not a surface to click, so
+        // it is not in the scene list -- but it is on screen, and a window
+        // that is on screen should be allowed to keep painting itself.
+        out.extend(self.scene().into_iter().filter_map(|item| match item {
+            SceneItem::Preview(surface, rect, _) => Some((surface, rect)),
+            _ => None,
+        }));
 
         // While locked that is the entire list. The windows below would
         // otherwise go on receiving frame callbacks and go on painting -- into
@@ -1218,7 +1261,8 @@ impl Huginn {
         if self.has_fullscreen() && self.app_switcher.is_none() {
             self.dock.hide_now();
             self.dock_panel = None;
-            self.dock_caption = None;
+            self.dock_previews.clear();
+            self.dock_hover_since = None;
             self.queue_redraw();
             return;
         }
@@ -1228,19 +1272,7 @@ impl Huginn {
             crate::dock::items(&self.apps, &self.running_app_ids())
         };
         let selected = self.app_switcher.map(|switcher| switcher.selected);
-        // The switcher names the highlighted window, since two tiles of one
-        // application look alike and the title is what tells them apart.
-        self.dock_caption = selected
-            .and_then(|index| self.dock_items.get(index)?.window)
-            .and_then(|id| self.windows.get(&id)?.title())
-            .and_then(|title| {
-                crate::dock::caption(
-                    &mut self.text,
-                    &title,
-                    self.output_area,
-                    self.scale.advertised,
-                )
-            });
+        self.rebuild_dock_previews();
         self.dock_panel = (self.app_switcher.is_some() || self.dock.is_visible(self.uptime()))
             .then(|| {
                 crate::dock::render(
@@ -1257,6 +1289,315 @@ impl Huginn {
         self.queue_redraw();
     }
 
+    /// Which windows the strip should show pictures of, and where the row of
+    /// them is centred: the switcher's highlighted window over the strip's
+    /// middle, or every window of the hovered application over its tile.
+    fn previewed_windows(&self) -> (Vec<huginn_core::window::WindowId>, Option<i32>) {
+        let Some(dock) = self.dock_rect() else {
+            return (Vec::new(), None);
+        };
+        if let Some(switcher) = self.app_switcher {
+            let window = self
+                .dock_items
+                .get(switcher.selected)
+                .and_then(|item| item.window);
+            return (window.into_iter().collect(), Some(dock.x() + dock.w() / 2));
+        }
+        let Some(index) = self.dock_hover else {
+            return (Vec::new(), None);
+        };
+        let Some(entry) = self
+            .dock_items
+            .get(index)
+            .and_then(|item| item.entry)
+            .and_then(|i| self.apps.get(i))
+        else {
+            return (Vec::new(), None);
+        };
+        // Every workspace, not just this one: the point of a picture is to
+        // find a window you cannot see, and one put away elsewhere is
+        // exactly that.
+        let windows = self
+            .space
+            .workspaces()
+            .iter()
+            .flat_map(|workspace| workspace.windows().iter().copied())
+            .filter(|id| self.mapped.contains(id))
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .and_then(WindowSurface::app_id)
+                    .is_some_and(|app_id| crate::dock::matches(entry, &app_id))
+            })
+            .collect();
+        let tile = crate::dock::item_rect(dock, index);
+        (windows, Some(tile.x() + tile.w() / 2))
+    }
+
+    /// Lay out and frame the thumbnails for [`Self::previewed_windows`].
+    fn rebuild_dock_previews(&mut self) {
+        self.dock_previews.clear();
+        // Still waiting out the hover delay: `refresh_dock` runs on every
+        // frame of the strip's own animation, and must not jump the queue.
+        if self.app_switcher.is_none() && self.dock_hover_since.is_some() {
+            return;
+        }
+        let (windows, anchor) = self.previewed_windows();
+        let (Some(anchor), Some(dock)) = (anchor, self.dock_rect()) else {
+            return;
+        };
+        let sized: Vec<(huginn_core::window::WindowId, (i32, i32))> = windows
+            .into_iter()
+            .filter_map(|id| {
+                let placed = self.placed_rect(id)?;
+                Some((id, (placed.w(), placed.h())))
+            })
+            .collect();
+        let sizes: Vec<(i32, i32)> = sized.iter().map(|(_, size)| *size).collect();
+        // Laid out twice: the captions need the frames' widths to fit under,
+        // and the frames need the captions' height to stand above. The second
+        // pass changes only where the row sits, not how wide anything is.
+        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area, 0);
+        let captions: Vec<Option<crate::canvas::Panel>> = sized
+            .iter()
+            .zip(&frames)
+            .map(|((id, _), frame)| {
+                let title = self.windows.get(id)?.title()?;
+                let backing = crate::dock::preview_backing(*frame, self.output_area);
+                crate::dock::caption(
+                    &mut self.text,
+                    &title,
+                    backing.w(),
+                    self.output_area,
+                    self.scale.advertised,
+                )
+            })
+            .collect();
+        let reserve = captions
+            .iter()
+            .flatten()
+            .map(|caption| crate::dock::caption_room(caption, self.output_area))
+            .max()
+            .unwrap_or(0);
+        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area, reserve);
+        self.dock_previews = sized
+            .into_iter()
+            .zip(frames)
+            .zip(captions)
+            .map(|(((window, _), frame), caption)| DockPreview {
+                window,
+                frame,
+                panel: crate::dock::preview_frame(frame, self.output_area, self.scale.advertised),
+                caption,
+            })
+            .collect();
+    }
+
+    /// Where `id`'s surface would be drawn at full size, if it has one.
+    fn placed_rect(&self, id: huginn_core::window::WindowId) -> Option<Rect> {
+        let surface = self.windows.get(&id)?.wl_surface()?;
+        let placed = place_in_pane(&surface, self.space.window(id)?.geometry);
+        (placed.w() > 0 && placed.h() > 0).then_some(placed)
+    }
+
+    /// Where the window is on screen at `now`: part way through a motion if
+    /// it has one, otherwise wherever its buffer sits in its pane.
+    fn drawn_rect(&self, id: WindowId, now: std::time::Duration) -> Option<Rect> {
+        match self.motions.get(&id) {
+            Some(motion) => Some(motion.rect_at(now)),
+            None => self.placed_rect(id),
+        }
+    }
+
+    /// The dock tile a minimized window goes to and comes back from.
+    ///
+    /// Its application's tile when the dock shows one; otherwise — the dock
+    /// hidden, or the last window of an application that is not pinned — the
+    /// middle of the bottom edge, which is where the dock lives even when it
+    /// is not showing.
+    fn minimize_target(&self, id: WindowId) -> Rect {
+        let tile = self.dock_rect().and_then(|dock| {
+            let app_id = self.windows.get(&id)?.app_id()?;
+            let index = self.dock_items.iter().position(|item| {
+                item.entry
+                    .and_then(|entry| self.apps.get(entry))
+                    .is_some_and(|entry| crate::dock::matches(entry, &app_id))
+            })?;
+            Some(crate::dock::item_rect(dock, index))
+        });
+        tile.unwrap_or_else(|| {
+            let area = self.output_area;
+            let side = crate::dock::placement(area, 1, 1.0).h();
+            Rect::from_xywh(
+                area.x() + (area.w() - side) / 2,
+                area.bottom() - side,
+                side,
+                side,
+            )
+        })
+    }
+
+    /// Start or redirect a motion for every window `arrange` moved.
+    ///
+    /// `before` is where each visible window was drawn going in; `changed` is
+    /// what the core reports coming out. Only a change of *size* starts a
+    /// motion — a pane carried sideways at the same size is the carousel
+    /// scrolling, which is already an animation, and a motion in flight is
+    /// carried along with it rather than left behind to finish at a place the
+    /// strip has since left.
+    fn start_motions(
+        &mut self,
+        before: &[(WindowId, Rect)],
+        changed: &[(WindowId, Rect)],
+        now: std::time::Duration,
+    ) {
+        let instant = self.reduced_motion();
+        for (id, to) in changed {
+            let Some((_, from)) = before.iter().find(|(other, _)| other == id) else {
+                continue;
+            };
+            let resized = from.w() != to.w() || from.h() != to.h();
+            match self.motions.get_mut(id) {
+                Some(motion) if !resized => {
+                    let was = motion.to();
+                    motion.shift(to.x() - was.x(), to.y() - was.y());
+                }
+                Some(motion) => motion.retarget(*to, now, instant),
+                None if resized => {
+                    self.motions
+                        .insert(*id, crate::motion::Motion::resize(*from, *to, now, instant));
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Whether window motion should skip to the end. See
+    /// [`crate::settings::Motion`].
+    fn reduced_motion(&self) -> bool {
+        self.settings.motion() == crate::settings::Motion::Reduced
+    }
+
+    /// The active workspace's windows as scene items, frontmost first: any
+    /// pane still flying into the dock on top, then the tiles, each drawn at
+    /// its motion's rectangle if it has one and at its pane if not.
+    fn window_items(&self) -> Vec<SceneItem<'_>> {
+        let now = self.uptime();
+        let mut out = Vec::new();
+        // A ghost: the layout no longer has the window, but the screen still
+        // does until it reaches the dock. A picture rather than a surface,
+        // since there is nothing there to click on any more.
+        for (id, motion) in &self.motions {
+            if motion.kind() != crate::motion::Kind::Minimize {
+                continue;
+            }
+            let Some(surface) = self.windows.get(id).and_then(WindowSurface::wl_surface) else {
+                continue;
+            };
+            let Some(placed) = self.placed_rect(*id) else {
+                continue;
+            };
+            let transform = crate::motion::fit(placed, motion.rect_at(now), motion.alpha_at(now));
+            out.push(SceneItem::Preview(surface, placed, transform));
+        }
+        let Some(workspace) = self.space.workspaces().get(self.space.active_index()) else {
+            return out;
+        };
+        for id in workspace.windows() {
+            if !self.mapped.contains(id)
+                || self
+                    .space
+                    .window(*id)
+                    .is_none_or(huginn_core::window::Window::is_minimized)
+            {
+                continue;
+            }
+            let Some(surface) = self.windows.get(id).and_then(WindowSurface::wl_surface) else {
+                continue;
+            };
+            let Some(placed) = self.placed_rect(*id) else {
+                continue;
+            };
+            match self.motions.get(id) {
+                // A resize: the buffer at its natural size, its frame's
+                // corner pinned to the moving rectangle's corner, cropped
+                // to it. The content never stretches; the edge slides.
+                Some(motion) if motion.kind() == crate::motion::Kind::Resize => {
+                    let drawn = motion.rect_at(now);
+                    let frame = crate::popup::window_geometry(&surface);
+                    let origin = Rect::from_xywh(
+                        drawn.x() - frame.loc.x,
+                        drawn.y() - frame.loc.y,
+                        placed.w(),
+                        placed.h(),
+                    );
+                    out.push(SceneItem::Clipped(
+                        surface,
+                        origin,
+                        drawn,
+                        motion.alpha_at(now),
+                    ));
+                }
+                // Coming back from the dock: genuinely growing, so scaled,
+                // and hit-tested at its real rectangle, which is where it
+                // is about to be.
+                Some(motion) => {
+                    let transform =
+                        crate::motion::fit(placed, motion.rect_at(now), motion.alpha_at(now));
+                    out.push(SceneItem::WorkspaceSurface(surface, placed, transform));
+                }
+                None => out.push(SceneItem::Surface(surface, placed)),
+            }
+        }
+        out
+    }
+
+    /// The scene items for the thumbnails, frontmost first.
+    fn dock_preview_items(&self) -> Vec<SceneItem<'_>> {
+        let mut out = Vec::new();
+        for preview in &self.dock_previews {
+            let Some(surface) = self
+                .windows
+                .get(&preview.window)
+                .and_then(WindowSurface::wl_surface)
+            else {
+                continue;
+            };
+            // Re-placed each frame rather than remembered: the client may
+            // commit a new size while the pictures are up, and they should
+            // follow.
+            let Some(placed) = self.placed_rect(preview.window) else {
+                continue;
+            };
+            let frame = preview.frame;
+            let scale = (f64::from(frame.w()) / f64::from(placed.w()))
+                .min(f64::from(frame.h()) / f64::from(placed.h()));
+            // Centred inside the frame: the frame is sized to the window's
+            // aspect, but rounding leaves a pixel or two either way.
+            let (w, h) = (f64::from(placed.w()) * scale, f64::from(placed.h()) * scale);
+            let x = f64::from(frame.x()) + (f64::from(frame.w()) - w) / 2.0;
+            let y = f64::from(frame.y()) + (f64::from(frame.h()) - h) / 2.0;
+            // The renderer scales about the origin and then shifts, so the
+            // shift is where the box is minus where the scaled window would
+            // have landed.
+            let transform = WorkspacePreview {
+                scale_x: scale,
+                scale_y: scale,
+                offset_x: x - f64::from(placed.x()) * scale,
+                offset_y: y - f64::from(placed.y()) * scale,
+                alpha: 1.0,
+            };
+            let backing = crate::dock::preview_backing(frame, self.output_area);
+            out.push(SceneItem::Preview(surface, placed, transform));
+            out.push(SceneItem::Overlay(preview.panel.buffer(), backing, 1.0));
+            if let Some(caption) = &preview.caption {
+                let below = crate::dock::caption_placement(caption, backing, self.output_area);
+                out.push(SceneItem::Overlay(caption.buffer(), below, 1.0));
+            }
+        }
+        out
+    }
+
     /// Tell the dock where the pointer went.
     pub(crate) fn dock_pointer_moved(&mut self) {
         let now = self.uptime();
@@ -1270,6 +1611,32 @@ impl Huginn {
             .pointer_moved(y, self.output_area, over_dock, now, motion)
         {
             self.refresh_dock();
+        }
+        // Pictures of the hovered application's windows. Only the ordinary
+        // dock: the switcher chooses its own picture, by selection.
+        let hover = if self.app_switcher.is_none() && over_dock {
+            self.dock_rect().and_then(|rect| {
+                self.dock
+                    .item_at(self.pointer_point().x, rect, self.dock_items.len())
+            })
+        } else {
+            None
+        };
+        if hover != self.dock_hover {
+            // Pictures already up follow the pointer along the strip at
+            // once; arriving from elsewhere waits out the delay.
+            let browsing = !self.dock_previews.is_empty();
+            self.dock_hover = hover;
+            self.dock_previews.clear();
+            self.dock_hover_since = None;
+            if hover.is_some() {
+                if browsing {
+                    self.rebuild_dock_previews();
+                } else {
+                    self.dock_hover_since = Some(now);
+                }
+            }
+            self.queue_redraw();
         }
     }
 
@@ -1435,6 +1802,10 @@ impl Huginn {
 
     /// Put only the highlighted pane in the background, leaving the workspace usable.
     fn minimize_focused(&mut self) {
+        let now = self.uptime();
+        // Where it is on screen right now, before the core forgets it is
+        // there: the flight to the dock starts from here.
+        let from = self.space.focused().and_then(|id| self.drawn_rect(id, now));
         let Some(id) = self.space.minimize_focused() else {
             return;
         };
@@ -1445,6 +1816,16 @@ impl Huginn {
         self.arrange();
         self.refresh_dock();
         self.refresh_focus();
+        // After `refresh_dock`, so the tile it flies to is the one the dock
+        // now shows — and after `arrange`, which would otherwise read this as
+        // a resize (it is not: the window is leaving, not moving).
+        if let Some(from) = from {
+            let to = crate::motion::fit_aspect(from, self.minimize_target(id));
+            let instant = self.reduced_motion();
+            self.motions
+                .insert(id, crate::motion::Motion::minimize(from, to, now, instant));
+            self.queue_redraw();
+        }
     }
 
     /// Temporarily promote the minimized-application dock over the workspace.
@@ -1512,6 +1893,20 @@ impl Huginn {
         self.arrange();
         if let Some(surface) = self.windows.get(&id) {
             surface.send_configure();
+        }
+        // Grow out of the dock tile it was put away into, into the tile the
+        // layout just gave it. This replaces whatever `arrange` started for
+        // it: from the layout's point of view the window merely changed size,
+        // but it was not on screen to change size from.
+        if self.mapped.contains(&id)
+            && let Some(window) = self.space.window(id)
+        {
+            let now = self.uptime();
+            let to = window.geometry;
+            let from = crate::motion::fit_aspect(to, self.minimize_target(id));
+            let instant = self.reduced_motion();
+            self.motions
+                .insert(id, crate::motion::Motion::restore(from, to, now, instant));
         }
         self.refresh_focus();
     }
@@ -1807,6 +2202,15 @@ impl Huginn {
             self.refresh_settings();
         }
         self.tick_volume(now);
+        if let Some(since) = self.dock_hover_since {
+            if now.saturating_sub(since) >= crate::dock::PREVIEW_DELAY {
+                self.dock_hover_since = None;
+                self.rebuild_dock_previews();
+            }
+            // Keep frames flowing until the delay is up, so a pointer that
+            // has stopped moving still gets its pictures on time.
+            self.queue_redraw();
+        }
         if self.dock.is_animating(now) {
             self.refresh_dock();
         }
@@ -1819,6 +2223,14 @@ impl Huginn {
         if self.focus_ring_is_animating(now) {
             // Same shape as the launcher: the alpha is read at draw time, so
             // all the fade needs is frames. The last one paints it at zero.
+            self.queue_redraw();
+        }
+        // Windows still travelling need frames; ones that have arrived are
+        // dropped, and the frame after that draws them the ordinary way at
+        // the rectangle they arrived at. Either way a redraw is owed.
+        let travelling = self.motions.len();
+        self.motions.retain(|_, motion| !motion.is_settled(now));
+        if travelling > 0 {
             self.queue_redraw();
         }
     }
@@ -2055,7 +2467,13 @@ impl Huginn {
         if window.mode == WindowMode::Fullscreen {
             return None;
         }
-        Some(window.geometry.ring(crate::theme::FOCUS_RING_WIDTH))
+        // Around where the window is *drawn*, so the ring travels with a
+        // tile still on its way rather than waiting for it at the far end.
+        let rect = self
+            .motions
+            .get(&id)
+            .map_or(window.geometry, |motion| motion.rect_at(self.uptime()));
+        Some(rect.ring(crate::theme::FOCUS_RING_WIDTH))
     }
 
     /// The focus ring's edges, each paired with the buffer that paints it.
@@ -2254,7 +2672,27 @@ impl Huginn {
     /// call would make clients re-render continuously.
     pub(crate) fn arrange(&mut self) {
         self.settle_carousel();
-        for (id, rect) in self.space.arrange() {
+        // Where each visible window is drawn *before* the layout moves it,
+        // which is where its motion has to start from. Taken now rather than
+        // remembered, because "where it is drawn" already accounts for a
+        // motion still in flight from the last relayout.
+        let now = self.uptime();
+        let before: Vec<(WindowId, Rect)> = self
+            .space
+            .active_workspace()
+            .windows()
+            .iter()
+            .filter(|id| self.mapped.contains(id))
+            .filter(|id| {
+                self.space
+                    .window(**id)
+                    .is_some_and(|window| !window.is_minimized())
+            })
+            .filter_map(|id| Some((*id, self.drawn_rect(*id, now)?)))
+            .collect();
+        let changed = self.space.arrange();
+        self.start_motions(&before, &changed, now);
+        for (id, rect) in changed {
             let Some(window) = self.windows.get(&id) else {
                 continue;
             };
