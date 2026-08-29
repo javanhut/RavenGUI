@@ -199,7 +199,7 @@ impl Space {
     /// There is nothing to take hold of, and flipping the layout under a
     /// gesture that can do nothing visible would be a mode change the user
     /// never sees happen — the workspace would sit in [`Layout::Carousel`] with
-    /// nothing on screen to say so, and the next `Super`+`Shift`+`C` would read
+    /// nothing on screen to say so, and the next `Super`+`Ctrl`+`C` would read
     /// as inverted because it toggles back to tiling.
     ///
     /// "Nowhere to go" is [`strip::max_offset`] rather than an emptiness test,
@@ -1152,7 +1152,7 @@ mod tests {
         // The invisible-flip bug: one or two panes at two columns lay out
         // identically tiled and carousel, and the strip cannot scroll at all,
         // so taking the claim would leave the workspace silently in a mode the
-        // screen gives no sign of — and the next Super+Shift+C would look
+        // screen gives no sign of — and the next Super+Ctrl+C would look
         // inverted, toggling back to tiling instead of into the carousel.
         for panes in [1, 2] {
             let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));

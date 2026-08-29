@@ -161,22 +161,22 @@ client cannot receive or override them:
 
 | Chord | Does |
 |---|---|
-| `Super+Shift+E` / `T` | open a terminal |
-| `Super+Shift+Q` / `X` | close the focused window |
-| `Super+Shift+J` / `K` | focus the next / previous window |
-| `Super+Shift+arrows` | move the focused window between tiles |
-| `Super+Shift+Return` | swap the focused window into the first tile |
-| `Super+Shift+C` | open or accept the workspace carousel |
-| `Super+Shift+R` | resize the focused window with the arrows |
-| `Super+Shift+1..9` | go to a workspace |
+| `Super+Ctrl+E` / `T` | open a terminal |
+| `Super+Ctrl+Q` / `X` | close the focused window |
+| `Super+Ctrl+J` / `K` | focus the next / previous window |
+| `Super+Ctrl+arrows` | move the focused window between tiles |
+| `Super+Ctrl+Return` | swap the focused window into the first tile |
+| `Super+Ctrl+C` | open or accept the workspace carousel |
+| `Super+Ctrl+R` | resize the focused window with the arrows |
+| `Super+Ctrl+1..9` | go to a workspace |
 | `Super+Ctrl+Shift+1..9` | send the focused window to a workspace |
 | `Super+C` / `Super+V` | copy / paste in the focused client |
 | `Super+L` | lock the session |
-| `Super+Shift+Space` | open the application launcher |
-| `Super+Shift+A` | open the pinned applications |
-| `Super+Shift+S` | open quick settings |
-| `Super+Shift+H` | show or hide the keybinding list |
-| `Super+Shift+Esc` | quit the compositor |
+| `Super+Ctrl+Space` | open the application launcher |
+| `Super+Ctrl+A` | open the pinned applications |
+| `Super+Ctrl+S` | open quick settings |
+| `Super+Ctrl+H` | show or hide the keybinding list |
+| `Super+Ctrl+Esc` | quit the compositor |
 | volume keys | raise, lower or mute the output volume |
 
 `Super+L` is the one chord on the plain `Super` layer that is never handed back.
@@ -186,15 +186,15 @@ does nothing whenever a terminal happens to be focused fails at exactly the
 moment somebody walks away from a machine believing they locked it.
 
 While the session is locked no chord in this table resolves at all — every key
-goes to the lock screen, including `Super+Shift+Esc`. The volume keys are the
+goes to the lock screen, including `Super+Ctrl+Esc`. The volume keys are the
 one exception: they act on the speakers rather than on the session, and they
 work whatever is open — the launcher, quick settings, or the lock screen. Each
 press shows a slider at the bottom of the screen for a moment; the level is set
 through `wpctl`, so it needs PipeWire, and the slider says "not connected" when
-there is none. The same level is a row in quick settings (`Super+Shift+S`),
+there is none. The same level is a row in quick settings (`Super+Ctrl+S`),
 where the left and right arrows step it and `Return` mutes.
 
-The pinned panel (`Super+Shift+A`) shows the applications the user has pinned,
+The pinned panel (`Super+Ctrl+A`) shows the applications the user has pinned,
 drawn the way the launcher draws its suggestions. Things get onto it through
 the launcher: `Tab` on an application opens its actions menu, whose last item
 is "Pin" (or "Unpin"). On the panel, `Return` opens the highlighted
@@ -219,7 +219,7 @@ row is no. The row cannot type a PIN, so a device that insists on one needs
 
 The session also locks itself after a period with no input — ten minutes by
 default, changed or turned off from the "Lock when idle" row in quick settings
-(`Super+Shift+S`). Every input event counts as presence, including one that
+(`Super+Ctrl+S`). Every input event counts as presence, including one that
 resolves to no binding. There is no `idle-inhibit-unstable-v1`, so a client
 cannot hold this off; a video player that needs to has to ask the person
 watching to turn the row off.
@@ -242,7 +242,7 @@ The current workspace shrinks into a centred card while the workspaces beside
 it appear as narrow, dimmed side cards. The row follows the fingers and settles
 onto the workspace nearest where they lift; that workspace then expands to fill
 the output. Each card is a complete workspace, not a window from the current
-workspace. `Super+Shift+C` opens the same view from the keyboard and a second
+workspace. `Super+Ctrl+C` opens the same view from the keyboard and a second
 press accepts the centred workspace.
 
 **A three-finger swipe never reaches a client.** Huginn advertises no
@@ -335,7 +335,7 @@ WAYLAND_DISPLAY=wayland-2 ./my-panel
 ```
 
 The nested backend needs no seat, no DRM master and no TTY, so it also works
-over ssh. `Super+Shift+Esc` quits it.
+over ssh. `Super+Ctrl+Esc` quits it.
 
 ### A client to check the compositor against
 

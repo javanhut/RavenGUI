@@ -4,7 +4,7 @@
 //! This panel answers a different question — "the things I always want" —
 //! and so has no field: what is on it was put there deliberately, through the
 //! launcher's actions menu, and stays in the order it was put. `Super`+
-//! `Shift`+`A` opens it; Enter opens what is highlighted; the actions menu,
+//! `Ctrl`+`A` opens it; Enter opens what is highlighted; the actions menu,
 //! `Delete` and `Shift`+arrows take things off it and move them about.
 //!
 //! It is drawn with the launcher's own tiles, rows, menu and footer (see

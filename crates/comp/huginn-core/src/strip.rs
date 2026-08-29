@@ -12,7 +12,7 @@
 //! the workspace rather than a second piece of state that can disagree with it.
 //!
 //! It also means the existing focus bindings already drive the carousel:
-//! `Super`+`Shift`+`J` moves to the next pane and brings it into view, because
+//! `Super`+`Ctrl`+`J` moves to the next pane and brings it into view, because
 //! bringing it into view is all that focusing it means here. A separate "scroll"
 //! that could leave the focused pane off screen would be a second way to say the
 //! same thing, and the two would drift.
