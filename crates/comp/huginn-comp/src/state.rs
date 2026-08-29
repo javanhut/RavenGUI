@@ -116,10 +116,13 @@ pub(crate) enum SceneItem<'a> {
     /// like a workspace card's window, but invisible to hit testing: it is a
     /// picture of a window, not the window.
     Preview(WlSurface, Rect, WorkspacePreview),
-    /// A window mid-resize: the surface at its natural size with its origin
-    /// at the first rectangle, cropped to the second, at an alpha. Content
-    /// stays 1:1 while the edge moves — see [`crate::motion`] for why that
-    /// beats scaling it.
+    /// A tiled window: the surface at its natural size with its origin at the
+    /// first rectangle, cropped to its pane in the second, at an alpha.
+    ///
+    /// The crop remains after a resize motion finishes. Wayland clients answer
+    /// a configure asynchronously, so for a few frames their current buffer
+    /// can still have the old size. Letting it render without this crop would
+    /// spill into a newly nested sibling until the new buffer arrived.
     Clipped(WlSurface, Rect, Rect, f32),
     /// Opaque backing for a workspace card, so empty space and empty
     /// workspaces still read as physical cards rather than holes in the row.
@@ -937,11 +940,12 @@ impl Huginn {
     ///
     /// Hit testing and frame callbacks both want a client on the other end, and
     /// the focus ring has none.
-    pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (WlSurface, Rect)> {
+    pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (WlSurface, Rect, Option<Rect>)> {
         self.scene().into_iter().filter_map(|item| match item {
-            SceneItem::Surface(surface, rect)
-            | SceneItem::WorkspaceSurface(surface, rect, _)
-            | SceneItem::Clipped(surface, rect, _, _) => Some((surface, rect)),
+            SceneItem::Surface(surface, rect) | SceneItem::WorkspaceSurface(surface, rect, _) => {
+                Some((surface, rect, None))
+            }
+            SceneItem::Clipped(surface, rect, clip, _) => Some((surface, rect, Some(clip))),
             SceneItem::Preview(..)
             | SceneItem::Ring(..)
             | SceneItem::Overlay(..)
@@ -958,7 +962,10 @@ impl Huginn {
     /// a callback before its first paint deadlocks it against a compositor
     /// waiting for the buffer that callback would have produced.
     pub(crate) fn frame_surfaces(&self) -> Vec<(WlSurface, Rect)> {
-        let mut out: Vec<(WlSurface, Rect)> = self.scene_surfaces().collect();
+        let mut out: Vec<(WlSurface, Rect)> = self
+            .scene_surfaces()
+            .map(|(surface, rect, _)| (surface, rect))
+            .collect();
         // The switcher's thumbnail is a picture, not a surface to click, so
         // it is not in the scene list -- but it is on screen, and a window
         // that is on screen should be allowed to keep painting itself.
@@ -1546,6 +1553,24 @@ impl Huginn {
                         crate::motion::fit(placed, motion.rect_at(now), motion.alpha_at(now));
                     out.push(SceneItem::WorkspaceSurface(surface, placed, transform));
                 }
+                // Keep ordinary tiled panes cropped too. The resize spring can
+                // settle before a slow client has committed the configured
+                // size; drawing the old buffer unrestricted for that interval
+                // is the one-frame flash into a sibling pane. Floating and
+                // fullscreen windows are not nested and keep their natural
+                // surface bounds.
+                None if self
+                    .space
+                    .window(*id)
+                    .is_some_and(|window| window.is_tiled()) =>
+                {
+                    let pane = self
+                        .space
+                        .window(*id)
+                        .expect("window checked above")
+                        .geometry;
+                    out.push(SceneItem::Clipped(surface, placed, pane, 1.0));
+                }
                 None => out.push(SceneItem::Surface(surface, placed)),
             }
         }
@@ -1926,27 +1951,23 @@ impl Huginn {
     /// Open the workspace Cover Flow at the active workspace.
     pub(crate) fn open_workspace_carousel(&mut self) {
         let now = self.uptime();
+        let duration = self
+            .settings
+            .motion()
+            .duration(crate::anim::WORKSPACE_CAROUSEL_OPEN);
         if let Some(carousel) = &mut self.workspace_carousel {
             // A fresh gesture may arrive while the previous selection is still
             // expanding. Reverse that motion from its current value instead of
             // letting the old close finish underneath the new fingers.
-            carousel.reveal.animate_to(
-                1.0,
-                now,
-                crate::anim::WORKSPACE_CAROUSEL_OPEN,
-                crate::anim::Curve::EaseOut,
-            );
+            carousel
+                .reveal
+                .animate_to(1.0, now, duration, crate::anim::Curve::EaseOut);
             carousel.closing = false;
             self.queue_redraw();
             return;
         }
         let mut reveal = crate::anim::Animated::settled(0.0);
-        reveal.animate_to(
-            1.0,
-            now,
-            crate::anim::WORKSPACE_CAROUSEL_OPEN,
-            crate::anim::Curve::EaseOut,
-        );
+        reveal.animate_to(1.0, now, duration, crate::anim::Curve::EaseOut);
         self.workspace_carousel = Some(WorkspaceCarousel {
             position: crate::anim::Animated::settled(self.space.active_index() as f32),
             reveal,
@@ -1959,22 +1980,20 @@ impl Huginn {
     pub(crate) fn close_workspace_carousel(&mut self) {
         let now = self.uptime();
         let last = self.space.workspaces().len().saturating_sub(1);
+        let duration = self
+            .settings
+            .motion()
+            .duration(crate::anim::WORKSPACE_CAROUSEL_CLOSE);
         let Some(carousel) = &mut self.workspace_carousel else {
             return;
         };
         let target = carousel.position.value(now).round().clamp(0.0, last as f32) as usize;
-        carousel.position.animate_to(
-            target as f32,
-            now,
-            crate::anim::WORKSPACE_CAROUSEL_CLOSE,
-            crate::anim::Curve::EaseInOut,
-        );
-        carousel.reveal.animate_to(
-            0.0,
-            now,
-            crate::anim::WORKSPACE_CAROUSEL_CLOSE,
-            crate::anim::Curve::EaseInOut,
-        );
+        carousel
+            .position
+            .animate_to(target as f32, now, duration, crate::anim::Curve::EaseInOut);
+        carousel
+            .reveal
+            .animate_to(0.0, now, duration, crate::anim::Curve::EaseInOut);
         carousel.closing = true;
         self.space.activate_workspace(target);
         self.arrange();

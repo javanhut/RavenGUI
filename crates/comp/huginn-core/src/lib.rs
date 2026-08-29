@@ -592,10 +592,15 @@ impl Space {
             if !win.is_tiled() {
                 continue;
             }
-            let sized = Rect::new(rect.origin, win.hints.clamp(rect.size));
-            if win.geometry != sized {
-                win.geometry = sized;
-                changed.push((id, sized));
+            // A tile is an allocation, not a size suggestion. Honouring a
+            // client's minimum or maximum here makes its recorded geometry
+            // differ from the split tree: a large minimum overlaps a sibling,
+            // and a small maximum leaves a hole. The client may still commit a
+            // differently sized buffer, but the compositor centres and clips
+            // that buffer inside this authoritative pane.
+            if win.geometry != rect {
+                win.geometry = rect;
+                changed.push((id, rect));
             }
         }
 
@@ -701,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn size_hints_are_honoured_over_layout_geometry() {
+    fn tiled_layout_stays_authoritative_over_client_size_hints() {
         let mut s = space();
         let w = s.open_window();
         s.window_mut(w).expect("just opened").hints = SizeHints {
@@ -710,8 +715,9 @@ mod tests {
         };
         s.arrange();
         assert_eq!(
-            s.window(w).expect("still open").geometry.size,
-            Size::new(640, 480)
+            s.window(w).expect("still open").geometry,
+            SCREEN.inset(DEFAULT_GAP),
+            "a client hint must not make its pane leave a hole"
         );
     }
 

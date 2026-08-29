@@ -126,7 +126,18 @@ impl Huginn {
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
-        for (surface, rect) in self.scene_surfaces() {
+        for (surface, rect, clip) in self.scene_surfaces() {
+            // A client may still have its pre-resize buffer while its pane has
+            // already been nested. Match hit testing to the compositor crop so
+            // an invisible overflow cannot steal clicks from its sibling.
+            if clip.is_some_and(|clip| {
+                !clip.contains(huginn_core::geometry::Point::new(
+                    point.x as i32,
+                    point.y as i32,
+                ))
+            }) {
+                continue;
+            }
             let origin: Point<i32, Logical> = (rect.x(), rect.y()).into();
             if let Some(found) =
                 under_from_surface_tree(&surface, point, origin, WindowSurfaceType::ALL)
