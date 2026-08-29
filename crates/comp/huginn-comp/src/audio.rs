@@ -23,6 +23,13 @@
 //! settings does. A slider that silently goes nowhere is a bug report; one
 //! that says "not connected" is a to-do.
 //!
+//! Whether there is a mixer is asked every time, not once at startup. Huginn
+//! is the first thing the session starts, and PipeWire comes up a second or
+//! two behind it: a decision made at startup would be "no mixer" on every
+//! boot, and the keys would draw a slider all day without ever moving the
+//! sound. Each key press re-reads the level anyway, so the same read says
+//! whether anyone answered.
+//!
 //! # The slider
 //!
 //! Shown for a moment whenever a key changes the level, then gone. Nothing
@@ -212,22 +219,20 @@ impl Default for Volume {
 }
 
 impl Volume {
-    /// Find the machine's mixer, if it has one.
+    /// The machine's mixer: `wpctl`, whether or not PipeWire is up yet.
+    ///
+    /// Not a probe. PipeWire usually starts after huginn does, so whether a
+    /// read gets an answer at startup says nothing about a minute later; the
+    /// mixer is asked again on every key press, and [`Volume::is_real`]
+    /// follows the latest answer.
     pub(crate) fn detect() -> Self {
-        let mixer = Wpctl;
-        match mixer.read() {
-            Some(level) => {
-                tracing::info!(?level, "volume: wpctl");
-                let mut volume = Self::with_mixer(Box::new(mixer));
-                volume.level = level;
-                volume.real = true;
-                volume
-            }
-            None => {
-                tracing::info!("volume: no wpctl or no PipeWire; the slider is a stub");
-                Self::default()
-            }
+        let volume = Self::with_mixer(Box::new(Wpctl));
+        if volume.real {
+            tracing::info!(level = ?volume.level, "volume: wpctl");
+        } else {
+            tracing::info!("volume: wpctl gave no answer yet; will keep asking");
         }
+        volume
     }
 
     pub(crate) fn with_mixer(mixer: Box<dyn Mixer>) -> Self {
@@ -263,9 +268,7 @@ impl Volume {
     /// Re-reads the mixer first, so a level moved from elsewhere is stepped
     /// from where it actually is rather than from where this last left it.
     pub(crate) fn press(&mut self, key: Key, now: Duration, motion: Motion) {
-        if let Some(level) = self.mixer.read() {
-            self.level = level;
-        }
+        self.sync();
         let level = self.level;
         let next = match key {
             Key::Raise => Level {
@@ -287,6 +290,7 @@ impl Volume {
 
     /// Step the level by `delta` percent. What the settings row does.
     pub(crate) fn adjust(&mut self, delta: i32, now: Duration, motion: Motion) {
+        self.sync();
         let percent = (self.level.percent as i32 + delta).clamp(0, 100) as u32;
         self.set(
             Level {
@@ -299,6 +303,7 @@ impl Volume {
     }
 
     pub(crate) fn toggle_mute(&mut self, now: Duration, motion: Motion) {
+        self.sync();
         let level = self.level;
         self.set(
             Level {
@@ -308,6 +313,22 @@ impl Volume {
             now,
             motion,
         );
+    }
+
+    /// Ask the mixer where it is. A level moved from elsewhere is stepped
+    /// from where it actually is; a mixer that has come up since the last
+    /// look (or gone away) changes what the caption says.
+    fn sync(&mut self) {
+        match self.mixer.read() {
+            Some(level) => {
+                if !self.real {
+                    tracing::info!(?level, "volume: mixer connected");
+                }
+                self.level = level;
+                self.real = true;
+            }
+            None => self.real = false,
+        }
     }
 
     fn set(&mut self, level: Level, now: Duration, motion: Motion) {
@@ -652,6 +673,49 @@ mod tests {
         };
         volume.press(Key::Raise, T0, Motion::Full);
         assert_eq!(volume.level().percent, 25);
+    }
+
+    #[test]
+    fn a_mixer_that_comes_up_after_startup_is_noticed() {
+        /// Answers nothing until told PipeWire is up.
+        #[derive(Debug)]
+        struct Late {
+            up: RefCell<bool>,
+            applied: RefCell<Vec<Level>>,
+        }
+        impl Mixer for Late {
+            fn read(&self) -> Option<Level> {
+                self.up.borrow().then_some(Level {
+                    percent: 40,
+                    muted: false,
+                })
+            }
+            fn apply(&self, level: Level) {
+                self.applied.borrow_mut().push(level);
+            }
+        }
+        let late = Rc::new(Late {
+            up: RefCell::new(false),
+            applied: RefCell::new(Vec::new()),
+        });
+        #[derive(Debug)]
+        struct Via(Rc<Late>);
+        impl Mixer for Via {
+            fn read(&self) -> Option<Level> {
+                self.0.read()
+            }
+            fn apply(&self, level: Level) {
+                self.0.apply(level);
+            }
+        }
+        let mut volume = Volume::with_mixer(Box::new(Via(late.clone())));
+        assert!(!volume.is_real(), "nothing answered at startup");
+
+        *late.up.borrow_mut() = true;
+        volume.press(Key::Raise, T0, Motion::Full);
+        assert!(volume.is_real(), "the mixer came up and nobody noticed");
+        assert_eq!(volume.level().percent, 45, "stepped from the mixer's level");
+        assert_eq!(late.applied.borrow().last().map(|l| l.percent), Some(45));
     }
 
     #[test]
