@@ -29,6 +29,8 @@ mod gesture;
 #[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
+mod motion;
+#[cfg(target_os = "linux")]
 mod overlay;
 #[cfg(target_os = "linux")]
 mod pointer;
