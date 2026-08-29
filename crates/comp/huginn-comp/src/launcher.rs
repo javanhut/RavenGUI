@@ -157,6 +157,12 @@ pub(crate) enum Outcome {
         entry: Option<std::path::PathBuf>,
         argv: Vec<String>,
     },
+    /// Pin `entry` to the pinned panel, or unpin it if it already is. The
+    /// launcher stays open: pinning is bookkeeping, not a launch, and the
+    /// user may well want to pin two things in a row. The compositor owns
+    /// the pin list (see [`crate::pins`]) and tells the launcher what it
+    /// now holds through [`Launcher::set_pinned`].
+    TogglePin { entry: std::path::PathBuf },
 }
 
 /// What a re-rank does with the highlight. Typing asks a new question and
@@ -232,6 +238,10 @@ pub(crate) struct Launcher {
     /// what knows where the rows ended up — and read by [`Self::hover`] and
     /// [`Self::click`], so the mouse and the keyboard agree on what is where.
     layout: Layout,
+    /// The desktop files currently pinned, so the actions menu can offer
+    /// "Pin" or "Unpin" without being handed the pin list on every key. Set
+    /// by the compositor when the launcher opens and after each toggle.
+    pinned: Vec<std::path::PathBuf>,
 }
 
 impl Default for Launcher {
@@ -252,6 +262,7 @@ impl Default for Launcher {
             reveal: crate::anim::Animated::settled(0.0),
             origin: None,
             layout: Layout::default(),
+            pinned: Vec::new(),
         }
     }
 }
@@ -411,11 +422,29 @@ impl Launcher {
         self.menu
     }
 
-    /// What the actions menu offers for `entry`: "Open", then each action.
-    pub(crate) fn menu_items(entry: &Entry) -> Vec<&str> {
+    /// What the actions menu offers for `entry`: "Open", each action, and
+    /// last — where a stray Down cannot land on it by accident — "Pin", or
+    /// "Unpin" when it already is.
+    pub(crate) fn menu_items<'a>(&self, entry: &'a Entry) -> Vec<&'a str> {
         std::iter::once("Open")
             .chain(entry.actions.iter().map(|a| a.name.as_str()))
+            .chain(std::iter::once(if self.is_pinned(entry) {
+                UNPIN
+            } else {
+                PIN
+            }))
             .collect()
+    }
+
+    /// Whether `entry` is on the pinned panel, as last told.
+    pub(crate) fn is_pinned(&self, entry: &Entry) -> bool {
+        self.pinned.contains(&entry.path)
+    }
+
+    /// Tell the launcher what is pinned. The menu, if it is up, relabels
+    /// itself on the next redraw.
+    pub(crate) fn set_pinned(&mut self, pinned: Vec<std::path::PathBuf>) {
+        self.pinned = pinned;
     }
 
     /// Whether the panel is showing the suggestion grid rather than a list.
@@ -534,7 +563,7 @@ impl Launcher {
                     let count = self
                         .selection()
                         .and_then(|i| entries.get(i))
-                        .map_or(1, |e| e.actions.len() + 1);
+                        .map_or(1, |e| self.menu_items(e).len());
                     let next = if key == Key::Up {
                         item.saturating_sub(1)
                     } else {
@@ -652,6 +681,13 @@ impl Launcher {
         };
         let argv = match self.menu {
             None | Some(0) => entry.argv(&[]),
+            // The last item pins or unpins rather than running anything.
+            Some(n) if n + 1 == self.menu_items(entry).len() => {
+                self.menu = None;
+                return Outcome::TogglePin {
+                    entry: entry.path.clone(),
+                };
+            }
             Some(n) => entry
                 .actions
                 .get(n - 1)
@@ -1221,12 +1257,43 @@ mod tests {
         );
         assert_eq!(launcher.menu(), Some(0));
         assert_eq!(
-            Launcher::menu_items(&apps[0]),
-            ["Open", "New Window", "New Incognito Window"]
+            launcher.menu_items(&apps[0]),
+            ["Open", "New Window", "New Incognito Window", "Pin"]
         );
         // Tab again puts it away.
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.menu(), None);
+    }
+
+    #[test]
+    fn the_last_menu_item_pins_and_then_unpins_without_closing() {
+        let apps = browser();
+        let frecency = Frecency::new();
+        let mut launcher = Launcher::default();
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
+        for _ in 0..3 {
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
+        }
+        assert_eq!(
+            launcher.press(Key::Launch, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::TogglePin {
+                entry: apps[0].path.clone()
+            }
+        );
+        assert!(launcher.is_open(), "pinning closed the launcher");
+        assert_eq!(launcher.menu(), None, "the menu stayed up after pinning");
+        // The compositor did the pinning, and says so; the label follows.
+        launcher.set_pinned(vec![apps[0].path.clone()]);
+        assert_eq!(launcher.menu_items(&apps[0]).last(), Some(&UNPIN));
+        launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
+        for _ in 0..3 {
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
+        }
+        assert!(matches!(
+            launcher.press(Key::Launch, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::TogglePin { .. }
+        ));
     }
 
     #[test]
@@ -1238,11 +1305,14 @@ mod tests {
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
-        // Stops at the last item rather than wrapping.
+        // Past the actions is "Pin", and the menu stops there rather than
+        // wrapping.
+        launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(
             launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Unchanged
         );
+        launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(
             launcher.press(Key::Launch, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Launch {
@@ -2290,11 +2360,11 @@ impl Layout {
 }
 
 /// Panel width at a 1080p output, in pixels.
-const WIDTH: f32 = 560.0;
+pub(crate) const WIDTH: f32 = 560.0;
 /// Padding inside the panel's border.
-const PAD: f32 = 18.0;
+pub(crate) const PAD: f32 = 18.0;
 /// Text size at a 1080p output.
-const BASE_SIZE: f32 = 16.0;
+pub(crate) const BASE_SIZE: f32 = 16.0;
 /// How many results are shown. Beyond this the answer was not in the list and
 /// another keystroke is faster than another screenful.
 const VISIBLE: usize = 8;
@@ -2311,15 +2381,15 @@ const FILES: usize = 4;
 /// How much of a result row's inner width the application's kind ("Web
 /// Browser") may take, at most, before it is cut. The name is what was
 /// asked for; the kind is why the row answered, and stays the smaller half.
-const KIND_SHARE: f32 = 0.45;
+pub(crate) const KIND_SHARE: f32 = 0.45;
 /// The theme icon drawn beside a file.
 const FILE_ICON: &str = "text-x-generic";
 /// Height of a suggestion tile at a 1080p output.
-const TILE: f32 = 104.0;
+pub(crate) const TILE: f32 = 104.0;
 /// Space between tiles.
-const TILE_GAP: f32 = 12.0;
+pub(crate) const TILE_GAP: f32 = 12.0;
 /// Corner radius of the panel.
-const RADIUS: f32 = 22.0;
+pub(crate) const RADIUS: f32 = 22.0;
 /// Opacity of the panel's background.
 ///
 /// Low enough that the blurred desktop behind the panel (see
@@ -2327,13 +2397,13 @@ const RADIUS: f32 = 22.0;
 /// stays legible over a busy wallpaper. At the old `0xF2` the blur was there
 /// and invisible: a 95%-opaque panel hides whatever is behind it, blurred or
 /// not.
-const ALPHA: u8 = 0xD8;
+pub(crate) const ALPHA: u8 = 0xD8;
 // Legibility bounds the alpha from below; above the upper bound the panel
 // hides the blur behind it and the blur pass is pure cost.
 const _: () = assert!(ALPHA >= 0xC0 && ALPHA <= 0xE0);
 /// The tile and field fill: a shade lighter than the panel, so they read as
 /// wells set into it rather than as lines drawn on it.
-const WELL_ALPHA: u8 = 0x70;
+pub(crate) const WELL_ALPHA: u8 = 0x70;
 /// The footer's key hints, in the order they are read. The grid also
 /// answers to sideways arrows, and says so; the menu says what it does.
 const GRID_HINTS: &[(&str, &str)] = &[
@@ -2394,6 +2464,10 @@ const RESULT_GLYPH: &str = "=";
 
 /// What is shown before anything has been typed.
 const PLACEHOLDER: &str = "Search applications and files";
+/// The actions menu's last item, which puts the entry on the pinned panel
+/// — or takes it off. See [`crate::pinned`].
+pub(crate) const PIN: &str = "Pin";
+pub(crate) const UNPIN: &str = "Unpin";
 
 /// Where the panel sits, and how big, at the current reveal.
 ///
@@ -2491,20 +2565,23 @@ fn compose(
     // Everything here is in the canvas's own pixels, which `density` makes
     // more numerous than the logical ones the panel is placed in. See
     // `Panel::from_canvas`.
-    let density = density.max(1);
-    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
-    let size = BASE_SIZE * scale;
-    let pad = PAD * scale;
-    let width = (WIDTH * scale) as usize;
-    let row = size * 2.2;
-    let field = size * 2.6;
-    let radius = RADIUS * scale;
-    let inner = width as f32 - pad * 2.0;
-    let gap = TILE_GAP * scale;
-    let heading = size * 1.9;
-    let footer = size * 2.4;
+    let m = Metrics::for_output(output, density);
+    let Metrics {
+        density,
+        scale,
+        size,
+        pad,
+        width,
+        row,
+        field,
+        radius,
+        inner,
+        gap,
+        heading,
+        footer,
+    } = m;
     // A menu of `items` actions: its heading, the rows, a little air below.
-    let entry_menu_h = |items: usize| heading + row * items as f32 + gap;
+    let entry_menu_h = |items: usize| m.menu_height(items);
 
     // The grid before anything is typed, the list once something is: the
     // panel is as tall as whichever it is showing.
@@ -2554,7 +2631,7 @@ fn compose(
         .menu()
         .and(launcher.selection())
         .and_then(|i| apps.get(i))
-        .map(|entry| entry_menu_h(Launcher::menu_items(entry).len()));
+        .map(|entry| entry_menu_h(launcher.menu_items(entry).len()));
     let body = body.max(menu.unwrap_or(0.0));
     let height = (pad * 2.0 + field + gap + body + footer) as usize;
 
@@ -2663,77 +2740,18 @@ fn compose(
             let x = pad + (tile_w + gap) * col as f32;
             let ty = y + (tile_h + gap) * row_n as f32;
             layout.hits.push((rect(x, ty, tile_w, tile_h), slot));
-            let corner = tile_h * 0.16;
-            if slot == selected {
-                // A ring: the accent drawn a little larger, and the tile's
-                // own fill on top of it. Two fills rather than a stroke,
-                // because the canvas has no stroke and this is the same
-                // shape the dock's selection uses.
-                let ring = (2.0 * scale).max(2.0);
-                canvas.fill_rounded(
-                    (x - ring) as usize,
-                    (ty - ring) as usize,
-                    (tile_w + ring * 2.0) as usize,
-                    (tile_h + ring * 2.0) as usize,
-                    corner + ring,
-                    crate::theme::ACCENT,
-                );
-                canvas.fill_rounded(
-                    x as usize,
-                    ty as usize,
-                    tile_w as usize,
-                    tile_h as usize,
-                    corner,
-                    crate::theme::BACKGROUND,
-                );
-                canvas.fill_rounded(
-                    x as usize,
-                    ty as usize,
-                    tile_w as usize,
-                    tile_h as usize,
-                    corner,
-                    crate::theme::ACCENT.with_alpha(0x2E),
-                );
-            } else {
-                canvas.fill_rounded(
-                    x as usize,
-                    ty as usize,
-                    tile_w as usize,
-                    tile_h as usize,
-                    corner,
-                    crate::theme::BORDER.with_alpha(WELL_ALPHA),
-                );
-            }
-            let icon_size = (size * 2.4) as u32;
-            let label_size = size * 0.95;
-            // Icon above label, the pair centred in the tile.
-            let stack = icon_size as f32 + 6.0 * scale + label_size * 1.35;
-            let top = ty + (tile_h - stack) / 2.0;
-            if let Some(pixmap) = entry
-                .icon
-                .as_deref()
-                .and_then(|name| launcher_icon(icons, name, icon_size / density, density))
-                .and_then(|path| pixmaps.get(&path, icon_size))
-            {
-                canvas.blit(
-                    (x + (tile_w - icon_size as f32) / 2.0) as usize,
-                    top as usize,
-                    &tinted(pixmap),
-                );
-            }
-            let label = fit(text, &entry.name, label_size, tile_w - gap);
-            let (lw, _) = text.measure(&label, label_size);
-            text.draw(
+            draw_tile(
                 &mut canvas,
-                &label,
-                label_size,
-                (x + (tile_w - lw) / 2.0) as i32,
-                (top + icon_size as f32 + 6.0 * scale) as i32,
-                if slot == selected {
-                    crate::theme::TEXT
-                } else {
-                    crate::theme::TEXT_DIM
-                },
+                text,
+                icons,
+                pixmaps,
+                &m,
+                entry,
+                x,
+                ty,
+                tile_w,
+                tile_h,
+                slot == selected,
             );
         }
         if tiles > 0 {
@@ -2880,7 +2898,6 @@ fn compose(
             y += gap;
         }
 
-        let kind_size = size * 0.85;
         for index in launcher.window() {
             let Some(entry) = apps.get(*index) else {
                 continue;
@@ -2889,69 +2906,7 @@ fn compose(
             if let Some(slot) = slot_of(Target::App(*index)) {
                 layout.hits.push((rect(pad, y, inner, row), slot));
             }
-            if highlighted {
-                canvas.fill_rounded(
-                    pad as usize,
-                    y as usize,
-                    inner as usize,
-                    row as usize,
-                    row * 0.25,
-                    crate::theme::ACCENT.with_alpha(0x2E),
-                );
-            }
-            // The icon, if the theme has one. An application with no icon
-            // gets its name at the same indent as everything else rather
-            // than shifted left, so the column of names stays a column.
-            let icon_size = (size * 1.5) as u32;
-            let icon_x = pad + 8.0 * scale;
-            if let Some(pixmap) = entry
-                .icon
-                .as_deref()
-                .and_then(|name| launcher_icon(icons, name, icon_size / density, density))
-                .and_then(|path| pixmaps.get(&path, icon_size))
-            {
-                canvas.blit(
-                    icon_x as usize,
-                    (y + (row - icon_size as f32) / 2.0) as usize,
-                    &tinted(pixmap),
-                );
-            }
-            // Why it matched, against the right edge. The query is run over
-            // the generic name and the comment as well as the name, so a
-            // search for "browser" lands on "Brave" — and without "Web
-            // Browser" beside it the hit looks like a mistake. It also tells
-            // three "Avahi ... Browser" rows apart. Cut before it can take
-            // the row over, and the name cut before it can run into it.
-            let name_x = icon_x + icon_size as f32 + 10.0 * scale;
-            let right = pad + inner - 10.0 * scale;
-            let mut name_room = right - name_x;
-            if let Some(kind) = kind_of(entry) {
-                let kind = fit(text, kind, kind_size, inner * KIND_SHARE);
-                let (kw, _) = text.measure(&kind, kind_size);
-                let kind_x = right - kw;
-                text.draw(
-                    &mut canvas,
-                    &kind,
-                    kind_size,
-                    kind_x as i32,
-                    (y + (row - kind_size * 1.35) / 2.0) as i32,
-                    crate::theme::TEXT_DIM,
-                );
-                name_room = kind_x - gap - name_x;
-            }
-            let name = fit(text, &entry.name, size, name_room);
-            text.draw(
-                &mut canvas,
-                &name,
-                size,
-                name_x as i32,
-                (y + (row - size * 1.35) / 2.0) as i32,
-                if highlighted {
-                    crate::theme::TEXT
-                } else {
-                    crate::theme::TEXT_DIM
-                },
-            );
+            draw_app_row(&mut canvas, text, icons, pixmaps, &m, entry, y, highlighted);
             y += row;
         }
 
@@ -3092,85 +3047,454 @@ fn compose(
         launcher.menu(),
         launcher.selection().and_then(|i| apps.get(i)),
     ) {
-        let items = Launcher::menu_items(entry);
-        let menu_w = inner * 0.5;
-        let menu_h = entry_menu_h(items.len());
-        let mx = pad + inner - menu_w;
-        let my = (y - menu_h).max(pad + field + gap);
-        let corner = row * 0.4;
-        let edge = 1.0_f32.max(scale * 0.75);
-        canvas.fill_rounded(
-            (mx - edge) as usize,
-            (my - edge) as usize,
-            (menu_w + edge * 2.0) as usize,
-            (menu_h + edge * 2.0) as usize,
-            corner + edge,
-            crate::theme::BORDER,
-        );
-        canvas.fill_rounded(
-            mx as usize,
-            my as usize,
-            menu_w as usize,
-            menu_h as usize,
-            corner,
-            crate::theme::BACKGROUND,
-        );
-        let title = fit(text, &entry.name, size * 0.85, menu_w - gap * 2.0);
-        text.draw(
+        let items = launcher.menu_items(entry);
+        draw_menu(
             &mut canvas,
-            &title,
-            size * 0.85,
-            (mx + gap) as i32,
-            (my + (heading - size * 1.15) / 2.0) as i32,
-            crate::theme::TEXT_DIM,
+            text,
+            &mut layout,
+            &m,
+            &entry.name,
+            &items,
+            item,
+            y,
+            pad + field + gap,
         );
-        let mut iy = my + heading;
-        for (n, label) in items.iter().enumerate() {
-            layout
-                .menu_hits
-                .push((rect(mx + gap / 2.0, iy, menu_w - gap, row), n));
-            if n == item {
-                canvas.fill_rounded(
-                    (mx + gap / 2.0) as usize,
-                    iy as usize,
-                    (menu_w - gap) as usize,
-                    row as usize,
-                    row * 0.25,
-                    crate::theme::ACCENT.with_alpha(0x2E),
-                );
-            }
-            let label = fit(text, label, size, menu_w - gap * 2.0);
-            text.draw(
-                &mut canvas,
-                &label,
-                size,
-                (mx + gap) as i32,
-                (iy + (row - size * 1.35) / 2.0) as i32,
-                if n == item {
-                    crate::theme::TEXT
-                } else {
-                    crate::theme::TEXT_DIM
-                },
-            );
-            iy += row;
+    }
+
+    draw_footer(
+        &mut canvas,
+        text,
+        &m,
+        y,
+        hints_for(target, launcher.menu().is_some(), grid),
+    );
+
+    (canvas, layout)
+}
+
+/// The measurements every panel that looks like the launcher is laid out
+/// with, in canvas pixels.
+///
+/// One struct rather than a dozen `let`s at the top of each `compose`, so the
+/// pinned panel (see [`crate::pinned`]) is drawn to exactly the launcher's
+/// proportions rather than to a copy of them that drifts by a constant.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Metrics {
+    /// Canvas pixels per logical pixel, at least 1.
+    pub(crate) density: u32,
+    /// Everything below is multiplied by this: the 1080p design size, times
+    /// how much taller the output is, times the density.
+    pub(crate) scale: f32,
+    /// Body text size.
+    pub(crate) size: f32,
+    /// Padding inside the panel's border.
+    pub(crate) pad: f32,
+    /// The panel's width.
+    pub(crate) width: usize,
+    /// Height of a list row.
+    pub(crate) row: f32,
+    /// Height of the search field.
+    pub(crate) field: f32,
+    /// Corner radius of the panel.
+    pub(crate) radius: f32,
+    /// The width inside the padding.
+    pub(crate) inner: f32,
+    /// Space between tiles, and between sections.
+    pub(crate) gap: f32,
+    /// Height of a section heading.
+    pub(crate) heading: f32,
+    /// Height of the footer.
+    pub(crate) footer: f32,
+}
+
+impl Metrics {
+    /// The measurements for `output` at `density` pixels per logical one.
+    pub(crate) fn for_output(output: Rect, density: u32) -> Self {
+        let density = density.max(1);
+        let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
+        let size = BASE_SIZE * scale;
+        let pad = PAD * scale;
+        let width = (WIDTH * scale) as usize;
+        Self {
+            density,
+            scale,
+            size,
+            pad,
+            width,
+            row: size * 2.2,
+            field: size * 2.6,
+            radius: RADIUS * scale,
+            inner: width as f32 - pad * 2.0,
+            gap: TILE_GAP * scale,
+            heading: size * 1.9,
+            footer: size * 2.4,
         }
     }
 
-    // The footer: a hairline, then what the keys do. Chips for the keys and
-    // dim text for the verbs, so the eye finds the key first.
+    /// The same measurements for a panel `width` canvas pixels wide.
+    pub(crate) fn with_width(self, width: usize) -> Self {
+        Self {
+            width,
+            inner: width as f32 - self.pad * 2.0,
+            ..self
+        }
+    }
+
+    /// A menu of `items` actions: its heading, the rows, a little air below.
+    pub(crate) fn menu_height(&self, items: usize) -> f32 {
+        self.heading + self.row * items as f32 + self.gap
+    }
+}
+
+/// Paint the panel's ground: the rounded, frosted rectangle everything else
+/// sits on.
+pub(crate) fn draw_ground(canvas: &mut Canvas, m: &Metrics, width: usize, height: usize) {
+    canvas.fill_rounded(
+        0,
+        0,
+        width,
+        height,
+        m.radius,
+        crate::theme::BACKGROUND.with_alpha(ALPHA),
+    );
+}
+
+/// A section heading — "Suggested", "Recent", "Files" — at `y`.
+pub(crate) fn draw_heading(canvas: &mut Canvas, text: &mut Text, m: &Metrics, y: f32, label: &str) {
+    text.draw(
+        canvas,
+        label,
+        m.size * 0.95,
+        m.pad as i32,
+        (y + (m.heading - m.size * 1.3) / 2.0) as i32,
+        crate::theme::TEXT_DIM,
+    );
+}
+
+/// A hairline across the panel's inner width at `y`.
+pub(crate) fn draw_rule(canvas: &mut Canvas, m: &Metrics, y: f32) {
     canvas.fill(
-        pad as usize,
+        m.pad as usize,
         y as usize,
-        inner as usize,
+        m.inner as usize,
         1,
         crate::theme::BORDER.to_rgba_bytes(),
     );
+}
+
+/// A suggestion tile: icon over label, in a well, ringed when selected.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_tile(
+    canvas: &mut Canvas,
+    text: &mut Text,
+    icons: &Icons,
+    pixmaps: &mut Pixmaps,
+    m: &Metrics,
+    entry: &Entry,
+    x: f32,
+    ty: f32,
+    tile_w: f32,
+    tile_h: f32,
+    selected: bool,
+) {
+    let Metrics {
+        density,
+        scale,
+        size,
+        gap,
+        ..
+    } = *m;
+    let corner = tile_h * 0.16;
+    if selected {
+        // A ring: the accent drawn a little larger, and the tile's
+        // own fill on top of it. Two fills rather than a stroke,
+        // because the canvas has no stroke and this is the same
+        // shape the dock's selection uses.
+        let ring = (2.0 * scale).max(2.0);
+        canvas.fill_rounded(
+            (x - ring) as usize,
+            (ty - ring) as usize,
+            (tile_w + ring * 2.0) as usize,
+            (tile_h + ring * 2.0) as usize,
+            corner + ring,
+            crate::theme::ACCENT,
+        );
+        canvas.fill_rounded(
+            x as usize,
+            ty as usize,
+            tile_w as usize,
+            tile_h as usize,
+            corner,
+            crate::theme::BACKGROUND,
+        );
+        canvas.fill_rounded(
+            x as usize,
+            ty as usize,
+            tile_w as usize,
+            tile_h as usize,
+            corner,
+            crate::theme::ACCENT.with_alpha(0x2E),
+        );
+    } else {
+        canvas.fill_rounded(
+            x as usize,
+            ty as usize,
+            tile_w as usize,
+            tile_h as usize,
+            corner,
+            crate::theme::BORDER.with_alpha(WELL_ALPHA),
+        );
+    }
+    let icon_size = (size * 2.4) as u32;
+    let label_size = size * 0.95;
+    // Icon above label, the pair centred in the tile.
+    let stack = icon_size as f32 + 6.0 * scale + label_size * 1.35;
+    let top = ty + (tile_h - stack) / 2.0;
+    if let Some(pixmap) = entry
+        .icon
+        .as_deref()
+        .and_then(|name| launcher_icon(icons, name, icon_size / density, density))
+        .and_then(|path| pixmaps.get(&path, icon_size))
+    {
+        canvas.blit(
+            (x + (tile_w - icon_size as f32) / 2.0) as usize,
+            top as usize,
+            &tinted(pixmap),
+        );
+    }
+    let label = fit(text, &entry.name, label_size, tile_w - gap);
+    let (lw, _) = text.measure(&label, label_size);
+    text.draw(
+        canvas,
+        &label,
+        label_size,
+        (x + (tile_w - lw) / 2.0) as i32,
+        (top + icon_size as f32 + 6.0 * scale) as i32,
+        if selected {
+            crate::theme::TEXT
+        } else {
+            crate::theme::TEXT_DIM
+        },
+    );
+}
+
+/// A result row: icon, name, and what the application is against the right
+/// edge, washed in the accent when highlighted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_app_row(
+    canvas: &mut Canvas,
+    text: &mut Text,
+    icons: &Icons,
+    pixmaps: &mut Pixmaps,
+    m: &Metrics,
+    entry: &Entry,
+    y: f32,
+    highlighted: bool,
+) {
+    let Metrics {
+        density,
+        scale,
+        size,
+        pad,
+        row,
+        inner,
+        gap,
+        ..
+    } = *m;
+    let kind_size = size * 0.85;
+    if highlighted {
+        canvas.fill_rounded(
+            pad as usize,
+            y as usize,
+            inner as usize,
+            row as usize,
+            row * 0.25,
+            crate::theme::ACCENT.with_alpha(0x2E),
+        );
+    }
+    // The icon, if the theme has one. An application with no icon
+    // gets its name at the same indent as everything else rather
+    // than shifted left, so the column of names stays a column.
+    let icon_size = (size * 1.5) as u32;
+    let icon_x = pad + 8.0 * scale;
+    if let Some(pixmap) = entry
+        .icon
+        .as_deref()
+        .and_then(|name| launcher_icon(icons, name, icon_size / density, density))
+        .and_then(|path| pixmaps.get(&path, icon_size))
+    {
+        canvas.blit(
+            icon_x as usize,
+            (y + (row - icon_size as f32) / 2.0) as usize,
+            &tinted(pixmap),
+        );
+    }
+    // Why it matched, against the right edge. The query is run over
+    // the generic name and the comment as well as the name, so a
+    // search for "browser" lands on "Brave" — and without "Web
+    // Browser" beside it the hit looks like a mistake. It also tells
+    // three "Avahi ... Browser" rows apart. Cut before it can take
+    // the row over, and the name cut before it can run into it.
+    let name_x = icon_x + icon_size as f32 + 10.0 * scale;
+    let right = pad + inner - 10.0 * scale;
+    let mut name_room = right - name_x;
+    if let Some(kind) = kind_of(entry) {
+        let kind = fit(text, kind, kind_size, inner * KIND_SHARE);
+        let (kw, _) = text.measure(&kind, kind_size);
+        let kind_x = right - kw;
+        text.draw(
+            canvas,
+            &kind,
+            kind_size,
+            kind_x as i32,
+            (y + (row - kind_size * 1.35) / 2.0) as i32,
+            crate::theme::TEXT_DIM,
+        );
+        name_room = kind_x - gap - name_x;
+    }
+    let name = fit(text, &entry.name, size, name_room);
+    text.draw(
+        canvas,
+        &name,
+        size,
+        name_x as i32,
+        (y + (row - size * 1.35) / 2.0) as i32,
+        if highlighted {
+            crate::theme::TEXT
+        } else {
+            crate::theme::TEXT_DIM
+        },
+    );
+}
+
+/// The actions menu: `labels` under `title`, with `item` highlighted, its
+/// bottom edge at `bottom` and against the panel's right edge, never higher
+/// than `top`. Records each item's rectangle in `layout` for the pointer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_menu(
+    canvas: &mut Canvas,
+    text: &mut Text,
+    layout: &mut Layout,
+    m: &Metrics,
+    title: &str,
+    labels: &[&str],
+    item: usize,
+    bottom: f32,
+    top: f32,
+) {
+    let Metrics {
+        scale,
+        size,
+        pad,
+        row,
+        inner,
+        gap,
+        heading,
+        ..
+    } = *m;
+    let rect =
+        |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
+    let menu_w = inner * 0.5;
+    let menu_h = m.menu_height(labels.len());
+    let mx = pad + inner - menu_w;
+    let my = (bottom - menu_h).max(top);
+    let corner = row * 0.4;
+    let edge = 1.0_f32.max(scale * 0.75);
+    canvas.fill_rounded(
+        (mx - edge) as usize,
+        (my - edge) as usize,
+        (menu_w + edge * 2.0) as usize,
+        (menu_h + edge * 2.0) as usize,
+        corner + edge,
+        crate::theme::BORDER,
+    );
+    canvas.fill_rounded(
+        mx as usize,
+        my as usize,
+        menu_w as usize,
+        menu_h as usize,
+        corner,
+        crate::theme::BACKGROUND,
+    );
+    let title = fit(text, title, size * 0.85, menu_w - gap * 2.0);
+    text.draw(
+        canvas,
+        &title,
+        size * 0.85,
+        (mx + gap) as i32,
+        (my + (heading - size * 1.15) / 2.0) as i32,
+        crate::theme::TEXT_DIM,
+    );
+    let mut iy = my + heading;
+    for (n, label) in labels.iter().enumerate() {
+        layout
+            .menu_hits
+            .push((rect(mx + gap / 2.0, iy, menu_w - gap, row), n));
+        if n == item {
+            canvas.fill_rounded(
+                (mx + gap / 2.0) as usize,
+                iy as usize,
+                (menu_w - gap) as usize,
+                row as usize,
+                row * 0.25,
+                crate::theme::ACCENT.with_alpha(0x2E),
+            );
+        }
+        let label = fit(text, label, size, menu_w - gap * 2.0);
+        text.draw(
+            canvas,
+            &label,
+            size,
+            (mx + gap) as i32,
+            (iy + (row - size * 1.35) / 2.0) as i32,
+            if n == item {
+                crate::theme::TEXT
+            } else {
+                crate::theme::TEXT_DIM
+            },
+        );
+        iy += row;
+    }
+}
+
+/// The footer: a hairline at `y`, then what the keys do. Chips for the keys
+/// and dim text for the verbs, so the eye finds the key first.
+pub(crate) fn draw_footer(
+    canvas: &mut Canvas,
+    text: &mut Text,
+    m: &Metrics,
+    y: f32,
+    hints: &[(&str, &str)],
+) {
+    let Metrics {
+        scale,
+        size,
+        pad,
+        gap,
+        footer,
+        ..
+    } = *m;
+    draw_rule(canvas, m, y);
     let hint_size = size * 0.85;
     let chip_h = hint_size * 1.7;
     let chip_pad = 6.0 * scale;
     let mut hx = pad;
     let hy = y + (footer - chip_h) / 2.0 + 1.0;
-    let hints = hints_for(target, launcher.menu().is_some(), grid);
+    // The air between hints: two gaps when the row has room, and less when
+    // it does not, down to a chip's padding — so a panel with one hint more
+    // than the launcher's does not push its last verb off the edge.
+    let taken: f32 = hints
+        .iter()
+        .map(|(key, verb)| {
+            text.measure(key, hint_size).0 + chip_pad * 3.0 + text.measure(verb, hint_size).0
+        })
+        .sum();
+    let between = hints.len().saturating_sub(1) as f32;
+    let spacing = if between > 0.0 {
+        ((m.inner - taken) / between).clamp(chip_pad, gap * 2.0)
+    } else {
+        gap * 2.0
+    };
     for (key, verb) in hints {
         let (kw, _) = text.measure(key, hint_size);
         let chip_w = kw + chip_pad * 2.0;
@@ -3183,7 +3507,7 @@ fn compose(
             crate::theme::BORDER,
         );
         text.draw(
-            &mut canvas,
+            canvas,
             key,
             hint_size,
             (hx + chip_pad) as i32,
@@ -3192,17 +3516,15 @@ fn compose(
         );
         hx += chip_w + chip_pad;
         text.draw(
-            &mut canvas,
+            canvas,
             verb,
             hint_size,
             hx as i32,
             (hy + (chip_h - hint_size * 1.35) / 2.0) as i32,
             crate::theme::TEXT_DIM,
         );
-        hx += text.measure(verb, hint_size).0 + gap * 2.0;
+        hx += text.measure(verb, hint_size).0 + spacing;
     }
-
-    (canvas, layout)
 }
 
 /// The measurements a list row is laid out with, in canvas pixels.
@@ -3296,7 +3618,12 @@ const TINT_LIGHTNESS: (f32, f32) = (0.74, 0.62);
 /// flat glyph drawn for exactly this treatment. The dock keeps the coloured
 /// artwork and calls [`Icons::find`] directly, so the preference lives here
 /// rather than in the lookup.
-fn launcher_icon(icons: &Icons, name: &str, size: u32, density: u32) -> Option<std::path::PathBuf> {
+pub(crate) fn launcher_icon(
+    icons: &Icons,
+    name: &str,
+    size: u32,
+    density: u32,
+) -> Option<std::path::PathBuf> {
     icons
         .find_symbolic(name, size, density)
         .or_else(|| icons.find(name, size, density))
@@ -3306,7 +3633,7 @@ fn launcher_icon(icons: &Icons, name: &str, size: u32, density: u32) -> Option<s
 ///
 /// An icon with no hue to speak of takes the accent, so a monochrome glyph
 /// is still one of the family rather than the one grey thing in the grid.
-fn tinted(icon: &raven_desktop::Pixmap) -> raven_desktop::Pixmap {
+pub(crate) fn tinted(icon: &raven_desktop::Pixmap) -> raven_desktop::Pixmap {
     let hue = icon.hue().unwrap_or_else(accent_hue);
     icon.tinted(
         hsl(hue, TINT_SATURATION, TINT_LIGHTNESS.0),
@@ -3370,7 +3697,7 @@ fn ago(secs: u64) -> String {
 /// comment ("Browse the World Wide Web") is a sentence, and only stands in
 /// when there is no generic name. Blank values are treated as absent so a
 /// `GenericName=` line with nothing after it draws nothing.
-fn kind_of(entry: &Entry) -> Option<&str> {
+pub(crate) fn kind_of(entry: &Entry) -> Option<&str> {
     entry
         .generic_name
         .as_deref()
@@ -3383,7 +3710,7 @@ fn kind_of(entry: &Entry) -> Option<&str> {
 ///
 /// A tile is a label, not a document: a long name is truncated rather than
 /// wrapped, so the grid stays a grid.
-fn fit(text: &mut Text, name: &str, size: f32, max_w: f32) -> String {
+pub(crate) fn fit(text: &mut Text, name: &str, size: f32, max_w: f32) -> String {
     if text.measure(name, size).0 <= max_w {
         return name.to_owned();
     }
@@ -3911,8 +4238,8 @@ mod render_tests {
         let apps = apps();
         let (launcher, layout) = laid_out(&apps, "", &[], true);
         assert!(launcher.menu().is_some());
-        // "Open" alone: the fixtures have no actions.
-        assert_eq!(layout.menu_hits.len(), 1);
+        // "Open" and "Pin": the fixtures have no actions.
+        assert_eq!(layout.menu_hits.len(), 2);
         let item = centre(layout.menu_hits[0].0);
         assert_eq!(layout.menu_hit(item), Some(0));
         // The menu is on top, so the tile under it is not what is there.
@@ -3941,7 +4268,7 @@ mod render_tests {
             1,
             "the fixture did not narrow to one row"
         );
-        assert_eq!(layout.menu_hits.len(), 2);
+        assert_eq!(layout.menu_hits.len(), 3, "Open, the action, and Pin");
         let (_, bare) = laid_out(&apps, &query, &[], false);
         assert!(
             bare.size.1 < layout.size.1,

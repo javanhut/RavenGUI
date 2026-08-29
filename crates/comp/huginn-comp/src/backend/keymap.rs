@@ -84,6 +84,11 @@ pub(crate) enum Action {
     /// there is no surface to focus and nothing to forward to. While it is
     /// open the keymap stops resolving chords entirely.
     Launcher(crate::launcher::Key),
+    /// Open the pinned panel.
+    OpenPinned,
+    /// A key while the pinned panel is open. Every key goes to it, for the
+    /// reason every key goes to the launcher.
+    Pinned(crate::pinned::Key),
     /// Dismiss the temporary minimized-application switcher.
     DismissSwitcher,
     /// A media key: raise, lower or mute the output volume.
@@ -114,6 +119,8 @@ pub(crate) struct Modes {
     pub launcher: Option<Option<char>>,
     /// Quick settings is open, and takes every key.
     pub settings_open: bool,
+    /// The pinned panel is open, and takes every key.
+    pub pinned_open: bool,
     /// Resize mode is active, and owns the arrows.
     pub resizing: bool,
     /// The session is locked. Nothing resolves; every key is the lock
@@ -218,6 +225,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "open the application launcher",
     },
     Binding {
+        action: Action::OpenPinned,
+        chord: "Super+A",
+        description: "open the pinned applications",
+    },
+    Binding {
         action: Action::OpenSettings,
         chord: "Super+Shift+S",
         description: "open quick settings",
@@ -320,6 +332,14 @@ pub(crate) fn resolve(
         return FilterResult::Intercept(pressed(key_state, Action::Settings(key)));
     }
 
+    // The pinned panel, likewise: compositor-drawn, and every key is its
+    // own — Shift turns the arrows into moves, so the modifier is passed
+    // along rather than stripped.
+    if mode.pinned_open {
+        let key = crate::pinned::Key::from_keysym(sym, modifiers.shift);
+        return FilterResult::Intercept(pressed(key_state, Action::Pinned(key)));
+    }
+
     // The launcher takes everything, chords included, and forwards nothing.
     // A key reaching the focused client while a search field is open would let
     // a window act on what the user was typing at the launcher — and `Escape`
@@ -340,6 +360,12 @@ pub(crate) fn resolve(
         // whatever is focused.
         if matches!(sym, keysyms::KEY_l | keysyms::KEY_L) {
             return FilterResult::Intercept(pressed(key_state, Action::Lock));
+        }
+        // The pinned panel is the other one: it is the chord asked for, and
+        // a panel that opens everywhere except over a terminal would be
+        // found broken exactly where it is reached for most.
+        if matches!(sym, keysyms::KEY_a | keysyms::KEY_A) {
+            return FilterResult::Intercept(pressed(key_state, Action::OpenPinned));
         }
         // Copy and paste are borrowed back, and only from clients that have no
         // use of their own for the chord.
@@ -690,6 +716,45 @@ mod tests {
                 "Escape did not reach the launcher with {mods:?}"
             );
         }
+    }
+
+    #[test]
+    fn super_a_opens_the_pinned_panel_and_the_panel_takes_every_key() {
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_a),
+            Some(Action::OpenPinned)
+        );
+        // Like Super+L, not given back to a client that owns the Super layer.
+        assert!(matches!(
+            with_super_owned(super_held(), keysyms::KEY_A),
+            FilterResult::Intercept(Some(Action::OpenPinned))
+        ));
+        let mode = Modes {
+            pinned_open: true,
+            ..Modes::default()
+        };
+        // Escape is the way out, and a compositor chord does not shadow it.
+        for mods in [ModifiersState::default(), super_held(), super_shift()] {
+            assert!(matches!(
+                resolve(KeyState::Pressed, &mods, keysyms::KEY_Escape, mode),
+                FilterResult::Intercept(Some(Action::Pinned(crate::pinned::Key::Dismiss)))
+            ));
+        }
+        // Shift+arrow arrives as a move, not as a window-management chord.
+        assert!(matches!(
+            resolve(KeyState::Pressed, &super_shift(), keysyms::KEY_Left, mode),
+            FilterResult::Intercept(Some(Action::Pinned(crate::pinned::Key::Move(Dir::Left))))
+        ));
+        // A letter it has no use for is swallowed rather than forwarded.
+        assert!(matches!(
+            resolve(
+                KeyState::Pressed,
+                &ModifiersState::default(),
+                keysyms::KEY_z,
+                mode
+            ),
+            FilterResult::Intercept(Some(Action::Pinned(crate::pinned::Key::Ignored)))
+        ));
     }
 
     #[test]
