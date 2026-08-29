@@ -17,6 +17,7 @@
 use std::time::Duration;
 
 use huginn_core::geometry::Rect;
+use huginn_core::window::WindowId;
 use raven_desktop::{Entry, Icons, Pixmaps};
 
 use crate::anim::{Animated, Curve};
@@ -45,6 +46,9 @@ pub(crate) struct Item {
     pub entry: Option<usize>,
     /// Whether a window of this application is open.
     pub running: bool,
+    /// One particular window, when the strip is listing windows rather than
+    /// applications — the switcher's tiles. `None` in the ordinary dock.
+    pub window: Option<WindowId>,
 }
 
 impl Item {
@@ -53,6 +57,7 @@ impl Item {
         Self {
             entry: None,
             running: false,
+            window: None,
         }
     }
 
@@ -134,6 +139,7 @@ pub(crate) fn items(apps: &[Entry], running: &[String]) -> Vec<Item> {
             items.push(Item {
                 entry: Some(index),
                 running: is_running(&apps[index]),
+                window: None,
             });
         }
     }
@@ -166,7 +172,56 @@ pub(crate) fn items(apps: &[Entry], running: &[String]) -> Vec<Item> {
         items.push(Item {
             entry: Some(index),
             running: true,
+            window: None,
         });
+    }
+    items
+}
+
+/// Build the switcher's strip: the launcher, then one tile per window.
+///
+/// The ordinary dock is one item per *application* — §4 does not want a
+/// window list. The switcher is the exception, because its whole job is to
+/// bring back something put away, and two minimized windows of one browser
+/// are two different things to bring back. Tiles keep the dock's order —
+/// pinned applications first, then the rest in application-list order — and
+/// windows of one application sit together in the order they were minimized.
+///
+/// A window whose `app_id` matches no installed application has no icon to
+/// draw and is skipped, as it is from the dock.
+pub(crate) fn window_items(apps: &[Entry], windows: &[(WindowId, String)]) -> Vec<Item> {
+    let mut items = vec![Item::launcher()];
+    let mut claimed: Vec<WindowId> = Vec::new();
+
+    let place = |index: usize, items: &mut Vec<Item>, claimed: &mut Vec<WindowId>| {
+        for (id, app_id) in windows {
+            if !claimed.contains(id) && matches(&apps[index], app_id) {
+                claimed.push(*id);
+                items.push(Item {
+                    entry: Some(index),
+                    running: true,
+                    window: Some(*id),
+                });
+            }
+        }
+    };
+
+    let mut placed: Vec<usize> = Vec::new();
+    for name in PINNED {
+        if let Some(index) = apps.iter().position(|e| {
+            e.path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(name))
+        }) {
+            placed.push(index);
+            place(index, &mut items, &mut claimed);
+        }
+    }
+    for index in 0..apps.len() {
+        if !placed.contains(&index) {
+            place(index, &mut items, &mut claimed);
+        }
     }
     items
 }
@@ -301,6 +356,8 @@ const RADIUS: f32 = 0.28;
 /// Distance from the bottom of the screen when fully up.
 const MARGIN: f32 = 12.0;
 const ALPHA: u8 = 0xE6;
+/// Text size of the switcher's title caption at a 1080p output.
+const CAPTION_SIZE: f32 = 14.0;
 
 /// The dock's rectangle on `output` at the current reveal.
 ///
@@ -420,6 +477,73 @@ pub(crate) fn render(
     Panel::from_canvas(&canvas, density)
 }
 
+/// The selected window's title, as a small pill to sit under the switcher.
+///
+/// Separate from the strip rather than a row inside it: the strip's rectangle
+/// is what [`Dock::item_at`] recovers the icon pitch from, and the renderer
+/// scales the panel to that rectangle, so growing the strip would squash the
+/// icons and misplace clicks. A second panel costs nothing and disturbs
+/// neither.
+///
+/// `None` when there is no font to draw with, or nothing to say.
+pub(crate) fn caption(text: &mut Text, title: &str, output: Rect, density: u32) -> Option<Panel> {
+    if !text.is_usable() || title.is_empty() {
+        return None;
+    }
+    let density = density.max(1);
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
+    let size = CAPTION_SIZE * scale;
+    let pad = GAP * scale;
+    // Long titles are cut rather than wrapped: the pill is a label, not a
+    // document, and it must not grow wider than the screen.
+    let max_w = output.w() as f32 * density as f32 * 0.6;
+    let mut title = title.to_owned();
+    let (mut w, h) = text.measure(&title, size);
+    while w > max_w && title.chars().count() > 1 {
+        title.pop();
+        while !title.is_char_boundary(title.len()) {
+            title.pop();
+        }
+        let (tw, _) = text.measure(&format!("{title}…"), size);
+        w = tw;
+        if w <= max_w {
+            title.push('…');
+            break;
+        }
+    }
+    let (pw, ph) = ((w + pad * 2.0) as usize, (h + pad) as usize);
+    let mut canvas = Canvas::new(pw.max(1), ph.max(1));
+    canvas.fill_rounded(
+        0,
+        0,
+        pw,
+        ph,
+        ph as f32 * 0.5,
+        crate::theme::BACKGROUND.with_alpha(ALPHA),
+    );
+    text.draw(
+        &mut canvas,
+        &title,
+        size,
+        pad as i32,
+        (pad / 2.0) as i32,
+        crate::theme::TEXT,
+    );
+    Some(Panel::from_canvas(&canvas, density))
+}
+
+/// Where the caption goes: centred under `dock`, a margin below it.
+pub(crate) fn caption_placement(panel: &Panel, dock: Rect, output: Rect) -> Rect {
+    let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5);
+    let (w, h) = panel.size();
+    Rect::from_xywh(
+        dock.x() + (dock.w() - w) / 2,
+        dock.y() + dock.h() + (MARGIN * scale) as i32,
+        w,
+        h,
+    )
+}
+
 /// A grid of squares, for the launcher button.
 fn draw_launcher_glyph(canvas: &mut Canvas, x: f32, y: f32, size: f32, scale: f32) {
     let cell = size / 3.4;
@@ -465,6 +589,12 @@ mod tests {
             entry("Files", "org.gnome.Nautilus", None),
             entry("Firefox", "firefox", Some("Navigator")),
         ]
+    }
+
+    /// Two window ids, allocated the only way there is: by a `Space`.
+    fn ids() -> (WindowId, WindowId) {
+        let mut space = huginn_core::Space::new(SCREEN);
+        (space.open_window(), space.open_window())
     }
 
     const SCREEN: Rect = Rect::from_xywh(0, 0, 1920, 1080);
@@ -579,6 +709,43 @@ mod tests {
         let items = items(&apps(), &["Navigator".to_owned(), "Navigator".to_owned()]);
         let firefoxes = items.iter().filter(|i| i.entry == Some(2)).count();
         assert_eq!(firefoxes, 1);
+    }
+
+    #[test]
+    fn the_switcher_gives_each_window_of_one_application_its_own_tile() {
+        // The one place a window list is wanted: two minimized browser
+        // windows are two things to bring back, and a single tile could only
+        // ever bring back the first.
+        let (a, b) = ids();
+        let items = window_items(
+            &apps(),
+            &[(a, "Navigator".to_owned()), (b, "Navigator".to_owned())],
+        );
+        let firefoxes: Vec<Option<WindowId>> = items
+            .iter()
+            .filter(|i| i.entry == Some(2))
+            .map(|i| i.window)
+            .collect();
+        assert_eq!(firefoxes, vec![Some(a), Some(b)]);
+        assert!(items[0].is_launcher(), "the launcher is still first");
+    }
+
+    #[test]
+    fn switcher_tiles_keep_the_dock_order() {
+        let (t, f) = ids();
+        // Firefox minimized first, but the terminal is pinned and comes first.
+        let items = window_items(
+            &apps(),
+            &[(f, "Navigator".to_owned()), (t, "raven-terminal".to_owned())],
+        );
+        let order: Vec<Option<WindowId>> = items.iter().map(|i| i.window).collect();
+        assert_eq!(order, vec![None, Some(t), Some(f)]);
+    }
+
+    #[test]
+    fn a_window_of_an_unknown_application_makes_no_tile() {
+        let items = window_items(&apps(), &[(ids().0, "mystery".to_owned())]);
+        assert_eq!(items.len(), 1);
     }
 
     #[test]

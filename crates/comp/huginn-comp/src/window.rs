@@ -89,6 +89,30 @@ impl WindowSurface {
         }
     }
 
+    /// What the window calls this particular window, for telling two windows
+    /// of one application apart in the switcher.
+    ///
+    /// `title` on Wayland, `WM_NAME`/`_NET_WM_NAME` on X11. Empty is normalised
+    /// to `None`, as for [`Self::app_id`].
+    pub(crate) fn title(&self) -> Option<String> {
+        match self {
+            Self::Xdg(t) => with_states(t.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()?
+                    .lock()
+                    .ok()?
+                    .title
+                    .clone()
+            })
+            .filter(|title| !title.is_empty()),
+            Self::X11(x) => {
+                let title = x.title();
+                (!title.is_empty()).then_some(title)
+            }
+        }
+    }
+
     /// Ask the client to close. Politely: both of these are requests the client
     /// is free to answer with a save dialog, and neither kills anything.
     pub(crate) fn close(&self) {
