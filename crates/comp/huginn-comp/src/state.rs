@@ -393,6 +393,8 @@ pub(crate) struct Huginn {
     /// The dock, and its rendered strip.
     pub(crate) dock: crate::dock::Dock,
     dock_panel: Option<crate::canvas::Panel>,
+    /// The switcher's title pill under the strip; only while it is open.
+    dock_caption: Option<crate::canvas::Panel>,
     /// The items the strip currently holds, so a click can be resolved against
     /// the same list that was drawn.
     dock_items: Vec<crate::dock::Item>,
@@ -567,6 +569,7 @@ impl Huginn {
             socket: String::new(),
             dock: crate::dock::Dock::default(),
             dock_panel: None,
+            dock_caption: None,
             dock_items: Vec::new(),
             settings: crate::settings::Settings::new(volume.clone()),
             settings_panel: None,
@@ -806,6 +809,10 @@ impl Huginn {
             && let Some(rect) = self.dock_rect()
         {
             out.push(SceneItem::Overlay(panel.buffer(), rect, 1.0));
+            if let Some(caption) = &self.dock_caption {
+                let below = crate::dock::caption_placement(caption, rect, self.output_area);
+                out.push(SceneItem::Overlay(caption.buffer(), below, 1.0));
+            }
         }
         // A panel's own menu belongs directly on top of the panel, not on top
         // of everything, so each layer surface carries its popups with it.
@@ -1153,8 +1160,9 @@ impl Huginn {
             .collect()
     }
 
-    /// Application ids for panes explicitly put in the background, on any workspace.
-    fn minimized_app_ids(&self) -> Vec<String> {
+    /// Panes explicitly put in the background, on any workspace, with the
+    /// application each belongs to.
+    fn minimized_windows(&self) -> Vec<(huginn_core::window::WindowId, String)> {
         self.space
             .workspaces()
             .iter()
@@ -1164,7 +1172,7 @@ impl Huginn {
                     .window(**id)
                     .is_some_and(huginn_core::window::Window::is_minimized)
             })
-            .filter_map(|id| self.windows.get(id)?.app_id())
+            .filter_map(|id| Some((*id, self.windows.get(id)?.app_id()?)))
             .collect()
     }
 
@@ -1210,16 +1218,29 @@ impl Huginn {
         if self.has_fullscreen() && self.app_switcher.is_none() {
             self.dock.hide_now();
             self.dock_panel = None;
+            self.dock_caption = None;
             self.queue_redraw();
             return;
         }
-        let running = if self.app_switcher.is_some() {
-            self.minimized_app_ids()
+        self.dock_items = if self.app_switcher.is_some() {
+            crate::dock::window_items(&self.apps, &self.minimized_windows())
         } else {
-            self.running_app_ids()
+            crate::dock::items(&self.apps, &self.running_app_ids())
         };
-        self.dock_items = crate::dock::items(&self.apps, &running);
         let selected = self.app_switcher.map(|switcher| switcher.selected);
+        // The switcher names the highlighted window, since two tiles of one
+        // application look alike and the title is what tells them apart.
+        self.dock_caption = selected
+            .and_then(|index| self.dock_items.get(index)?.window)
+            .and_then(|id| self.windows.get(&id)?.title())
+            .and_then(|title| {
+                crate::dock::caption(
+                    &mut self.text,
+                    &title,
+                    self.output_area,
+                    self.scale.advertised,
+                )
+            });
         self.dock_panel = (self.app_switcher.is_some() || self.dock.is_visible(self.uptime()))
             .then(|| {
                 crate::dock::render(
@@ -1428,8 +1449,7 @@ impl Huginn {
 
     /// Temporarily promote the minimized-application dock over the workspace.
     fn open_app_switcher(&mut self) {
-        let running = self.minimized_app_ids();
-        self.dock_items = crate::dock::items(&self.apps, &running);
+        self.dock_items = crate::dock::window_items(&self.apps, &self.minimized_windows());
         let selected = self.switcher_items().into_iter().next();
         let Some(selected) = selected else {
             return;
@@ -1462,39 +1482,38 @@ impl Huginn {
         let Some(switcher) = self.app_switcher.take() else {
             return;
         };
-        let item = self.dock_items.get(switcher.selected).cloned();
-        if let Some(item) = item
-            && let Some(entry) = item.entry.and_then(|index| self.apps.get(index))
-        {
-            let minimized = self
-                .space
-                .workspaces()
-                .iter()
-                .flat_map(|workspace| workspace.windows().iter().copied())
-                .find(|id| {
-                    self.space
-                        .window(*id)
-                        .is_some_and(|window| window.is_minimized())
-                        && self
-                            .windows
-                            .get(id)
-                            .and_then(WindowSurface::app_id)
-                            .is_some_and(|app_id| crate::dock::matches(entry, &app_id))
-                });
-            if let Some(id) = minimized {
-                self.space.bring_to_active_workspace(id);
-                self.space.unminimize(id);
-                if let Some(surface) = self.windows.get(&id) {
-                    surface.set_fullscreen(false);
-                }
-                self.arrange();
-                if let Some(surface) = self.windows.get(&id) {
-                    surface.send_configure();
-                }
-                self.refresh_focus();
-            }
+        // The tile names its window outright; there is nothing to search for.
+        // Checked that it is still minimized, since the window may have been
+        // closed or restored some other way while the switcher was up.
+        let minimized = self
+            .dock_items
+            .get(switcher.selected)
+            .and_then(|item| item.window)
+            .filter(|id| {
+                self.space
+                    .window(*id)
+                    .is_some_and(|window| window.is_minimized())
+            });
+        if let Some(id) = minimized {
+            self.restore_window(id);
         }
         self.refresh_dock();
+    }
+
+    /// Bring a minimized window back onto the active workspace as an ordinary
+    /// tile, and focus it. See [`Self::accept_app_switcher`] for why not
+    /// fullscreen.
+    fn restore_window(&mut self, id: huginn_core::window::WindowId) {
+        self.space.bring_to_active_workspace(id);
+        self.space.unminimize(id);
+        if let Some(surface) = self.windows.get(&id) {
+            surface.set_fullscreen(false);
+        }
+        self.arrange();
+        if let Some(surface) = self.windows.get(&id) {
+            surface.send_configure();
+        }
+        self.refresh_focus();
     }
 
     /// Open the workspace Cover Flow at the active workspace.
@@ -1685,20 +1704,40 @@ impl Huginn {
             }
             return;
         }
-        // Focus the first window belonging to it.
-        let running: Vec<(huginn_core::window::WindowId, String)> = self
+        // Focus the first visible window belonging to it on this workspace.
+        // Failing that, bring back one it has put away: a running indicator
+        // under an icon whose click does nothing reads as broken, and the
+        // one thing a minimized window wants from its icon is to come back.
+        let visible = self
             .space
             .active_workspace()
             .windows()
             .iter()
-            .filter_map(|id| Some((*id, self.windows.get(id)?.app_id()?)))
-            .collect();
-        if let Some((id, _)) = running
-            .iter()
-            .find(|(_, app_id)| crate::dock::matches(entry, app_id))
-        {
-            self.space.active_workspace_mut().focus(*id);
+            .copied()
+            .filter(|id| {
+                self.space
+                    .window(*id)
+                    .is_some_and(|window| !window.is_minimized())
+            })
+            .find(|id| {
+                self.windows
+                    .get(id)
+                    .and_then(WindowSurface::app_id)
+                    .is_some_and(|app_id| crate::dock::matches(entry, &app_id))
+            });
+        if let Some(id) = visible {
+            self.space.active_workspace_mut().focus(id);
             self.refresh_focus();
+            return;
+        }
+        let minimized = self
+            .minimized_windows()
+            .into_iter()
+            .find(|(_, app_id)| crate::dock::matches(entry, app_id))
+            .map(|(id, _)| id);
+        if let Some(id) = minimized {
+            self.restore_window(id);
+            self.refresh_dock();
         }
     }
 
