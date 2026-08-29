@@ -173,13 +173,13 @@ client cannot receive or override them:
 | `Super+C` / `Super+V` | copy / paste in the focused client |
 | `Super+L` | lock the session |
 | `Super+Shift+Space` | open the application launcher |
-| `Super+A` | open the pinned applications |
+| `Super+Shift+A` | open the pinned applications |
 | `Super+Shift+S` | open quick settings |
 | `Super+Shift+H` | show or hide the keybinding list |
 | `Super+Shift+Esc` | quit the compositor |
 | volume keys | raise, lower or mute the output volume |
 
-`Super+L` and `Super+A` are the two chords on the plain `Super` layer that are never handed back.
+`Super+L` is the one chord on the plain `Super` layer that is never handed back.
 `Super+C` and `Super+V` are given to a client that drives `Super` itself, since
 a terminal has its own use for them; `Super+L` is not, because a lock chord that
 does nothing whenever a terminal happens to be focused fails at exactly the
@@ -194,7 +194,7 @@ through `wpctl`, so it needs PipeWire, and the slider says "not connected" when
 there is none. The same level is a row in quick settings (`Super+Shift+S`),
 where the left and right arrows step it and `Return` mutes.
 
-The pinned panel (`Super+A`) shows the applications the user has pinned,
+The pinned panel (`Super+Shift+A`) shows the applications the user has pinned,
 drawn the way the launcher draws its suggestions. Things get onto it through
 the launcher: `Tab` on an application opens its actions menu, whose last item
 is "Pin" (or "Unpin"). On the panel, `Return` opens the highlighted

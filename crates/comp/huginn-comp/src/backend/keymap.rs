@@ -226,7 +226,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         action: Action::OpenPinned,
-        chord: "Super+A",
+        chord: "Super+Shift+A",
         description: "open the pinned applications",
     },
     Binding {
@@ -361,12 +361,6 @@ pub(crate) fn resolve(
         if matches!(sym, keysyms::KEY_l | keysyms::KEY_L) {
             return FilterResult::Intercept(pressed(key_state, Action::Lock));
         }
-        // The pinned panel is the other one: it is the chord asked for, and
-        // a panel that opens everywhere except over a terminal would be
-        // found broken exactly where it is reached for most.
-        if matches!(sym, keysyms::KEY_a | keysyms::KEY_A) {
-            return FilterResult::Intercept(pressed(key_state, Action::OpenPinned));
-        }
         // Copy and paste are borrowed back, and only from clients that have no
         // use of their own for the chord.
         if mode.focus_owns_super {
@@ -382,6 +376,7 @@ pub(crate) fn resolve(
 
     let action = match sym {
         keysyms::KEY_space => Action::OpenLauncher,
+        keysyms::KEY_a | keysyms::KEY_A => Action::OpenPinned,
         keysyms::KEY_s | keysyms::KEY_S => Action::OpenSettings,
         keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
         // Shift is what separates this from `Super`+`C`, which is copy: the
@@ -719,16 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn super_a_opens_the_pinned_panel_and_the_panel_takes_every_key() {
+    fn super_shift_a_opens_the_pinned_panel_and_the_panel_takes_every_key() {
         assert_eq!(
-            intercepted(super_held(), keysyms::KEY_a),
+            intercepted(super_shift(), keysyms::KEY_a),
             Some(Action::OpenPinned)
         );
-        // Like Super+L, not given back to a client that owns the Super layer.
-        assert!(matches!(
-            with_super_owned(super_held(), keysyms::KEY_A),
-            FilterResult::Intercept(Some(Action::OpenPinned))
-        ));
+        // Plain Super+A stays the application's.
+        assert!(forwarded(KeyState::Pressed, super_held(), keysyms::KEY_a));
         let mode = Modes {
             pinned_open: true,
             ..Modes::default()
