@@ -326,7 +326,7 @@ pub(crate) struct Huginn {
     /// buffer, or one whose only buffer was painted at a size it has since been
     /// told to change, is what shows a frame of white or garbage when a
     /// Chromium-based application starts. See the design spec, §5.
-    mapped: HashSet<WindowId>,
+    pub(crate) mapped: HashSet<WindowId>,
 
     /// Menus, dropdowns and tooltips, and the modal grabs that dismiss them.
     ///
@@ -3230,6 +3230,12 @@ impl Huginn {
         // outside it to put a ring, and the point of fullscreen is that nothing
         // else is on screen to tell it apart from.
         if window.mode == WindowMode::Fullscreen {
+            return None;
+        }
+        // A minimized window is in the dock, not on the desktop, and its
+        // geometry is wherever its pane was before it left. Ringing that
+        // would outline empty space inside whichever pane grew into it.
+        if window.is_minimized() {
             return None;
         }
         // Around where the window is *drawn*, so the ring travels with a

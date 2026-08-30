@@ -158,10 +158,18 @@ impl Huginn {
     ) -> Option<huginn_core::window::WindowId> {
         let p = huginn_core::geometry::Point::new(point.x as i32, point.y as i32);
         // Every screen's workspace: the click may be on the other monitor.
+        //
+        // A minimized window keeps the geometry it had when it left the
+        // layout, and that rectangle is now under the pane that grew to fill
+        // it. It is not on screen, so it cannot be clicked: matching it would
+        // focus a window nobody can see and ring the empty space it used to
+        // occupy. Unmapped windows are skipped for the same reason.
         self.visible_window_ids().into_iter().rev().find(|id| {
-            self.space
-                .window(*id)
-                .is_some_and(|w| w.geometry.contains(p))
+            self.mapped.contains(id)
+                && self
+                    .space
+                    .window(*id)
+                    .is_some_and(|w| !w.is_minimized() && w.geometry.contains(p))
         })
     }
 
