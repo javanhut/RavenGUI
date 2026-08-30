@@ -2552,6 +2552,11 @@ impl Huginn {
             // panel itself does not need recomposing — but a frame still has
             // to be asked for, or the motion happens with nothing drawing it.
             self.queue_redraw();
+        } else if self.launcher_panel.is_some() && !self.launcher.is_visible(now) {
+            // The close animation has ended; the pixels can go. Left in place,
+            // the panel would keep steering `blur_rect` under whatever opens
+            // next.
+            self.refresh_launcher();
         }
         if self.pinned.is_animating(now) {
             self.queue_redraw();
