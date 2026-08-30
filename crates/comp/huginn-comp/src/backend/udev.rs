@@ -1657,6 +1657,7 @@ impl Udev {
             Action::OpenSettings => state.open_settings(),
             Action::Settings(key) => state.settings_key(key),
             Action::OpenFullSettings => state.open_full_settings(),
+            Action::OpenStore => state.open_store(),
             Action::OpenLauncher => state.open_launcher(),
             Action::OpenPinned => state.open_pinned(),
             Action::Pinned(key) => state.pinned_key(key),

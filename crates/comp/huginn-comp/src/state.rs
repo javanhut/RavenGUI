@@ -752,6 +752,11 @@ impl Huginn {
         self.launch(None, &[crate::theme::SETTINGS_APP.to_owned()]);
     }
 
+    /// Open the software store.
+    pub(crate) fn open_store(&mut self) {
+        self.launch(None, &[crate::theme::STORE_APP.to_owned()]);
+    }
+
     /// Show or hide the keybinding overlay.
     ///
     /// Rendered on the way in rather than kept around: it is a few hundred
