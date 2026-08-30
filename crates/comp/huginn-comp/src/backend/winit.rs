@@ -172,12 +172,22 @@ pub(crate) fn run() -> Result<()> {
     let socket_source = ListeningSocketSource::new_auto().context("binding wayland socket")?;
     let socket = socket_source.socket_name().to_string_lossy().into_owned();
 
+    let (disconnect, disconnects) =
+        calloop::ping::make_ping().context("creating the client-disconnect ping")?;
     handle
-        .insert_source(socket_source, |stream, _, data: &mut Nested| {
+        .insert_source(disconnects, |_, _, data: &mut Nested| {
+            if data.state.recover_lost_lock() {
+                data.arm_claim_timeout();
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("client-disconnect source: {e}"))?;
+
+    handle
+        .insert_source(socket_source, move |stream, _, data: &mut Nested| {
             if let Err(e) = data
                 .display
                 .handle()
-                .insert_client(stream, Arc::new(ClientState::default()))
+                .insert_client(stream, Arc::new(ClientState::new(disconnect.clone())))
             {
                 tracing::warn!(error = %e, "could not accept a client");
             }
@@ -260,10 +270,16 @@ impl Nested {
     /// it: a lock screen that never claims the blank must not leave a nested
     /// window that can only be closed from outside.
     fn lock_session(&mut self) {
-        const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
         if self.state.is_locked() || !self.state.lock_and_launch() {
             return;
         }
+        self.arm_claim_timeout();
+    }
+
+    /// The claim timeout, armed for the first lock screen and for each one
+    /// started again after a crash; see `Huginn::recover_lost_lock`.
+    fn arm_claim_timeout(&mut self) {
+        const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
         let timer = Timer::from_duration(CLAIM_TIMEOUT);
         if let Err(e) = self.handle.insert_source(timer, |_, _, data: &mut Nested| {
             data.state.abandon_lock_if_unclaimed();
