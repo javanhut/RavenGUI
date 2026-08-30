@@ -80,7 +80,20 @@ impl Wallpaper {
     /// nobody has set one on. A file that is there and will not decode is a
     /// warning, because somebody did something and it did not work.
     pub(crate) fn installed() -> Option<Self> {
-        let path = installed_path()?;
+        Self::at(installed_path()?)
+    }
+
+    /// The user's own choice from `desktop.toml` when it names a file that
+    /// decodes, otherwise the machine's. `ravencanvasd` draws over both when
+    /// it runs; this is what shows when it does not.
+    pub(crate) fn chosen_or_installed(chosen: Option<PathBuf>) -> Option<Self> {
+        chosen
+            .filter(|p| p.is_file())
+            .and_then(Self::at)
+            .or_else(Self::installed)
+    }
+
+    fn at(path: PathBuf) -> Option<Self> {
         match load(&path) {
             Ok(wallpaper) => {
                 tracing::info!(

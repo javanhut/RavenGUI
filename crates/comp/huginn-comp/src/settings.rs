@@ -110,6 +110,19 @@ impl IdleAfter {
         }
     }
 
+    /// The closest setting to a number of minutes, for `desktop.toml`.
+    /// Zero is never; anything else rounds up to the next step, so a request
+    /// to lock sooner is never quietly made later.
+    pub(crate) fn from_minutes(minutes: u32) -> Self {
+        match minutes {
+            0 => Self::Off,
+            1..=5 => Self::Minutes5,
+            6..=10 => Self::Minutes10,
+            11..=15 => Self::Minutes15,
+            _ => Self::Minutes30,
+        }
+    }
+
     fn from_value(value: &str) -> Option<Self> {
         [
             Self::Off,
@@ -181,6 +194,41 @@ pub(crate) trait Control: std::fmt::Debug {
     /// a next step. A toggle is never finished in that sense.
     fn concluded(&self) -> bool {
         false
+    }
+    /// A program the row wants started, once. The panel cannot spawn — that
+    /// takes the compositor's socket — so it hands the name up and the
+    /// compositor launches it after the press is handled.
+    fn take_launch(&mut self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// The row that leaves the panel for the settings application, which is
+/// where everything this panel is too small for lives.
+#[derive(Debug, Default)]
+struct AllSettings {
+    requested: bool,
+}
+
+impl Control for AllSettings {
+    fn label(&self) -> &str {
+        "All settings"
+    }
+    fn read(&self) -> Reading {
+        Reading {
+            value: "Open".to_owned(),
+            real: true,
+        }
+    }
+    fn activate(&mut self) -> bool {
+        self.requested = true;
+        true
+    }
+    fn concluded(&self) -> bool {
+        self.requested
+    }
+    fn take_launch(&mut self) -> Option<&'static str> {
+        self.requested.then_some(crate::theme::SETTINGS_APP)
     }
 }
 
@@ -899,6 +947,7 @@ impl Settings {
                 Box::new(Brightness { percent: 75 }),
                 Box::new(WiFi { on: true }),
                 Box::new(BluetoothRow::new(Box::new(crate::bluetooth::Unavailable))),
+                Box::new(AllSettings::default()),
                 // Last, so that stepping down through the panel arrives at it
                 // deliberately and a stray Return on the first row is a mute,
                 // not a shutdown.
@@ -981,6 +1030,24 @@ impl Settings {
             .find(|c| c.label() == PINS_LAYOUT)
             .and_then(|c| crate::pins::Orientation::from_value(&c.read().value))
             .unwrap_or_default()
+    }
+
+    /// Give the Animations and Lock rows what `desktop.toml` said. Called at
+    /// startup and whenever the file changes; between those the rows are the
+    /// source, as with [`Self::set_pins_layout`].
+    pub(crate) fn apply_desktop_config(&mut self, motion: Motion, after: IdleAfter) {
+        for control in &mut self.controls {
+            if control.label() == "Animations" {
+                *control = Box::new(Animations { motion });
+            } else if control.label() == "Lock when idle" {
+                *control = Box::new(IdleLock { after });
+            }
+        }
+    }
+
+    /// A program a row asked for on its last activation, if any. Taken once.
+    pub(crate) fn take_launch(&mut self) -> Option<&'static str> {
+        self.controls.iter_mut().find_map(|c| c.take_launch())
     }
 
     /// Give the pinned rows what the file said. Called once at startup,
@@ -1177,7 +1244,7 @@ fn compose(
         size,
         pad as i32,
         pad as i32,
-        crate::theme::ACCENT,
+        crate::theme::accent(),
     );
     canvas.fill(
         pad as usize,
@@ -1197,7 +1264,7 @@ fn compose(
                 y as usize,
                 width - 2,
                 row as usize,
-                crate::theme::ACCENT,
+                crate::theme::accent(),
                 0x2E,
             );
             canvas.fill(
@@ -1205,7 +1272,7 @@ fn compose(
                 y as usize,
                 (3.0 * scale) as usize,
                 row as usize,
-                crate::theme::ACCENT.to_rgba_bytes(),
+                crate::theme::accent().to_rgba_bytes(),
             );
         }
 
@@ -1245,7 +1312,7 @@ fn compose(
                         filled as usize,
                         track_h as usize,
                         track_h / 2.0,
-                        crate::theme::ACCENT,
+                        crate::theme::accent(),
                     );
                 }
                 let knob = 10.0 * scale;
@@ -1284,7 +1351,7 @@ fn compose(
             (width as f32 - pad - value_w) as i32,
             text_y,
             if reading.real {
-                crate::theme::ACCENT
+                crate::theme::accent()
             } else {
                 crate::theme::TEXT_DIM
             },

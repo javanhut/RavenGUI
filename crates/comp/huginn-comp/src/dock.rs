@@ -455,7 +455,7 @@ pub(crate) fn render(
                 (icon + inset * 2.0) as usize,
                 (icon + inset * 2.0) as usize,
                 icon * 0.24,
-                crate::theme::ACCENT.with_alpha(0x70),
+                crate::theme::accent().with_alpha(0x70),
             );
         }
         if item.is_launcher() {
@@ -485,7 +485,7 @@ pub(crate) fn render(
                 dot as usize,
                 dot as usize,
                 dot / 2.0,
-                crate::theme::ACCENT,
+                crate::theme::accent(),
             );
         }
     }
@@ -688,7 +688,7 @@ fn draw_launcher_glyph(canvas: &mut Canvas, x: f32, y: f32, size: f32, scale: f3
                 cell as usize,
                 cell as usize,
                 (2.0 * scale).max(1.0),
-                crate::theme::ACCENT,
+                crate::theme::accent(),
             );
         }
     }
@@ -1213,7 +1213,7 @@ mod dump {
                     dot as usize,
                     dot as usize,
                     dot / 2.0,
-                    crate::theme::ACCENT,
+                    crate::theme::accent(),
                 );
             }
         }

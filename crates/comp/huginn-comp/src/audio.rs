@@ -465,7 +465,7 @@ fn compose(volume: &Volume, text: &mut Text, output: Rect, density: u32) -> Canv
         if level.muted {
             crate::theme::TEXT_DIM
         } else {
-            crate::theme::ACCENT
+            crate::theme::accent()
         },
     );
 
@@ -490,7 +490,7 @@ fn compose(volume: &Volume, text: &mut Text, output: Rect, density: u32) -> Canv
             filled as usize,
             track_h as usize,
             track_h / 2.0,
-            crate::theme::ACCENT,
+            crate::theme::accent(),
         );
     }
 
@@ -807,7 +807,7 @@ mod tests {
         }
         let output = Rect::from_xywh(0, 0, 1920, 1080);
         // Count accent-coloured pixels along the track's centre line.
-        let accent = crate::theme::ACCENT.to_rgba_bytes();
+        let accent = crate::theme::accent().to_rgba_bytes();
         let mut filled = |volume: &Volume| {
             let canvas = compose(volume, &mut text, output, 1);
             let row = (HEIGHT - PAD - TRACK / 2.0) as usize;

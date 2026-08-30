@@ -266,6 +266,7 @@ pub(crate) fn run() -> Result<()> {
     // here for the same reason XWayland is: it only registers an event source,
     // and everything it does happens later, from the loop.
     crate::appwatch::start::<Udev>(&handle);
+    crate::configwatch::start::<Udev>(&handle);
     crate::fileindex::start::<Udev>(&handle, &mut state);
     // BlueZ, for the quick settings row. Same shape: a thread and a wake-up.
     crate::bluetooth::start::<Udev>(&handle, &mut state);
@@ -1617,15 +1618,8 @@ impl Udev {
                 state.toggle_workspace_carousel();
             }
             Action::OpenSettings => state.open_settings(),
-            Action::Settings(key) => {
-                let now = state.uptime();
-                match state.settings.press(key, now) {
-                    crate::settings::Outcome::Dismissed | crate::settings::Outcome::Redraw => {
-                        state.refresh_settings()
-                    }
-                    crate::settings::Outcome::Unchanged => {}
-                }
-            }
+            Action::Settings(key) => state.settings_key(key),
+            Action::OpenFullSettings => state.open_full_settings(),
             Action::OpenLauncher => state.open_launcher(),
             Action::OpenPinned => state.open_pinned(),
             Action::Pinned(key) => state.pinned_key(key),

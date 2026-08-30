@@ -617,7 +617,23 @@ impl Space {
     /// Minimize the focused pane while leaving its client alive in this workspace.
     pub fn minimize_focused(&mut self) -> Option<WindowId> {
         let id = self.focused()?;
-        self.windows.get_mut(&id)?.minimize();
+        self.minimize(id).then_some(id)
+    }
+
+    /// Put one window away, wherever it is. If it was the focused one, focus
+    /// moves to the next window still showing on the active workspace. Call
+    /// [`Self::arrange`] afterwards. Returns whether anything changed.
+    pub fn minimize(&mut self, id: WindowId) -> bool {
+        let Some(window) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        if window.is_minimized() {
+            return false;
+        }
+        window.minimize();
+        if self.focused() != Some(id) {
+            return true;
+        }
 
         let next = self.workspaces[self.active]
             .windows()
@@ -631,7 +647,7 @@ impl Space {
                         .is_some_and(|window| !window.is_minimized())
             });
         self.workspaces[self.active].set_focus(next);
-        Some(id)
+        true
     }
 
     /// Bring a minimized window back into the layout, and report whether it

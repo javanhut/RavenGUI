@@ -166,20 +166,32 @@ knows. That is macOS's "looks like 2560×1440" done per surface rather than to
 the finished frame, which costs nothing in code because `DrmCompositor` already
 composes at whatever fraction the output reports.
 
-## No configuration
+## Configuration: one file, written by Settings
 
-There is no config file. The desktop ships one look and one set of behaviours,
-compiled in — see `huginn-comp/src/theme.rs`, which is the whole visual
-language, and `backend/keymap.rs`, which is the whole keymap.
+The desktop ships one look and one set of behaviours, compiled in — see
+`huginn-comp/src/theme.rs`, which is the whole visual language, and
+`backend/keymap.rs`, which is the whole keymap. There is no `HUGINN_TERMINAL`
+override: an environment variable is a user-facing configuration surface with
+extra steps.
 
-This is a deliberate constraint rather than an unfinished feature. A format a
-user can write is a format that must not change between releases, and a config
-schema drifting under someone is the commonest way a compositor breaks a
-desktop that was working. A constant cannot drift, because nothing outside the
-binary ever names it.
+What a person may change lives in exactly one file, `~/.config/raven/desktop.toml`,
+written by the Settings application (`raven-settings`, `Super+Ctrl+P`, or the
+"All settings" row in quick settings) and read by the compositor at start and
+whenever it changes (`huginn-comp/src/desktop_config.rs`, `configwatch.rs`).
+Of that file the compositor honours the accent, animations, the idle lock
+timeout, the terminal the spawn chord opens, a wallpaper of its own for
+when `ravencanvasd` is not running, and `blur` — which blurs the desktop
+behind *glass* windows (translucent clients that ask for it by `app_id`;
+Raven Settings today) using the launcher's blur pass. Clients' own minimize
+buttons (`xdg_toplevel.set_minimized`) go to the dock like the gesture. Every key is optional, an absent file is
+the compiled-in look, and a file that does not parse is logged and ignored
+rather than half-applied. The rest of the file — theme mode, blur, scale, the
+bar — is for the applications and RoostBar, which read it themselves.
 
-There is no `HUGINN_TERMINAL` override either: an environment variable is a
-user-facing configuration surface with extra steps.
+This is still a deliberate constraint rather than an unfinished feature. A
+format a user can write is a format that must not change between releases,
+which is why the compositor's share of it is five keys with defaults, and why
+the file is written by a program that knows the schema rather than by hand.
 
 What this constrains is configuration, not extension. Software written outside
 this repository still gets a surface on the desktop — as a layer-shell client,

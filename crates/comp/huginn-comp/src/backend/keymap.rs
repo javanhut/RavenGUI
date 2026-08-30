@@ -72,6 +72,8 @@ pub(crate) enum Action {
     ToggleHelp,
     /// Open the application launcher.
     OpenLauncher,
+    /// Open the settings application — the full one, not the panel.
+    OpenFullSettings,
     /// Enter resize mode: arrows then resize the focused window.
     EnterResize,
     /// Resize the focused window while in resize mode.
@@ -249,6 +251,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "open quick settings",
     },
     Binding {
+        action: Action::OpenFullSettings,
+        chord: "Super+Ctrl+P",
+        description: "open the settings application",
+    },
+    Binding {
         action: Action::ToggleHelp,
         chord: "Super+Ctrl+H",
         description: "show or hide this list",
@@ -396,6 +403,8 @@ pub(crate) fn resolve(
         keysyms::KEY_space => Action::OpenLauncher,
         keysyms::KEY_a | keysyms::KEY_A => Action::OpenPinned,
         keysyms::KEY_s | keysyms::KEY_S => Action::OpenSettings,
+        // P for preferences: S is the panel, and the two sit together.
+        keysyms::KEY_p | keysyms::KEY_P => Action::OpenFullSettings,
         keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
         // Ctrl is what separates this from `Super`+`C`, which is copy: the
         // branch above returns before this one whenever Ctrl is not held.

@@ -167,6 +167,7 @@ client cannot receive or override them:
 | `Super+Ctrl+arrows` | move the focused window between tiles |
 | `Super+Ctrl+Return` | swap the focused window into the first tile |
 | `Super+Ctrl+C` | open or accept the workspace carousel |
+| `Super+Ctrl+P` | open the settings application |
 | `Super+Ctrl+R` | resize the focused window with the arrows |
 | `Super+Ctrl+1..9` | go to a workspace |
 | `Super+Ctrl+Shift+1..9` | send the focused window to a workspace |
