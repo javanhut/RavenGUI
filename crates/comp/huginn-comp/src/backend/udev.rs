@@ -1594,7 +1594,7 @@ impl Udev {
             && key_state == smithay::backend::input::KeyState::Pressed
             && !matches!(action, Some(Action::Resize(_)))
         {
-            self.state.resizing = false;
+            self.state.set_resize_mode(false);
         }
         if let Some(action) = action {
             self.apply(action, time);
@@ -1646,11 +1646,11 @@ impl Udev {
             Action::FocusNextOutput => state.focus_next_output(),
             Action::SendToNextOutput => state.send_focused_to_next_output(),
             Action::EnterResize => {
-                state.resizing = true;
+                state.set_resize_mode(true);
                 tracing::debug!("resize mode: arrows resize, Escape or Return leaves");
             }
             Action::Resize(dir) => state.resize_focused(dir),
-            Action::LeaveResize => state.resizing = false,
+            Action::LeaveResize => state.set_resize_mode(false),
             Action::ToggleCarousel => {
                 state.toggle_workspace_carousel();
             }

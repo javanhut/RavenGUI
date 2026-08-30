@@ -54,6 +54,57 @@ pub(crate) enum WindowSurface {
 }
 
 impl WindowSurface {
+    /// Tell a native client whether the compositor has tiled it.
+    ///
+    /// The size in a configure is enough to place a surface, but it is not the
+    /// whole xdg-shell contract for a tiled window. Toolkits use the four tiled
+    /// edge states to remove free-window shadows and resize handles, and some
+    /// defer their tiled layout until those states arrive. Every edge is tiled
+    /// here because a pane is compositor-owned on all four sides, including at
+    /// an output edge where the configured gap still belongs to the layout.
+    /// X11 has no equivalent per-edge state; its geometry is authoritative and
+    /// is applied directly in [`Self::configure`].
+    pub(crate) fn set_tiled(&self, tiled: bool) {
+        let Self::Xdg(t) = self else {
+            return;
+        };
+        t.with_pending_state(|state| {
+            use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+            for edge in [
+                xdg_toplevel::State::TiledTop,
+                xdg_toplevel::State::TiledRight,
+                xdg_toplevel::State::TiledBottom,
+                xdg_toplevel::State::TiledLeft,
+            ] {
+                if tiled {
+                    state.states.set(edge);
+                } else {
+                    state.states.unset(edge);
+                }
+            }
+        });
+    }
+
+    /// Mark a native client as being interactively resized.
+    ///
+    /// External toolkits use this hint to switch to their responsive resize
+    /// path instead of treating each configure as an unrelated final size.
+    /// X11 clients resize immediately when configured and need no matching
+    /// state transition.
+    pub(crate) fn set_resizing(&self, resizing: bool) {
+        let Self::Xdg(t) = self else {
+            return;
+        };
+        t.with_pending_state(|state| {
+            use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+            if resizing {
+                state.states.set(xdg_toplevel::State::Resizing);
+            } else {
+                state.states.unset(xdg_toplevel::State::Resizing);
+            }
+        });
+    }
+
     /// The Wayland surface backing this window, if it has one yet.
     ///
     /// `None` for an X11 window between its creation and XWayland associating a
@@ -166,6 +217,13 @@ impl WindowSurface {
 
     /// Tell the client that the compositor has put it in fullscreen state.
     pub(crate) fn set_fullscreen(&self, fullscreen: bool) {
+        // Fullscreen and tiled are mutually exclusive descriptions. Keeping
+        // stale tiled edges in the fullscreen configure confuses toolkits that
+        // choose their decorations and resize path from this state set.
+        self.set_tiled(!fullscreen);
+        if fullscreen {
+            self.set_resizing(false);
+        }
         match self {
             Self::Xdg(t) => {
                 t.with_pending_state(|state| {

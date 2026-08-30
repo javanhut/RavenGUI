@@ -2530,6 +2530,25 @@ impl Huginn {
         }
     }
 
+    /// Enter or leave keyboard resize mode and mirror it to the focused
+    /// xdg-toplevel.
+    ///
+    /// Keeping this transition beside the layout operation matters for
+    /// third-party clients: GTK, Qt and Chromium all understand the standard
+    /// `resizing` state, while none can know about Raven's private key mode.
+    /// The state-only configure on entry and exit brackets the size configures
+    /// produced by [`Self::resize_focused`].
+    pub(crate) fn set_resize_mode(&mut self, resizing: bool) {
+        if self.resizing == resizing {
+            return;
+        }
+        self.resizing = resizing;
+        if let Some(surface) = self.space.focused().and_then(|id| self.windows.get(&id)) {
+            surface.set_resizing(resizing);
+            surface.send_configure();
+        }
+    }
+
     /// Open the launcher, growing it out of the dock's launcher icon.
     ///
     /// The origin is only taken when the dock is actually on screen — §4 asks
@@ -3927,6 +3946,7 @@ impl XdgShellHandler for Huginn {
         // configure below is the first the client ever sees.
         self.arrange();
 
+        WindowSurface::Xdg(surface.clone()).set_tiled(true);
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
             state.size = Some(self.space.window(id).map_or_else(
