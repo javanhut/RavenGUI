@@ -103,6 +103,19 @@ pub(crate) fn elements_split(
     scale: f64,
 ) -> (Vec<HuginnElement>, Vec<HuginnElement>) {
     let all = elements(renderer, state, fallback_cursor, view, scale);
+    // A glass window is found by its own elements rather than by counting:
+    // a surface tree yields one element per subsurface, so a scene index is
+    // not an element index. Everything up to and including the last element
+    // of that surface stays sharp; the rest is what shows through it.
+    if let Some(surface) = state.glass_surface() {
+        use smithay::backend::renderer::element::Element as _;
+        let wanted = smithay::backend::renderer::element::Id::from_wayland_resource(&surface);
+        if let Some(last) = all.iter().rposition(|e| *e.id() == wanted) {
+            let mut front = all;
+            let back = front.split_off(last + 1);
+            return (front, back);
+        }
+    }
     // `elements` puts the cursor in front of everything `scene` produced, so
     // the boundary is that plus the panels above it.
     let cursor = all.len() - state.scene().len();

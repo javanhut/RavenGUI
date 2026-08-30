@@ -2723,36 +2723,30 @@ impl Huginn {
     /// present only when it is. Counted rather than hardcoded so the boundary
     /// cannot drift from the order [`Huginn::scene`] actually pushes in.
     ///
-    /// With no panel open and a glass window on screen, the boundary moves
-    /// down to just past that window: everything the scene draws in front of
-    /// it stays sharp, and everything behind it is what shows through.
+    /// With no panel open and a glass window on screen the renderer ignores
+    /// this and splits at the window's own elements — see [`Self::glass_surface`].
     pub(crate) fn blur_boundary(&self) -> usize {
-        let panels = usize::from(self.help.is_some())
+        usize::from(self.help.is_some())
             + usize::from(self.volume_panel.is_some())
             + usize::from(self.launcher_panel.is_some())
             + usize::from(self.pinned_panel.is_some())
-            + usize::from(self.settings_panel.is_some());
+            + usize::from(self.settings_panel.is_some())
+    }
+
+    /// The glass window's surface, when it — not a panel — is what the blur
+    /// is for. The renderer splits the scene at its elements; see
+    /// `render::elements_split`.
+    pub(crate) fn glass_surface(&self) -> Option<WlSurface> {
         if self.panel_blur_open() {
-            return panels;
+            return None;
         }
-        match self.glass_window() {
-            Some((id, _)) => self.scene_index_of(id).map_or(panels, |i| i + 1),
-            None => panels,
-        }
+        let (id, _) = self.glass_window()?;
+        self.windows.get(&id)?.wl_surface()
     }
 
     /// Whether a panel that blurs is on screen (mid-animation included).
     fn panel_blur_open(&self) -> bool {
         self.launcher_panel.is_some() || self.pinned_panel.is_some()
-    }
-
-    /// Where a window's surface sits in [`Self::scene`], front to back.
-    fn scene_index_of(&self, id: WindowId) -> Option<usize> {
-        let wanted = self.windows.get(&id)?.wl_surface()?;
-        self.scene().iter().position(|item| match item {
-            SceneItem::Surface(surface, _) => *surface == wanted,
-            _ => false,
-        })
     }
 
     /// Windows that draw themselves translucent and ask for the desktop
