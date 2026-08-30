@@ -404,6 +404,8 @@ pub(crate) struct Huginn {
     /// set, and leaves the backends' clear colour showing.
     wallpaper: Option<crate::wallpaper::Wallpaper>,
     wallpaper_panels: Vec<Option<crate::canvas::Panel>>,
+    /// What `~/.config/raven/desktop.toml` said when last read.
+    desktop_config: crate::desktop_config::DesktopConfig,
 
     /// Whether the arrows are currently resizing the focused window.
     ///
@@ -542,6 +544,8 @@ pub(crate) fn place_in_pane(surface: &WlSurface, pane: Rect) -> Rect {
 
 impl Huginn {
     pub(crate) fn new(dh: &DisplayHandle, area: Rect) -> Self {
+        let desktop_config = crate::desktop_config::DesktopConfig::load();
+        crate::theme::set_accent(desktop_config.accent());
         let volume = crate::audio::Volume::detect().shared();
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(dh, "huginn");
@@ -611,7 +615,7 @@ impl Huginn {
             staged_layout: Vec::new(),
             layout_changed: false,
             focus_ring: std::array::from_fn(|_| {
-                SolidColorBuffer::new((0, 0), crate::theme::ACCENT.to_rgba_f32())
+                SolidColorBuffer::new((0, 0), crate::theme::accent().to_rgba_f32())
             }),
             workspace_card: SolidColorBuffer::new(
                 (area.w(), area.h()),
@@ -621,7 +625,8 @@ impl Huginn {
             motions: HashMap::new(),
             focus_ring_shown: None,
             help: None,
-            wallpaper: crate::wallpaper::Wallpaper::installed(),
+            wallpaper: crate::wallpaper::Wallpaper::chosen_or_installed(desktop_config.wallpaper()),
+            desktop_config,
             wallpaper_panels: Vec::new(),
             resizing: false,
             socket: String::new(),
@@ -656,6 +661,65 @@ impl Huginn {
             .settings
             .set_pins_layout(huginn.pins.position(), huginn.pins.orientation());
         huginn
+            .settings
+            .apply_desktop_config(huginn.desktop_config.motion(), huginn.desktop_config.idle_after());
+        huginn
+    }
+
+    /// Re-read `desktop.toml` and apply what changed. Driven by
+    /// [`crate::configwatch`] when the settings application saves.
+    pub(crate) fn reload_desktop_config(&mut self) {
+        let cfg = crate::desktop_config::DesktopConfig::load();
+        tracing::info!("desktop settings changed");
+
+        crate::theme::set_accent(cfg.accent());
+        let accent = crate::theme::accent().to_rgba_f32();
+        for ring in &mut self.focus_ring {
+            ring.set_color(accent);
+        }
+
+        self.settings.apply_desktop_config(cfg.motion(), cfg.idle_after());
+
+        if cfg.wallpaper() != self.desktop_config.wallpaper() {
+            self.wallpaper = crate::wallpaper::Wallpaper::chosen_or_installed(cfg.wallpaper());
+            self.wallpaper_panels = self
+                .outputs
+                .iter()
+                .map(|output| {
+                    self.wallpaper
+                        .as_ref()
+                        .map(|w| w.panel(output.scale.render, output.scale.advertised))
+                })
+                .collect();
+        }
+        self.desktop_config = cfg;
+
+        // Everything compositor-drawn reads the accent when it renders, so
+        // rebuild what is on screen.
+        self.refresh_dock();
+        self.refresh_settings();
+        self.refresh_launcher();
+        self.refresh_pinned();
+        self.queue_redraw();
+    }
+
+    /// A key for the quick settings panel, and whatever a row asked for.
+    pub(crate) fn settings_key(&mut self, key: crate::settings::Key) {
+        let now = self.uptime();
+        match self.settings.press(key, now) {
+            crate::settings::Outcome::Dismissed | crate::settings::Outcome::Redraw => {
+                self.refresh_settings()
+            }
+            crate::settings::Outcome::Unchanged => {}
+        }
+        if let Some(program) = self.settings.take_launch() {
+            self.launch(None, &[program.to_owned()]);
+        }
+    }
+
+    /// Open the settings application.
+    pub(crate) fn open_full_settings(&mut self) {
+        self.launch(None, &[crate::theme::SETTINGS_APP.to_owned()]);
     }
 
     /// Show or hide the keybinding overlay.
@@ -1359,9 +1423,10 @@ impl Huginn {
         self.windows.get(&id)?.app_id()
     }
 
-    /// The terminal to launch for the spawn binding.
-    pub(crate) fn terminal_command(&self) -> &'static str {
-        crate::theme::TERMINAL
+    /// The terminal to launch for the spawn binding: `desktop.toml`'s, or
+    /// the compiled-in one.
+    pub(crate) fn terminal_command(&self) -> &str {
+        self.desktop_config.terminal()
     }
 
     /// Adopt the scale a newly-configured output decided on.
@@ -2098,13 +2163,22 @@ impl Huginn {
 
     /// Put only the highlighted pane in the background, leaving the workspace usable.
     fn minimize_focused(&mut self) {
+        if let Some(id) = self.space.focused() {
+            self.minimize_window(id);
+        }
+    }
+
+    /// Put one window away to the dock, with the flight that shows where it
+    /// went. The gesture and the chord minimize the focused one; a client's
+    /// own minimize button — `xdg_toplevel.set_minimized` — names its window.
+    pub(crate) fn minimize_window(&mut self, id: WindowId) {
         let now = self.uptime();
         // Where it is on screen right now, before the core forgets it is
         // there: the flight to the dock starts from here.
-        let from = self.space.focused().and_then(|id| self.drawn_rect(id, now));
-        let Some(id) = self.space.minimize_focused() else {
+        let from = self.drawn_rect(id, now);
+        if !self.space.minimize(id) {
             return;
-        };
+        }
         if let Some(surface) = self.windows.get(&id) {
             surface.set_fullscreen(false);
             surface.send_configure();
@@ -2648,21 +2722,88 @@ impl Huginn {
     /// The help overlay, the launcher and quick settings, in that order — each
     /// present only when it is. Counted rather than hardcoded so the boundary
     /// cannot drift from the order [`Huginn::scene`] actually pushes in.
+    ///
+    /// With no panel open and a glass window on screen, the boundary moves
+    /// down to just past that window: everything the scene draws in front of
+    /// it stays sharp, and everything behind it is what shows through.
     pub(crate) fn blur_boundary(&self) -> usize {
-        usize::from(self.help.is_some())
+        let panels = usize::from(self.help.is_some())
             + usize::from(self.volume_panel.is_some())
             + usize::from(self.launcher_panel.is_some())
             + usize::from(self.pinned_panel.is_some())
-            + usize::from(self.settings_panel.is_some())
+            + usize::from(self.settings_panel.is_some());
+        if self.panel_blur_open() {
+            return panels;
+        }
+        match self.glass_window() {
+            Some((id, _)) => self.scene_index_of(id).map_or(panels, |i| i + 1),
+            None => panels,
+        }
+    }
+
+    /// Whether a panel that blurs is on screen (mid-animation included).
+    fn panel_blur_open(&self) -> bool {
+        self.launcher_panel.is_some() || self.pinned_panel.is_some()
+    }
+
+    /// Where a window's surface sits in [`Self::scene`], front to back.
+    fn scene_index_of(&self, id: WindowId) -> Option<usize> {
+        let wanted = self.windows.get(&id)?.wl_surface()?;
+        self.scene().iter().position(|item| match item {
+            SceneItem::Surface(surface, _) => *surface == wanted,
+            _ => false,
+        })
+    }
+
+    /// Windows that draw themselves translucent and ask for the desktop
+    /// blurred behind them, by `app_id`. Raven Settings is the one today:
+    /// its glass look is only glass with something soft behind it.
+    const GLASS_APP_IDS: &'static [&'static str] = &["raven-settings", "com.ravensettings.Raven"];
+
+    /// The glass window on screen, if `desktop.toml` allows blur and one is
+    /// mapped and not put away: the focused one first, else any.
+    pub(crate) fn glass_window(&self) -> Option<(WindowId, Rect)> {
+        if !self.desktop_config.appearance.blur {
+            return None;
+        }
+        let now = self.uptime();
+        let is_glass = |id: &WindowId| {
+            self.mapped.contains(id)
+                && self
+                    .space
+                    .window(*id)
+                    .is_some_and(|w| !w.is_minimized())
+                && self
+                    .windows
+                    .get(id)
+                    .and_then(|w| w.app_id())
+                    .is_some_and(|app| Self::GLASS_APP_IDS.iter().any(|g| g.eq_ignore_ascii_case(&app)))
+        };
+        let id = self
+            .space
+            .focused()
+            .filter(is_glass)
+            .or_else(|| self.space.active_workspace().windows().iter().copied().find(is_glass))?;
+        let rect = self.drawn_rect(id, now)?;
+        Some((id, rect))
     }
 
     /// How blurred the desktop behind the panels should be, in pixels.
     ///
     /// Zero when no panel is open, which is what lets the renderer take the
-    /// ordinary path unchanged for the overwhelming majority of frames.
+    /// ordinary path unchanged for the overwhelming majority of frames. A
+    /// glass window asks for the full radius for as long as it is there.
     pub(crate) fn blur_radius(&self) -> f32 {
         let clock = self.uptime();
-        crate::blur::radius_for(self.launcher.reveal(clock).max(self.pinned.reveal(clock)))
+        let panels = crate::blur::radius_for(self.launcher.reveal(clock).max(self.pinned.reveal(clock)));
+        if panels > 0.0 || self.panel_blur_open() {
+            return panels;
+        }
+        if self.glass_window().is_some() {
+            crate::blur::MAX_RADIUS
+        } else {
+            0.0
+        }
     }
 
     /// Where on the output the blurred desktop shows through: the launcher
@@ -2689,13 +2830,26 @@ impl Huginn {
         }
         // The pinned panel is drawn with the launcher's corners, so its
         // blur is inset the same way.
-        let panel = self.pinned_panel.as_ref()?;
-        crate::launcher::blur_rect(crate::pinned::placement(
-            self.output_area(),
-            panel.size(),
-            self.pinned.position(),
-            self.pinned.reveal(clock),
-        ))
+        if let Some(panel) = self.pinned_panel.as_ref() {
+            return crate::launcher::blur_rect(crate::pinned::placement(
+                self.output_area(),
+                panel.size(),
+                self.pinned.position(),
+                self.pinned.reveal(clock),
+            ));
+        }
+        // A glass window: its own rectangle, inset by the corner radius a
+        // libadwaita window draws, so the blurred patch does not show past
+        // the rounded corners.
+        let (_, rect) = self.glass_window()?;
+        const CORNER: i32 = 12;
+        let inset = Rect::from_xywh(
+            rect.x() + CORNER,
+            rect.y() + CORNER,
+            (rect.w() - 2 * CORNER).max(0),
+            (rect.h() - 2 * CORNER).max(0),
+        );
+        (inset.w() > 0 && inset.h() > 0).then_some(inset)
     }
 
     /// Advance anything that is animating, and ask for another frame if it is
@@ -3683,6 +3837,15 @@ impl XdgShellHandler for Huginn {
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
         if let Some(id) = self.xdg_window_id(&surface) {
             self.set_fullscreen(id, false);
+        }
+    }
+
+    /// A client's own minimize button. Goes to the dock the same way the
+    /// gesture and the chord send a window there, so there is one notion of
+    /// "put away" whichever side asked.
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(id) = self.xdg_window_id(&surface) {
+            self.minimize_window(id);
         }
     }
 

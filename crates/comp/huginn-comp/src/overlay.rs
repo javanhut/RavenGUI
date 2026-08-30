@@ -116,7 +116,7 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
         size,
         pad as i32,
         y as i32,
-        crate::theme::ACCENT,
+        crate::theme::accent(),
     );
     y += line + line_gap;
     canvas.fill(
@@ -135,7 +135,7 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
             size,
             pad as i32,
             y as i32,
-            crate::theme::ACCENT,
+            crate::theme::accent(),
         );
         text.draw(
             &mut canvas,
@@ -264,7 +264,7 @@ mod tests {
             return;
         }
         let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
-        let accent = crate::theme::ACCENT.to_rgba_bytes();
+        let accent = crate::theme::accent().to_rgba_bytes();
         let partial = canvas
             .pixels
             .chunks_exact(4)

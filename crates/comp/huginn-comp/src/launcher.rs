@@ -2703,7 +2703,7 @@ fn compose(
         text_y as usize,
         caret_w as usize,
         (size * 1.4) as usize,
-        crate::theme::ACCENT.to_rgba_bytes(),
+        crate::theme::accent().to_rgba_bytes(),
     );
 
     // Position in navigation order — a tile, a row, or a file row.
@@ -2793,7 +2793,7 @@ fn compose(
                         inner as usize,
                         row as usize,
                         row * 0.25,
-                        crate::theme::ACCENT.with_alpha(0x2E),
+                        crate::theme::accent().with_alpha(0x2E),
                     );
                 }
                 if let Some(pixmap) = entry
@@ -2950,7 +2950,7 @@ fn compose(
                         inner as usize,
                         row as usize,
                         row * 0.25,
-                        crate::theme::ACCENT.with_alpha(0x2E),
+                        crate::theme::accent().with_alpha(0x2E),
                     );
                 }
                 if let Some(icon) = &file_icon {
@@ -3217,7 +3217,7 @@ pub(crate) fn draw_tile(
             (tile_w + ring * 2.0) as usize,
             (tile_h + ring * 2.0) as usize,
             corner + ring,
-            crate::theme::ACCENT,
+            crate::theme::accent(),
         );
         canvas.fill_rounded(
             x as usize,
@@ -3233,7 +3233,7 @@ pub(crate) fn draw_tile(
             tile_w as usize,
             tile_h as usize,
             corner,
-            crate::theme::ACCENT.with_alpha(0x2E),
+            crate::theme::accent().with_alpha(0x2E),
         );
     } else {
         canvas.fill_rounded(
@@ -3309,7 +3309,7 @@ pub(crate) fn draw_app_row(
             inner as usize,
             row as usize,
             row * 0.25,
-            crate::theme::ACCENT.with_alpha(0x2E),
+            crate::theme::accent().with_alpha(0x2E),
         );
     }
     // The icon, if the theme has one. An application with no icon
@@ -3437,7 +3437,7 @@ pub(crate) fn draw_menu(
                 (menu_w - gap) as usize,
                 row as usize,
                 row * 0.25,
-                crate::theme::ACCENT.with_alpha(0x2E),
+                crate::theme::accent().with_alpha(0x2E),
             );
         }
         let label = fit(text, label, size, menu_w - gap * 2.0);
@@ -3569,7 +3569,7 @@ fn glyph_row(
             inner as usize,
             row as usize,
             row * 0.25,
-            crate::theme::ACCENT.with_alpha(0x2E),
+            crate::theme::accent().with_alpha(0x2E),
         );
     }
     let icon_size = size * 1.5;
@@ -3582,7 +3582,7 @@ fn glyph_row(
         glyph_size,
         (icon_x + (icon_size - gw) / 2.0) as i32,
         (y + (row - glyph_size * 1.35) / 2.0) as i32,
-        crate::theme::ACCENT,
+        crate::theme::accent(),
     );
     let name_x = icon_x + icon_size + 10.0 * scale;
     text.draw(
@@ -3643,7 +3643,7 @@ pub(crate) fn tinted(icon: &raven_desktop::Pixmap) -> raven_desktop::Pixmap {
 
 /// The theme accent's hue, so a fallback tint matches the focus ring.
 fn accent_hue() -> f32 {
-    let [r, g, b, _] = crate::theme::ACCENT
+    let [r, g, b, _] = crate::theme::accent()
         .to_rgba_bytes()
         .map(|c| f32::from(c) / 255.0);
     let (max, min) = (r.max(g).max(b), r.min(g).min(b));
@@ -3892,7 +3892,7 @@ mod render_tests {
     fn the_highlighted_row_is_tinted_rather_than_flooded() {
         // A solid accent row is unreadable and was what the bug produced.
         let (canvas, _) = drawn("", 0);
-        let accent = crate::theme::ACCENT.to_rgba_bytes();
+        let accent = crate::theme::accent().to_rgba_bytes();
         let flooded = canvas
             .pixels
             .chunks_exact(4)

@@ -52,6 +52,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+# The one file the desktop reads about itself: ~/.config/raven/desktop.toml,
+# written by raven-settings. See huginn-comp/src/desktop_config.rs.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 # BlueZ, for the quick settings Bluetooth row. Blocking API only: the
 # connection runs its executor on a thread of its own, and the compositor
 # talks to it from a thread of its own too, so no async runtime enters the
