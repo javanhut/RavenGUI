@@ -300,12 +300,24 @@ pub(crate) fn run() -> Result<()> {
     let socket = socket_source.socket_name().to_string_lossy().into_owned();
     state.set_socket(socket.clone());
 
+    // Every client rings this on its way out, and the loop then asks whether
+    // the one that left was the lock screen. See `Huginn::recover_lost_lock`.
+    let (disconnect, disconnects) =
+        calloop::ping::make_ping().context("creating the client-disconnect ping")?;
     handle
-        .insert_source(socket_source, |stream, _, data: &mut Udev| {
+        .insert_source(disconnects, |_, _, data: &mut Udev| {
+            if data.state.recover_lost_lock() {
+                data.arm_claim_timeout();
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("client-disconnect source: {e}"))?;
+
+    handle
+        .insert_source(socket_source, move |stream, _, data: &mut Udev| {
             if let Err(e) = data
                 .display
                 .handle()
-                .insert_client(stream, Arc::new(ClientState::default()))
+                .insert_client(stream, Arc::new(ClientState::new(disconnect.clone())))
             {
                 tracing::warn!(error = %e, "could not accept a client");
             }
@@ -743,6 +755,13 @@ fn refresh_mhz(mode: &smithay::reexports::drm::control::Mode) -> i32 {
     refresh as i32
 }
 
+/// How long the lock screen has to claim the session before the
+/// compositor gives up on it. Generous: this covers a cold exec, a
+/// Wayland connection and a socket round-trip to `ravend`, on a machine
+/// that is a few hundred milliseconds out of suspend and still bringing
+/// its disk back.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Udev {
     /// Lock the session: blank it, start the lock screen, and give the lock
     /// screen a bounded time to claim the blank.
@@ -753,13 +772,6 @@ impl Udev {
     /// the session must not leave a blank nobody can get past, and it makes
     /// no difference which path put the blank up.
     fn lock_session(&mut self) {
-        /// How long the lock screen has to claim the session before the
-        /// compositor gives up on it. Generous: this covers a cold exec, a
-        /// Wayland connection and a socket round-trip to `ravend`, on a machine
-        /// that is a few hundred milliseconds out of suspend and still bringing
-        /// its disk back.
-        const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
-
         if self.state.is_locked() {
             // Already held -- locked before it went to sleep, or `Super`+`L`
             // pressed twice. Nothing to do, and nothing to start: starting
@@ -770,7 +782,15 @@ impl Udev {
         if !self.state.lock_and_launch() {
             return;
         }
+        self.arm_claim_timeout();
+    }
 
+    /// Give the lock screen just started `CLAIM_TIMEOUT` to claim the blank.
+    ///
+    /// Armed for the first lock screen and again for every one started in
+    /// its place after a crash: each is a new process that may equally never
+    /// arrive.
+    fn arm_claim_timeout(&mut self) {
         let timer = Timer::from_duration(CLAIM_TIMEOUT);
         if let Err(e) = self.handle.insert_source(timer, |_, _, data: &mut Udev| {
             data.state.abandon_lock_if_unclaimed();

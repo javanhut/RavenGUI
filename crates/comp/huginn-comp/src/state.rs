@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
 use std::time::Instant;
 
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
+
 use crate::window::WindowSurface;
 use huginn_core::{
     Space,
@@ -86,6 +88,22 @@ use smithay::{
 #[derive(Default, Debug)]
 pub(crate) struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// Rung when this client goes away, so the event loop can ask
+    /// [`Huginn::recover_lost_lock`] whether the client that just left was
+    /// the lock screen. The lock protocol has no message for that case -- a
+    /// client that dies simply stops talking -- and this runs on the
+    /// display's thread with no access to the compositor's state, so a ping
+    /// is the whole of what it can do.
+    pub on_disconnect: Option<calloop::ping::Ping>,
+}
+
+impl ClientState {
+    pub(crate) fn new(on_disconnect: calloop::ping::Ping) -> Self {
+        Self {
+            compositor_state: CompositorClientState::default(),
+            on_disconnect: Some(on_disconnect),
+        }
+    }
 }
 
 impl ClientData for ClientState {
@@ -95,6 +113,9 @@ impl ClientData for ClientState {
 
     fn disconnected(&self, id: ClientId, reason: DisconnectReason) {
         tracing::debug!(?id, ?reason, "client disconnected");
+        if let Some(ping) = &self.on_disconnect {
+            ping.ping();
+        }
     }
 }
 
@@ -1393,6 +1414,89 @@ impl Huginn {
         self.lock = None;
         self.refresh_focus();
         self.queue_redraw();
+    }
+
+    /// How many times a lock screen that died is started again before the
+    /// session is revealed instead. One crash is a bad frame; the same crash
+    /// three times running is a lock screen that cannot run on this machine,
+    /// and restarting it forever is a black screen with a heartbeat.
+    const LOCK_RELAUNCHES: u32 = 3;
+
+    /// Notice a lock screen that died while holding the session, and start
+    /// another.
+    ///
+    /// `ext-session-lock-v1` has no message for this. A client that crashes
+    /// -- a protocol error, a signal, an OOM -- simply disconnects, its lock
+    /// object dies with the connection, and the compositor is left exactly
+    /// where the protocol told it to be: session hidden, every output a
+    /// cleared frame, waiting for an unlock that can never come. Every
+    /// lock-screen crash was a machine that had to be power-cycled.
+    ///
+    /// So this runs whenever any client disconnects (see
+    /// [`ClientState::on_disconnect`]). If the client that held the lock is
+    /// gone, the blank stays up -- the session is still hidden, and that is
+    /// not negotiable -- and a fresh lock screen is started to claim it,
+    /// with the same claim timeout as the first. After
+    /// [`Self::LOCK_RELAUNCHES`] of those the session is revealed instead,
+    /// for the reason on [`Lock`]: somebody at a wedged blank screen can
+    /// already hold the power button, so the blank protects nothing.
+    ///
+    /// Returns whether a new lock screen was started, so the caller can arm
+    /// the claim timeout for it.
+    pub(crate) fn recover_lost_lock(&mut self) -> bool {
+        let lost = self
+            .lock
+            .as_ref()
+            .and_then(|lock| lock.client.as_ref())
+            .is_some_and(|client| !client.handle.is_alive());
+        if !lost {
+            return false;
+        }
+        let relaunches = match self.lock.as_mut() {
+            Some(lock) => {
+                lock.client = None;
+                lock.relaunches += 1;
+                lock.relaunches
+            }
+            None => return false,
+        };
+        // The surfaces went with the client; nothing is drawn until the next
+        // one makes its own, and the cleared frame in the meantime is the
+        // point.
+        self.refresh_focus();
+        self.queue_redraw();
+
+        if relaunches > Self::LOCK_RELAUNCHES {
+            tracing::error!(
+                program = crate::theme::LOCK_SCREEN,
+                attempts = Self::LOCK_RELAUNCHES,
+                "the lock screen keeps dying; revealing the desktop rather than \
+                 leaving a screen nobody can get past"
+            );
+            self.lock = None;
+            self.refresh_focus();
+            self.queue_redraw();
+            return false;
+        }
+
+        tracing::error!(
+            program = crate::theme::LOCK_SCREEN,
+            attempt = relaunches,
+            "the lock screen died while the session was locked; starting it again"
+        );
+        let argv = [crate::theme::LOCK_SCREEN.to_string()];
+        if crate::backend::spawn(&argv, &self.socket, self.x11_display) {
+            return true;
+        }
+
+        tracing::error!(
+            program = crate::theme::LOCK_SCREEN,
+            "the lock screen would not start again; revealing the desktop"
+        );
+        self.lock = None;
+        self.refresh_focus();
+        self.queue_redraw();
+        false
     }
 
     /// Whether the focused client handles the `Super` layer itself.
@@ -4084,7 +4188,10 @@ impl SessionLockHandler for Huginn {
             return;
         }
 
-        lock.client = Some(ClientLock::default());
+        lock.client = Some(ClientLock {
+            handle: confirmation.ext_session_lock().clone(),
+            surfaces: Vec::new(),
+        });
         self.refresh_focus();
         self.queue_redraw();
 
@@ -4262,6 +4369,9 @@ pub(crate) struct Lock {
     /// The client's lock object, once one has asked. `None` while this is the
     /// compositor's own pre-emptive blank.
     client: Option<ClientLock>,
+    /// How many times the lock screen has been started again after dying
+    /// while holding this lock. Bounded by [`Huginn::LOCK_RELAUNCHES`].
+    relaunches: u32,
 }
 
 impl Lock {
@@ -4280,8 +4390,13 @@ impl Lock {
 }
 
 /// A lock a client asked for and the compositor confirmed.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ClientLock {
+    /// The client's `ext_session_lock_v1`. Kept for one question: is the
+    /// client still there? A lock screen that crashes takes its connection
+    /// with it, the resource dies with the connection, and nothing in the
+    /// protocol says so -- see [`Huginn::recover_lost_lock`].
+    handle: ExtSessionLockV1,
     /// One surface per output, by output name, as the client makes them.
     ///
     /// Empty between the lock being confirmed and the first lock surface
