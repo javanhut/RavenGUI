@@ -18,6 +18,7 @@
 //! clients keep themselves going, because every buffer they commit sets the
 //! flag that produces the next frame callback.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,7 @@ use crate::backend::chord;
 use crate::backend::input;
 use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use crate::render;
 use crate::state::{ClientState, Huginn};
 
@@ -82,7 +84,9 @@ struct Nested {
     blur: Option<crate::blur::Blur>,
     output: Output,
     keyboard: KeyboardHandle<Huginn>,
-    cursor: Option<Cursor>,
+    /// Theme cursors by shape, loaded as clients ask for them. The nested
+    /// window is 1x for the life of the process, so density is not a key.
+    cursors: HashMap<CursorIcon, Cursor>,
     start: Instant,
     signal: LoopSignal,
     /// The event loop, for arming the lock claim timeout from a keystroke.
@@ -222,7 +226,10 @@ pub(crate) fn run() -> Result<()> {
     // Cloned rather than fetched per event: get_keyboard borrows the seat out
     // of Huginn, which conflicts with passing Huginn itself to keyboard.input.
     // Loaded once: the nested window is 1× for the life of the process.
-    let cursor = crate::pointer::Cursor::from_env(state.scale().advertised);
+    let mut cursors = HashMap::new();
+    if let Some(cursor) = crate::pointer::Cursor::from_env(state.scale().advertised) {
+        cursors.insert(CursorIcon::Default, cursor);
+    }
 
     let keyboard = state
         .seat
@@ -242,7 +249,7 @@ pub(crate) fn run() -> Result<()> {
         backend,
         output,
         keyboard,
-        cursor,
+        cursors,
         start: Instant::now(),
         signal,
         handle: handle.clone(),
@@ -327,9 +334,22 @@ impl Nested {
         //
         // The scene is split once: `behind` is blurred into the texture, and
         // also drawn sharp beneath the blur, which is cropped to the panel.
+        let icon = match &self.state.cursor_status {
+            CursorImageStatus::Named(icon) => *icon,
+            _ => CursorIcon::Default,
+        };
+        if !self.cursors.contains_key(&icon)
+            && let Some(cursor) = Cursor::named(icon, self.state.scale().advertised)
+        {
+            self.cursors.insert(icon, cursor);
+        }
+        let cursor = self
+            .cursors
+            .get(&icon)
+            .or_else(|| self.cursors.get(&CursorIcon::Default));
         let (front, behind) = {
             let renderer = self.backend.renderer();
-            render::elements_split(renderer, &self.state, self.cursor.as_ref(), view, scale)
+            render::elements_split(renderer, &self.state, cursor, view, scale)
         };
         let blurred = match self.state.blur_rect() {
             Some(rect) if radius > 0.0 => {

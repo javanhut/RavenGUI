@@ -11,6 +11,7 @@ use std::io::Read;
 use smithay::{
     backend::{allocator::Fourcc, renderer::element::memory::MemoryRenderBuffer},
     desktop::{WindowSurfaceType, utils::under_from_surface_tree},
+    input::pointer::CursorIcon,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, Transform},
 };
@@ -42,18 +43,30 @@ impl Cursor {
     /// when there is none: the pointer will be invisible over the background,
     /// which is worth a line in the log and not worth refusing to start.
     pub(crate) fn from_env(density: u32) -> Option<Self> {
-        let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_owned());
-        let size = std::env::var("XCURSOR_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24);
-        let cursor = Self::load(&theme, "default", size, density);
+        let cursor = Self::named(CursorIcon::Default, density);
         if cursor.is_none() {
             tracing::warn!(
                 "no cursor theme found; the pointer will be invisible over the background"
             );
         }
         cursor
+    }
+
+    /// The user's cursor for `icon`, as named by a `cursor-shape-v1` client,
+    /// on an output of `density`.
+    ///
+    /// Tries the icon's CSS name and then its legacy X11 aliases, since themes
+    /// differ in which they ship. `None` when the theme has none of them; the
+    /// caller falls back to the default arrow rather than showing nothing.
+    pub(crate) fn named(icon: CursorIcon, density: u32) -> Option<Self> {
+        let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_owned());
+        let size = std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        std::iter::once(icon.name())
+            .chain(icon.alt_names().iter().copied())
+            .find_map(|name| Self::load(&theme, name, size, density))
     }
 
     /// Load `name` at roughly `size` logical pixels from `theme`, for an

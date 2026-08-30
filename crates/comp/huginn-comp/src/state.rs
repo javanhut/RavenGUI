@@ -31,9 +31,9 @@ use smithay::{
         element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
-    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_session_lock, delegate_shm, delegate_viewporter,
-    delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_fractional_scale,
+    delegate_layer_shell, delegate_output, delegate_seat, delegate_session_lock, delegate_shm,
+    delegate_viewporter, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -54,6 +54,7 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
+        cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
@@ -258,6 +259,13 @@ pub(crate) struct Huginn {
     /// dropping it withdraws the global and clients lose the answer.
     #[allow(dead_code)]
     pub fractional_scale_state: FractionalScaleManagerState,
+    /// `wp_cursor_shape_manager_v1`: a client names a cursor and the
+    /// compositor draws it from the system theme, at the screen's density.
+    /// Without this GTK 4.22 falls back to its built-in 32-pixel bitmaps and
+    /// asks for them at the wrong size through a viewport, so the pointer
+    /// grows the moment it crosses into a GTK window. Held, not read.
+    #[allow(dead_code)]
+    pub cursor_shape_state: CursorShapeManagerState,
     /// Held, not read: dropping this would withdraw the xdg-output global
     /// and clients would lose their output information mid-session.
     #[allow(dead_code)]
@@ -589,6 +597,7 @@ impl Huginn {
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
             viewporter_state: ViewporterState::new::<Self>(dh),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
+            cursor_shape_state: CursorShapeManagerState::new::<Self>(dh),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             // Any client may lock. The protocol's filter exists to restrict the
             // global to a privileged client, which needs a way to tell one
@@ -4156,6 +4165,11 @@ delegate_data_device!(Huginn);
 delegate_output!(Huginn);
 delegate_viewporter!(Huginn);
 delegate_fractional_scale!(Huginn);
+// cursor-shape-v1 can also name a cursor for a tablet tool, so smithay asks
+// for this even though tablets are not routed (see docs/protocols.md). The
+// defaults ignore the request, which is exactly right until they are.
+impl smithay::wayland::tablet_manager::TabletSeatHandler for Huginn {}
+delegate_cursor_shape!(Huginn);
 impl SessionLockHandler for Huginn {
     fn lock_state(&mut self) -> &mut SessionLockManagerState {
         &mut self.session_lock_state
