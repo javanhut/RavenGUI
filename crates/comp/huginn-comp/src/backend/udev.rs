@@ -98,6 +98,7 @@ use crate::backend::gpu::{self, Bridge, DumbSurface, Scanout, Secondary};
 use crate::backend::input;
 use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use crate::render;
 use crate::render::HuginnElement;
 use crate::state::{ClientState, Huginn};
@@ -180,10 +181,11 @@ struct Udev {
     blur: Option<crate::blur::Blur>,
     screens: HashMap<ScreenKey, Screen>,
     keyboard: KeyboardHandle<Huginn>,
-    /// The theme cursor, one bitmap per density in use. A 1x laptop panel
-    /// beside a 2x monitor needs both, and the pointer is drawn on whichever
-    /// screen it is over with that screen's.
-    cursors: HashMap<u32, Cursor>,
+    /// The theme cursors, one bitmap per density and shape in use. A 1x
+    /// laptop panel beside a 2x monitor needs both, and the pointer is drawn
+    /// on whichever screen it is over with that screen's. Shapes other than
+    /// the arrow are loaded the first time a client asks for them.
+    cursors: HashMap<(u32, CursorIcon), Cursor>,
     socket: String,
     start: Instant,
     signal: LoopSignal,
@@ -433,7 +435,7 @@ pub(crate) fn run() -> Result<()> {
     // of other densities appear.
     let mut cursors = HashMap::new();
     if let Some(cursor) = crate::pointer::Cursor::from_env(state.scale().advertised) {
-        cursors.insert(state.scale().advertised, cursor);
+        cursors.insert((state.scale().advertised, CursorIcon::Default), cursor);
     }
 
     let keyboard = state
@@ -1325,10 +1327,10 @@ impl Udev {
         // theme each time.
         for output in &outputs {
             let density = output.scale.advertised;
-            if !self.cursors.contains_key(&density)
+            if !self.cursors.contains_key(&(density, CursorIcon::Default))
                 && let Some(cursor) = Cursor::from_env(density)
             {
-                self.cursors.insert(cursor.density, cursor);
+                self.cursors.insert((cursor.density, CursorIcon::Default), cursor);
             }
         }
         // Reflows the layer surfaces and the windows underneath them on every
@@ -1374,7 +1376,22 @@ impl Udev {
         }) else {
             return;
         };
-        let cursor = self.cursors.get(&density);
+        // The shape a client named through cursor-shape-v1, or the arrow.
+        // Loaded on first use and kept; a shape the theme lacks falls back to
+        // the arrow rather than to no pointer at all.
+        let icon = match &self.state.cursor_status {
+            CursorImageStatus::Named(icon) => *icon,
+            _ => CursorIcon::Default,
+        };
+        if !self.cursors.contains_key(&(density, icon))
+            && let Some(cursor) = Cursor::named(icon, density)
+        {
+            self.cursors.insert((density, icon), cursor);
+        }
+        let cursor = self
+            .cursors
+            .get(&(density, icon))
+            .or_else(|| self.cursors.get(&(density, CursorIcon::Default)));
 
         // Clients learn which screen they are on -- and so what scale to
         // draw at -- from here, once a frame, before the frame is built.

@@ -20,6 +20,7 @@ For how to actually use these, see `docs/integration.md`.
 | `wp_fractional_scale_manager_v1` | fractional scale factors |
 | `wl_output`, `xdg_output` | mode, integer scale, logical size, position; `wl_surface.enter`/`leave` per screen |
 | `wl_seat` | keyboard and pointer |
+| `wp_cursor_shape_manager_v1` | a client names its cursor and the compositor draws it from the system theme, at the screen's density |
 | `wl_data_device_manager` | clipboard and drag-and-drop |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
 | `ext_session_lock_manager_v1` | locking the session. See below |
@@ -134,7 +135,6 @@ find them in the registry.
 | `wlr-virtual-pointer`, `virtual-keyboard-v1` | No input injection. Remote-desktop and automation tools cannot drive the session. |
 | `ext-idle-notify-v1` | A client cannot be told the session went idle. The compositor locks on its own timer, so auto-lock works — what is missing is any way for *other* software to react to idleness. |
 | `idle-inhibit-unstable-v1` | A client cannot hold the idle lock off. A full-screen video is indistinguishable from an empty room, so a film longer than the timeout locks the screen mid-play. The way out is the "Lock when idle" row in quick settings, which is a person saying what a protocol would otherwise have said for them. |
-| `cursor-shape-v1` | Clients must supply cursor bitmaps rather than naming a shape. |
 | `tablet-v2` | Graphics tablets are not routed. |
 | `single-pixel-buffer-v1`, `content-type-v1`, `alpha-modifier-v1` | Minor optimisations unavailable. |
 | `drm-lease-v1` | No direct-lease VR headsets. |
