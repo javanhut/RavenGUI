@@ -162,7 +162,7 @@ pub(crate) fn run() -> Result<()> {
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    state.set_output_scale(scale);
+    state.set_output_scale("huginn-winit", Some(output.clone()), scale);
     // One output for the life of the process; nothing ever withdraws it.
     let _global = state.add_output(&output, &dh);
 
@@ -211,7 +211,7 @@ pub(crate) fn run() -> Result<()> {
     // Cloned rather than fetched per event: get_keyboard borrows the seat out
     // of Huginn, which conflicts with passing Huginn itself to keyboard.input.
     // Loaded once: the nested window is 1× for the life of the process.
-    let cursor = crate::pointer::Cursor::from_env(state.scale.advertised);
+    let cursor = crate::pointer::Cursor::from_env(state.scale().advertised);
 
     let keyboard = state
         .seat
@@ -296,7 +296,8 @@ impl Nested {
         let radius = self.state.blur_radius();
         // Always 1 here — see the output setup — but the elements were built
         // against it, so it is the only correct value to draw them with.
-        let scale = self.state.scale.fractional();
+        let scale = self.state.scale().fractional();
+        let view = self.state.output_area();
 
         // The blur's offscreen passes have to happen before the output
         // framebuffer is bound — they bind their own — so they run here, on
@@ -311,7 +312,7 @@ impl Nested {
         // also drawn sharp beneath the blur, which is cropped to the panel.
         let (front, behind) = {
             let renderer = self.backend.renderer();
-            render::elements_split(renderer, &self.state, self.cursor.as_ref())
+            render::elements_split(renderer, &self.state, self.cursor.as_ref(), view, scale)
         };
         let blurred = match self.state.blur_rect() {
             Some(rect) if radius > 0.0 => {
@@ -386,8 +387,9 @@ impl Nested {
                     .change_current_state(Some(mode), None, None, None);
                 // Panels re-anchor and re-reserve first; the window area is
                 // whatever is left over.
+                let scale = OutputScale::for_output(Size::new(size.w, size.h), Size::new(0, 0));
                 self.state
-                    .set_output_area(Rect::from_xywh(0, 0, size.w, size.h));
+                    .set_output_scale("huginn-winit", Some(self.output.clone()), scale);
             }
             WinitEvent::Redraw => self.state.queue_redraw(),
             WinitEvent::CloseRequested => self.signal.stop(),
@@ -516,6 +518,8 @@ impl Nested {
             Action::SendToWorkspace(i) => {
                 state.space.send_focused_to_workspace(i);
             }
+            Action::FocusNextOutput => state.focus_next_output(),
+            Action::SendToNextOutput => state.send_focused_to_next_output(),
             Action::EnterResize => {
                 state.resizing = true;
                 tracing::debug!("resize mode: arrows resize, Escape or Return leaves");

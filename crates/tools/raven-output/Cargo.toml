@@ -1,0 +1,19 @@
+[package]
+name = "raven-output"
+description = "List and arrange Huginn's screens over raven_shell_v1."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "raven-output"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+raven-protocol = { workspace = true, features = ["client"] }
+wayland-client.workspace = true
+
+[lints]
+workspace = true

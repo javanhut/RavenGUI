@@ -52,8 +52,16 @@ use smithay::{
         egl::EGLDevice,
         input::{Event as _, InputEvent, KeyboardKeyEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::{ImportDma, element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer},
+        renderer::{
+            Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer,
+            element::{
+                Id, Kind, surface::WaylandSurfaceRenderElement, texture::TextureRenderElement,
+            },
+            gles::{GlesRenderer, GlesTexture},
+            utils::draw_render_elements,
+        },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
+        udev::all_gpus,
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
     input::keyboard::{KeyboardHandle, Keysym},
@@ -71,7 +79,7 @@ use smithay::{
             Display, DisplayHandle, backend::GlobalId, protocol::wl_surface::WlSurface,
         },
     },
-    utils::{DeviceFd, SERIAL_COUNTER, Transform},
+    utils::{DeviceFd, Physical, Rectangle, SERIAL_COUNTER, Scale, Transform},
     wayland::{
         compositor::{SurfaceAttributes, TraversalAction, with_surface_tree_downward},
         socket::ListeningSocketSource,
@@ -86,10 +94,12 @@ use huginn_core::{
 
 use crate::backend::advertise;
 use crate::backend::chord;
+use crate::backend::gpu::{self, Bridge, DumbSurface, Scanout, Secondary};
 use crate::backend::input;
 use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
 use crate::render;
+use crate::render::HuginnElement;
 use crate::state::{ClientState, Huginn};
 
 /// Background colour of an empty workspace.
@@ -100,9 +110,25 @@ type Exporter = GbmFramebufferExporter<DrmDeviceFd>;
 type Manager = DrmOutputManager<Allocator, Exporter, (), DrmDeviceFd>;
 type Surface = DrmOutput<Allocator, Exporter, (), DrmDeviceFd>;
 
+/// A screen is a CRTC on a device; CRTC handles repeat across devices.
+type ScreenKey = (libc::dev_t, crtc::Handle);
+
+/// Where a screen's pixels go. See [`crate::backend::gpu`].
+enum ScreenScanout {
+    /// On the GPU the compositor renders on.
+    Primary(Surface),
+    /// On another GPU, through a shared buffer.
+    Gpu {
+        drm: Surface,
+        bridge: Option<Bridge>,
+    },
+    /// On a device with no GPU, through dumb buffers.
+    Dumb(DumbSurface),
+}
+
 /// One scan-out surface: a CRTC with a connector attached.
 struct Screen {
-    drm: Surface,
+    scanout: ScreenScanout,
     output: Output,
     /// The `wl_output` global this screen advertises. Kept so that unplugging
     /// the monitor can withdraw it — a global left behind is an output clients
@@ -119,6 +145,13 @@ struct Screen {
     /// The scale policy for this panel. `logical` is what the screen measures
     /// in the desktop's coordinates, which is the unit `relayout` works in.
     scale: OutputScale,
+    /// The panel's pixels and millimetres, kept so `relayout` can derive the
+    /// scale again with or without a saved override.
+    physical: Size,
+    mm: Size,
+    /// Where this screen sits in the desktop, in logical pixels. Decided by
+    /// `relayout`, which is also what tells the core.
+    rect: Rect,
     /// A frame is queued and we are waiting for its page flip. Queueing another
     /// before the flip completes returns EBUSY.
     awaiting_flip: bool,
@@ -138,12 +171,19 @@ struct Udev {
     /// a device id and most of them are about something else.
     device_id: libc::dev_t,
     manager: Manager,
+    /// The primary's allocator, for the buffers that bridge to other GPUs.
+    allocator: GbmAllocator<DrmDeviceFd>,
     renderer: GlesRenderer,
+    /// Every other DRM device on the seat that has connectors.
+    secondaries: HashMap<libc::dev_t, Secondary>,
     /// The blur, if its shader compiled. `None` means panels do not blur.
     blur: Option<crate::blur::Blur>,
-    screens: HashMap<crtc::Handle, Screen>,
+    screens: HashMap<ScreenKey, Screen>,
     keyboard: KeyboardHandle<Huginn>,
-    cursor: Option<Cursor>,
+    /// The theme cursor, one bitmap per density in use. A 1x laptop panel
+    /// beside a 2x monitor needs both, and the pointer is drawn on whichever
+    /// screen it is over with that screen's.
+    cursors: HashMap<u32, Cursor>,
     socket: String,
     start: Instant,
     signal: LoopSignal,
@@ -200,7 +240,7 @@ pub(crate) fn run() -> Result<()> {
     );
     let manager = DrmOutputManager::new(
         drm_device,
-        allocator,
+        allocator.clone(),
         GbmFramebufferExporter::new(
             gbm.clone(),
             node.node_with_type(NodeType::Render).and_then(|r| r.ok()),
@@ -289,13 +329,17 @@ pub(crate) fn run() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("wayland display source: {e}"))?;
 
     // --- hardware --------------------------------------------------------
+    let primary_id = node.dev_id();
     handle
-        .insert_source(drm_notifier, |event, meta, data: &mut Udev| match event {
-            DrmEvent::VBlank(crtc) => data.on_vblank(crtc),
-            DrmEvent::Error(e) => {
-                tracing::error!(error = %e, ?meta, "DRM error");
-            }
-        })
+        .insert_source(
+            drm_notifier,
+            move |event, meta, data: &mut Udev| match event {
+                DrmEvent::VBlank(crtc) => data.on_vblank(primary_id, crtc),
+                DrmEvent::Error(e) => {
+                    tracing::error!(error = %e, ?meta, "DRM error");
+                }
+            },
+        )
         .map_err(|e| anyhow::anyhow!("DRM source: {e}"))?;
 
     handle
@@ -323,6 +367,9 @@ pub(crate) fn run() -> Result<()> {
             SessionEvent::PauseSession => {
                 tracing::info!("session paused; releasing devices");
                 data.manager.pause();
+                for secondary in data.secondaries.values_mut() {
+                    secondary.pause();
+                }
                 for screen in data.screens.values_mut() {
                     screen.awaiting_flip = false;
                 }
@@ -369,9 +416,12 @@ pub(crate) fn run() -> Result<()> {
         data.reclaim_display(true);
     });
 
-    // For the density the state starts with; `relayout` loads it again when
-    // the first screen — or a different one — says otherwise.
-    let cursor = crate::pointer::Cursor::from_env(state.scale.advertised);
+    // For the density the state starts with; `relayout` loads more as screens
+    // of other densities appear.
+    let mut cursors = HashMap::new();
+    if let Some(cursor) = crate::pointer::Cursor::from_env(state.scale().advertised) {
+        cursors.insert(state.scale().advertised, cursor);
+    }
 
     let keyboard = state
         .seat
@@ -389,14 +439,28 @@ pub(crate) fn run() -> Result<()> {
         session,
         device_id: node.dev_id(),
         manager,
+        allocator,
         renderer,
+        secondaries: HashMap::new(),
         screens: HashMap::new(),
         keyboard,
-        cursor,
+        cursors,
         socket,
         start: Instant::now(),
         signal,
     };
+
+    // Every other DRM device on the seat: the discrete GPU on a hybrid
+    // laptop, a DisplayLink dock already plugged in. Each is opened the way a
+    // hotplugged one is, so there is one code path for both.
+    match all_gpus(&seat_name) {
+        Ok(paths) => {
+            for path in paths.iter().filter(|p| **p != gpu_path) {
+                data.add_device(path);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "listing DRM devices; driving the primary only"),
+    }
 
     // The initial scan. Identical to the one a hotplug triggers, so there is
     // only one code path that can put a monitor on screen.
@@ -430,6 +494,10 @@ pub(crate) fn run() -> Result<()> {
             // for either reason is never answered at all.
             crate::dmabuf::import_pending(&mut data.renderer, &mut data.state);
 
+            // A client applied a layout: arrange again with what it saved.
+            if data.state.take_layout_change() {
+                data.relayout();
+            }
             if data.state.take_redraw() {
                 for screen in data.screens.values_mut() {
                     screen.dirty = true;
@@ -451,14 +519,28 @@ pub(crate) fn run() -> Result<()> {
 ///
 /// The preferred mode is the panel's native one. Falling back to the first
 /// available beats refusing to light up the screen at all.
+/// The mode to drive a connector at: the panel's native resolution, at the
+/// fastest refresh it offers there.
+///
+/// The kernel flags one mode PREFERRED, which is the native resolution from
+/// the EDID -- the right size, since anything else is the monitor's own
+/// scaler blurring the picture. It is not always the fastest: a 144 Hz panel
+/// commonly flags its 60 Hz mode, so the refresh is chosen here from every
+/// mode of that size. With no flag at all the first mode is what the kernel
+/// considers best.
 fn preferred_mode(connector: &connector::Info) -> Option<smithay::reexports::drm::control::Mode> {
     use smithay::reexports::drm::control::ModeTypeFlags;
 
-    connector
-        .modes()
+    let modes = connector.modes();
+    let native = modes
         .iter()
         .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .or_else(|| connector.modes().first())
+        .or_else(|| modes.first())?;
+    modes
+        .iter()
+        .filter(|m| m.size() == native.size())
+        .max_by_key(|m| refresh_mhz(m))
+        .or(Some(native))
         .copied()
 }
 
@@ -481,6 +563,154 @@ fn describe(connector: &connector::Info, mode: &DrmMode) -> (Mode, OutputScale) 
         Size::new(phys_w as i32, phys_h as i32),
     );
     (wl_mode, scale)
+}
+
+/// Put a frame on a screen of the primary GPU.
+fn present_primary(
+    renderer: &mut GlesRenderer,
+    drm: &mut Surface,
+    elements: &[HuginnElement],
+) -> Result<bool> {
+    let result = drm
+        .render_frame(renderer, elements, CLEAR, FrameFlags::DEFAULT)
+        .map_err(|e| anyhow::anyhow!("rendering: {e}"))?;
+    if result.is_empty {
+        return Ok(false);
+    }
+    drm.queue_frame(())
+        .map_err(|e| anyhow::anyhow!("queueing: {e}"))?;
+    Ok(true)
+}
+
+/// Put a frame on a screen of another GPU: render on the primary into the
+/// bridge buffer, draw that buffer on the secondary.
+#[allow(clippy::too_many_arguments)]
+fn present_gpu(
+    primary: &mut GlesRenderer,
+    allocator: &mut GbmAllocator<DrmDeviceFd>,
+    secondary: &mut GlesRenderer,
+    drm: &mut Surface,
+    bridge: &mut Option<Bridge>,
+    elements: &[HuginnElement],
+    size: smithay::utils::Size<i32, Physical>,
+    scale: f64,
+) -> Result<bool> {
+    if bridge.as_ref().is_some_and(|b| b.size != size) {
+        *bridge = None;
+    }
+    let bridge = match bridge {
+        Some(bridge) => bridge,
+        None => bridge.insert(Bridge::new(allocator, secondary, size)?),
+    };
+    render_into(primary, &mut bridge.dmabuf, size, scale, elements)?;
+
+    // A fresh id each frame: the bridge is redrawn whole, so there is no
+    // damage to track, and the compositor's damage tracking takes an unknown
+    // element as fully damaged, which it is.
+    let element = TextureRenderElement::from_static_texture(
+        Id::new(),
+        secondary.context_id(),
+        (0.0, 0.0),
+        bridge.texture.clone(),
+        1,
+        Transform::Normal,
+        Some(1.0),
+        None,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let elements = [element];
+    let empty = drm
+        .render_frame(secondary, &elements, CLEAR, FrameFlags::DEFAULT)
+        .map(|result| result.is_empty)
+        .map_err(|e| anyhow::anyhow!("rendering on the secondary: {e}"))?;
+    if empty {
+        return Ok(false);
+    }
+    drm.queue_frame(())
+        .map_err(|e| anyhow::anyhow!("queueing on the secondary: {e}"))?;
+    Ok(true)
+}
+
+/// Put a frame on a screen of a device with no GPU: render on the primary
+/// into a texture, read it back, copy it into the device's dumb buffer.
+fn present_dumb(
+    primary: &mut GlesRenderer,
+    dumb: &mut DumbSurface,
+    elements: &[HuginnElement],
+    scale: f64,
+) -> Result<bool> {
+    let size = dumb.size();
+    let mut texture = match dumb.texture.take() {
+        Some(texture) => texture,
+        None => primary
+            .create_buffer(gpu::BRIDGE_FORMAT, (size.w, size.h).into())
+            .map_err(|e| anyhow::anyhow!("creating the read-back texture: {e}"))?,
+    };
+    let pixels = {
+        let mut framebuffer = primary
+            .bind(&mut texture)
+            .map_err(|e| anyhow::anyhow!("binding the read-back texture: {e}"))?;
+        draw(primary, &mut framebuffer, size, scale, elements)?;
+        let mapping = primary
+            .copy_framebuffer(
+                &framebuffer,
+                Rectangle::from_size((size.w, size.h).into()),
+                gpu::BRIDGE_FORMAT,
+            )
+            .map_err(|e| anyhow::anyhow!("reading the frame back: {e}"))?;
+        primary
+            .map_texture(&mapping)
+            .map_err(|e| anyhow::anyhow!("mapping the read-back: {e}"))?
+            .to_vec()
+    };
+    dumb.texture = Some(texture);
+    dumb.present(&pixels)?;
+    Ok(true)
+}
+
+/// Render `elements` into `target` on the primary and wait for the GPU, so
+/// whoever reads the buffer next sees the finished frame.
+fn render_into<T>(
+    renderer: &mut GlesRenderer,
+    target: &mut T,
+    size: smithay::utils::Size<i32, Physical>,
+    scale: f64,
+    elements: &[HuginnElement],
+) -> Result<()>
+where
+    GlesRenderer: Bind<T>,
+{
+    let mut framebuffer = renderer
+        .bind(target)
+        .map_err(|e| anyhow::anyhow!("binding the bridge: {e}"))?;
+    draw(renderer, &mut framebuffer, size, scale, elements)
+}
+
+fn draw(
+    renderer: &mut GlesRenderer,
+    framebuffer: &mut <GlesRenderer as smithay::backend::renderer::RendererSuper>::Framebuffer<'_>,
+    size: smithay::utils::Size<i32, Physical>,
+    scale: f64,
+    elements: &[HuginnElement],
+) -> Result<()> {
+    let damage = [Rectangle::from_size(size)];
+    let mut frame = renderer
+        .render(framebuffer, size, Transform::Normal)
+        .map_err(|e| anyhow::anyhow!("starting the frame: {e}"))?;
+    frame
+        .clear(CLEAR.into(), &damage)
+        .map_err(|e| anyhow::anyhow!("clearing: {e}"))?;
+    draw_render_elements::<GlesRenderer, _, _>(&mut frame, Scale::from(scale), elements, &damage)
+        .map_err(|e| anyhow::anyhow!("drawing: {e}"))?;
+    let sync = frame
+        .finish()
+        .map_err(|e| anyhow::anyhow!("finishing: {e}"))?;
+    // The other device reads this buffer next, and it has no fence to wait
+    // on: block here so it never samples a half-drawn frame.
+    let _ = sync.wait();
+    Ok(())
 }
 
 /// Refresh rate in mHz, the unit `wl_output` reports.
@@ -553,24 +783,14 @@ impl Udev {
         }
     }
 
-    /// Take the display back and repaint all of it.
-    ///
-    /// Two things arrive here: a VT switch handing the session back, and a
-    /// resume from suspend. They differ in one argument and one assumption.
-    ///
-    /// `disable_connectors` asks smithay to tear the connectors down before
-    /// bringing them back up, which forces a full modeset rather than trusting
-    /// the state the device claims to be in. A VT switch does not need it —
-    /// we surrendered DRM master cleanly and took it back the same way. A
-    /// resume does: nothing surrendered anything, we held master straight
-    /// through a firmware transition, and what the device reports afterwards
-    /// is not necessarily what is actually programmed into it.
-    ///
-    /// Every screen is marked dirty either way. Whatever is in the scanout
-    /// buffer after either event is not something we put there.
     fn reclaim_display(&mut self, disable_connectors: bool) {
         if let Err(e) = self.manager.activate(disable_connectors) {
             tracing::error!(error = %e, "could not reactivate DRM");
+        }
+        for (dev, secondary) in &mut self.secondaries {
+            if let Err(e) = secondary.activate(disable_connectors) {
+                tracing::error!(device = dev, error = %e, "could not reactivate a secondary DRM device");
+            }
         }
         for screen in self.screens.values_mut() {
             screen.dirty = true;
@@ -578,60 +798,142 @@ impl Udev {
             // complete. Left set, it would make every future frame look like
             // one already in flight and nothing would ever be drawn again.
             screen.awaiting_flip = false;
+            if let ScreenScanout::Dumb(dumb) = &mut screen.scanout {
+                dumb.reset();
+            }
         }
         self.state.queue_redraw();
     }
 
-    /// A DRM device appeared, changed, or went away.
-    ///
-    /// Almost every event here is about a device we are not driving — udev
-    /// reports the whole `drm` subsystem — so the device id is checked first.
     fn on_udev(&mut self, event: &UdevEvent) {
         match *event {
-            UdevEvent::Changed { device_id } if device_id == self.device_id => {
+            UdevEvent::Changed { device_id }
+                if device_id == self.device_id || self.secondaries.contains_key(&device_id) =>
+            {
                 // A connector changed state. Which one, udev does not say.
-                tracing::debug!("GPU reported a change; rescanning connectors");
-                self.sync_connectors();
+                tracing::debug!(
+                    device = device_id,
+                    "device reported a change; rescanning connectors"
+                );
+                if self.sync_device(device_id) {
+                    self.relayout();
+                    self.state.queue_redraw();
+                }
             }
             UdevEvent::Removed { device_id } if device_id == self.device_id => {
-                // Every screen, buffer and framebuffer we hold belongs to a
-                // device that no longer exists. There is nothing to fall back
-                // to, so hand the session back rather than spin on EIO.
-                tracing::error!("the GPU huginn is driving was removed; shutting down");
+                // Every buffer we render into belongs to a device that no
+                // longer exists. There is nothing to fall back to, so hand
+                // the session back rather than spin on EIO.
+                tracing::error!("the GPU huginn renders on was removed; shutting down");
                 self.signal.stop();
+            }
+            UdevEvent::Removed { device_id } if self.secondaries.contains_key(&device_id) => {
+                self.remove_device(device_id);
             }
             UdevEvent::Added {
                 device_id,
                 ref path,
-            } if device_id != self.device_id => {
-                // Multi-GPU needs a DrmOutputManager per device and a way to
-                // move buffers between them; until then, say so rather than
-                // leave a plugged-in card silently dark.
-                tracing::info!(
-                    ?path,
-                    "another GPU appeared; huginn drives only the primary one"
-                );
+            } if device_id != self.device_id && !self.secondaries.contains_key(&device_id) => {
+                self.add_device(path);
             }
             _ => {}
         }
     }
 
-    /// Bring `screens` into line with what is actually plugged in.
+    /// Bring up a DRM device other than the primary and scan its connectors.
     ///
-    /// Runs once at startup and again on every udev `Changed` event for our
-    /// GPU. It has to be a full reconciliation rather than an add or a remove:
-    /// the event says only that *something* about the device changed, and a
-    /// single change can be both — a KVM switch flipping inputs disconnects one
-    /// connector and connects another before we get a chance to look. It can
-    /// also be neither: the same connector, still connected, with a different
-    /// monitor on the end of it, which is why connectors we already drive are
-    /// re-read rather than skipped.
+    /// Fail-soft: a device that will not open is logged and left alone,
+    /// because a dock that will not come up must not take the laptop's own
+    /// screen down with it.
+    fn add_device(&mut self, path: &std::path::Path) {
+        let mut session = self.session.clone();
+        let (mut secondary, notifier) = match Secondary::open(&mut session, path) {
+            Ok(opened) => opened,
+            Err(e) => {
+                tracing::warn!(?path, error = %format!("{e:#}"), "could not bring up a DRM device");
+                return;
+            }
+        };
+        let dev = secondary.node.dev_id();
+        match self
+            .handle
+            .insert_source(notifier, move |event, meta, data: &mut Udev| match event {
+                DrmEvent::VBlank(crtc) => data.on_vblank(dev, crtc),
+                DrmEvent::Error(e) => {
+                    tracing::error!(device = dev, error = %e, ?meta, "DRM error");
+                }
+            }) {
+            Ok(token) => secondary.token = Some(token),
+            Err(e) => {
+                tracing::warn!(?path, error = %e, "could not watch a DRM device for vblanks; not driving it");
+                return;
+            }
+        }
+        self.secondaries.insert(dev, secondary);
+        if self.sync_device(dev) {
+            self.relayout();
+            self.state.queue_redraw();
+        }
+    }
+
+    /// A secondary device went away: its screens with it.
+    fn remove_device(&mut self, dev: libc::dev_t) {
+        let dh = self.dh.clone();
+        let mut changed = false;
+        self.screens.retain(|key, screen| {
+            if key.0 != dev {
+                return true;
+            }
+            tracing::info!(name = %screen.name, "output gone with its device");
+            dh.remove_global::<Huginn>(screen.global.clone());
+            changed = true;
+            false
+        });
+        if let Some(secondary) = self.secondaries.remove(&dev) {
+            if let Some(token) = secondary.token {
+                self.handle.remove(token);
+            }
+            tracing::info!(path = ?secondary.path, "DRM device removed");
+        }
+        if changed {
+            self.relayout();
+            self.state.queue_redraw();
+        }
+    }
+
+    /// The DRM device with id `dev`, primary or secondary.
+    fn device(&self, dev: libc::dev_t) -> Option<&DrmDevice> {
+        if dev == self.device_id {
+            Some(self.manager.device())
+        } else {
+            self.secondaries.get(&dev).map(Secondary::device)
+        }
+    }
+
     fn sync_connectors(&mut self) {
-        let resources = match self.manager.device().resource_handles() {
+        let mut devices: Vec<libc::dev_t> = self.secondaries.keys().copied().collect();
+        devices.insert(0, self.device_id);
+        let mut changed = false;
+        for dev in devices {
+            changed |= self.sync_device(dev);
+        }
+        if changed {
+            self.relayout();
+            self.state.queue_redraw();
+        }
+    }
+
+    /// Reconcile the screens of one device with its connectors. Returns
+    /// whether anything changed; the caller lays the desktop out again.
+    fn sync_device(&mut self, dev: libc::dev_t) -> bool {
+        let Some(device) = self.device(dev) else {
+            return false;
+        };
+        let resources = match device.resource_handles() {
             Ok(resources) => resources,
             Err(e) => {
-                tracing::warn!(error = %e, "reading DRM resources; keeping the current outputs");
-                return;
+                tracing::warn!(device = dev, error = %e, "reading DRM resources; keeping the current outputs");
+                return false;
             }
         };
 
@@ -641,19 +943,19 @@ impl Udev {
         let connected: Vec<connector::Info> = resources
             .connectors()
             .iter()
-            .filter_map(|handle| self.manager.device().get_connector(*handle, true).ok())
+            .filter_map(|handle| device.get_connector(*handle, true).ok())
             .filter(|connector| connector.state() == connector::State::Connected)
             .collect();
         let live: HashSet<connector::Handle> =
             connected.iter().map(connector::Info::handle).collect();
 
         // --- gone ---
-        // Dropping the Screen drops its DrmOutput, which is what releases the
-        // CRTC back to the manager for the next connector to claim.
+        // Dropping the Screen drops its scan-out surface, which is what
+        // releases the CRTC for the next connector to claim.
         let dh = self.dh.clone();
         let mut changed = false;
-        self.screens.retain(|_, screen| {
-            if live.contains(&screen.connector) {
+        self.screens.retain(|key, screen| {
+            if key.0 != dev || live.contains(&screen.connector) {
                 return true;
             }
             tracing::info!(name = %screen.name, "output unplugged");
@@ -665,31 +967,28 @@ impl Udev {
         // --- new, or still here but different ---
         let known: HashSet<connector::Handle> = self
             .screens
-            .values()
-            .map(|screen| screen.connector)
+            .iter()
+            .filter(|(key, _)| key.0 == dev)
+            .map(|(_, screen)| screen.connector)
             .collect();
         for connector in &connected {
             if known.contains(&connector.handle()) {
-                changed |= self.refresh_screen(connector);
+                changed |= self.refresh_screen(dev, connector);
                 continue;
             }
-            match self.add_screen(&resources, connector) {
+            match self.add_screen(dev, &resources, connector) {
                 Ok(()) => changed = true,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "could not bring up a connector")
                 }
             }
         }
-
-        if changed {
-            self.relayout();
-            self.state.queue_redraw();
-        }
+        changed
     }
 
-    /// Give one newly connected connector a CRTC, an output, and a global.
     fn add_screen(
         &mut self,
+        dev: libc::dev_t,
         resources: &ResourceHandles,
         connector: &connector::Info,
     ) -> Result<()> {
@@ -702,17 +1001,18 @@ impl Udev {
         let Some(mode) = preferred_mode(connector) else {
             anyhow::bail!("{name} reports no modes");
         };
-        let Some(crtc) = self.free_crtc(resources, connector) else {
+        let Some(crtc) = self.free_crtc(dev, resources, connector) else {
             anyhow::bail!("no free CRTC for {name}");
         };
 
         let (wl_mode, scale) = describe(connector, &mode);
         let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
+        let mm = Size::new(phys_w as i32, phys_h as i32);
         let output = Output::new(
             name.clone(),
             PhysicalProperties {
                 // Physical size is in millimetres and comes back as u32.
-                size: (phys_w as i32, phys_h as i32).into(),
+                size: (mm.w, mm.h).into(),
                 subpixel: Subpixel::Unknown,
                 make: "Huginn".to_owned(),
                 model: name.clone(),
@@ -730,47 +1030,88 @@ impl Udev {
         output.set_preferred(wl_mode);
         let global = self.state.add_output(&output, &self.dh);
 
-        let dh = self.dh.clone();
-        let drm =
-            self.manager
-                .initialize_output(
-                    crtc,
-                    mode,
-                    &[connector.handle()],
-                    &output,
-                    None,
-                    &mut self.renderer,
-                    &DrmOutputRenderElements::<
-                        GlesRenderer,
-                        WaylandSurfaceRenderElement<GlesRenderer>,
-                    >::default(),
-                )
-                .map_err(|e| {
-                    // The global went out before the CRTC came up, so take it back
-                    // rather than advertise an output that renders nothing.
-                    dh.remove_global::<Huginn>(global.clone());
-                    anyhow::anyhow!("initialising {name}: {e}")
-                })?;
+        let scanout =
+            if dev == self.device_id {
+                self.manager
+                    .initialize_output(
+                        crtc,
+                        mode,
+                        &[connector.handle()],
+                        &output,
+                        None,
+                        &mut self.renderer,
+                        &DrmOutputRenderElements::<
+                            GlesRenderer,
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >::default(),
+                    )
+                    .map(ScreenScanout::Primary)
+                    .map_err(|e| anyhow::anyhow!("initialising {name}: {e}"))
+            } else {
+                match self.secondaries.get_mut(&dev).map(|s| &mut s.scanout) {
+                    Some(Scanout::Gpu { manager, renderer }) => manager
+                        .initialize_output(
+                            crtc,
+                            mode,
+                            &[connector.handle()],
+                            &output,
+                            None,
+                            &mut **renderer,
+                            &DrmOutputRenderElements::<
+                                GlesRenderer,
+                                TextureRenderElement<GlesTexture>,
+                            >::default(),
+                        )
+                        .map(|drm| ScreenScanout::Gpu { drm, bridge: None })
+                        .map_err(|e| anyhow::anyhow!("initialising {name} on its GPU: {e}")),
+                    Some(Scanout::Dumb { device, fd }) => {
+                        DumbSurface::new(device, fd, crtc, mode, &[connector.handle()])
+                            .map(ScreenScanout::Dumb)
+                            .with_context(|| format!("initialising {name} with dumb buffers"))
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "{name} is on a device huginn is not driving"
+                    )),
+                }
+            };
+        let scanout = match scanout {
+            Ok(scanout) => scanout,
+            Err(e) => {
+                // The global went out before the CRTC came up, so take it back
+                // rather than advertise an output that renders nothing.
+                self.dh.remove_global::<Huginn>(global);
+                return Err(e);
+            }
+        };
 
         tracing::info!(
             %name,
             ?crtc,
+            device = dev,
             width = wl_mode.size.w,
             height = wl_mode.size.h,
             refresh_mhz = wl_mode.refresh,
+            kind = match scanout {
+                ScreenScanout::Primary(_) => "primary",
+                ScreenScanout::Gpu { .. } => "secondary gpu",
+                ScreenScanout::Dumb(_) => "dumb",
+            },
             "output up"
         );
 
         self.screens.insert(
-            crtc,
+            (dev, crtc),
             Screen {
-                drm,
+                scanout,
                 output,
                 global,
                 connector: connector.handle(),
                 name,
                 mode,
                 scale,
+                physical: scale.physical,
+                mm,
+                rect: Rect::from_xywh(0, 0, scale.logical.w, scale.logical.h),
                 awaiting_flip: false,
                 dirty: true,
             },
@@ -778,24 +1119,12 @@ impl Udev {
         Ok(())
     }
 
-    /// Follow a change to the panel behind a connector we already drive.
-    ///
-    /// A KVM switch, or a monitor swapped while the cable stays in, keeps the
-    /// connector handle and changes everything else: the preferred mode, the
-    /// physical size, and with it the scale. The rescan force-probed the
-    /// connector, so what it reports now is the new panel and not the kernel's
-    /// memory of the old one. Returns whether anything changed.
-    ///
-    /// The mode is switched in place rather than by tearing the screen down:
-    /// clients keep the `wl_output` they know and see a mode event on it, the
-    /// same as they would from any compositor with a display settings page.
-    /// [`DrmOutput::use_mode`] only stages the mode for the next commit, so
-    /// marking the screen dirty is what actually performs the modeset.
-    fn refresh_screen(&mut self, connector: &connector::Info) -> bool {
-        let Some((&crtc, _)) = self
+    fn refresh_screen(&mut self, dev: libc::dev_t, connector: &connector::Info) -> bool {
+        let Some(&key) = self
             .screens
             .iter()
-            .find(|(_, screen)| screen.connector == connector.handle())
+            .find(|(key, screen)| key.0 == dev && screen.connector == connector.handle())
+            .map(|(key, _)| key)
         else {
             return false;
         };
@@ -806,27 +1135,56 @@ impl Udev {
             return false;
         };
         let (wl_mode, scale) = describe(connector, &mode);
+        let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
 
-        let screen = self
-            .screens
-            .get_mut(&crtc)
+        let Udev {
+            screens,
+            secondaries,
+            renderer,
+            ..
+        } = self;
+        let screen = screens
+            .get_mut(&key)
             .expect("looked up by connector just above");
         if mode == screen.mode && scale == screen.scale {
             return false;
         }
 
         if mode != screen.mode {
-            if let Err(e) =
-                screen.drm.use_mode(
-                    mode,
-                    &mut self.renderer,
-                    &DrmOutputRenderElements::<
-                        GlesRenderer,
-                        WaylandSurfaceRenderElement<GlesRenderer>,
-                    >::default(),
-                )
-            {
-                tracing::warn!(name = %screen.name, error = %e, "switching mode; keeping the old one");
+            let switched = match &mut screen.scanout {
+                ScreenScanout::Primary(drm) => drm
+                    .use_mode(
+                        mode,
+                        renderer,
+                        &DrmOutputRenderElements::<
+                            GlesRenderer,
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >::default(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+                ScreenScanout::Gpu { drm, bridge } => {
+                    *bridge = None;
+                    match secondaries.get_mut(&dev).map(|s| &mut s.scanout) {
+                        Some(Scanout::Gpu {
+                            renderer: secondary,
+                            ..
+                        }) => drm
+                            .use_mode(
+                                mode,
+                                &mut **secondary,
+                                &DrmOutputRenderElements::<
+                                    GlesRenderer,
+                                    TextureRenderElement<GlesTexture>,
+                                >::default(),
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}")),
+                        _ => Err(anyhow::anyhow!("its device is gone")),
+                    }
+                }
+                ScreenScanout::Dumb(dumb) => dumb.use_mode(mode),
+            };
+            if let Err(e) = switched {
+                tracing::warn!(name = %screen.name, error = %format!("{e:#}"), "switching mode; keeping the old one");
                 return false;
             }
             tracing::info!(
@@ -843,6 +1201,8 @@ impl Udev {
 
         screen.mode = mode;
         screen.scale = scale;
+        screen.physical = scale.physical;
+        screen.mm = Size::new(phys_w as i32, phys_h as i32);
         // The physical size on the `wl_output` global is fixed at creation and
         // stays as the old panel reported it; nothing downstream reads it, the
         // scale policy having already been applied here.
@@ -854,91 +1214,150 @@ impl Udev {
         true
     }
 
-    /// A CRTC this connector can drive that no screen has already taken.
     fn free_crtc(
         &self,
+        dev: libc::dev_t,
         resources: &ResourceHandles,
         connector: &connector::Info,
     ) -> Option<crtc::Handle> {
+        let device = self.device(dev)?;
         connector
             .encoders()
             .iter()
-            .filter_map(|encoder| self.manager.device().get_encoder(*encoder).ok())
+            .filter_map(|encoder| device.get_encoder(*encoder).ok())
             .flat_map(|encoder| resources.filter_crtcs(encoder.possible_crtcs()))
-            .find(|crtc| !self.screens.contains_key(crtc))
+            .find(|crtc| !self.screens.contains_key(&(dev, *crtc)))
     }
 
-    /// Lay the screens out left to right and tell the core how much room it has.
-    ///
-    /// In logical pixels throughout: a 4K panel at 2× is 1920 wide here, which
-    /// is the unit the desktop is laid out in and the renderer scales back up
-    /// from. Using the panel's native size instead would hand the core a
-    /// desktop twice as large as the screen, of which clients — told 2× —
-    /// would then show a quarter.
-    ///
-    /// Ordered by connector name rather than by CRTC or discovery order, so
-    /// that unplugging the middle of three monitors and plugging it back in
-    /// puts it back where it was instead of shuffling the other two.
     fn relayout(&mut self) {
-        let mut order: Vec<crtc::Handle> = self.screens.keys().copied().collect();
-        order.sort_by(|a, b| self.screens[a].name.cmp(&self.screens[b].name));
+        let saved = self.state.output_layout().to_vec();
+        let builtin = |name: &str| {
+            name.starts_with("eDP") || name.starts_with("LVDS") || name.starts_with("DSI")
+        };
 
-        let mut x = 0;
-        let mut leftmost = None;
-        for crtc in order {
-            let screen = &self.screens[&crtc];
-            screen
-                .output
-                .change_current_state(None, None, None, Some((x, 0).into()));
-            leftmost.get_or_insert(screen.scale);
-            x += screen.scale.logical.w;
-        }
+        let mut keys: Vec<ScreenKey> = self.screens.keys().copied().collect();
+        keys.sort_by(|a, b| self.screens[a].name.cmp(&self.screens[b].name));
 
-        // Single-output for now: huginn-core still models one scale and one
-        // usable area, so the leftmost screen defines both. Multi-output needs
-        // a per-output area in the core before it means anything here. With
-        // nothing connected the last known scale is kept — resizing every
-        // client to zero and back is a configure storm that buys nothing while
-        // no one can see the screen.
-        if let Some(scale) = leftmost
-            && scale != self.state.scale
-        {
-            // `set_output_scale` derives the area from the logical size and
-            // reflows the layer surfaces and the windows underneath them.
-            // The panels the shell draws are composed for the new density the
-            // next time each is refreshed; the cursor bitmap is the one thing
-            // loaded once, so it is loaded again here.
-            self.state.set_output_scale(scale);
-            if self
-                .cursor
-                .as_ref()
-                .is_none_or(|cursor| cursor.density != scale.advertised)
-            {
-                self.cursor = Cursor::from_env(scale.advertised);
+        // A saved scale wins over the one the panel's size implies. Applied
+        // before placing, since it changes how much room the screen takes.
+        for key in &keys {
+            let screen = self.screens.get_mut(key).expect("key from the same map");
+            let wanted = saved
+                .iter()
+                .find(|s| s.name == screen.name)
+                .and_then(|s| s.scale)
+                .map_or_else(
+                    || OutputScale::for_output(screen.physical, screen.mm),
+                    |scale| OutputScale::from_effective(screen.physical, scale),
+                );
+            if wanted != screen.scale {
+                tracing::info!(name = %screen.name, advertised = wanted.advertised, effective = wanted.fractional(), "output scale set");
+                screen.scale = wanted;
+                screen
+                    .output
+                    .change_current_state(None, None, Some(advertise(wanted)), None);
+                screen.dirty = true;
             }
         }
+
+        let candidates: Vec<huginn_core::layout::Candidate> = keys
+            .iter()
+            .map(|key| {
+                let screen = &self.screens[key];
+                huginn_core::layout::Candidate {
+                    name: screen.name.clone(),
+                    size: screen.scale.logical,
+                    builtin: builtin(&screen.name),
+                }
+            })
+            .collect();
+        let placed = huginn_core::layout::arrange(&candidates, &saved);
+
+        let mut outputs = Vec::with_capacity(keys.len());
+        for (key, rect) in keys.iter().zip(placed) {
+            let screen = self.screens.get_mut(key).expect("key from the same map");
+            if screen.rect != rect {
+                screen.dirty = true;
+            }
+            screen.rect = rect;
+            screen
+                .output
+                .change_current_state(None, None, None, Some((rect.x(), rect.y()).into()));
+            outputs.push(crate::state::OutputInfo {
+                name: screen.name.clone(),
+                rect,
+                scale: screen.scale,
+                mm: screen.mm,
+                output: Some(screen.output.clone()),
+            });
+        }
+
+        // With nothing connected the last known layout is kept — resizing
+        // every client to zero and back is a configure storm that buys nothing
+        // while no one can see the screen. `set_outputs` ignores an empty list
+        // for the same reason.
+        if outputs.is_empty() {
+            return;
+        }
+        // Every density on screen has a cursor loaded for it. Loaded once
+        // and kept: a monitor that comes and goes should not re-read the
+        // theme each time.
+        for output in &outputs {
+            let density = output.scale.advertised;
+            if !self.cursors.contains_key(&density)
+                && let Some(cursor) = Cursor::from_env(density)
+            {
+                self.cursors.insert(cursor.density, cursor);
+            }
+        }
+        // Reflows the layer surfaces and the windows underneath them on every
+        // screen; the panels the shell draws are composed for their screen's
+        // density the next time each is refreshed.
+        self.state.set_outputs(outputs);
     }
 
-    /// Render every screen that has changes and is not already waiting on a flip.
     fn render_dirty(&mut self) {
-        let crtcs: Vec<crtc::Handle> = self
+        let keys: Vec<ScreenKey> = self
             .screens
             .iter()
             .filter(|(_, s)| s.dirty && !s.awaiting_flip)
-            .map(|(c, _)| *c)
+            .map(|(k, _)| *k)
             .collect();
-        for crtc in crtcs {
-            self.render(crtc);
+        for key in keys {
+            self.render(key);
         }
     }
 
-    fn render(&mut self, crtc: crtc::Handle) {
+    fn render(&mut self, key: ScreenKey) {
         // Advance animations before assembling the scene, so this frame shows
         // where they are now rather than where they were last frame.
         self.state.tick_animations();
         if !self.session.is_active() {
             return;
         }
+
+        // This screen's view of the desktop: where it sits and what it
+        // renders at. Every screen draws the same scene; this is what makes
+        // each draw its own part of it.
+        let Some((view, scale, density, size)) = self.screens.get(&key).map(|screen| {
+            (
+                screen.rect,
+                screen.scale.fractional(),
+                screen.scale.advertised,
+                screen
+                    .output
+                    .current_mode()
+                    .map(|mode| mode.size)
+                    .unwrap_or_default(),
+            )
+        }) else {
+            return;
+        };
+        let cursor = self.cursors.get(&density);
+
+        // Clients learn which screen they are on -- and so what scale to
+        // draw at -- from here, once a frame, before the frame is built.
+        self.state.update_surface_outputs();
 
         // The blur's offscreen passes bind their own framebuffers, so they run
         // before `render_frame` takes the renderer. `None` — no panel open, no
@@ -950,17 +1369,14 @@ impl Udev {
         // is cropped to the panel and the rest of the screen still has to
         // show something.
         let (front, behind) =
-            render::elements_split(&mut self.renderer, &self.state, self.cursor.as_ref());
+            render::elements_split(&mut self.renderer, &self.state, cursor, view, scale);
         let radius = self.state.blur_radius();
         let blurred = match self.state.blur_rect() {
-            Some(rect) if radius > 0.0 => {
-                let size = self
-                    .screens
-                    .get(&crtc)
-                    .and_then(|screen| screen.output.current_mode())
-                    .map(|mode| mode.size)
-                    .unwrap_or_default();
-                let scale = self.state.scale.fractional();
+            // The panel is on the focused screen; a blur for it on any other
+            // would be a smear over nothing.
+            Some(rect) if radius > 0.0 && rect.overlaps(view) => {
+                let rect =
+                    Rect::from_xywh(rect.x() - view.x(), rect.y() - view.y(), rect.w(), rect.h());
                 self.blur
                     .as_mut()
                     .and_then(|blur| blur.pass(&mut self.renderer, &behind, size, scale, radius))
@@ -975,29 +1391,52 @@ impl Udev {
         elements.extend(blurred);
         elements.extend(behind);
 
-        let Some(screen) = self.screens.get_mut(&crtc) else {
+        let Udev {
+            renderer,
+            allocator,
+            screens,
+            secondaries,
+            ..
+        } = self;
+        let Some(screen) = screens.get_mut(&key) else {
             return;
         };
 
-        match screen
-            .drm
-            .render_frame(&mut self.renderer, &elements, CLEAR, FrameFlags::DEFAULT)
-        {
-            Ok(result) => {
-                if result.is_empty {
-                    // Nothing changed on screen; do not burn a page flip on it.
-                    screen.dirty = false;
-                } else {
-                    match screen.drm.queue_frame(()) {
-                        Ok(()) => {
-                            screen.awaiting_flip = true;
-                            screen.dirty = false;
-                        }
-                        Err(e) => tracing::warn!(name = %screen.name, error = %e, "queueing frame"),
-                    }
+        // Every kind renders the same elements with the primary; they differ
+        // only in where the pixels go afterwards. `Ok(true)` is a frame in
+        // flight, `Ok(false)` a frame with nothing new in it.
+        let presented = match &mut screen.scanout {
+            ScreenScanout::Primary(drm) => present_primary(renderer, drm, &elements),
+            ScreenScanout::Gpu { drm, bridge } => {
+                match secondaries.get_mut(&key.0).map(|s| &mut s.scanout) {
+                    Some(Scanout::Gpu {
+                        renderer: secondary,
+                        ..
+                    }) => present_gpu(
+                        renderer,
+                        allocator,
+                        secondary,
+                        drm,
+                        bridge,
+                        &elements,
+                        size,
+                        scale,
+                    ),
+                    _ => Err(anyhow::anyhow!("its device is gone")),
                 }
             }
-            Err(e) => tracing::warn!(name = %screen.name, error = %e, "rendering frame"),
+            ScreenScanout::Dumb(dumb) => present_dumb(renderer, dumb, &elements, scale),
+        };
+        match presented {
+            Ok(true) => {
+                screen.awaiting_flip = true;
+                screen.dirty = false;
+            }
+            // Nothing changed on screen; do not burn a page flip on it.
+            Ok(false) => screen.dirty = false,
+            Err(e) => {
+                tracing::warn!(name = %screen.name, error = %format!("{e:#}"), "presenting frame")
+            }
         }
 
         // Frame callbacks go out even when the frame had no damage, and to
@@ -1011,19 +1450,25 @@ impl Udev {
         }
     }
 
-    /// A queued frame reached the screen.
-    fn on_vblank(&mut self, crtc: crtc::Handle) {
-        if let Some(screen) = self.screens.get_mut(&crtc) {
+    fn on_vblank(&mut self, dev: libc::dev_t, crtc: crtc::Handle) {
+        let key = (dev, crtc);
+        if let Some(screen) = self.screens.get_mut(&key) {
             screen.awaiting_flip = false;
-            if let Err(e) = screen.drm.frame_submitted() {
+            let submitted = match &screen.scanout {
+                ScreenScanout::Primary(drm) | ScreenScanout::Gpu { drm, .. } => {
+                    drm.frame_submitted().map(|_| ())
+                }
+                ScreenScanout::Dumb(_) => Ok(()),
+            };
+            if let Err(e) = submitted {
                 tracing::warn!(name = %screen.name, error = %e, "frame_submitted");
             }
         }
         // Only draw again if something actually changed. Rendering on every
         // vblank regardless would rebuild the whole scene 60 times a second on
         // a desktop that is sitting still.
-        if self.screens.get(&crtc).is_some_and(|s| s.dirty) {
-            self.render(crtc);
+        if self.screens.get(&key).is_some_and(|s| s.dirty) {
+            self.render(key);
         }
     }
 
@@ -1160,6 +1605,8 @@ impl Udev {
             Action::SendToWorkspace(i) => {
                 state.space.send_focused_to_workspace(i);
             }
+            Action::FocusNextOutput => state.focus_next_output(),
+            Action::SendToNextOutput => state.send_focused_to_next_output(),
             Action::EnterResize => {
                 state.resizing = true;
                 tracing::debug!("resize mode: arrows resize, Escape or Return leaves");

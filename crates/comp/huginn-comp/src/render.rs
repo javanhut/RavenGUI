@@ -41,6 +41,7 @@ use smithay::{
 
 use crate::pointer::Cursor;
 use crate::state::{Huginn, SceneItem};
+use huginn_core::geometry::Rect;
 
 render_elements! {
     /// Everything Huginn can draw.
@@ -98,8 +99,10 @@ pub(crate) fn elements_split(
     renderer: &mut GlesRenderer,
     state: &Huginn,
     fallback_cursor: Option<&Cursor>,
+    view: Rect,
+    scale: f64,
 ) -> (Vec<HuginnElement>, Vec<HuginnElement>) {
-    let all = elements(renderer, state, fallback_cursor);
+    let all = elements(renderer, state, fallback_cursor, view, scale);
     // `elements` puts the cursor in front of everything `scene` produced, so
     // the boundary is that plus the panels above it.
     let cursor = all.len() - state.scene().len();
@@ -109,14 +112,32 @@ pub(crate) fn elements_split(
     (front, back)
 }
 
-/// Build the full scene, cursor included, front to back.
+/// Build the full scene, cursor included, front to back, as seen from one
+/// screen.
+///
+/// `view` is that screen's rectangle in the desktop's logical coordinates and
+/// `scale` its fractional render scale. The scene is one desktop; each screen
+/// draws the part of it under `view`, at its own density. Elements are moved
+/// so `view`'s corner is the origin -- the DRM surface knows nothing about
+/// where its screen sits -- and anything wholly outside it is left out, so a
+/// window on the other monitor costs this one nothing.
 pub(crate) fn elements(
     renderer: &mut GlesRenderer,
     state: &Huginn,
     fallback_cursor: Option<&Cursor>,
+    view: Rect,
+    scale: f64,
 ) -> Vec<HuginnElement> {
-    // The scale the desktop is composed at. See the module docs.
-    let scale = state.scale.fractional();
+    let (ox, oy) = (view.x(), view.y());
+    // Everything `scene` hands out is in desktop coordinates; this is the
+    // one place they become this screen's.
+    let local = |rect: Rect| Rect::from_xywh(rect.x() - ox, rect.y() - oy, rect.w(), rect.h());
+    let on_screen = |rect: Rect| rect.overlaps(view);
+    let pointer: Point<f64, Logical> = (
+        state.pointer_location.x - f64::from(ox),
+        state.pointer_location.y - f64::from(oy),
+    )
+        .into();
 
     let mut out: Vec<HuginnElement> = Vec::new();
 
@@ -133,8 +154,7 @@ pub(crate) fn elements(
                     .map(|attrs| attrs.lock().unwrap().hotspot)
                     .unwrap_or_default()
             });
-            let position: Point<i32, Logical> =
-                state.pointer_location.to_i32_round::<i32>() - hotspot;
+            let position: Point<i32, Logical> = pointer.to_i32_round::<i32>() - hotspot;
             out.extend(
                 render_elements_from_surface_tree(
                     renderer,
@@ -152,8 +172,8 @@ pub(crate) fn elements(
         CursorImageStatus::Named(_) => {
             if let Some(cursor) = fallback_cursor {
                 let position: Point<f64, Logical> = (
-                    state.pointer_location.x - f64::from(cursor.hotspot.x),
-                    state.pointer_location.y - f64::from(cursor.hotspot.y),
+                    pointer.x - f64::from(cursor.hotspot.x),
+                    pointer.y - f64::from(cursor.hotspot.y),
                 )
                     .into();
                 if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
@@ -175,11 +195,16 @@ pub(crate) fn elements(
 
     for item in state.scene() {
         match item {
+            SceneItem::Surface(_, rect)
+            | SceneItem::Clipped(_, rect, _, _)
+            | SceneItem::Overlay(_, rect, _)
+            | SceneItem::Ring(_, rect, _)
+                if !on_screen(rect) => {}
             SceneItem::Surface(surface, rect) => out.extend(
                 render_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    Point::<i32, Logical>::from((rect.x(), rect.y()))
+                    Point::<i32, Logical>::from((rect.x() - ox, rect.y() - oy))
                         .to_physical_precise_round::<f64, i32>(scale),
                     scale,
                     1.0,
@@ -191,6 +216,7 @@ pub(crate) fn elements(
             SceneItem::Clipped(surface, rect, clip, alpha) => {
                 // Cropped, not scaled: the content stays at its natural size
                 // and the moving edge cuts it off. See `crate::motion`.
+                let clip = local(clip);
                 let crop = Rectangle::<i32, Logical>::new(
                     (clip.x(), clip.y()).into(),
                     (clip.w(), clip.h()).into(),
@@ -200,7 +226,7 @@ pub(crate) fn elements(
                     render_elements_from_surface_tree(
                         renderer,
                         &surface,
-                        Point::<i32, Logical>::from((rect.x(), rect.y()))
+                        Point::<i32, Logical>::from((rect.x() - ox, rect.y() - oy))
                             .to_physical_precise_round::<f64, i32>(scale),
                         scale,
                         alpha,
@@ -213,7 +239,7 @@ pub(crate) fn elements(
             }
             SceneItem::WorkspaceSurface(surface, rect, transform)
             | SceneItem::Preview(surface, rect, transform) => {
-                let origin = Point::<i32, Logical>::from((rect.x(), rect.y()))
+                let origin = Point::<i32, Logical>::from((rect.x() - ox, rect.y() - oy))
                     .to_physical_precise_round::<f64, i32>(scale);
                 let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))
                     .to_physical_precise_round::<f64, i32>(scale);
@@ -241,8 +267,11 @@ pub(crate) fn elements(
                 );
             }
             SceneItem::WorkspaceCard(buffer, transform) => {
-                let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))
-                    .to_physical_precise_round::<f64, i32>(scale);
+                let offset = Point::<f64, Logical>::from((
+                    transform.offset_x - f64::from(ox),
+                    transform.offset_y - f64::from(oy),
+                ))
+                .to_physical_precise_round::<f64, i32>(scale);
                 let element = SolidColorRenderElement::from_buffer(
                     buffer,
                     (0, 0),
@@ -268,8 +297,11 @@ pub(crate) fn elements(
                 // would shimmer as they re-hinted at each one.
                 if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
-                    Point::<f64, Logical>::from((f64::from(rect.x()), f64::from(rect.y())))
-                        .to_physical(scale),
+                    Point::<f64, Logical>::from((
+                        f64::from(rect.x() - ox),
+                        f64::from(rect.y() - oy),
+                    ))
+                    .to_physical(scale),
                     buffer,
                     Some(alpha),
                     None,
@@ -282,7 +314,7 @@ pub(crate) fn elements(
             SceneItem::Ring(buffer, rect, alpha) => {
                 out.push(HuginnElement::Ring(SolidColorRenderElement::from_buffer(
                     buffer,
-                    Point::<i32, Logical>::from((rect.x(), rect.y()))
+                    Point::<i32, Logical>::from((rect.x() - ox, rect.y() - oy))
                         .to_physical_precise_round::<f64, i32>(scale),
                     scale,
                     alpha,

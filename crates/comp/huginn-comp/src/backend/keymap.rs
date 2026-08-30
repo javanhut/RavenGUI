@@ -38,6 +38,10 @@ pub(crate) enum Action {
     Move(Dir),
     Workspace(usize),
     SendToWorkspace(usize),
+    /// Move focus to the next screen, onto whatever workspace it shows.
+    FocusNextOutput,
+    /// Send the focused window to the next screen, keeping focus here.
+    SendToNextOutput,
     Spawn,
     Quit,
     /// Copy in the focused client, by sending it the chord it understands.
@@ -208,6 +212,16 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::SendToWorkspace(0),
         chord: "Super+Ctrl+Shift+1..9",
         description: "send the focused window to a workspace",
+    },
+    Binding {
+        action: Action::FocusNextOutput,
+        chord: "Super+Ctrl+Tab",
+        description: "focus the next screen",
+    },
+    Binding {
+        action: Action::SendToNextOutput,
+        chord: "Super+Ctrl+Shift+Tab",
+        description: "send the focused window to the next screen",
     },
     Binding {
         action: Action::Copy,
@@ -397,6 +411,11 @@ pub(crate) fn resolve(
         keysyms::KEY_Up => Action::Move(Dir::Up),
         keysyms::KEY_Down => Action::Move(Dir::Down),
         keysyms::KEY_Escape => Action::Quit,
+        // Shift+Tab arrives as ISO_Left_Tab on most layouts and as Tab with
+        // Shift held on the rest; both mean the same thing here.
+        keysyms::KEY_ISO_Left_Tab => Action::SendToNextOutput,
+        keysyms::KEY_Tab if modifiers.shift => Action::SendToNextOutput,
+        keysyms::KEY_Tab => Action::FocusNextOutput,
         // Adding Shift sends the window there instead of going there yourself.
         sym => match workspace_index(sym) {
             Some(i) if modifiers.shift => Action::SendToWorkspace(i),
