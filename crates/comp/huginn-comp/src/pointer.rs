@@ -157,17 +157,12 @@ impl Huginn {
         point: Point<f64, Logical>,
     ) -> Option<huginn_core::window::WindowId> {
         let p = huginn_core::geometry::Point::new(point.x as i32, point.y as i32);
-        self.space
-            .active_workspace()
-            .windows()
-            .iter()
-            .rev()
-            .find(|id| {
-                self.space
-                    .window(**id)
-                    .is_some_and(|w| w.geometry.contains(p))
-            })
-            .copied()
+        // Every screen's workspace: the click may be on the other monitor.
+        self.visible_window_ids().into_iter().rev().find(|id| {
+            self.space
+                .window(*id)
+                .is_some_and(|w| w.geometry.contains(p))
+        })
     }
 
     /// The interactive layer surface under `point`, if there is one.
@@ -204,14 +199,30 @@ impl Huginn {
     /// Clamp the pointer to the output. Without this a relative motion event
     /// can walk the cursor off screen, where it is both invisible and unable to
     /// reach anything.
+    ///
+    /// With several screens the pointer may be anywhere on any of them, and
+    /// where they touch it crosses freely. Off every screen, it goes to the
+    /// nearest point on the nearest one, which is what lets it slide along a
+    /// monitor's edge and round a corner where the two are not the same
+    /// height.
     pub(crate) fn clamp_pointer(&self, point: Point<f64, Logical>) -> Point<f64, Logical> {
-        let area: Rect = self.output_area();
-        let max_x = f64::from(area.right() - 1).max(0.0);
-        let max_y = f64::from(area.bottom() - 1).max(0.0);
-        (
-            point.x.clamp(f64::from(area.x()), max_x),
-            point.y.clamp(f64::from(area.y()), max_y),
-        )
-            .into()
+        let clamp_to = |area: Rect| -> Point<f64, Logical> {
+            let max_x = f64::from(area.right() - 1).max(f64::from(area.x()));
+            let max_y = f64::from(area.bottom() - 1).max(f64::from(area.y()));
+            (
+                point.x.clamp(f64::from(area.x()), max_x),
+                point.y.clamp(f64::from(area.y()), max_y),
+            )
+                .into()
+        };
+        self.outputs()
+            .iter()
+            .map(|output| clamp_to(output.rect))
+            .min_by(|a, b| {
+                let da = (a.x - point.x).powi(2) + (a.y - point.y).powi(2);
+                let db = (b.x - point.x).powi(2) + (b.y - point.y).powi(2);
+                da.total_cmp(&db)
+            })
+            .unwrap_or(point)
     }
 }

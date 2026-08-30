@@ -28,6 +28,7 @@
 
 pub mod geometry;
 pub mod layer;
+pub mod layout;
 pub mod scale;
 pub mod strip;
 pub mod tiles;
@@ -49,20 +50,47 @@ const DEFAULT_WORKSPACES: u64 = 9;
 /// Gutter used until the compositor supplies its own. See [`Space::set_gap`].
 const DEFAULT_GAP: i32 = 8;
 
+/// One screen the desktop spans, in logical coordinates shared by every
+/// screen.
+///
+/// `output` is the whole of it, which is what fullscreen covers. `area` is
+/// what is left for windows once the panels on that screen have taken their
+/// exclusive zones. Each screen has its own pair: a dock on the laptop panel
+/// reserves nothing on the monitor beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputArea {
+    pub output: Rect,
+    pub area: Rect,
+}
+
+impl OutputArea {
+    /// A screen with no panels on it yet.
+    pub const fn new(output: Rect) -> Self {
+        Self {
+            output,
+            area: output,
+        }
+    }
+}
+
 /// The complete window-management state of one seat.
 #[derive(Debug)]
 pub struct Space {
     windows: BTreeMap<WindowId, Window>,
     workspaces: Vec<Workspace>,
+    /// The focused workspace. Its output is the focused output: the one
+    /// keybindings act on, new windows open on, and the shell's panels sit on.
     active: usize,
-    /// Usable area after layer-shell exclusive zones (panels, docks) are
-    /// subtracted. Single-output for now; multi-output arrives with the udev
-    /// backend, at which point this becomes a per-output field.
-    area: Rect,
-    /// The whole output, before panels take anything. What a fullscreen
-    /// window covers: fullscreen means the screen, not the space between the
-    /// bars.
-    output: Rect,
+    /// Every screen, in one global coordinate space. Never empty: with no
+    /// monitor connected the last known geometry is kept, so the desktop has
+    /// somewhere to be when one comes back.
+    outputs: Vec<OutputArea>,
+    /// Which workspace each output is showing, parallel to `outputs`.
+    ///
+    /// The invariant that makes multi-monitor mean anything: every output shows
+    /// exactly one workspace, no workspace is visible on two outputs, and the
+    /// active workspace is the one visible on the focused output.
+    visible: Vec<usize>,
     /// Space between tiled windows and around the edge of the pane.
     ///
     /// Held here rather than read from a constant so `huginn-core` keeps
@@ -99,7 +127,8 @@ pub struct Space {
 }
 
 impl Space {
-    /// Create a space with [`DEFAULT_WORKSPACES`] empty workspaces.
+    /// Create a space with [`DEFAULT_WORKSPACES`] empty workspaces on one
+    /// output covering `area`.
     pub fn new(area: Rect) -> Self {
         Self {
             windows: BTreeMap::new(),
@@ -107,8 +136,8 @@ impl Space {
                 .map(|n| Workspace::new(WorkspaceId::from_raw(n)))
                 .collect(),
             active: 0,
-            area,
-            output: area,
+            outputs: vec![OutputArea::new(area)],
+            visible: vec![0],
             gap: DEFAULT_GAP,
             carousel_columns: strip::DEFAULT_COLUMNS,
             carousel_offset: None,
@@ -160,7 +189,7 @@ impl Space {
     /// stale origin and undo the nudge.
     pub fn update_carousel_target(&mut self) -> Option<i32> {
         let tiled = self.tiled_windows();
-        let (area, gap, columns) = (self.area, self.gap, self.carousel_columns);
+        let (area, gap, columns) = (self.area(), self.gap, self.carousel_columns);
         // Read before the workspace is borrowed, not because the order matters
         // to the logic but because it does to the borrow checker.
         let drag = self.carousel_drag;
@@ -211,7 +240,7 @@ impl Space {
         // Subsumes the empty case: `max_offset` is zero for a strip with no
         // panes, so there is no separate emptiness test to keep in step.
         let tiled = self.tiled_windows();
-        if strip::max_offset(&tiled, self.area, self.gap, self.carousel_columns) == 0 {
+        if strip::max_offset(&tiled, self.area(), self.gap, self.carousel_columns) == 0 {
             return None;
         }
         let ws = &mut self.workspaces[self.active];
@@ -244,7 +273,7 @@ impl Space {
     pub fn drag_carousel(&mut self, offset: i32) -> Option<i32> {
         let held = self.carousel_drag?;
         let tiled = self.tiled_windows();
-        let (area, gap, columns) = (self.area, self.gap, self.carousel_columns);
+        let (area, gap, columns) = (self.area(), self.gap, self.carousel_columns);
         let ws = &mut self.workspaces[self.active];
         if held != ws.id() {
             return None;
@@ -268,7 +297,7 @@ impl Space {
     pub fn end_carousel_drag(&mut self) -> Option<WindowId> {
         let held = self.carousel_drag.take()?;
         let tiled = self.tiled_windows();
-        let (area, gap, columns) = (self.area, self.gap, self.carousel_columns);
+        let (area, gap, columns) = (self.area(), self.gap, self.carousel_columns);
         let ws = &mut self.workspaces[self.active];
         if held != ws.id() {
             return None;
@@ -279,31 +308,169 @@ impl Space {
         Some(pane)
     }
 
-    /// The area available to windows.
-    pub const fn area(&self) -> Rect {
-        self.area
+    /// The area available to windows on the focused output.
+    pub fn area(&self) -> Rect {
+        self.outputs[self.focused_output()].area
     }
 
-    /// Update the usable area, e.g. when a panel claims an exclusive zone or an
-    /// output is resized. Call [`Self::arrange`] afterwards to apply it.
+    /// Update the usable area of the focused output, e.g. when a panel claims
+    /// an exclusive zone. Call [`Self::arrange`] afterwards to apply it.
     pub fn set_area(&mut self, area: Rect) {
-        self.area = area;
+        let index = self.focused_output();
+        self.outputs[index].area = area;
     }
 
-    /// The whole output rectangle, which is what fullscreen covers.
-    pub const fn output(&self) -> Rect {
-        self.output
+    /// The whole rectangle of the focused output, which is what fullscreen
+    /// covers there.
+    pub fn output(&self) -> Rect {
+        self.outputs[self.focused_output()].output
     }
 
-    /// Update the whole output rectangle. Call [`Self::arrange`] afterwards.
+    /// Update the whole rectangle of the focused output. Call
+    /// [`Self::arrange`] afterwards.
     pub fn set_output(&mut self, output: Rect) {
-        self.output = output;
+        let index = self.focused_output();
+        self.outputs[index].output = output;
+    }
+
+    /// Every screen the desktop spans. Never empty.
+    pub fn outputs(&self) -> &[OutputArea] {
+        &self.outputs
+    }
+
+    /// The output the active workspace is on: where focus is.
+    pub fn focused_output(&self) -> usize {
+        self.workspaces[self.active].output()
+    }
+
+    /// The workspace each output is showing, as `(output, workspace)` index
+    /// pairs in output order.
+    pub fn visible_workspaces(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.visible.iter().copied().enumerate()
+    }
+
+    /// The workspace output `index` is showing.
+    pub fn visible_on(&self, index: usize) -> Option<usize> {
+        self.visible.get(index).copied()
+    }
+
+    /// The output whose rectangle contains `point`, if any.
+    pub fn output_at(&self, point: geometry::Point) -> Option<usize> {
+        self.outputs
+            .iter()
+            .position(|screen| screen.output.contains(point))
+    }
+
+    /// Update the usable area of one output. Call [`Self::arrange`] after.
+    pub fn set_output_area(&mut self, index: usize, area: Rect) -> bool {
+        match self.outputs.get_mut(index) {
+            Some(screen) if screen.area != area => {
+                screen.area = area;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace the set of screens. Call [`Self::arrange`] afterwards.
+    ///
+    /// Reconciles the workspaces with the new set rather than resetting them:
+    /// a monitor unplugged sends its workspaces to the screen that remains,
+    /// windows and focus intact, and a monitor plugged in is given a workspace
+    /// of its own -- the first one nobody is looking at -- so it comes up as a
+    /// desktop rather than a blank. An empty list keeps the outputs there
+    /// were; the desktop needs somewhere to be while nothing is connected.
+    pub fn set_outputs(&mut self, outputs: Vec<OutputArea>) {
+        if outputs.is_empty() {
+            return;
+        }
+        // Each previous output's areas are replaced in order; a caller that
+        // rebuilds the list from scratch on every hotplug gets stable
+        // workspace placement for the screens that stayed, which is what
+        // keeps the laptop panel's desktop on the laptop panel.
+        let count = outputs.len();
+        self.outputs = outputs;
+
+        // Workspaces on a screen that is gone move to the last one left.
+        let last = count - 1;
+        for workspace in &mut self.workspaces {
+            if workspace.output() >= count {
+                workspace.set_output(last);
+            }
+        }
+        self.visible.truncate(count);
+        // A screen that survived may now show a workspace that also moved
+        // here from a lost screen; the first claim wins and the rest are
+        // hidden, which is what a workspace on a screen you cannot see is.
+        let mut seen = Vec::with_capacity(count);
+        for index in 0..self.visible.len() {
+            let workspace = self.visible[index];
+            if seen.contains(&workspace) || self.workspaces[workspace].output() != index {
+                self.visible[index] = usize::MAX;
+            } else {
+                seen.push(workspace);
+            }
+        }
+        // New screens, and survivors left without a workspace, take the first
+        // workspace not visible anywhere. The active workspace is never
+        // handed away: it is what the person is working in.
+        for index in 0..count {
+            if index < self.visible.len() && self.visible[index] != usize::MAX {
+                continue;
+            }
+            let pick = (0..self.workspaces.len())
+                .find(|candidate| {
+                    !seen.contains(candidate)
+                        && *candidate != self.active
+                        && self.workspaces[*candidate].output() == index
+                })
+                .or_else(|| {
+                    (0..self.workspaces.len())
+                        .find(|candidate| !seen.contains(candidate) && *candidate != self.active)
+                })
+                // Nine workspaces and more than nine screens: share the last.
+                .unwrap_or(self.active);
+            self.workspaces[pick].set_output(index);
+            seen.push(pick);
+            if index < self.visible.len() {
+                self.visible[index] = pick;
+            } else {
+                self.visible.push(pick);
+            }
+        }
+        // The active workspace must be visible on its own output.
+        let focused = self.workspaces[self.active].output();
+        if self.visible[focused] != self.active {
+            self.visible[focused] = self.active;
+        }
+        debug_assert_eq!(self.visible.len(), self.outputs.len());
+    }
+
+    /// Move focus to output `index`, onto the workspace it is showing.
+    pub fn focus_output(&mut self, index: usize) -> bool {
+        let Some(&workspace) = self.visible.get(index) else {
+            return false;
+        };
+        if workspace == self.active {
+            return false;
+        }
+        self.active = workspace;
+        true
+    }
+
+    /// Send the focused window to the workspace output `index` is showing,
+    /// keeping focus where it is. Call [`Self::arrange`] afterwards.
+    pub fn send_focused_to_output(&mut self, index: usize) -> bool {
+        let Some(&workspace) = self.visible.get(index) else {
+            return false;
+        };
+        self.send_focused_to_workspace(workspace)
     }
 
     /// Put `id` into or out of fullscreen, and report whether anything
     /// changed. Call [`Self::arrange`] afterwards to apply it.
     pub fn set_fullscreen(&mut self, id: WindowId, on: bool) -> bool {
-        let output = self.output;
+        let output = self.output_of(id);
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
@@ -401,12 +568,36 @@ impl Space {
 
     /// Switch to workspace `index`. Out-of-range indices are ignored rather
     /// than clamped, so a stray keybinding cannot silently jump to workspace 9.
+    ///
+    /// A workspace already showing on another screen is not pulled across:
+    /// focus goes to it where it is. Anything else is shown on the focused
+    /// screen, replacing what that screen showed, and moves there if it lived
+    /// on a different screen -- the screen you are looking at is the one you
+    /// mean.
     pub fn activate_workspace(&mut self, index: usize) -> bool {
         if index >= self.workspaces.len() || index == self.active {
             return false;
         }
+        if self.visible.contains(&index) {
+            self.active = index;
+            return true;
+        }
+        let output = self.focused_output();
+        self.workspaces[index].set_output(output);
+        self.visible[output] = index;
         self.active = index;
         true
+    }
+
+    /// The output rectangle of the screen holding window `id`, or the focused
+    /// screen's when the window is on no workspace.
+    fn output_of(&self, id: WindowId) -> Rect {
+        let index = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.windows().contains(&id))
+            .map_or(self.focused_output(), Workspace::output);
+        self.outputs[index].output
     }
 
     /// Send the focused window to workspace `index`, keeping the current
@@ -512,9 +703,19 @@ impl Space {
     /// mean a configure storm on every unrelated state change — clients treat
     /// that as a resize and re-render.
     pub fn arrange(&mut self) -> Vec<(WindowId, Rect)> {
-        let area = self.area;
-        let output = self.output;
-        let ws = &self.workspaces[self.active];
+        let mut changed = Vec::new();
+        for output in 0..self.visible.len() {
+            let workspace = self.visible[output];
+            changed.extend(self.arrange_workspace(workspace, self.outputs[output]));
+        }
+        changed
+    }
+
+    /// Lay out one workspace in one screen's geometry.
+    fn arrange_workspace(&mut self, index: usize, screen: OutputArea) -> Vec<(WindowId, Rect)> {
+        let area = screen.area;
+        let output = screen.output;
+        let ws = &self.workspaces[index];
 
         // Everything that owns a tile — which is everything except floating
         // windows. A fullscreen window stays in the tree so that leaving
@@ -535,9 +736,14 @@ impl Space {
         // have been kept up to date by whoever last changed a window's mode.
         let gap = self.gap;
         let columns = self.carousel_columns;
-        let held = self.carousel_offset;
-        let drag = self.carousel_drag;
-        let ws = &mut self.workspaces[self.active];
+        // A slide or a swipe belongs to the active workspace; a strip on
+        // another screen simply settles where its focus asks.
+        let (held, drag) = if index == self.active {
+            (self.carousel_offset, self.carousel_drag)
+        } else {
+            (None, None)
+        };
+        let ws = &mut self.workspaces[index];
         let laid = match ws.layout() {
             Layout::Tiled => {
                 ws.reconcile_tiles(&tiled, area, gap);
@@ -1389,5 +1595,135 @@ mod tests {
         assert_eq!(s.active_workspace().windows(), &[pane]);
         assert_eq!(s.focused(), Some(pane));
         assert!(!s.workspaces()[0].windows().contains(&pane));
+    }
+
+    // ---- outputs -------------------------------------------------------
+
+    const LEFT: Rect = Rect::from_xywh(0, 0, 1920, 1080);
+    const RIGHT: Rect = Rect::from_xywh(1920, 0, 2560, 1440);
+
+    fn two_screens() -> Space {
+        let mut s = Space::new(LEFT);
+        s.set_outputs(vec![OutputArea::new(LEFT), OutputArea::new(RIGHT)]);
+        s
+    }
+
+    #[test]
+    fn a_new_output_is_given_a_workspace_of_its_own() {
+        let s = two_screens();
+        let visible: Vec<_> = s.visible_workspaces().collect();
+        assert_eq!(visible, vec![(0, 0), (1, 1)]);
+        assert_eq!(s.workspaces()[1].output(), 1);
+        assert_eq!(s.focused_output(), 0, "focus stays on the screen it was on");
+    }
+
+    #[test]
+    fn each_screen_lays_its_workspace_out_in_its_own_area() {
+        let mut s = two_screens();
+        let left = s.open_window();
+        s.activate_workspace(1);
+        let right = s.open_window();
+        let changed = s.arrange();
+        assert_eq!(changed.len(), 2);
+        assert!(
+            LEFT.contains(s.window(left).unwrap().geometry.center()),
+            "a window on workspace 1 tiles on the left screen"
+        );
+        assert!(
+            RIGHT.contains(s.window(right).unwrap().geometry.center()),
+            "a window on workspace 2 tiles on the right screen"
+        );
+        assert!(
+            !s.window(right).unwrap().geometry.overlaps(LEFT),
+            "nothing straddles the bezel"
+        );
+    }
+
+    #[test]
+    fn activating_a_workspace_shown_on_another_screen_moves_focus_there() {
+        let mut s = two_screens();
+        assert!(s.activate_workspace(1));
+        assert_eq!(s.focused_output(), 1);
+        // It did not get pulled across: the left screen still shows workspace 1.
+        assert_eq!(s.visible_on(0), Some(0));
+        assert_eq!(s.visible_on(1), Some(1));
+    }
+
+    #[test]
+    fn activating_a_hidden_workspace_shows_it_on_the_focused_screen() {
+        let mut s = two_screens();
+        s.focus_output(1);
+        assert!(s.activate_workspace(4));
+        assert_eq!(s.visible_on(1), Some(4));
+        assert_eq!(s.workspaces()[4].output(), 1);
+        assert_eq!(s.visible_on(0), Some(0), "the other screen is untouched");
+    }
+
+    #[test]
+    fn fullscreen_covers_the_window_s_own_screen() {
+        let mut s = two_screens();
+        s.focus_output(1);
+        let id = s.open_window();
+        s.set_fullscreen(id, true);
+        s.arrange();
+        assert_eq!(s.window(id).unwrap().geometry, RIGHT);
+    }
+
+    #[test]
+    fn sending_to_an_output_moves_the_window_and_keeps_focus() {
+        let mut s = two_screens();
+        let id = s.open_window();
+        assert!(s.send_focused_to_output(1));
+        s.arrange();
+        assert!(RIGHT.contains(s.window(id).unwrap().geometry.center()));
+        assert_eq!(s.focused_output(), 0);
+    }
+
+    #[test]
+    fn unplugging_a_screen_brings_its_workspaces_home() {
+        let mut s = two_screens();
+        s.focus_output(1);
+        let id = s.open_window();
+        s.set_outputs(vec![OutputArea::new(LEFT)]);
+        assert_eq!(s.outputs().len(), 1);
+        assert_eq!(s.workspaces()[1].output(), 0);
+        // The workspace being worked in stays the one on screen.
+        assert_eq!(s.visible_on(0), Some(1));
+        assert_eq!(s.focused_output(), 0);
+        s.arrange();
+        assert!(LEFT.contains(s.window(id).unwrap().geometry.center()));
+    }
+
+    #[test]
+    fn replugging_restores_a_desktop_on_the_new_screen() {
+        let mut s = two_screens();
+        s.set_outputs(vec![OutputArea::new(LEFT)]);
+        s.set_outputs(vec![OutputArea::new(LEFT), OutputArea::new(RIGHT)]);
+        let visible: Vec<_> = s.visible_workspaces().collect();
+        assert_eq!(visible.len(), 2);
+        assert_ne!(visible[0].1, visible[1].1, "no workspace shows twice");
+    }
+
+    #[test]
+    fn a_panel_on_one_screen_reserves_nothing_on_the_other() {
+        let mut s = two_screens();
+        assert!(s.set_output_area(0, Rect::from_xywh(0, 40, 1920, 1040)));
+        assert_eq!(s.outputs()[1].area, RIGHT);
+        assert_eq!(s.area(), Rect::from_xywh(0, 40, 1920, 1040));
+    }
+
+    #[test]
+    fn output_at_finds_the_screen_under_a_point() {
+        let s = two_screens();
+        assert_eq!(s.output_at(geometry::Point::new(10, 10)), Some(0));
+        assert_eq!(s.output_at(geometry::Point::new(3000, 10)), Some(1));
+        assert_eq!(s.output_at(geometry::Point::new(10, 2000)), None);
+    }
+
+    #[test]
+    fn an_empty_output_list_is_ignored() {
+        let mut s = two_screens();
+        s.set_outputs(Vec::new());
+        assert_eq!(s.outputs().len(), 2);
     }
 }

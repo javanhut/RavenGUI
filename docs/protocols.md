@@ -18,7 +18,7 @@ For how to actually use these, see `docs/integration.md`.
 | `zwp_linux_dmabuf_v1` | hardware buffers; advertised once the backend has a renderer |
 | `wp_viewporter` | source cropping and destination scaling |
 | `wp_fractional_scale_manager_v1` | fractional scale factors |
-| `wl_output`, `xdg_output` | mode, integer scale, logical size, position |
+| `wl_output`, `xdg_output` | mode, integer scale, logical size, position; `wl_surface.enter`/`leave` per screen |
 | `wl_seat` | keyboard and pointer |
 | `wl_data_device_manager` | clipboard and drag-and-drop |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
@@ -34,13 +34,14 @@ The contract between Huginn and the desktop shell, covering only what no
 standard protocol provides. Panels, the dock and the wallpaper are layer-shell
 surfaces; this file does not duplicate them.
 
-### `raven_shell_manager_v1` — version 2
+### `raven_shell_manager_v1` — version 3
 
 | | |
 |---|---|
 | `destroy` | request, destructor. Objects made through the manager are unaffected. |
 | `get_workspace_state` | request. Creates a `raven_workspace_state_v1`. |
 | `open_quick_settings` | request, since 2. Opens the compositor-drawn quick settings panel as the keybinding would. A no-op if it is already open, and while the session is locked. |
+| `get_output_layout` | request, since 3. Creates a `raven_output_layout_v1`. |
 
 The second version exists for a bar whose battery reading is a natural place
 to click: the panel it should lead to is drawn by the compositor, so the bar
@@ -54,6 +55,24 @@ at version 1 sees no difference.
 | `destroy` | request, destructor |
 | `activate(index)` | request. Switch to a workspace. An out-of-range index is ignored, not clamped. |
 | `state(count, active, occupied)` | event. Sent once on creation and again whenever a field changes, never when nothing did. `occupied` is a bitmask; bit N is set if workspace N holds a window. Caps at 32. |
+
+### `raven_output_layout_v1` — version 1
+
+| | |
+|---|---|
+| `destroy` | request, destructor |
+| `set_position(name, x, y)` | request. Stage where a screen's top-left corner goes, in logical pixels. |
+| `set_scale(name, scale)` | request. Stage an effective scale for a screen; 0 returns it to the one derived from its size. |
+| `apply()` | request. Apply every staged change at once, save the result, and report the new geometry. A name that matches no connected screen is saved for when it connects. |
+| `output(name, x, y, width, height, scale, physical_width, physical_height, mm_width, mm_height, focused)` | event. One per screen, followed by `done`. Sent on creation and again whenever the set of screens or their geometry changes. |
+| `done()` | event. The set of `output` events is complete. |
+
+Positions that would overlap are pushed right of what they collide with,
+and the arrangement is shifted so its top-left is the origin, so the geometry
+reported after `apply` is the truth rather than the request. The arrangement
+is kept in `$XDG_STATE_HOME/raven/outputs` by connector name. `raven-output`
+(`crates/tools/raven-output`) is the command-line client and the reference for
+a settings page. See `docs/outputs.md`.
 
 ### Stability
 

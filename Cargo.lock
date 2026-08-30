@@ -1819,6 +1819,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-output"
+version = "0.0.1"
+dependencies = [
+ "raven-protocol",
+ "wayland-client",
+]
+
+[[package]]
 name = "raven-protocol"
 version = "0.0.1"
 dependencies = [

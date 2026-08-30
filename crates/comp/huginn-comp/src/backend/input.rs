@@ -60,6 +60,7 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
 
 fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     state.pointer_location = location;
+    state.pointer_crossed_outputs();
     // The dock watches the bottom edge. Told before the event is forwarded, so
     // a reveal and the client's own motion land in the same frame -- unless the
     // session is locked, in which case the dock is not on screen and a pointer

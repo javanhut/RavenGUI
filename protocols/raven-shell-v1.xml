@@ -21,7 +21,7 @@
     is what makes moving this file to its own repository a mechanical step.
   </description>
 
-  <interface name="raven_shell_manager_v1" version="2">
+  <interface name="raven_shell_manager_v1" version="3">
     <description summary="entry point for the desktop shell">
       Handed to the shell so it can observe compositor state it cannot see as an
       ordinary Wayland client.
@@ -57,6 +57,89 @@
         not an exception to that.
       </description>
     </request>
+
+    <request name="get_output_layout" since="3">
+      <description summary="observe and arrange the screens">
+        Create an object reporting every connected screen with its place in
+        the desktop, through which a client can move screens and set their
+        scale. The arrangement is remembered by the compositor across
+        sessions, by connector name.
+
+        The compositor sends the full set of output events followed by done
+        immediately on creation, and again whenever the set of screens or
+        their geometry changes.
+      </description>
+      <arg name="id" type="new_id" interface="raven_output_layout_v1"/>
+    </request>
+  </interface>
+
+  <interface name="raven_output_layout_v1" version="1">
+    <description summary="where each screen sits, and the means to move it">
+      Created through raven_shell_manager_v1.get_output_layout.
+
+      Positions are in the desktop's logical pixels, shared by every screen.
+      Changes are staged with set_position and set_scale and take effect on
+      apply, together, so a client arranging three screens does not have the
+      desktop reflow three times. Whatever is applied is saved and reapplied
+      the next time a screen of that name connects.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop observing the layout"/>
+    </request>
+
+    <request name="set_position">
+      <description summary="stage a position for a screen">
+        Where the screen's top-left corner should go. A position that would
+        overlap another screen is pushed right of it when applied, and the
+        whole arrangement is shifted so its top-left is the origin; the
+        geometry reported afterwards is the truth.
+      </description>
+      <arg name="name" type="string" summary="connector name, as reported by output"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
+
+    <request name="set_scale">
+      <description summary="stage a scale for a screen">
+        The effective scale to lay the screen out at, overriding the one the
+        compositor derives from its physical size. Zero returns it to the
+        derived scale. Clients are still told an integer scale; see the
+        compositor's documentation on scaling.
+      </description>
+      <arg name="name" type="string" summary="connector name"/>
+      <arg name="scale" type="fixed" summary="effective scale, or 0 for automatic"/>
+    </request>
+
+    <request name="apply">
+      <description summary="apply and save the staged changes">
+        Apply every staged change at once, save the result, and report the
+        new geometry through output events followed by done. A name that
+        matches no connected screen is saved for when it connects.
+      </description>
+    </request>
+
+    <event name="output">
+      <description summary="one screen">
+        Sent for every screen, followed by done. Sent again for all of them
+        whenever any changes.
+      </description>
+      <arg name="name" type="string" summary="connector name: eDP-1, HDMI-A-1"/>
+      <arg name="x" type="int" summary="left edge, logical pixels"/>
+      <arg name="y" type="int" summary="top edge, logical pixels"/>
+      <arg name="width" type="int" summary="logical width"/>
+      <arg name="height" type="int" summary="logical height"/>
+      <arg name="scale" type="fixed" summary="effective scale in use"/>
+      <arg name="physical_width" type="int" summary="pixels across the panel"/>
+      <arg name="physical_height" type="int" summary="pixels down the panel"/>
+      <arg name="mm_width" type="int" summary="panel width in millimetres, 0 if unknown"/>
+      <arg name="mm_height" type="int" summary="panel height in millimetres, 0 if unknown"/>
+      <arg name="focused" type="uint" summary="1 if this is the focused screen"/>
+    </event>
+
+    <event name="done">
+      <description summary="the set of output events is complete"/>
+    </event>
   </interface>
 
   <interface name="raven_workspace_state_v1" version="1">

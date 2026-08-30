@@ -338,7 +338,7 @@ pub(crate) struct Huginn {
     /// Panels, docks, wallpapers and overlays, with the geometry last sent to
     /// each. Storing what was sent is what keeps [`Huginn::refresh_layers`]
     /// from configuring on every commit and driving clients into a redraw loop.
-    layers: Vec<(LayerSurface, Rect)>,
+    layers: Vec<(LayerSurface, Rect, usize)>,
     /// Where the carousel is scrolled to, while it is getting there.
     ///
     /// The compositor's half of the layout: `huginn-core` works out where the
@@ -376,16 +376,25 @@ pub(crate) struct Huginn {
     /// Where the keyboard currently sits. Resolved in one place, in
     /// [`Self::refresh_focus`], and read by the `Super` rule and the ring.
     keyboard_on: KeyboardOn,
-    /// The whole output, before exclusive zones are subtracted. `space`'s area
-    /// is this minus whatever the panels have claimed.
-    output_area: Rect,
+    /// Every screen, in the one logical coordinate space the desktop is laid
+    /// out in, parallel to `space.outputs()`. Never empty: with nothing
+    /// connected the last known screen is kept so the desktop has somewhere
+    /// to be.
+    outputs: Vec<OutputInfo>,
+    /// Where the screens were asked to go, by connector name, kept across
+    /// sessions. See `huginn_core::layout`.
+    layout: Vec<huginn_core::layout::Saved>,
+    /// Changes a client has staged and not yet applied.
+    staged_layout: Vec<huginn_core::layout::Saved>,
+    /// `apply` happened; the backend owes a re-arrange.
+    layout_changed: bool,
 
     /// The keybinding overlay, drawn once when it is summoned rather than on
     /// every frame. `None` when it is not on screen, which is almost always.
     help: Option<crate::overlay::Overlay>,
 
     /// The wallpaper at its own size, read from disk once at startup, and the
-    /// copy composed for this output.
+    /// copies composed for each output, parallel to `outputs`.
     ///
     /// Two fields because the halves have different costs: decoding a
     /// photograph is tens of milliseconds and its result never changes, while
@@ -394,12 +403,7 @@ pub(crate) struct Huginn {
     /// `None` on either is the ordinary state of a machine with no wallpaper
     /// set, and leaves the backends' clear colour showing.
     wallpaper: Option<crate::wallpaper::Wallpaper>,
-    wallpaper_panel: Option<crate::canvas::Panel>,
-
-    /// What this output renders at, and what clients are told.
-    ///
-    /// One output for now; this becomes per-output alongside `output_area`.
-    pub(crate) scale: OutputScale,
+    wallpaper_panels: Vec<Option<crate::canvas::Panel>>,
 
     /// Whether the arrows are currently resizing the focused window.
     ///
@@ -560,7 +564,6 @@ impl Huginn {
             shm_state: ShmState::new::<Self>(dh, Vec::new()),
             viewporter_state: ViewporterState::new::<Self>(dh),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
-            scale: OutputScale::for_output(Size::new(area.w(), area.h()), Size::new(0, 0)),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             // Any client may lock. The protocol's filter exists to restrict the
             // global to a privileged client, which needs a way to tell one
@@ -603,7 +606,10 @@ impl Huginn {
             carousel_on: None,
             focused_layer: None,
             keyboard_on: KeyboardOn::default(),
-            output_area: area,
+            outputs: vec![OutputInfo::bare(area)],
+            layout: load_layout(),
+            staged_layout: Vec::new(),
+            layout_changed: false,
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), crate::theme::ACCENT.to_rgba_f32())
             }),
@@ -616,7 +622,7 @@ impl Huginn {
             focus_ring_shown: None,
             help: None,
             wallpaper: crate::wallpaper::Wallpaper::installed(),
-            wallpaper_panel: None,
+            wallpaper_panels: Vec::new(),
             resizing: false,
             socket: String::new(),
             dock: crate::dock::Dock::default(),
@@ -662,11 +668,12 @@ impl Huginn {
         self.help = match self.help {
             Some(_) => None,
             None => {
-                let area = self.output_area;
+                let area = self.output_area();
+                let advertised = self.scale().advertised;
                 Some(crate::overlay::Overlay::render(
                     area,
                     &mut self.text,
-                    self.scale.advertised,
+                    advertised,
                 ))
             }
         };
@@ -675,17 +682,17 @@ impl Huginn {
     }
 
     /// Set the full output rectangle and reflow everything beneath it.
-    pub(crate) fn set_output_area(&mut self, area: Rect) {
-        self.output_area = area;
-        self.space.set_output(area);
+    fn apply_output_geometry(&mut self) {
+        let area = self.output_area();
         self.workspace_card.resize((area.w(), area.h()));
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
         if self.help.is_some() {
+            let advertised = self.scale().advertised;
             self.help = Some(crate::overlay::Overlay::render(
                 area,
                 &mut self.text,
-                self.scale.advertised,
+                advertised,
             ));
         }
         self.refresh_layers();
@@ -698,14 +705,20 @@ impl Huginn {
     /// configure unless geometry actually moved — a client that receives a
     /// configure it did not need will redraw, commit, and land right back here.
     pub(crate) fn refresh_layers(&mut self) {
-        let output = self.output_area;
-        let mut zones = Vec::new();
+        // One set of exclusive zones per screen: a dock on the laptop panel
+        // takes nothing from the monitor beside it.
+        let mut zones: Vec<Vec<Exclusive>> = vec![Vec::new(); self.outputs.len()];
         let mut updates = Vec::new();
 
-        for (index, (surface, last)) in self.layers.iter().enumerate() {
+        for (index, (surface, last, on)) in self.layers.iter().enumerate() {
             let Some(state) = layer_state(surface) else {
                 continue;
             };
+            // A surface whose screen was unplugged lands on the primary
+            // rather than vanishing: a panel is more use on the wrong screen
+            // than on none.
+            let on = (*on).min(self.outputs.len() - 1);
+            let output = self.outputs[on].rect;
             let rect = place(output, state.anchors, state.desired, state.margins);
 
             // A negative exclusive zone means "ignore other panels and use the
@@ -722,7 +735,7 @@ impl Huginn {
                 && has_buffer(surface.wl_surface())
                 && let Some(edge) = state.anchors.exclusive_edge()
             {
-                zones.push(Exclusive {
+                zones[on].push(Exclusive {
                     edge,
                     size: state.exclusive,
                 });
@@ -734,7 +747,7 @@ impl Huginn {
         }
 
         for (index, rect) in updates {
-            let (surface, last) = &mut self.layers[index];
+            let (surface, last, _) = &mut self.layers[index];
             *last = rect;
             surface.with_pending_state(|pending| {
                 pending.size = Some((rect.w(), rect.h()).into());
@@ -742,10 +755,11 @@ impl Huginn {
             surface.send_configure();
         }
 
-        let usable = usable_area(output, &zones);
-        if usable != self.space.area() {
-            tracing::debug!(?usable, panels = zones.len(), "usable area changed");
-            self.space.set_area(usable);
+        for (on, zones) in zones.iter().enumerate() {
+            let usable = usable_area(self.outputs[on].rect, zones);
+            if self.space.set_output_area(on, usable) {
+                tracing::debug!(output = %self.outputs[on].name, ?usable, panels = zones.len(), "usable area changed");
+            }
         }
         self.arrange();
 
@@ -765,7 +779,7 @@ impl Huginn {
     pub(crate) fn all_layers(&self) -> Vec<(&LayerSurface, Rect)> {
         self.layers
             .iter()
-            .map(|(surface, rect)| (surface, *rect))
+            .map(|(surface, rect, _)| (surface, *rect))
             .collect()
     }
 
@@ -773,8 +787,8 @@ impl Huginn {
     pub(crate) fn layers_on(&self, layer: Layer) -> Vec<(&LayerSurface, Rect)> {
         self.layers
             .iter()
-            .filter(|(surface, _)| layer_state(surface).is_some_and(|s| s.layer == layer))
-            .map(|(surface, rect)| (surface, *rect))
+            .filter(|(surface, _, _)| layer_state(surface).is_some_and(|s| s.layer == layer))
+            .map(|(surface, rect, _)| (surface, *rect))
             .collect()
     }
 
@@ -785,9 +799,148 @@ impl Huginn {
             .expect("the seat is constructed with a pointer")
     }
 
-    /// The full output rectangle, before panels reserve any of it.
+    /// The focused screen's rectangle, before panels reserve any of it.
+    ///
+    /// The focused screen is the one the shell's own panels sit on and the
+    /// one keybindings act on; it follows the pointer between screens.
     pub(crate) fn output_area(&self) -> Rect {
-        self.output_area
+        self.outputs[self.space.focused_output().min(self.outputs.len() - 1)].rect
+    }
+
+    /// The focused screen's scale: what the shell composes its panels at.
+    pub(crate) fn scale(&self) -> OutputScale {
+        self.outputs[self.space.focused_output().min(self.outputs.len() - 1)].scale
+    }
+
+    /// Every screen, in output order.
+    pub(crate) fn outputs(&self) -> &[OutputInfo] {
+        &self.outputs
+    }
+
+    /// The screen named `name`, as an index into [`Self::outputs`].
+    pub(crate) fn output_index(&self, name: &str) -> Option<usize> {
+        self.outputs.iter().position(|o| o.name == name)
+    }
+
+    /// Replace the set of screens.
+    ///
+    /// The backend calls this whenever a connector comes or goes or changes
+    /// mode, with every screen's position already decided. The core
+    /// reconciles the workspaces (see [`huginn_core::Space::set_outputs`]);
+    /// this composes what the compositor itself draws per screen -- the
+    /// wallpaper at each panel's density -- and reflows the panels.
+    pub(crate) fn set_outputs(&mut self, outputs: Vec<OutputInfo>) {
+        if outputs.is_empty() {
+            return;
+        }
+        for output in &outputs {
+            let scale = output.scale;
+            tracing::info!(
+                name = %output.name,
+                at = %format!("{},{}", output.rect.x(), output.rect.y()),
+                advertised = scale.advertised,
+                logical = %format!("{}x{}", scale.logical.w, scale.logical.h),
+                render = %format!("{}x{}", scale.render.w, scale.render.h),
+                physical = %format!("{}x{}", scale.physical.w, scale.physical.h),
+                resample = scale.needs_resample(),
+                "output"
+            );
+        }
+        // Composed here rather than on demand: this is the one place the size
+        // it has to match can change, and scaling a photograph in the middle
+        // of assembling a frame would drop that frame.
+        self.wallpaper_panels = outputs
+            .iter()
+            .map(|output| {
+                self.wallpaper
+                    .as_ref()
+                    .map(|wallpaper| wallpaper.panel(output.scale.render, output.scale.advertised))
+            })
+            .collect();
+        self.space.set_outputs(
+            outputs
+                .iter()
+                .map(|output| huginn_core::OutputArea::new(output.rect))
+                .collect(),
+        );
+        self.outputs = outputs;
+        // Somewhere on a screen, always: a pointer left on a monitor that was
+        // just unplugged is invisible and can reach nothing.
+        self.pointer_location = self.clamp_pointer(self.pointer_location);
+        self.apply_output_geometry();
+        self.broadcast_outputs();
+    }
+
+    /// Move focus to the screen after the focused one, wrapping round.
+    pub(crate) fn focus_next_output(&mut self) {
+        let count = self.space.outputs().len();
+        let next = (self.space.focused_output() + 1) % count;
+        if self.space.focus_output(next) {
+            self.broadcast_workspaces();
+            self.queue_redraw();
+        }
+    }
+
+    /// Send the focused window to the screen after the focused one.
+    pub(crate) fn send_focused_to_next_output(&mut self) {
+        let count = self.space.outputs().len();
+        let next = (self.space.focused_output() + 1) % count;
+        if next != self.space.focused_output() {
+            self.space.send_focused_to_output(next);
+        }
+    }
+
+    /// The pointer moved; if it crossed onto another screen, focus follows.
+    ///
+    /// Called from the shared motion handler. Focus follows the pointer
+    /// between screens and only between screens: within one, clicking is
+    /// what moves it, as it always has.
+    pub(crate) fn pointer_crossed_outputs(&mut self) {
+        let Some(on) = self.space.output_at(self.pointer_point()) else {
+            return;
+        };
+        if on == self.space.focused_output() {
+            return;
+        }
+        if self.space.focus_output(on) {
+            tracing::debug!(output = %self.outputs[on].name, "focus followed the pointer");
+            self.refresh_focus();
+            self.broadcast_workspaces();
+            self.queue_redraw();
+        }
+    }
+
+    /// Tell every surface which screens it is on.
+    ///
+    /// `wl_surface.enter`/`leave` is how a toolkit learns the scale to draw
+    /// at: it picks the largest of the outputs it has entered. Never sending
+    /// them leaves every client at 1x, which on a 4K panel is a desktop of
+    /// tiny blurry windows. Sent from the render path, once per frame, so a
+    /// window dragged across a bezel is told as it crosses.
+    pub(crate) fn update_surface_outputs(&self) {
+        let surfaces: Vec<(WlSurface, Rect)> = self.frame_surfaces();
+        for output in &self.outputs {
+            let Some(wl) = &output.output else {
+                continue;
+            };
+            let screen = smithay::utils::Rectangle::<i32, smithay::utils::Logical>::new(
+                (output.rect.x(), output.rect.y()).into(),
+                (output.rect.w(), output.rect.h()).into(),
+            );
+            for (surface, rect) in &surfaces {
+                let placed = smithay::utils::Rectangle::<i32, smithay::utils::Logical>::new(
+                    (rect.x(), rect.y()).into(),
+                    (rect.w(), rect.h()).into(),
+                );
+                // `output_update` walks the tree with the root at `placed`'s
+                // origin, so the overlap is expressed relative to that root.
+                let overlap = screen.intersection(placed).map(|mut overlap| {
+                    overlap.loc -= placed.loc;
+                    overlap
+                });
+                smithay::desktop::utils::output_update(wl, overlap, surface);
+            }
+        }
     }
 
     /// Everything to paint, front to back.
@@ -810,11 +963,11 @@ impl Huginn {
         // a cleared screen rather than a stale one.
         if let Some(lock) = &self.lock {
             let mut out = Vec::new();
-            if let Some(surface) = lock.surface() {
-                out.push(SceneItem::Surface(
-                    surface.wl_surface().clone(),
-                    self.output_area,
-                ));
+            for (name, surface) in lock.surfaces() {
+                let Some(rect) = self.output_index(name).map(|i| self.outputs[i].rect) else {
+                    continue;
+                };
+                out.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
             }
             return out;
         }
@@ -838,14 +991,14 @@ impl Huginn {
         if let Some(help) = &self.help {
             out.push(SceneItem::Overlay(
                 help.buffer(),
-                help.placement(self.output_area),
+                help.placement(self.output_area()),
                 1.0,
             ));
         }
         if let Some(panel) = &self.volume_panel {
             out.push(SceneItem::Overlay(
                 panel.buffer(),
-                crate::audio::placement(self.output_area, panel.size()),
+                crate::audio::placement(self.output_area(), panel.size()),
                 self.volume.borrow().reveal(self.uptime()),
             ));
         }
@@ -855,7 +1008,7 @@ impl Huginn {
             out.push(SceneItem::Overlay(
                 panel.buffer(),
                 crate::launcher::placement(
-                    self.output_area,
+                    self.output_area(),
                     panel.size(),
                     self.launcher.origin(),
                     reveal,
@@ -868,7 +1021,7 @@ impl Huginn {
             out.push(SceneItem::Overlay(
                 panel.buffer(),
                 crate::pinned::placement(
-                    self.output_area,
+                    self.output_area(),
                     panel.size(),
                     self.pinned.position(),
                     reveal,
@@ -879,7 +1032,7 @@ impl Huginn {
         if let Some(panel) = &self.settings_panel {
             out.push(SceneItem::Overlay(
                 panel.buffer(),
-                panel.centred_on(self.output_area),
+                panel.centred_on(self.output_area()),
                 self.settings.reveal(self.uptime()).clamp(0.0, 1.0),
             ));
         }
@@ -966,8 +1119,10 @@ impl Huginn {
         // of. Below the background layer too -- a client that asked for
         // `Layer::Background` wants to be over the wallpaper, which is the
         // only thing that layer is for.
-        if let Some(panel) = &self.wallpaper_panel {
-            out.push(SceneItem::Overlay(panel.buffer(), self.output_area, 1.0));
+        for (output, panel) in self.outputs.iter().zip(&self.wallpaper_panels) {
+            if let Some(panel) = panel {
+                out.push(SceneItem::Overlay(panel.buffer(), output.rect, 1.0));
+            }
         }
         out
     }
@@ -1021,18 +1176,25 @@ impl Huginn {
         }
 
         out.extend(
-            self.space
-                .active_workspace()
-                .windows()
-                .iter()
+            self.visible_window_ids()
+                .into_iter()
                 .filter(|id| !self.mapped.contains(id))
                 .filter_map(|id| {
-                    let surface = self.windows.get(id)?.wl_surface()?;
-                    let geometry = self.space.window(*id)?.geometry;
+                    let surface = self.windows.get(&id)?.wl_surface()?;
+                    let geometry = self.space.window(id)?.geometry;
                     Some((surface, geometry))
                 }),
         );
         out
+    }
+
+    /// Every window on a workspace some screen is showing, screen by screen.
+    pub(crate) fn visible_window_ids(&self) -> Vec<huginn_core::window::WindowId> {
+        self.space
+            .visible_workspaces()
+            .filter_map(|(_, ws)| self.space.workspaces().get(ws))
+            .flat_map(|ws| ws.windows().iter().copied())
+            .collect()
     }
 
     /// Put the lock screen up.
@@ -1208,24 +1370,80 @@ impl Huginn {
     /// area from `scale.logical` rather than from the panel's real resolution:
     /// on a 4K 27" that is a 2560x1440 desktop over a 3840x2160 panel, which is
     /// what makes windows come out a sensible size instead of tiny.
-    pub(crate) fn set_output_scale(&mut self, scale: OutputScale) {
-        self.scale = scale;
-        self.set_output_area(Rect::from_xywh(0, 0, scale.logical.w, scale.logical.h));
-        // Composed here rather than on demand: this is the one place the size
-        // it has to match can change, and scaling a photograph in the middle
-        // of assembling a frame would drop that frame.
-        self.wallpaper_panel = self
-            .wallpaper
-            .as_ref()
-            .map(|wallpaper| wallpaper.panel(scale.render, scale.advertised));
-        tracing::info!(
-            advertised = scale.advertised,
-            logical = %format!("{}x{}", scale.logical.w, scale.logical.h),
-            render = %format!("{}x{}", scale.render.w, scale.render.h),
-            physical = %format!("{}x{}", scale.physical.w, scale.physical.h),
-            resample = scale.needs_resample(),
-            "output scale"
+    pub(crate) fn set_output_scale(
+        &mut self,
+        name: &str,
+        output: Option<Output>,
+        scale: OutputScale,
+    ) {
+        self.set_outputs(vec![OutputInfo {
+            name: name.to_owned(),
+            rect: Rect::from_xywh(0, 0, scale.logical.w, scale.logical.h),
+            scale,
+            mm: Size::ZERO,
+            output,
+        }]);
+    }
+
+    /// What was saved about where the screens go. See `huginn_core::layout`.
+    pub(crate) fn output_layout(&self) -> &[huginn_core::layout::Saved] {
+        &self.layout
+    }
+
+    /// Stage a position for a named screen; nothing moves until
+    /// [`Self::apply_output_layout`].
+    pub(crate) fn stage_output_position(&mut self, name: &str, x: i32, y: i32) {
+        huginn_core::layout::set_position(
+            &mut self.staged_layout,
+            name,
+            huginn_core::geometry::Point::new(x, y),
         );
+    }
+
+    /// Stage a scale override, or `None` to go back to the derived one.
+    pub(crate) fn stage_output_scale(&mut self, name: &str, scale: Option<f64>) {
+        if !self.staged_layout.iter().any(|s| s.name == name)
+            && let Some(saved) = self.layout.iter().find(|s| s.name == name)
+        {
+            // Start from what is saved so a scale change keeps the position.
+            self.staged_layout.push(saved.clone());
+        }
+        huginn_core::layout::set_scale(&mut self.staged_layout, name, scale);
+    }
+
+    /// Make the staged layout the saved one and ask the backend to re-arrange.
+    ///
+    /// Saved first, so a compositor that dies mid-reflow still comes back with
+    /// the arrangement that was asked for.
+    pub(crate) fn apply_output_layout(&mut self) {
+        let staged = std::mem::take(&mut self.staged_layout);
+        for entry in staged {
+            if let Some(at) = entry.position {
+                huginn_core::layout::set_position(&mut self.layout, &entry.name, at);
+            }
+            // A staged entry carries the scale it wants, including `None`
+            // for "back to automatic".
+            huginn_core::layout::set_scale(&mut self.layout, &entry.name, entry.scale);
+        }
+        self.save_layout();
+        self.layout_changed = true;
+    }
+
+    /// Whether the layout was applied since the backend last arranged. Clears
+    /// the flag: the backend calls this once per turn.
+    pub(crate) fn take_layout_change(&mut self) -> bool {
+        std::mem::take(&mut self.layout_changed)
+    }
+
+    fn save_layout(&self) {
+        if let Some(file) = layout_path()
+            && let Err(e) = save_text(&file, &huginn_core::layout::to_text(&self.layout))
+        {
+            tracing::warn!(
+                "could not save the output layout to {}: {e}",
+                file.display()
+            );
+        }
     }
 
     /// Monotonic time since the compositor started.
@@ -1292,7 +1510,7 @@ impl Huginn {
     pub(crate) fn dock_rect(&self) -> Option<Rect> {
         if self.app_switcher.is_some() {
             return Some(crate::dock::centred_placement(
-                self.output_area,
+                self.output_area(),
                 self.dock_items.len().max(1),
             ));
         }
@@ -1301,7 +1519,7 @@ impl Huginn {
             return None;
         }
         Some(crate::dock::placement(
-            self.output_area,
+            self.output_area(),
             self.dock_items.len().max(1),
             self.dock.reveal(now),
         ))
@@ -1324,6 +1542,7 @@ impl Huginn {
         };
         let selected = self.app_switcher.map(|switcher| switcher.selected);
         self.rebuild_dock_previews();
+        let (area, advertised) = (self.output_area(), self.scale().advertised);
         self.dock_panel = (self.app_switcher.is_some() || self.dock.is_visible(self.uptime()))
             .then(|| {
                 crate::dock::render(
@@ -1332,8 +1551,8 @@ impl Huginn {
                     &self.icons,
                     &mut self.pixmaps,
                     &mut self.text,
-                    self.output_area,
-                    self.scale.advertised,
+                    area,
+                    advertised,
                     selected,
                 )
             });
@@ -1408,29 +1627,24 @@ impl Huginn {
         // Laid out twice: the captions need the frames' widths to fit under,
         // and the frames need the captions' height to stand above. The second
         // pass changes only where the row sits, not how wide anything is.
-        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area, 0);
+        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area(), 0);
+        let (area, advertised) = (self.output_area(), self.scale().advertised);
         let captions: Vec<Option<crate::canvas::Panel>> = sized
             .iter()
             .zip(&frames)
             .map(|((id, _), frame)| {
                 let title = self.windows.get(id)?.title()?;
-                let backing = crate::dock::preview_backing(*frame, self.output_area);
-                crate::dock::caption(
-                    &mut self.text,
-                    &title,
-                    backing.w(),
-                    self.output_area,
-                    self.scale.advertised,
-                )
+                let backing = crate::dock::preview_backing(*frame, area);
+                crate::dock::caption(&mut self.text, &title, backing.w(), area, advertised)
             })
             .collect();
         let reserve = captions
             .iter()
             .flatten()
-            .map(|caption| crate::dock::caption_room(caption, self.output_area))
+            .map(|caption| crate::dock::caption_room(caption, self.output_area()))
             .max()
             .unwrap_or(0);
-        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area, reserve);
+        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area(), reserve);
         self.dock_previews = sized
             .into_iter()
             .zip(frames)
@@ -1438,7 +1652,11 @@ impl Huginn {
             .map(|(((window, _), frame), caption)| DockPreview {
                 window,
                 frame,
-                panel: crate::dock::preview_frame(frame, self.output_area, self.scale.advertised),
+                panel: crate::dock::preview_frame(
+                    frame,
+                    self.output_area(),
+                    self.scale().advertised,
+                ),
                 caption,
             })
             .collect();
@@ -1477,7 +1695,7 @@ impl Huginn {
             Some(crate::dock::item_rect(dock, index))
         });
         tile.unwrap_or_else(|| {
-            let area = self.output_area;
+            let area = self.output_area();
             let side = crate::dock::placement(area, 1, 1.0).h();
             Rect::from_xywh(
                 area.x() + (area.w() - side) / 2,
@@ -1551,10 +1769,7 @@ impl Huginn {
             let transform = crate::motion::fit(placed, motion.rect_at(now), motion.alpha_at(now));
             out.push(SceneItem::Preview(surface, placed, transform));
         }
-        let Some(workspace) = self.space.workspaces().get(self.space.active_index()) else {
-            return out;
-        };
-        for id in workspace.windows() {
+        for id in &self.visible_window_ids() {
             if !self.mapped.contains(id)
                 || self
                     .space
@@ -1656,11 +1871,11 @@ impl Huginn {
                 offset_y: y - f64::from(placed.y()) * scale,
                 alpha: 1.0,
             };
-            let backing = crate::dock::preview_backing(frame, self.output_area);
+            let backing = crate::dock::preview_backing(frame, self.output_area());
             out.push(SceneItem::Preview(surface, placed, transform));
             out.push(SceneItem::Overlay(preview.panel.buffer(), backing, 1.0));
             if let Some(caption) = &preview.caption {
-                let below = crate::dock::caption_placement(caption, backing, self.output_area);
+                let below = crate::dock::caption_placement(caption, backing, self.output_area());
                 out.push(SceneItem::Overlay(caption.buffer(), below, 1.0));
             }
         }
@@ -1680,13 +1895,13 @@ impl Huginn {
         // not appear ahead of the visible strip.
         let approaching_dock = self.app_switcher.is_none()
             && self.dock.is_animating(now)
-            && crate::dock::placement(self.output_area, self.dock_items.len().max(1), 1.0)
+            && crate::dock::placement(self.output_area(), self.dock_items.len().max(1), 1.0)
                 .contains(pointer);
         let motion = self.settings.motion();
         let y = self.pointer_location.y.round() as i32;
         if self.dock.pointer_moved(
             y,
-            self.output_area,
+            self.output_area(),
             over_dock || approaching_dock,
             now,
             motion,
@@ -2162,7 +2377,7 @@ impl Huginn {
         }
         let panel = self.launcher_panel.as_ref()?;
         let placed = crate::launcher::placement(
-            self.output_area,
+            self.output_area(),
             panel.size(),
             self.launcher.origin(),
             self.launcher.reveal(self.uptime()),
@@ -2288,7 +2503,7 @@ impl Huginn {
         }
         let panel = self.pinned_panel.as_ref()?;
         let placed = crate::pinned::placement(
-            self.output_area,
+            self.output_area(),
             panel.size(),
             self.pinned.position(),
             self.pinned.reveal(self.uptime()),
@@ -2349,6 +2564,7 @@ impl Huginn {
 
     /// Redraw the pinned panel, or drop it when it is closed.
     pub(crate) fn refresh_pinned(&mut self) {
+        let (area, advertised) = (self.output_area(), self.scale().advertised);
         self.pinned_panel = self.pinned.is_visible(self.uptime()).then(|| {
             let (panel, layout) = crate::pinned::render(
                 &self.pinned,
@@ -2356,8 +2572,8 @@ impl Huginn {
                 &mut self.text,
                 &self.icons,
                 &mut self.pixmaps,
-                self.output_area,
-                self.scale.advertised,
+                area,
+                advertised,
             );
             self.pinned.set_layout(layout);
             panel
@@ -2465,7 +2681,7 @@ impl Huginn {
         let clock = self.uptime();
         if let Some(panel) = self.launcher_panel.as_ref() {
             return crate::launcher::blur_rect(crate::launcher::placement(
-                self.output_area,
+                self.output_area(),
                 panel.size(),
                 self.launcher.origin(),
                 self.launcher.reveal(clock),
@@ -2475,7 +2691,7 @@ impl Huginn {
         // blur is inset the same way.
         let panel = self.pinned_panel.as_ref()?;
         crate::launcher::blur_rect(crate::pinned::placement(
-            self.output_area,
+            self.output_area(),
             panel.size(),
             self.pinned.position(),
             self.pinned.reveal(clock),
@@ -2617,15 +2833,11 @@ impl Huginn {
     /// [`Huginn::refresh_settings`].
     pub(crate) fn refresh_volume(&mut self) {
         let now = self.uptime();
+        let (area, advertised) = (self.output_area(), self.scale().advertised);
         let volume = self.volume.borrow();
-        self.volume_panel = volume.is_visible(now).then(|| {
-            crate::audio::render(
-                &volume,
-                &mut self.text,
-                self.output_area,
-                self.scale.advertised,
-            )
-        });
+        self.volume_panel = volume
+            .is_visible(now)
+            .then(|| crate::audio::render(&volume, &mut self.text, area, advertised));
         drop(volume);
         self.queue_redraw();
     }
@@ -2647,14 +2859,9 @@ impl Huginn {
     /// moment it is dismissed would make it vanish rather than leave.
     pub(crate) fn refresh_settings(&mut self) {
         let now = self.uptime();
+        let (area, advertised) = (self.output_area(), self.scale().advertised);
         self.settings_panel = self.settings.is_visible(now).then(|| {
-            crate::settings::render(
-                &self.settings,
-                &mut self.text,
-                self.output_area,
-                now,
-                self.scale.advertised,
-            )
+            crate::settings::render(&self.settings, &mut self.text, area, now, advertised)
         });
         // The volume row may just have moved the level, and the slider that
         // shows it is drawn whether the change came from a key or a row.
@@ -2760,6 +2967,7 @@ impl Huginn {
     /// frame: composing it walks the result list and shapes a string per row,
     /// which is cheap once per keystroke and wasteful sixty times a second.
     pub(crate) fn refresh_launcher(&mut self) {
+        let (area, advertised) = (self.output_area(), self.scale().advertised);
         self.launcher_panel = self.launcher.is_visible(self.uptime()).then(|| {
             let (panel, layout) = crate::launcher::render(
                 &self.launcher,
@@ -2767,8 +2975,8 @@ impl Huginn {
                 &mut self.text,
                 &self.icons,
                 &mut self.pixmaps,
-                self.output_area,
-                self.scale.advertised,
+                area,
+                advertised,
             );
             // The pointer hit-tests against where this redraw put things,
             // so the layout and the pixels change together.
@@ -2959,7 +3167,10 @@ impl Huginn {
     /// builder do not each have to decide what an X11 window with no surface yet
     /// should mean. It means the same thing as an unmapped window: skip it.
     pub(crate) fn render_list(&self) -> Vec<(WlSurface, Rect)> {
-        self.render_list_for(self.space.active_index())
+        self.space
+            .visible_workspaces()
+            .flat_map(|(_, ws)| self.render_list_for(ws))
+            .collect()
     }
 
     fn render_list_for(&self, workspace: usize) -> Vec<(WlSurface, Rect)> {
@@ -2991,7 +3202,7 @@ impl Huginn {
         let now = self.uptime();
         let position = carousel.position.value(now);
         let reveal = carousel.reveal.value(now).clamp(0.0, 1.0) as f64;
-        let area = self.output_area;
+        let area = self.output_area();
         let mut cards: Vec<(usize, f32, WorkspacePreview)> = self
             .space
             .workspaces()
@@ -3253,7 +3464,7 @@ impl Huginn {
             .layers
             .iter()
             .enumerate()
-            .filter_map(|(index, (surface, _))| {
+            .filter_map(|(index, (surface, _, _))| {
                 // An unmapped surface is not a candidate. A client may unmap by
                 // attaching a null buffer and stay alive to map again later, and
                 // one that did so while holding an exclusive claim would go on
@@ -3277,14 +3488,15 @@ impl Huginn {
             })
             .collect();
 
-        let clicked = self
-            .focused_layer
-            .as_ref()
-            .and_then(|want| self.layers.iter().position(|(s, _)| s.wl_surface() == want));
+        let clicked = self.focused_layer.as_ref().and_then(|want| {
+            self.layers
+                .iter()
+                .position(|(s, _, _)| s.wl_surface() == want)
+        });
 
         match keyboard_focus(&candidates, clicked, self.space.focused()) {
             KeyboardFocus::Layer(index) => {
-                let Some((surface, _)) = self.layers.get(index) else {
+                let Some((surface, _, _)) = self.layers.get(index) else {
                     return (None, KeyboardOn::Window);
                 };
                 let exclusive = candidates
@@ -3407,7 +3619,11 @@ impl CompositorHandler for Huginn {
         // first commit and expects a configure in response. Doing this on every
         // commit covers both that first configure and any later change, without
         // needing to track which is which.
-        if self.layers.iter().any(|(l, _)| l.wl_surface() == surface) {
+        if self
+            .layers
+            .iter()
+            .any(|(l, _, _)| l.wl_surface() == surface)
+        {
             self.refresh_layers();
         }
     }
@@ -3603,11 +3819,19 @@ impl WlrLayerShellHandler for Huginn {
     fn new_layer_surface(
         &mut self,
         surface: LayerSurface,
-        _output: Option<WlOutput>,
+        output: Option<WlOutput>,
         layer: Layer,
         namespace: String,
     ) {
-        tracing::debug!(%namespace, ?layer, "layer surface created");
+        // The screen the client asked for, or the focused one when it left
+        // the choice to us. Resolved to an index now and re-clamped on every
+        // refresh, so a panel outlives the screen it was made for.
+        let on = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .and_then(|o| self.output_index(&o.name()))
+            .unwrap_or_else(|| self.space.focused_output());
+        tracing::debug!(%namespace, ?layer, output = %self.outputs[on.min(self.outputs.len() - 1)].name, "layer surface created");
         // Only record it. Do NOT configure yet: the client sets its anchor,
         // size and exclusive zone *after* creating the surface and before its
         // first commit, so configuring here would compute geometry from empty
@@ -3616,7 +3840,7 @@ impl WlrLayerShellHandler for Huginn {
         //
         // Rect::ZERO as the "last sent" geometry guarantees that first
         // refresh_layers sees a change and does configure.
-        self.layers.push((surface, Rect::ZERO));
+        self.layers.push((surface, Rect::ZERO, on));
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
@@ -3627,7 +3851,7 @@ impl WlrLayerShellHandler for Huginn {
         if self.focused_layer.as_ref() == Some(surface.wl_surface()) {
             self.focused_layer = None;
         }
-        self.layers.retain(|(l, _)| l != &surface);
+        self.layers.retain(|(l, _, _)| l != &surface);
         tracing::debug!(remaining = self.layers.len(), "layer surface destroyed");
         self.refresh_layers();
     }
@@ -3648,7 +3872,7 @@ impl FractionalScaleHandler for Huginn {
     /// binds this and gets no scale back has to guess, and guessing is the
     /// thing this exists to remove.
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let scale = f64::from(self.scale.advertised);
+        let scale = f64::from(self.scale().advertised);
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional| {
                 fractional.set_preferred_scale(scale);
@@ -3724,11 +3948,16 @@ impl SessionLockHandler for Huginn {
     }
 
     /// The client made a surface to draw the lock screen on.
-    fn new_surface(&mut self, surface: LockSurface, _output: WlOutput) {
-        // Sized to the output before anything else. A lock surface has no say
+    fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
+        // Sized to its output before anything else. A lock surface has no say
         // in its own size -- the compositor tells it, and until it is told it
         // has nothing to draw into.
-        let area = self.output_area;
+        let name = Output::from_resource(&output)
+            .map(|o| o.name())
+            .unwrap_or_default();
+        let area = self
+            .output_index(&name)
+            .map_or_else(|| self.output_area(), |i| self.outputs[i].rect);
         surface.with_pending_state(|state| {
             state.size = Some((area.w() as u32, area.h() as u32).into());
         });
@@ -3741,11 +3970,10 @@ impl SessionLockHandler for Huginn {
             return;
         };
 
-        // One output, so one surface; a second replaces the first rather than
-        // being stacked behind it. When this compositor grows a second output
-        // this becomes a map keyed by the `output` argument, which is why that
-        // argument is already here.
-        client.surface = Some(surface);
+        // One surface per output. A second for the same output replaces the
+        // first rather than stacking behind it.
+        client.surfaces.retain(|(on, _)| *on != name);
+        client.surfaces.push((name, surface));
         self.refresh_focus();
         self.queue_redraw();
     }
@@ -3874,21 +4102,61 @@ pub(crate) struct Lock {
 }
 
 impl Lock {
-    /// The surface covering the output, if a client has provided one.
+    /// The surface that takes the keyboard while locked: the first one the
+    /// client made, if it has made any.
     pub(crate) fn surface(&self) -> Option<&LockSurface> {
-        self.client.as_ref()?.surface.as_ref()
+        self.client.as_ref()?.surfaces.first().map(|(_, s)| s)
+    }
+
+    /// Every lock surface with the name of the output it covers.
+    pub(crate) fn surfaces(&self) -> &[(String, LockSurface)] {
+        self.client
+            .as_ref()
+            .map_or(&[], |client| client.surfaces.as_slice())
     }
 }
 
 /// A lock a client asked for and the compositor confirmed.
 #[derive(Debug, Default)]
 pub(crate) struct ClientLock {
-    /// The surface covering the output, once the client has made one.
+    /// One surface per output, by output name, as the client makes them.
     ///
-    /// `None` between the lock being confirmed and the first lock surface
+    /// Empty between the lock being confirmed and the first lock surface
     /// arriving, which is a handful of milliseconds of blank screen and is
-    /// exactly what the protocol asks for.
-    surface: Option<LockSurface>,
+    /// exactly what the protocol asks for. A screen the client never covers
+    /// stays blank, which is the safe failure.
+    surfaces: Vec<(String, LockSurface)>,
+}
+
+/// One screen as the compositor sees it: where it sits in the desktop, what
+/// it renders at, and the `wl_output` clients know it by.
+#[derive(Debug, Clone)]
+pub(crate) struct OutputInfo {
+    /// The connector name -- `eDP-1`, `HDMI-A-1` -- which is also the
+    /// `wl_output` name.
+    pub(crate) name: String,
+    /// Where the screen sits, in logical pixels, in the global desktop.
+    pub(crate) rect: Rect,
+    /// Its density policy. See `huginn_core::scale`.
+    pub(crate) scale: OutputScale,
+    /// The panel's size in millimetres, `0x0` when it did not say.
+    pub(crate) mm: Size,
+    /// The advertised output. `None` only for the placeholder a `Huginn` is
+    /// built with before any backend has brought a screen up.
+    pub(crate) output: Option<Output>,
+}
+
+impl OutputInfo {
+    /// The placeholder screen before a backend reports a real one.
+    pub(crate) fn bare(area: Rect) -> Self {
+        Self {
+            name: String::new(),
+            rect: area,
+            scale: OutputScale::for_output(Size::new(area.w(), area.h()), Size::new(0, 0)),
+            mm: Size::ZERO,
+            output: None,
+        }
+    }
 }
 
 /// Translate the protocol's layer into the core's own vocabulary.
@@ -3984,6 +4252,47 @@ fn frecency_path_in(
 /// [`crate::pins`].
 fn pins_path() -> Option<std::path::PathBuf> {
     frecency_path().map(|history| history.with_file_name("pins"))
+}
+
+/// Where the screen arrangement lives: beside the pins, as `raven/outputs`.
+/// State rather than config by the same reasoning as the pins: it is written
+/// by the desktop in response to what the person did, not edited to change
+/// how the desktop behaves.
+fn layout_path() -> Option<std::path::PathBuf> {
+    frecency_path().map(|history| history.with_file_name("outputs"))
+}
+
+/// The arrangement from the last session, or none. Fail-soft.
+fn load_layout() -> Vec<huginn_core::layout::Saved> {
+    let Some(file) = layout_path() else {
+        return Vec::new();
+    };
+    match std::fs::read_to_string(&file) {
+        Ok(text) => huginn_core::layout::parse(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "could not load the output layout from {}: {e}",
+                file.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Write a state file atomically: a PID-named sibling, then a rename, the
+/// way `pins::Pins::save` does.
+fn save_text(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let result = std::fs::write(&temp, text).and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// The pins from the last session, or none. Fail-soft, as the history is.

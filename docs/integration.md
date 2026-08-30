@@ -313,9 +313,14 @@ compositor resample. `wp_viewporter` and `wp_fractional_scale_v1` are both
 available. `xdg_output` reports the logical size, which agrees with the desktop
 the compositor actually laid out.
 
-Huginn is **single-output today**. `zwlr_layer_shell_v1.get_layer_surface`
-accepts an output argument and it is currently ignored; every layer surface
-lands on the one output. Do not build a multi-monitor panel against this yet.
+Several outputs share one logical coordinate space; `xdg_output` gives each
+its position. `wl_surface.enter`/`leave` are sent as a surface crosses screens,
+so take your scale from the outputs you have entered, as the toolkits do.
+`zwlr_layer_shell_v1.get_layer_surface` honours its output argument: pass the
+`wl_output` you want a panel on, or `None` for the focused screen, and make one
+surface per output for a bar that should be on every screen. Exclusive zones
+are per screen. Lock screens are asked for one surface per output and every
+screen without one stays blank. See `docs/outputs.md`.
 
 ## Developing against it
 

@@ -9,6 +9,7 @@
 //! the protocol is additive-only, so anything shipped has to keep working.
 
 use raven_protocol::server::{
+    raven_output_layout_v1::{self, RavenOutputLayoutV1},
     raven_shell_manager_v1::{self, RavenShellManagerV1},
     raven_workspace_state_v1::{self, RavenWorkspaceStateV1},
 };
@@ -57,6 +58,8 @@ impl WorkspaceSnapshot {
 pub(crate) struct RavenShellState {
     observers: Vec<RavenWorkspaceStateV1>,
     last_sent: Option<WorkspaceSnapshot>,
+    /// Clients watching where the screens are.
+    layout_observers: Vec<RavenOutputLayoutV1>,
 }
 
 impl RavenShellState {
@@ -67,7 +70,7 @@ impl RavenShellState {
         // switch workspaces. Harmless on a single-user session, but it must be
         // gated (security-context, or a socket only the shell can reach)
         // before anything untrusted runs on this compositor.
-        dh.create_global::<Huginn, RavenShellManagerV1, ()>(2, ());
+        dh.create_global::<Huginn, RavenShellManagerV1, ()>(3, ());
         Self::default()
     }
 }
@@ -97,6 +100,49 @@ impl Huginn {
                 "workspace state sent"
             );
         }
+    }
+}
+
+impl Huginn {
+    /// Tell every layout observer where the screens are now.
+    ///
+    /// Not deduplicated the way workspace state is: the set of outputs
+    /// changes rarely and always for a reason a client wants to hear about.
+    pub(crate) fn broadcast_outputs(&mut self) {
+        self.raven_shell.layout_observers.retain(Resource::is_alive);
+        if self.raven_shell.layout_observers.is_empty() {
+            return;
+        }
+        let observers = self.raven_shell.layout_observers.clone();
+        for observer in &observers {
+            self.send_outputs(observer);
+        }
+    }
+
+    /// The full set of output events and a done, to one observer.
+    fn send_outputs(&self, observer: &RavenOutputLayoutV1) {
+        let focused = self.space.focused_output();
+        for (index, output) in self.outputs().iter().enumerate() {
+            if output.output.is_none() {
+                // The placeholder before any backend has a screen up.
+                continue;
+            }
+            let scale = output.scale;
+            observer.output(
+                output.name.clone(),
+                output.rect.x(),
+                output.rect.y(),
+                output.rect.w(),
+                output.rect.h(),
+                scale.fractional(),
+                scale.physical.w,
+                scale.physical.h,
+                output.mm.w,
+                output.mm.h,
+                u32::from(index == focused),
+            );
+        }
+        observer.done();
     }
 }
 
@@ -150,6 +196,11 @@ impl Dispatch<RavenShellManagerV1, ()> for Huginn {
                     state.open_settings();
                 }
             }
+            raven_shell_manager_v1::Request::GetOutputLayout { id } => {
+                let observer = data_init.init(id, ());
+                state.send_outputs(&observer);
+                state.raven_shell.layout_observers.push(observer);
+            }
             raven_shell_manager_v1::Request::Destroy => {}
             _ => {}
         }
@@ -191,5 +242,40 @@ impl Dispatch<RavenWorkspaceStateV1, ()> for Huginn {
         _data: &(),
     ) {
         state.raven_shell.observers.retain(|o| o != resource);
+    }
+}
+
+impl Dispatch<RavenOutputLayoutV1, ()> for Huginn {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &RavenOutputLayoutV1,
+        request: raven_output_layout_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            raven_output_layout_v1::Request::SetPosition { name, x, y } => {
+                state.stage_output_position(&name, x, y);
+            }
+            raven_output_layout_v1::Request::SetScale { name, scale } => {
+                state.stage_output_scale(&name, (scale > 0.0).then_some(scale));
+            }
+            raven_output_layout_v1::Request::Apply => {
+                // Saved now; the backend re-arranges on its next turn and
+                // the resulting geometry goes out from `set_outputs`.
+                state.apply_output_layout();
+            }
+            raven_output_layout_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+
+    fn destroyed(state: &mut Self, _client: ClientId, resource: &RavenOutputLayoutV1, _data: &()) {
+        state
+            .raven_shell
+            .layout_observers
+            .retain(|observer| observer.id() != resource.id());
     }
 }

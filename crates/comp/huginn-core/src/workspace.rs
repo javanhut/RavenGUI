@@ -79,6 +79,15 @@ pub struct Workspace {
     /// than cleared, so toggling out to tiling and back returns the strip to
     /// where it was instead of to its start.
     scroll: i32,
+    /// Which output this workspace lives on, as an index into
+    /// [`crate::Space::outputs`].
+    ///
+    /// A workspace belongs to one screen at a time and is laid out in that
+    /// screen's area; showing it on another screen moves it there. This is
+    /// what makes two monitors two desktops rather than one wide one, which
+    /// is the difference between a window filling a screen and a window
+    /// straddling a bezel.
+    output: usize,
 }
 
 impl Workspace {
@@ -90,7 +99,17 @@ impl Workspace {
             focus: None,
             tiles: Tiles::new(),
             scroll: 0,
+            output: 0,
         }
+    }
+
+    /// The output this workspace is laid out on. See the field.
+    pub const fn output(&self) -> usize {
+        self.output
+    }
+
+    pub(crate) fn set_output(&mut self, output: usize) {
+        self.output = output;
     }
 
     pub const fn id(&self) -> WorkspaceId {
