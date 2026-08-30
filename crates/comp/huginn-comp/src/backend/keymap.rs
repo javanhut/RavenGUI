@@ -74,6 +74,8 @@ pub(crate) enum Action {
     OpenLauncher,
     /// Open the settings application — the full one, not the panel.
     OpenFullSettings,
+    /// Open the software store.
+    OpenStore,
     /// Enter resize mode: arrows then resize the focused window.
     EnterResize,
     /// Resize the focused window while in resize mode.
@@ -256,6 +258,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "open the settings application",
     },
     Binding {
+        action: Action::OpenStore,
+        chord: "Super+Ctrl+I",
+        description: "open the software store",
+    },
+    Binding {
         action: Action::ToggleHelp,
         chord: "Super+Ctrl+H",
         description: "show or hide this list",
@@ -405,6 +412,9 @@ pub(crate) fn resolve(
         keysyms::KEY_s | keysyms::KEY_S => Action::OpenSettings,
         // P for preferences: S is the panel, and the two sit together.
         keysyms::KEY_p | keysyms::KEY_P => Action::OpenFullSettings,
+        // I for install: the store is the other application the desktop
+        // opens by name rather than through the launcher.
+        keysyms::KEY_i | keysyms::KEY_I => Action::OpenStore,
         keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
         // Ctrl is what separates this from `Super`+`C`, which is copy: the
         // branch above returns before this one whenever Ctrl is not held.

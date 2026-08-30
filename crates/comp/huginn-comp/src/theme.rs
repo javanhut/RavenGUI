@@ -88,6 +88,8 @@ pub(crate) fn set_accent(color: Option<Color>) {
 
 /// The settings application, opened from quick settings and its own chord.
 pub(crate) const SETTINGS_APP: &str = "raven-settings";
+/// The software store, opened from its own chord.
+pub(crate) const STORE_APP: &str = "raven-store";
 /// Panel, dock and overlay background.
 pub(crate) const BACKGROUND: Color = Color::from_argb(0xFF16_161F);
 /// Hairline borders.
