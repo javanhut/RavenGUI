@@ -533,6 +533,15 @@ impl Launcher {
         self.origin
     }
 
+    /// Re-aim the motion at where the dock icon is *now*.
+    ///
+    /// The origin is a global rect captured at open; an output relayout or a
+    /// focus change moves the dock out from under it, and a close animation
+    /// shrinking toward the old rect sweeps the panel across the wrong screen.
+    pub(crate) fn set_origin(&mut self, origin: Option<Rect>) {
+        self.origin = origin;
+    }
+
     /// Apply a keystroke.
     pub(crate) fn press(
         &mut self,

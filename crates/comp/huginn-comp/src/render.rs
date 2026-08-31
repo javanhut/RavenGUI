@@ -102,7 +102,7 @@ pub(crate) fn elements_split(
     view: Rect,
     scale: f64,
 ) -> (Vec<HuginnElement>, Vec<HuginnElement>) {
-    let all = elements(renderer, state, fallback_cursor, view, scale);
+    let (all, boundary) = elements_with_boundary(renderer, state, fallback_cursor, view, scale);
     // A glass window is found by its own elements rather than by counting:
     // a surface tree yields one element per subsurface, so a scene index is
     // not an element index. Everything up to and including the last element
@@ -116,17 +116,15 @@ pub(crate) fn elements_split(
             return (front, back);
         }
     }
-    // `elements` puts the cursor in front of everything `scene` produced, so
-    // the boundary is that plus the panels above it.
-    let cursor = all.len() - state.scene().len();
-    let above = cursor + state.blur_boundary();
     let mut front = all;
-    let back = front.split_off(above.min(front.len()));
+    let back = front.split_off(boundary);
     (front, back)
 }
 
 /// Build the full scene, cursor included, front to back, as seen from one
-/// screen.
+/// screen, plus the index of the first element at or below the blur boundary
+/// — everything before it goes over the blurred desktop, everything from it
+/// on is what gets blurred.
 ///
 /// `view` is that screen's rectangle in the desktop's logical coordinates and
 /// `scale` its fractional render scale. The scene is one desktop; each screen
@@ -134,13 +132,25 @@ pub(crate) fn elements_split(
 /// so `view`'s corner is the origin -- the DRM surface knows nothing about
 /// where its screen sits -- and anything wholly outside it is left out, so a
 /// window on the other monitor costs this one nothing.
-pub(crate) fn elements(
+///
+/// The index is counted while the list is built, at the moment the loop
+/// crosses [`Huginn::blur_boundary`] scene items, because a scene index is not
+/// an element index: an item wholly on another screen yields no elements at
+/// all, a surface tree yields one per subsurface, and a panel whose buffer
+/// import fails yields none. Working the boundary out afterwards by
+/// arithmetic on the two lengths gets all three wrong — on a two-screen
+/// desktop, routinely.
+///
+/// The cursor is drawn before the scene, so it always lands above the
+/// boundary: blurring the pointer would be blurring the one thing the user is
+/// aiming with.
+fn elements_with_boundary(
     renderer: &mut GlesRenderer,
     state: &Huginn,
     fallback_cursor: Option<&Cursor>,
     view: Rect,
     scale: f64,
-) -> Vec<HuginnElement> {
+) -> (Vec<HuginnElement>, usize) {
     let (ox, oy) = (view.x(), view.y());
     // Everything `scene` hands out is in desktop coordinates; this is the
     // one place they become this screen's.
@@ -206,7 +216,12 @@ pub(crate) fn elements(
         CursorImageStatus::Hidden => {}
     }
 
-    for item in state.scene() {
+    let above = state.blur_boundary();
+    let mut boundary = None;
+    for (index, item) in state.scene().into_iter().enumerate() {
+        if index == above {
+            boundary = Some(out.len());
+        }
         match item {
             SceneItem::Surface(_, rect)
             | SceneItem::Clipped(_, rect, _, _)
@@ -337,5 +352,8 @@ pub(crate) fn elements(
         }
     }
 
-    out
+    // Every scene item was above the boundary (or the scene was empty, as it
+    // is on a locked session): nothing to blur, everything in front.
+    let boundary = boundary.unwrap_or(out.len());
+    (out, boundary)
 }
