@@ -794,7 +794,43 @@ impl Huginn {
                 advertised,
             ));
         }
+        self.refresh_output_panels();
         self.refresh_layers();
+    }
+
+    /// Recompose every open compositor-drawn panel for the focused output.
+    ///
+    /// A panel is composed once, at the focused output's area and density,
+    /// and then only re-*placed* each frame — so when the focused output
+    /// changes (focus followed the pointer to another screen) or its
+    /// geometry does (a relayout, a scale change from Raven Settings), the
+    /// pixels in hand belong to the wrong screen: sized for another area,
+    /// composed at another density, and drawn stretched or shrunken to fit.
+    /// The wallpaper is recomposed in [`Self::set_outputs`] and the help
+    /// overlay in [`Self::apply_output_geometry`] for exactly this reason;
+    /// this does the same for the rest.
+    fn refresh_output_panels(&mut self) {
+        if self.launcher_panel.is_some() {
+            // The opening motion aims at the dock icon it grew from, captured
+            // as a global rect when the launcher opened. The dock has moved
+            // with the focused output, so re-aim before re-placing — the old
+            // rect can point at another screen entirely.
+            let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
+            self.launcher.set_origin(origin);
+            self.refresh_launcher();
+        }
+        if self.pinned_panel.is_some() {
+            self.refresh_pinned();
+        }
+        if self.settings_panel.is_some() {
+            self.refresh_settings();
+        }
+        if self.volume_panel.is_some() {
+            self.refresh_volume();
+        }
+        if self.dock_panel.is_some() {
+            self.refresh_dock();
+        }
     }
 
     /// Reposition every layer surface, recompute the area left for windows, and
@@ -975,6 +1011,9 @@ impl Huginn {
         let count = self.space.outputs().len();
         let next = (self.space.focused_output() + 1) % count;
         if self.space.focus_output(next) {
+            // The shell's panels sit on the focused screen, and their pixels
+            // were composed for the one focus just left.
+            self.refresh_output_panels();
             self.broadcast_workspaces();
             self.queue_redraw();
         }
@@ -1003,6 +1042,10 @@ impl Huginn {
         }
         if self.space.focus_output(on) {
             tracing::debug!(output = %self.outputs[on].name, "focus followed the pointer");
+            // Panels follow focus, so a launcher open on the old screen is
+            // about to be drawn on this one — recompose it for this screen's
+            // area and density rather than stretching the stale pixels.
+            self.refresh_output_panels();
             self.refresh_focus();
             self.broadcast_workspaces();
             self.queue_redraw();

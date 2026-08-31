@@ -189,7 +189,22 @@ struct Udev {
     socket: String,
     start: Instant,
     signal: LoopSignal,
+    /// `wl_output` globals withdrawn but not yet destroyed.
+    ///
+    /// A global cannot be destroyed the moment its screen unplugs: clients
+    /// were just told it exists, and one whose `bind` is already in flight
+    /// when the global is destroyed is killed by the server backend with a
+    /// protocol error — every client on the session, if the timing is bad
+    /// enough, which a flapping HDMI cable makes routine. Disabling sends
+    /// `global_remove` and leaves late binds harmless; the slot itself is
+    /// reaped here once every client has had ample time to hear the news.
+    retired_globals: Vec<(GlobalId, Instant)>,
 }
+
+/// How long a withdrawn `wl_output` global stays bindable before it is
+/// destroyed. Generous on purpose: the cost of waiting is one inert slot,
+/// the cost of not waiting long enough is a dead client.
+const GLOBAL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) fn run() -> Result<()> {
     // This is the first thing that fails when you try to run the udev backend
@@ -463,6 +478,7 @@ pub(crate) fn run() -> Result<()> {
         socket,
         start: Instant::now(),
         signal,
+        retired_globals: Vec::new(),
     };
 
     // Every other DRM device on the seat: the discrete GPU on a hybrid
@@ -518,6 +534,7 @@ pub(crate) fn run() -> Result<()> {
                     screen.dirty = true;
                 }
             }
+            data.reap_retired_globals();
             data.state.refresh();
             data.render_dirty();
             if let Err(e) = data.display.flush_clients() {
@@ -765,6 +782,29 @@ fn refresh_mhz(mode: &smithay::reexports::drm::control::Mode) -> i32 {
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Udev {
+    /// Withdraw a screen's `wl_output` global without destroying it.
+    ///
+    /// Clients hear `global_remove` at once; a `bind` already on the wire
+    /// lands on the disabled slot and gets an inert object instead of a
+    /// fatal "invalid global" protocol error. The slot is destroyed by
+    /// [`Self::reap_retired_globals`] after [`GLOBAL_GRACE`].
+    fn retire_global(&mut self, global: GlobalId) {
+        self.dh.disable_global::<Huginn>(global.clone());
+        self.retired_globals.push((global, Instant::now()));
+    }
+
+    /// Destroy retired globals every client has long since been told about.
+    fn reap_retired_globals(&mut self) {
+        let dh = self.dh.clone();
+        self.retired_globals.retain(|(global, retired_at)| {
+            if retired_at.elapsed() < GLOBAL_GRACE {
+                return true;
+            }
+            dh.remove_global::<Huginn>(global.clone());
+            false
+        });
+    }
+
     /// Lock the session: blank it, start the lock screen, and give the lock
     /// screen a bounded time to claim the blank.
     ///
@@ -901,17 +941,20 @@ impl Udev {
 
     /// A secondary device went away: its screens with it.
     fn remove_device(&mut self, dev: libc::dev_t) {
-        let dh = self.dh.clone();
+        let mut retired = Vec::new();
         let mut changed = false;
         self.screens.retain(|key, screen| {
             if key.0 != dev {
                 return true;
             }
             tracing::info!(name = %screen.name, "output gone with its device");
-            dh.remove_global::<Huginn>(screen.global.clone());
+            retired.push(screen.global.clone());
             changed = true;
             false
         });
+        for global in retired {
+            self.retire_global(global);
+        }
         if let Some(secondary) = self.secondaries.remove(&dev) {
             if let Some(token) = secondary.token {
                 self.handle.remove(token);
@@ -975,17 +1018,20 @@ impl Udev {
         // --- gone ---
         // Dropping the Screen drops its scan-out surface, which is what
         // releases the CRTC for the next connector to claim.
-        let dh = self.dh.clone();
+        let mut retired = Vec::new();
         let mut changed = false;
         self.screens.retain(|key, screen| {
             if key.0 != dev || live.contains(&screen.connector) {
                 return true;
             }
             tracing::info!(name = %screen.name, "output unplugged");
-            dh.remove_global::<Huginn>(screen.global.clone());
+            retired.push(screen.global.clone());
             changed = true;
             false
         });
+        for global in retired {
+            self.retire_global(global);
+        }
 
         // --- new, or still here but different ---
         let known: HashSet<connector::Handle> = self
@@ -1101,8 +1147,9 @@ impl Udev {
             Ok(scanout) => scanout,
             Err(e) => {
                 // The global went out before the CRTC came up, so take it back
-                // rather than advertise an output that renders nothing.
-                self.dh.remove_global::<Huginn>(global);
+                // rather than advertise an output that renders nothing. Taken
+                // back gently: clients are already racing to bind it.
+                self.retire_global(global);
                 return Err(e);
             }
         };
