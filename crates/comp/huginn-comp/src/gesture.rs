@@ -4,10 +4,14 @@
 //! workspace shrinks into the centre, its neighbours appear at the sides, and
 //! the row follows the fingers until they choose a workspace.
 //!
-//! Vertical motion manages applications: down minimizes the focused pane and
-//! up accepts a highlighted minimized application. A three-finger double tap
-//! opens that temporary application switcher; horizontal motion then moves
-//! through its applications instead of through workspaces.
+//! Vertical motion depends on what is on screen. Bare, up shrinks the
+//! workspaces into the overview — the reveal follows the fingers, and lifting
+//! them commits or snaps back — and down puts the focused pane away to the
+//! dock. With the overview open, down expands the centred workspace back out
+//! the same way. With the application switcher up, up accepts the highlighted
+//! minimized application. A three-finger double tap opens that temporary
+//! switcher; horizontal motion then moves through its applications instead of
+//! through workspaces.
 //!
 //! # Why this is a type and not four lines in the input handler
 //!
@@ -28,8 +32,9 @@
 //!   * A three-finger swipe that turns out to be vertical never becomes a
 //!     carousel drag, even if it later drifts sideways. Deciding once and
 //!     staying decided is what keeps the workspace row from lurching part way
-//!     through a motion the user meant for something else, and leaves the
-//!     vertical axis free for a gesture that does not exist yet.
+//!     through a motion the user meant for something else, and is what lets
+//!     the overview reveal ride the vertical travel without ever fighting the
+//!     row for the same fingers.
 
 /// Fingers that mean the carousel.
 ///
@@ -49,6 +54,18 @@ const COMMIT: f64 = 16.0;
 
 /// Touchpad travel that moves the workspace row by one complete card.
 const UNITS_PER_WORKSPACE: f64 = 180.0;
+
+/// Touchpad travel that takes the overview from fully expanded to fully
+/// revealed.
+///
+/// Short enough that one comfortable flick spans the whole reveal, and long
+/// enough that the shrink reads as following the fingers rather than jumping
+/// at them.
+const UNITS_PER_REVEAL: f64 = 140.0;
+
+/// How close to where it started a reveal swipe must come back for the lift
+/// to read as changed-my-mind rather than as the command it set out to be.
+const REVEAL_RETURN: f32 = 0.1;
 
 /// Longest gap between taps that still reads as a double tap.
 const DOUBLE_TAP_MSEC: u32 = 500;
@@ -83,6 +100,9 @@ enum Claim {
     Carousel { origin: f32 },
     /// A vertical application-switcher command.
     Vertical(Vertical),
+    /// Driving the overview reveal, which sat at `origin` when the axis
+    /// committed, having set out in `direction`.
+    Reveal { origin: f32, direction: Vertical },
     /// The wrong number of fingers. Nothing here wants it.
     Ignored,
 }
@@ -184,6 +204,50 @@ impl Swipe {
         };
         Some(direction)
     }
+
+    /// Take the vertical swipe as the overview's reveal, which sat at `origin`
+    /// when the axis committed.
+    ///
+    /// Only a swipe already proved vertical can be taken. From here the swipe
+    /// is a drag, not a command: [`Self::vertical`] goes quiet, so the lift
+    /// cannot also minimize or accept anything.
+    pub(crate) fn drives_reveal(&mut self, origin: f32) {
+        if let Claim::Vertical(direction) = self.claim {
+            self.claim = Claim::Reveal { origin, direction };
+        }
+    }
+
+    /// Where the overview reveal should sit for the accumulated travel, or
+    /// `None` while the swipe is not driving it.
+    ///
+    /// Computed from the total travel for the same reason as
+    /// [`Self::position`]: a swipe that goes out and comes back lands exactly
+    /// where it started. Sliding up reveals, as though the workspace were
+    /// pushed away under the fingers.
+    pub(crate) fn reveal(&self) -> Option<f32> {
+        let Claim::Reveal { origin, .. } = self.claim else {
+            return None;
+        };
+        Some((origin - (self.travel.1 / UNITS_PER_REVEAL) as f32).clamp(0.0, 1.0))
+    }
+
+    /// Whether a reveal-driving swipe ends with the overview open.
+    ///
+    /// The direction the swipe set out in decides — a flick does not have to
+    /// drag the reveal past halfway to mean it — unless the fingers came back
+    /// to within [`REVEAL_RETURN`] of where they started, which is a change of
+    /// mind, not a command. The threshold is clamped into the reveal's range
+    /// so a drag that began near either end still has a line it can cross.
+    pub(crate) fn reveal_commits(&self) -> Option<bool> {
+        let Claim::Reveal { origin, direction } = self.claim else {
+            return None;
+        };
+        let at = self.reveal()?;
+        Some(match direction {
+            Vertical::Up => at > (origin + REVEAL_RETURN).min(1.0 - REVEAL_RETURN),
+            Vertical::Down => at > (origin - REVEAL_RETURN).max(REVEAL_RETURN),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +337,90 @@ mod tests {
     fn vertical_direction_is_decided_from_the_fingers_motion() {
         assert_eq!(swipe(0.0, &[(0.0, 20.0)]).vertical(), Some(Vertical::Down));
         assert_eq!(swipe(0.0, &[(0.0, -20.0)]).vertical(), Some(Vertical::Up));
+    }
+
+    /// Feed `travel` to a fresh three-finger swipe one step at a time, taking
+    /// it as the reveal drag from `origin` the moment it proves vertical.
+    fn reveal_swipe(origin: f32, travel: &[(f64, f64)]) -> Swipe {
+        let mut s = Swipe::new(CAROUSEL_FINGERS);
+        for (dx, dy) in travel {
+            if s.takes_hold(*dx, *dy) == Some(Hold::Vertical) {
+                s.drives_reveal(origin);
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn an_upward_swipe_drives_the_reveal_with_the_fingers() {
+        let s = reveal_swipe(0.0, &[(0.0, -35.0), (1.0, -35.0)]);
+        assert!((s.reveal().unwrap() - 0.5).abs() < 0.001);
+        assert_eq!(s.reveal_commits(), Some(true));
+    }
+
+    #[test]
+    fn a_short_flick_up_still_opens() {
+        // Committing must not require dragging past halfway: the direction
+        // the swipe set out in is the intent.
+        let s = reveal_swipe(0.0, &[(0.0, -30.0)]);
+        assert_eq!(s.reveal_commits(), Some(true));
+    }
+
+    #[test]
+    fn an_up_swipe_that_comes_back_down_is_a_change_of_mind() {
+        let s = reveal_swipe(0.0, &[(0.0, -80.0), (0.0, 75.0)]);
+        assert_eq!(s.reveal_commits(), Some(false));
+    }
+
+    #[test]
+    fn a_downward_swipe_from_open_closes_the_overview() {
+        let s = reveal_swipe(1.0, &[(0.0, 40.0)]);
+        assert!(s.reveal().unwrap() < 1.0, "the reveal must follow the drag");
+        assert_eq!(s.reveal_commits(), Some(false));
+    }
+
+    #[test]
+    fn a_down_swipe_that_comes_back_up_leaves_the_overview_open() {
+        let s = reveal_swipe(1.0, &[(0.0, 60.0), (0.0, -55.0)]);
+        assert_eq!(s.reveal_commits(), Some(true));
+    }
+
+    #[test]
+    fn a_down_swipe_on_a_nearly_closed_overview_still_closes_it() {
+        // The origin sits below the return margin, so the naive threshold
+        // would be negative and the clamped reveal could never land under it.
+        let s = reveal_swipe(0.05, &[(0.0, 40.0)]);
+        assert_eq!(s.reveal_commits(), Some(false));
+    }
+
+    #[test]
+    fn the_reveal_is_clamped_to_its_range() {
+        assert_eq!(reveal_swipe(0.0, &[(0.0, -500.0)]).reveal(), Some(1.0));
+        assert_eq!(reveal_swipe(1.0, &[(0.0, 500.0)]).reveal(), Some(0.0));
+    }
+
+    #[test]
+    fn a_command_swipe_never_reports_a_reveal() {
+        // A vertical swipe nothing took as the reveal stays a command — it
+        // minimizes or accepts on the lift, and drives nothing meanwhile.
+        let s = swipe(0.0, &[(0.0, 20.0)]);
+        assert_eq!(s.reveal(), None);
+        assert_eq!(s.reveal_commits(), None);
+        assert_eq!(s.vertical(), Some(Vertical::Down));
+    }
+
+    #[test]
+    fn driving_the_reveal_silences_the_vertical_command() {
+        let s = reveal_swipe(0.0, &[(0.0, -40.0)]);
+        assert_eq!(s.vertical(), None, "the lift must not also minimize");
+    }
+
+    #[test]
+    fn a_horizontal_swipe_cannot_be_taken_as_the_reveal() {
+        let mut s = swipe(2.0, &[(-60.0, 0.0)]);
+        s.drives_reveal(0.0);
+        assert_eq!(s.reveal(), None);
+        assert_eq!(s.position(), Some(2.0 + 60.0 / 180.0));
     }
 
     #[test]
