@@ -2181,25 +2181,68 @@ impl Huginn {
         self.swipe = Some(crate::gesture::Swipe::new(fingers));
     }
 
-    /// The fingers moved. Opens and drives the workspace row once the swipe has
-    /// proved itself a horizontal three-finger one.
+    /// The fingers moved. Opens and drives the workspace row once the swipe
+    /// has proved itself a horizontal three-finger one, and drives the
+    /// overview's reveal once it has proved itself a bare vertical one.
     pub(crate) fn swipe_update(&mut self, dx: f64, dy: f64) {
         let Some(mut swipe) = self.swipe.take() else {
             return;
         };
-        if swipe.takes_hold(dx, dy) == Some(crate::gesture::Hold::Horizontal) {
-            if let Some(switcher) = self.app_switcher {
-                let selectable = self.switcher_items();
-                let origin = selectable
-                    .iter()
-                    .position(|index| *index == switcher.selected)
-                    .unwrap_or(0) as f32;
-                swipe.drives(origin);
-            } else {
-                let origin = self.space.active_index() as f32;
-                self.open_workspace_carousel();
-                swipe.drives(origin);
+        match swipe.takes_hold(dx, dy) {
+            Some(crate::gesture::Hold::Horizontal) => {
+                if let Some(switcher) = self.app_switcher {
+                    let selectable = self.switcher_items();
+                    let origin = selectable
+                        .iter()
+                        .position(|index| *index == switcher.selected)
+                        .unwrap_or(0) as f32;
+                    swipe.drives(origin);
+                } else {
+                    let origin = self.space.active_index() as f32;
+                    self.open_workspace_carousel();
+                    swipe.drives(origin);
+                }
             }
+            // A bare vertical swipe belongs to the overview. With the
+            // application switcher up the fingers are its commands — accept,
+            // minimize — which act on the lift, so nothing is taken here.
+            Some(crate::gesture::Hold::Vertical) if self.app_switcher.is_none() => {
+                let now = self.uptime();
+                match swipe.vertical() {
+                    Some(crate::gesture::Vertical::Up) => {
+                        let origin = if let Some(carousel) = &mut self.workspace_carousel {
+                            // Catching an overview mid-close: pick the reveal
+                            // up where it is and un-close it, or the animation
+                            // tick tears it down under the fingers the moment
+                            // the driven reveal reads as settled.
+                            carousel.closing = false;
+                            carousel.reveal.value(now)
+                        } else {
+                            // Born pinned shut: the fingers drive the reveal
+                            // from here, not the open animation.
+                            self.workspace_carousel = Some(WorkspaceCarousel {
+                                position: crate::anim::Animated::settled(
+                                    self.space.active_index() as f32,
+                                ),
+                                reveal: crate::anim::Animated::settled(0.0),
+                                closing: false,
+                            });
+                            0.0
+                        };
+                        swipe.drives_reveal(origin);
+                    }
+                    Some(crate::gesture::Vertical::Down) => {
+                        // Down with no overview stays a command: it minimizes
+                        // the focused pane on the lift, exactly as before.
+                        if let Some(carousel) = &mut self.workspace_carousel {
+                            carousel.closing = false;
+                            swipe.drives_reveal(carousel.reveal.value(now));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
         }
         if let Some(position) = swipe.position() {
             if self.app_switcher.is_some() {
@@ -2223,6 +2266,12 @@ impl Huginn {
                 }
             }
         }
+        if let Some(reveal) = swipe.reveal()
+            && let Some(carousel) = &mut self.workspace_carousel
+        {
+            carousel.reveal.jump_to(reveal);
+            self.queue_redraw();
+        }
         self.swipe = Some(swipe);
     }
 
@@ -2235,6 +2284,18 @@ impl Huginn {
         let Some(swipe) = self.swipe.take() else {
             return;
         };
+        if let Some(open) = swipe.reveal_commits() {
+            // The lift settles the reveal the fingers were driving: on to
+            // fully open, or back down to the workspace it came from. Closing
+            // re-activates the workspace the overview opened on, which is the
+            // one already active — a snap-back changes nothing but pixels.
+            if open {
+                self.open_workspace_carousel();
+            } else {
+                self.close_workspace_carousel();
+            }
+            return;
+        }
         if let Some(direction) = swipe.vertical() {
             match direction {
                 crate::gesture::Vertical::Down if self.app_switcher.is_none() => {
