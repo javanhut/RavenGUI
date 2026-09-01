@@ -317,7 +317,7 @@ Esc exits."
             };
 
             let fill = if self.focused { FOCUSED } else { UNFOCUSED };
-            for (index, chunk) in canvas.chunks_exact_mut(4).enumerate() {
+            for (index, chunk) in canvas.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let x = index as u32 % w;
                 let y = index as u32 / w;
                 let edge = x < 2 || y < 2 || x + 2 >= w || y + 2 >= h;

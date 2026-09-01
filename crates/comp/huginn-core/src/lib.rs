@@ -483,13 +483,53 @@ impl Space {
         window.mode != was
     }
 
-    /// Register a new window on the active workspace and focus it.
+    /// Register a new window and focus it.
+    ///
+    /// On the active workspace, unless that workspace is already at its
+    /// [`Workspace::tile_cap`] — then the window opens on the nearest
+    /// workspace with room and that workspace becomes active, so the window
+    /// appears in front of you rather than filing itself somewhere hidden.
+    /// With every workspace full, the cap yields: a window has to exist
+    /// somewhere, and an over-full workspace is a better failure than a
+    /// client whose surface was never given a home.
     pub fn open_window(&mut self) -> WindowId {
         let id = WindowId::from_raw(self.next_window);
         self.next_window += 1;
         self.windows.insert(id, Window::new(id));
+        if self.workspaces[self.active].is_full()
+            && let Some(target) = self.workspace_with_room()
+        {
+            self.activate_workspace(target);
+        }
         self.workspaces[self.active].insert(id);
         id
+    }
+
+    /// The workspace nearest the active one that is not at its cap, looking
+    /// one step forward, then one back, then further out — so an overflowing
+    /// window lands next door, not on the far end of the row.
+    fn workspace_with_room(&self) -> Option<usize> {
+        (1..self.workspaces.len())
+            .flat_map(|step| {
+                [
+                    self.active
+                        .checked_add(step)
+                        .filter(|i| *i < self.workspaces.len()),
+                    self.active.checked_sub(step),
+                ]
+            })
+            .flatten()
+            .find(|index| !self.workspaces[*index].is_full())
+    }
+
+    /// Set every workspace's window cap at once. Clamped to at least one.
+    ///
+    /// The compositor's way of applying a configured default; a single
+    /// workspace's cap is set on the workspace itself.
+    pub fn set_tile_cap(&mut self, cap: usize) {
+        for workspace in &mut self.workspaces {
+            workspace.set_tile_cap(cap);
+        }
     }
 
     /// Forget a window, removing it from whichever workspace holds it.
@@ -501,8 +541,14 @@ impl Space {
         if self.windows.remove(&id).is_none() {
             return false;
         }
-        for ws in &mut self.workspaces {
-            if ws.remove(id) {
+        for index in 0..self.workspaces.len() {
+            if self.workspaces[index].remove(id) {
+                // A soloed window that closes takes the solo with it: the
+                // windows it put away come back, or the workspace would be
+                // left showing nothing with no key that says why.
+                if self.workspaces[index].solo() == Some(id) {
+                    self.end_solo_on(index);
+                }
                 break;
             }
         }
@@ -611,6 +657,91 @@ impl Space {
         };
         self.workspaces[self.active].remove(id);
         self.workspaces[index].insert(id);
+        true
+    }
+
+    /// Give `id` the whole screen: put every other window on the active
+    /// workspace away, remembering the tiling as it stood. The pick is not
+    /// told it is fullscreen — a browser would answer by hiding its tabs and
+    /// chrome. It is simply the only tile left, and a lone tile is the whole
+    /// pane.
+    ///
+    /// The overview's pick. Soloing another window while one already holds
+    /// the screen trades them without touching the remembered tiling — the
+    /// state to come back to is the one from before any solo, not the one
+    /// mid-solo. Returns whether `id` was here to be soloed; call
+    /// [`Self::arrange`] afterwards.
+    pub fn solo_window(&mut self, id: WindowId) -> bool {
+        if !self.windows.contains_key(&id) || !self.workspaces[self.active].windows().contains(&id)
+        {
+            return false;
+        }
+        let members: Vec<WindowId> = self.workspaces[self.active].windows().to_vec();
+        let previous = self.workspaces[self.active].solo_mut().take();
+        let (tiles, mut hidden) = match previous {
+            Some(prev) if prev.window == id => {
+                *self.workspaces[self.active].solo_mut() = Some(prev);
+                return true;
+            }
+            Some(prev) => (prev.tiles, prev.hidden),
+            None => (self.workspaces[self.active].tiles().clone(), Vec::new()),
+        };
+
+        // The pick comes out of hiding — a previous solo may have put it
+        // away. Nothing else happens to it: with the rest of the workspace
+        // minimized below, the layout gives the last tile the whole pane.
+        hidden.retain(|w| *w != id);
+        self.unminimize(id);
+        // Everyone else is put away. Only the windows put away *here* are
+        // recorded, so one minimized by hand beforehand stays minimized when
+        // the solo ends.
+        for member in members {
+            if member == id {
+                continue;
+            }
+            let Some(window) = self.windows.get_mut(&member) else {
+                continue;
+            };
+            if window.mode == WindowMode::Fullscreen {
+                window.unfullscreen();
+            }
+            if !window.is_minimized() {
+                window.minimize();
+                if !hidden.contains(&member) {
+                    hidden.push(member);
+                }
+            }
+        }
+        *self.workspaces[self.active].solo_mut() = Some(workspace::Solo {
+            window: id,
+            tiles,
+            hidden,
+        });
+        self.workspaces[self.active].focus(id);
+        true
+    }
+
+    /// The window soloed on the active workspace, if one is.
+    pub fn solo(&self) -> Option<WindowId> {
+        self.workspaces[self.active].solo()
+    }
+
+    /// Put the active workspace back the way [`Self::solo_window`] found it:
+    /// the windows the solo put away come back, and the tile tree — order and
+    /// moved dividers both — is the one that was remembered. Returns whether
+    /// a solo was in progress; call [`Self::arrange`] afterwards.
+    pub fn end_solo(&mut self) -> bool {
+        self.end_solo_on(self.active)
+    }
+
+    fn end_solo_on(&mut self, index: usize) -> bool {
+        let Some(solo) = self.workspaces[index].solo_mut().take() else {
+            return false;
+        };
+        for id in solo.hidden {
+            self.unminimize(id);
+        }
+        *self.workspaces[index].tiles_mut() = solo.tiles;
         true
     }
 
@@ -762,7 +893,7 @@ impl Space {
         let ws = &mut self.workspaces[index];
         let laid = match ws.layout() {
             Layout::Tiled => {
-                ws.reconcile_tiles(&tiled, area, gap);
+                ws.reconcile_tiles(&tiled, area);
                 ws.tiles().arrange(area, gap)
             }
             // The strip needs no reconcile: it lays out `tiled` directly rather
@@ -1041,11 +1172,9 @@ mod tests {
         assert_eq!(s.focused(), Some(b), "and the window arrived focused");
     }
 
-    /// Three windows: `a` takes the left half, `b` and `c` split the right,
-    /// top to bottom. Each new window splits the tile of the one before it,
-    /// and the split follows the longer edge — so a wide pane divides in two
-    /// vertically first, then the tall right-hand tile divides horizontally.
-    fn master_and_stack() -> (Space, WindowId, WindowId, WindowId) {
+    /// Three windows in the canonical shape: `a` and `b` side by side on top,
+    /// `c` across the whole bottom at the same height.
+    fn a_b_c() -> (Space, WindowId, WindowId, WindowId) {
         let mut s = space();
         let a = s.open_window();
         let b = s.open_window();
@@ -1055,8 +1184,21 @@ mod tests {
     }
 
     #[test]
-    fn moving_right_out_of_the_master_takes_the_top_of_the_stack() {
-        let (mut s, a, b, c) = master_and_stack();
+    fn three_windows_take_the_two_over_one_shape() {
+        let (s, a, b, c) = a_b_c();
+        let rect = |id| s.window(id).expect("open").geometry;
+        let (ra, rb, rc) = (rect(a), rect(b), rect(c));
+        assert_eq!(ra.y(), rb.y(), "a and b share the top row");
+        assert!(ra.x() < rb.x());
+        assert_eq!(ra.h(), rb.h());
+        assert!(rc.y() > ra.y(), "c sits beneath them");
+        assert!(rc.w() > ra.w() + rb.w(), "c spans the full width");
+        assert!(ra.h().abs_diff(rc.h()) <= 1, "the rows are equal heights");
+    }
+
+    #[test]
+    fn moving_right_swaps_the_top_pair() {
+        let (mut s, a, b, c) = a_b_c();
         s.active_workspace_mut().focus(a);
         assert!(s.move_focused(Dir::Right));
         // Tile order, not membership order: membership records who lives here,
@@ -1066,25 +1208,25 @@ mod tests {
     }
 
     #[test]
-    fn moving_within_the_stack_walks_it_one_window_at_a_time() {
-        let (mut s, a, b, c) = master_and_stack();
+    fn moving_down_lands_in_the_wide_tile() {
+        let (mut s, a, b, c) = a_b_c();
         s.active_workspace_mut().focus(b);
         assert!(s.move_focused(Dir::Down));
         assert_eq!(s.active_workspace().tiles().windows(), [a, c, b]);
 
-        // And back, which must land exactly where it started.
+        // From the wide tile both top tiles are equally near; the tie falls
+        // to the one earliest in workspace order.
         s.arrange();
         assert!(s.move_focused(Dir::Up));
-        assert_eq!(s.active_workspace().tiles().windows(), [a, b, c]);
+        assert_eq!(s.active_workspace().tiles().windows(), [b, c, a]);
     }
 
     #[test]
     fn moving_into_the_wall_does_nothing() {
-        let (mut s, a, _b, _c) = master_and_stack();
+        let (mut s, a, _b, _c) = a_b_c();
         s.active_workspace_mut().focus(a);
-        // The master column is full height at the left edge: nothing is above,
-        // below, or left of it.
-        for dir in [Dir::Left, Dir::Up, Dir::Down] {
+        // The top-left tile has nothing above it or to its left.
+        for dir in [Dir::Left, Dir::Up] {
             assert!(
                 !s.move_focused(dir),
                 "{dir:?} found a neighbour that is not there"
@@ -1109,7 +1251,7 @@ mod tests {
 
     #[test]
     fn floating_windows_do_not_join_the_tiling_order() {
-        let (mut s, a, b, _c) = master_and_stack();
+        let (mut s, a, b, _c) = a_b_c();
         s.window_mut(b).expect("open").mode = WindowMode::Floating;
         s.arrange();
         s.active_workspace_mut().focus(b);
@@ -1118,7 +1260,8 @@ mod tests {
             "a floating window has no slot to swap"
         );
 
-        // And it is not a target either: from the master, right must skip it.
+        // And it is not a target either: moving right out of the first tile
+        // must skip it.
         s.active_workspace_mut().focus(a);
         assert!(s.move_focused(Dir::Right));
         assert_ne!(s.active_workspace().windows()[0], b);
@@ -1126,12 +1269,194 @@ mod tests {
 
     #[test]
     fn a_move_is_its_own_inverse() {
-        let (mut s, a, b, c) = master_and_stack();
+        let (mut s, a, b, c) = a_b_c();
         s.active_workspace_mut().focus(c);
         assert!(s.move_focused(Dir::Up));
         s.arrange();
         assert!(s.move_focused(Dir::Down));
         assert_eq!(s.active_workspace().windows(), &[a, b, c]);
+    }
+
+    #[test]
+    fn soloing_gives_one_window_the_screen_and_puts_the_rest_away() {
+        let (mut s, a, b, c) = a_b_c();
+        assert!(s.solo_window(a));
+        s.arrange();
+        assert_eq!(s.solo(), Some(a));
+        assert_eq!(s.focused(), Some(a));
+        assert_eq!(
+            s.window(a).unwrap().geometry,
+            SCREEN.inset(DEFAULT_GAP),
+            "a is the lone pane, not app fullscreen"
+        );
+        assert!(
+            s.window(a).unwrap().is_tiled(),
+            "the solo must not tell the client it is fullscreen"
+        );
+        assert!(s.window(b).unwrap().is_minimized());
+        assert!(s.window(c).unwrap().is_minimized());
+    }
+
+    #[test]
+    fn ending_the_solo_restores_the_tiling_as_it_stood() {
+        // Not merely re-tiled: the order after a swap and a moved divider
+        // both come back, because "put them back" means where they were.
+        let (mut s, a, b, c) = a_b_c();
+        s.active_workspace_mut().focus(a);
+        assert!(s.move_focused(Dir::Right)); // tiles now [b, a, c]
+        s.arrange();
+        let before: Vec<Rect> = [a, b, c]
+            .iter()
+            .map(|id| s.window(*id).unwrap().geometry)
+            .collect();
+
+        assert!(s.solo_window(c));
+        s.arrange();
+        assert!(s.end_solo());
+        s.arrange();
+
+        assert_eq!(s.solo(), None);
+        assert_eq!(s.active_workspace().tiles().windows(), [b, a, c]);
+        for (id, geometry) in [a, b, c].iter().zip(before) {
+            assert_eq!(
+                s.window(*id).unwrap().geometry,
+                geometry,
+                "a window did not return to its tile"
+            );
+            assert!(!s.window(*id).unwrap().is_minimized());
+        }
+    }
+
+    #[test]
+    fn trading_the_solo_keeps_the_original_tiling_to_come_back_to() {
+        let (mut s, a, b, c) = a_b_c();
+        s.arrange();
+        let original = s.window(a).unwrap().geometry;
+
+        assert!(s.solo_window(a));
+        s.arrange();
+        assert!(s.solo_window(b), "the pick can move while soloed");
+        s.arrange();
+        assert_eq!(s.solo(), Some(b));
+        assert_eq!(s.window(b).unwrap().geometry, SCREEN.inset(DEFAULT_GAP));
+        assert!(
+            s.window(a).unwrap().is_minimized(),
+            "the old pick steps back"
+        );
+
+        assert!(s.end_solo());
+        s.arrange();
+        assert_eq!(
+            s.window(a).unwrap().geometry,
+            original,
+            "the restore is the tiling before any solo"
+        );
+        assert!(
+            [a, b, c]
+                .iter()
+                .all(|id| !s.window(*id).unwrap().is_minimized())
+        );
+    }
+
+    #[test]
+    fn a_window_minimized_by_hand_stays_minimized_after_the_solo() {
+        let (mut s, a, b, _c) = a_b_c();
+        s.minimize(b);
+        s.arrange();
+        assert!(s.solo_window(a));
+        s.arrange();
+        assert!(s.end_solo());
+        s.arrange();
+        assert!(
+            s.window(b).unwrap().is_minimized(),
+            "the solo must only bring back what it put away"
+        );
+    }
+
+    #[test]
+    fn closing_the_soloed_window_brings_the_others_back() {
+        let (mut s, a, b, c) = a_b_c();
+        assert!(s.solo_window(a));
+        s.arrange();
+        assert!(s.close_window(a));
+        s.arrange();
+        assert_eq!(s.solo(), None);
+        assert!(!s.window(b).unwrap().is_minimized());
+        assert!(!s.window(c).unwrap().is_minimized());
+    }
+
+    #[test]
+    fn soloing_the_same_window_twice_changes_nothing() {
+        let (mut s, a, _b, _c) = a_b_c();
+        assert!(s.solo_window(a));
+        assert!(s.solo_window(a));
+        assert!(s.end_solo());
+        assert!(!s.end_solo(), "the solo ended the first time");
+    }
+
+    #[test]
+    fn a_window_somewhere_else_cannot_be_soloed() {
+        let mut s = space();
+        let a = s.open_window();
+        s.activate_workspace(1);
+        assert!(!s.solo_window(a));
+        assert!(!s.solo_window(WindowId::from_raw(999)));
+        assert_eq!(s.solo(), None);
+    }
+
+    #[test]
+    fn the_ninth_window_overflows_to_the_next_workspace() {
+        let mut s = space();
+        for _ in 0..workspace::DEFAULT_TILE_CAP {
+            s.open_window();
+        }
+        assert_eq!(s.active_index(), 0, "eight windows fit where they opened");
+
+        let ninth = s.open_window();
+        assert_eq!(s.active_index(), 1, "the ninth moves you next door");
+        assert_eq!(s.workspaces()[1].windows(), &[ninth]);
+        assert_eq!(s.focused(), Some(ninth), "and arrives focused");
+        assert_eq!(
+            s.workspaces()[0].windows().len(),
+            workspace::DEFAULT_TILE_CAP,
+            "the full workspace was left as it was"
+        );
+    }
+
+    #[test]
+    fn overflow_finds_the_nearest_workspace_with_room() {
+        // Forward first, then backward, then further out — so with the next
+        // workspace also full, the window lands one step back instead.
+        let mut s = space();
+        s.set_tile_cap(1);
+        s.open_window();
+        s.open_window(); // fills workspace 2, which becomes active
+        assert_eq!(s.active_index(), 1);
+        s.open_window(); // 1 and 2 are full; next door forward is 3
+        assert_eq!(s.active_index(), 2);
+
+        // Back on the full first workspace with 2 and 3 also full, one step
+        // forward is taken before two steps could be.
+        s.activate_workspace(0);
+        s.open_window();
+        assert_eq!(s.active_index(), 3);
+    }
+
+    #[test]
+    fn with_every_workspace_full_the_cap_yields() {
+        // A window must exist somewhere; an over-full workspace beats a
+        // client with no home.
+        let mut s = space();
+        s.set_tile_cap(1);
+        for _ in 0..9 {
+            s.open_window();
+        }
+        assert!(s.workspaces().iter().all(Workspace::is_full));
+        let extra = s.open_window();
+        assert!(
+            s.active_workspace().windows().contains(&extra),
+            "the tenth window still landed on the active workspace"
+        );
     }
 
     #[test]

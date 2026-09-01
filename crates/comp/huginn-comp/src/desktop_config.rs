@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn unknown_keys_and_sections_are_fine() {
         // The file carries sections for the bar and the applications too.
-        let cfg = DesktopConfig::parse("[privacy]\nx = 1\n[appearance]\nblur = true\ntheme_mode = \"dark\"\n").unwrap();
+        let cfg = DesktopConfig::parse(
+            "[privacy]\nx = 1\n[appearance]\nblur = true\ntheme_mode = \"dark\"\n",
+        )
+        .unwrap();
         assert_eq!(cfg.motion(), Motion::Full);
     }
 

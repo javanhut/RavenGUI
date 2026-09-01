@@ -82,6 +82,14 @@ pub(crate) enum Action {
     Resize(Dir),
     /// Leave resize mode.
     LeaveResize,
+    /// Move the overview's highlight one window over.
+    OverviewMove(Dir),
+    /// Take the overview's highlighted window: it gets the screen to itself
+    /// and the rest of its workspace is put away. With nothing highlighted,
+    /// the overview closes and the tiling is put back instead.
+    OverviewConfirm,
+    /// Leave the overview without taking anything, putting the tiling back.
+    OverviewCancel,
     /// Open the quick settings panel.
     OpenSettings,
     /// A key while quick settings is open.
@@ -131,6 +139,8 @@ pub(crate) struct Modes {
     pub pinned_open: bool,
     /// Resize mode is active, and owns the arrows.
     pub resizing: bool,
+    /// The workspace overview is up, and owns the arrows, Return and Escape.
+    pub overview: bool,
     /// The session is locked. Nothing resolves; every key is the lock
     /// screen's.
     pub locked: bool,
@@ -353,6 +363,25 @@ pub(crate) fn resolve(
             return FilterResult::Intercept(pressed(key_state, action));
         }
         // Not a resize key: fall through, and the caller leaves the mode.
+    }
+
+    // The overview owns only the keys that steer it — highlight with the
+    // arrows, Return to take the highlighted window, Escape to put the
+    // tiling back. Everything else falls through, so the chords still work:
+    // `Super`+`Ctrl`+`C` still accepts, the digits still jump workspaces.
+    if mode.overview {
+        let action = match sym {
+            keysyms::KEY_Left => Some(Action::OverviewMove(Dir::Left)),
+            keysyms::KEY_Right => Some(Action::OverviewMove(Dir::Right)),
+            keysyms::KEY_Up => Some(Action::OverviewMove(Dir::Up)),
+            keysyms::KEY_Down => Some(Action::OverviewMove(Dir::Down)),
+            keysyms::KEY_Return => Some(Action::OverviewConfirm),
+            keysyms::KEY_Escape => Some(Action::OverviewCancel),
+            _ => None,
+        };
+        if let Some(action) = action {
+            return FilterResult::Intercept(pressed(key_state, action));
+        }
     }
 
     if mode.settings_open {
@@ -700,6 +729,50 @@ mod tests {
             intercepted(super_ctrl(), keysyms::KEY_R),
             Some(Action::EnterResize)
         );
+    }
+
+    /// Resolve with the overview up.
+    fn while_overviewing(mods: ModifiersState, sym: u32) -> FilterResult<Option<Action>> {
+        let mode = Modes {
+            overview: true,
+            ..Modes::default()
+        };
+        resolve(KeyState::Pressed, &mods, sym, mode)
+    }
+
+    #[test]
+    fn the_overview_takes_the_arrows_return_and_escape() {
+        let none = ModifiersState::default();
+        assert!(matches!(
+            while_overviewing(none, keysyms::KEY_Right),
+            FilterResult::Intercept(Some(Action::OverviewMove(Dir::Right)))
+        ));
+        assert!(matches!(
+            while_overviewing(none, keysyms::KEY_Return),
+            FilterResult::Intercept(Some(Action::OverviewConfirm))
+        ));
+        assert!(matches!(
+            while_overviewing(none, keysyms::KEY_Escape),
+            FilterResult::Intercept(Some(Action::OverviewCancel))
+        ));
+    }
+
+    #[test]
+    fn the_overview_leaves_the_chords_alone() {
+        // Super+Ctrl+C must still accept the overview, and the digits must
+        // still jump workspaces — the mode owns three keys, not the keyboard.
+        assert!(matches!(
+            while_overviewing(super_ctrl(), keysyms::KEY_c),
+            FilterResult::Intercept(Some(Action::ToggleCarousel))
+        ));
+        assert!(matches!(
+            while_overviewing(super_ctrl(), keysyms::KEY_1),
+            FilterResult::Intercept(Some(Action::Workspace(0)))
+        ));
+        assert!(matches!(
+            while_overviewing(ModifiersState::default(), keysyms::KEY_a),
+            FilterResult::Forward
+        ));
     }
 
     #[test]

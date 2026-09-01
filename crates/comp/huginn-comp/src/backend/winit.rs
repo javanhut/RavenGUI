@@ -60,9 +60,9 @@ use crate::backend::chord;
 use crate::backend::input;
 use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
-use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use crate::render;
 use crate::state::{ClientState, Huginn};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 
 /// Background colour of an empty workspace.
 const CLEAR: Color32F = Color32F::new(0.06, 0.06, 0.09, 1.0);
@@ -450,6 +450,7 @@ impl Nested {
                 let settings_open = self.state.settings.is_open();
                 let pinned_open = self.state.pinned.is_open();
                 let resizing = self.state.resizing;
+                let overview = self.state.overview_open();
                 let locked = self.state.is_locked();
                 let switcher_open = self.state.app_switcher_open();
                 let action = self
@@ -478,6 +479,7 @@ impl Nested {
                                         settings_open,
                                         pinned_open,
                                         resizing,
+                                        overview,
                                         locked,
                                         switcher_open,
                                     },
@@ -563,6 +565,9 @@ impl Nested {
             }
             Action::Resize(dir) => state.resize_focused(dir),
             Action::LeaveResize => state.set_resize_mode(false),
+            Action::OverviewMove(dir) => state.overview_move(dir),
+            Action::OverviewConfirm => state.overview_confirm(),
+            Action::OverviewCancel => state.close_workspace_carousel(),
             Action::ToggleCarousel => {
                 state.toggle_workspace_carousel();
             }

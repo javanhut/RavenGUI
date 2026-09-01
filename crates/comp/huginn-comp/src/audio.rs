@@ -792,7 +792,7 @@ mod tests {
         let volume = at(percent);
         let canvas = compose(&volume, &mut text, Rect::from_xywh(0, 0, 1920, 1080), 1);
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
-        for pixel in canvas.pixels.chunks_exact(4) {
+        for pixel in canvas.pixels.as_chunks::<4>().0.iter() {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write(&path, ppm).expect("writing the dump");

@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn scaling_leaves_every_pixel_opaque() {
         let out = checker().scaled_to_cover(9, 5);
-        assert!(out.chunks_exact(4).all(|p| p[3] == 0xFF));
+        assert!(out.as_chunks::<4>().0.iter().all(|p| p[3] == 0xFF));
     }
 
     /// A destination the same shape as the source needs no crop at all, so

@@ -50,7 +50,12 @@ where
     let armed = inotify.watches().add(&dir, mask).is_ok()
         || dir
             .parent()
-            .map(|p| inotify.watches().add(p, WatchMask::CREATE | WatchMask::MOVED_TO).is_ok())
+            .map(|p| {
+                inotify
+                    .watches()
+                    .add(p, WatchMask::CREATE | WatchMask::MOVED_TO)
+                    .is_ok()
+            })
             .unwrap_or(false);
     if !armed {
         tracing::debug!(path = %dir.display(), "no config directory to watch");
@@ -106,11 +111,13 @@ where
             }
             scheduled.set(true);
             let done = Rc::clone(&scheduled);
-            if let Err(e) = lh.insert_source(Timer::from_duration(SETTLE), move |_, _, data: &mut D| {
-                done.set(false);
-                data.as_huginn().reload_desktop_config();
-                TimeoutAction::Drop
-            }) {
+            if let Err(e) =
+                lh.insert_source(Timer::from_duration(SETTLE), move |_, _, data: &mut D| {
+                    done.set(false);
+                    data.as_huginn().reload_desktop_config();
+                    TimeoutAction::Drop
+                })
+            {
                 tracing::warn!(error = %e, "could not schedule a settings reload");
                 scheduled.set(false);
             }

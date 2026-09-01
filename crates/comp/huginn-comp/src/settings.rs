@@ -1363,7 +1363,7 @@ fn compose(
     // slides out of, which does not exist yet.
     let reveal = settings.reveal(now).clamp(0.0, 1.0);
     if reveal < 1.0 {
-        for pixel in canvas.pixels.chunks_exact_mut(4) {
+        for pixel in canvas.pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel[3] = (f32::from(pixel[3]) * reveal) as u8;
         }
     }
@@ -1893,7 +1893,9 @@ mod tests {
         let faded = compose(&settings, &mut text, output, ms(20), 1);
         let alpha = |c: &Canvas| {
             c.pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|p| u32::from(p[3]))
                 .sum::<u32>()
         };
@@ -2220,7 +2222,7 @@ mod dump {
             1,
         );
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
-        for pixel in canvas.pixels.chunks_exact(4) {
+        for pixel in canvas.pixels.as_chunks::<4>().0.iter() {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write(&path, ppm).expect("writing the dump");
