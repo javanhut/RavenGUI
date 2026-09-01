@@ -3077,9 +3077,17 @@ impl Huginn {
         };
         if !item.running {
             // Not running: start it. The launcher opens applications rather
-            // than documents, so there are no targets to substitute.
+            // than documents, so there are no targets to substitute. A
+            // `Terminal=true` entry is wrapped in the terminal here just as
+            // the launcher and the pinned panel wrap it — the dock must not
+            // be the one place a TUI app launches without its terminal.
             let (path, argv) = (entry.path.clone(), entry.argv(&[]));
             if let Some(argv) = argv {
+                let argv = if entry.terminal {
+                    crate::launcher::in_terminal(argv, &self.apps)
+                } else {
+                    argv
+                };
                 self.launch(Some(path), &argv);
             } else {
                 tracing::warn!(name = %entry.name, "dock entry has nothing runnable");
