@@ -15,6 +15,10 @@ use crate::geometry::Rect;
 use crate::tiles::Tiles;
 use crate::window::WindowId;
 
+/// How many windows a workspace holds before new ones overflow to a
+/// neighbouring workspace. See [`Workspace::tile_cap`].
+pub const DEFAULT_TILE_CAP: usize = 8;
+
 /// Opaque handle to a workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceId(u64);
@@ -46,6 +50,23 @@ impl WorkspaceId {
 pub enum Direction {
     Forward,
     Backward,
+}
+
+/// What a workspace remembers while one of its windows is soloed — picked out
+/// of the overview to have the screen to itself.
+///
+/// The point of the record is the way back: the tile tree is kept whole, order
+/// and moved dividers included, so ending the solo restores the tiling as it
+/// stood rather than the canonical shape the windows would re-enter in.
+#[derive(Debug)]
+pub(crate) struct Solo {
+    /// The window holding the screen.
+    pub(crate) window: WindowId,
+    /// The tile tree as it stood when the first solo began.
+    pub(crate) tiles: Tiles,
+    /// The windows the solo put away. Only these come back when it ends — a
+    /// window minimized by hand beforehand stays minimized.
+    pub(crate) hidden: Vec<WindowId>,
 }
 
 /// The windows of one pane, and how the tiled ones are divided.
@@ -88,6 +109,18 @@ pub struct Workspace {
     /// is the difference between a window filling a screen and a window
     /// straddling a bezel.
     output: usize,
+    /// How many windows this workspace holds before it is full.
+    ///
+    /// Beside [`Self::layout`] and for the same reason: how crowded a space is
+    /// allowed to get is a property of the space you are in. The eight-window
+    /// default is where the grid stops being panes and starts being a contact
+    /// sheet; past it, [`crate::Space::open_window`] sends new windows to a
+    /// neighbouring workspace instead of dividing this one further.
+    tile_cap: usize,
+    /// The solo in progress here, if any. See [`Solo`]; driven by
+    /// [`crate::Space::solo_window`] and [`crate::Space::end_solo`], which own
+    /// the window modes this touches.
+    solo: Option<Solo>,
 }
 
 impl Workspace {
@@ -100,7 +133,34 @@ impl Workspace {
             tiles: Tiles::new(),
             scroll: 0,
             output: 0,
+            tile_cap: DEFAULT_TILE_CAP,
+            solo: None,
         }
+    }
+
+    /// The window soloed here, if one is.
+    pub fn solo(&self) -> Option<WindowId> {
+        self.solo.as_ref().map(|solo| solo.window)
+    }
+
+    pub(crate) fn solo_mut(&mut self) -> &mut Option<Solo> {
+        &mut self.solo
+    }
+
+    /// How many windows this workspace holds before it is full. See the field.
+    pub const fn tile_cap(&self) -> usize {
+        self.tile_cap
+    }
+
+    /// Set the cap. Clamped to at least one: a workspace no window may enter
+    /// would strand [`crate::Space::open_window`] with nowhere left to put one.
+    pub fn set_tile_cap(&mut self, cap: usize) {
+        self.tile_cap = cap.max(1);
+    }
+
+    /// Whether another window would take this workspace past its cap.
+    pub fn is_full(&self) -> bool {
+        self.windows.len() >= self.tile_cap
     }
 
     /// The output this workspace is laid out on. See the field.
@@ -178,17 +238,11 @@ impl Workspace {
 
     /// Bring the tree into line with `tiled`, the windows that belong in it.
     ///
-    /// Anything in the tree but not in `tiled` is dropped and its space
-    /// collapses; anything in `tiled` but not in the tree is inserted beside
-    /// the focused window, so a window that stops being fullscreen returns to
-    /// the tile next to whatever you were looking at.
-    pub fn reconcile_tiles(&mut self, tiled: &[WindowId], area: Rect, gap: i32) {
-        self.tiles.retain(|w| tiled.contains(&w));
-        for window in tiled {
-            if !self.tiles.contains(*window) {
-                self.tiles.insert(*window, self.focus, area, gap);
-            }
-        }
+    /// The tree takes the canonical shape for the new count; windows already
+    /// tiled keep their on-screen order and newcomers join at the end. `area`
+    /// decides whether the shapes are transposed for a portrait screen.
+    pub fn reconcile_tiles(&mut self, tiled: &[WindowId], area: Rect) {
+        self.tiles.reconcile(tiled, area);
     }
 
     /// Insert `window` directly after the focused window and focus it.
@@ -360,7 +414,7 @@ mod tests {
     fn tiled_ws(n: u64) -> Workspace {
         let mut w = ws_with(n);
         let all: Vec<WindowId> = w.windows().to_vec();
-        w.reconcile_tiles(&all, AREA, 0);
+        w.reconcile_tiles(&all, AREA);
         w
     }
 
@@ -514,7 +568,7 @@ mod tests {
         // Cycling over tile order alone would strand every floating window:
         // there would be no key that reaches it.
         let mut w = ws_with(3);
-        w.reconcile_tiles(&[id(1), id(2)], AREA, 0);
+        w.reconcile_tiles(&[id(1), id(2)], AREA);
         w.focus(id(1));
         let seen: Vec<Option<WindowId>> =
             (0..3).map(|_| w.cycle_focus(Direction::Forward)).collect();
@@ -528,7 +582,7 @@ mod tests {
     fn a_floating_window_is_left_out_of_the_tree_entirely() {
         // Only floating windows have no tile. Membership still holds them.
         let mut w = ws_with(3);
-        w.reconcile_tiles(&[id(1), id(3)], AREA, 0);
+        w.reconcile_tiles(&[id(1), id(3)], AREA);
         assert_eq!(w.tiles().windows(), [id(1), id(3)]);
         assert_eq!(w.windows().len(), 3, "membership lost a window");
     }

@@ -1231,7 +1231,7 @@ mod tests {
             println!("menu {item}: {rect:?}");
         }
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
-        for pixel in canvas.pixels.chunks_exact(4) {
+        for pixel in canvas.pixels.as_chunks::<4>().0.iter() {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write(&path, ppm).expect("writing the dump");

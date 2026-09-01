@@ -74,8 +74,7 @@ pub(crate) const ACCENT: Color = Color::from_argb(0xFF7A_A2F7);
 /// top of this file — kept small on purpose: an accent is a colour the person
 /// picked from a short list, not a schema. Read by every drawing site through
 /// [`accent`]; set from [`crate::desktop_config`] at startup and on reload.
-static ACCENT_IN_USE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0xFF7A_A2F7);
+static ACCENT_IN_USE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xFF7A_A2F7);
 
 pub(crate) fn accent() -> Color {
     Color(ACCENT_IN_USE.load(std::sync::atomic::Ordering::Relaxed))

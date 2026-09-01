@@ -419,6 +419,9 @@ pub(crate) fn item_rect(dock: Rect, index: usize) -> Rect {
 ///
 /// The rectangle it is drawn into comes from [`placement`], in logical pixels;
 /// this composes the same shape with `density` times the pixels each way.
+// One argument per thing painted; bundling them into a struct would name a
+// type whose only meaning is "the arguments of this function".
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
     items: &[Item],
     apps: &[Entry],
@@ -1218,7 +1221,7 @@ mod dump {
             }
         }
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
-        for pixel in canvas.pixels.chunks_exact(4) {
+        for pixel in canvas.pixels.as_chunks::<4>().0.iter() {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write(&path, ppm).expect("writing the dump");

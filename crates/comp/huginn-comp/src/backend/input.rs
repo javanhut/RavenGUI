@@ -163,6 +163,18 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         return;
     }
 
+    // The overview owns the primary click while it is up: on a window's
+    // patch it takes that window, anywhere else it dismisses and the tiling
+    // goes back. Before the dock and the scene both — everything under the
+    // overview is scenery while it is showing, and a click that fell through
+    // to a window's stale rectangle would act on a desktop nobody can see.
+    if button_state == ButtonState::Pressed
+        && event.button_code() == BTN_LEFT
+        && state.overview_click()
+    {
+        return;
+    }
+
     // The dock is compositor-drawn, so it is not under the pointer as far as
     // any client is concerned. It has to be asked first, or a click on it
     // falls through to whatever window is behind it.

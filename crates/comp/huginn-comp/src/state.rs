@@ -175,6 +175,10 @@ struct WorkspaceCarousel {
     position: crate::anim::Animated,
     reveal: crate::anim::Animated,
     closing: bool,
+    /// The window the highlight is on, steered by the arrows. `None` until a
+    /// key or the pointer puts it somewhere — and what decides, on the way
+    /// out, between taking a window and putting the tiling back.
+    selected: Option<huginn_core::window::WindowId>,
 }
 
 /// One thumbnail above the dock: the switcher's highlighted window, or a
@@ -522,6 +526,9 @@ pub(crate) struct Huginn {
     /// focused one is fullscreen.
     focus_ring: [SolidColorBuffer; 4],
     workspace_card: SolidColorBuffer,
+    /// Accent-coloured backing drawn a few pixels proud of the overview's
+    /// highlighted window, so the highlight reads as a ring around it.
+    overview_halo: SolidColorBuffer,
     focus_ring_at: Option<[Rect; 4]>,
     /// Windows whose drawn rectangle is still on its way to the layout's.
     ///
@@ -568,6 +575,77 @@ pub(crate) fn place_in_pane(surface: &WlSurface, pane: Rect) -> Rect {
         pane.y() + slack_y - frame.loc.y,
         frame.size.w,
         frame.size.h,
+    )
+}
+
+/// The patches of screen the overview spreads one workspace's windows over:
+/// `count` boxes in as square a grid as holds them, inset from the screen's
+/// edges, with a short last row centred. The grid is only where the patches
+/// are — each window keeps its own shape inside its patch and stops at its
+/// real size, so few windows read as themselves laid loosely on the desk,
+/// not as tiles of a second layout.
+fn overview_cells(count: usize, area: Rect) -> Vec<Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let columns = (count as f64).sqrt().ceil() as usize;
+    let rows = count.div_ceil(columns);
+    let (margin_x, margin_y) = (area.w() / 16, area.h() / 12);
+    let gutter = area.w() / 48;
+    let stage = Rect::from_xywh(
+        area.x() + margin_x,
+        area.y() + margin_y,
+        area.w() - 2 * margin_x,
+        area.h() - 2 * margin_y,
+    );
+    let cell_w = (stage.w() - gutter * (columns as i32 - 1)) / columns as i32;
+    let cell_h = (stage.h() - gutter * (rows as i32 - 1)) / rows as i32;
+    (0..count)
+        .map(|i| {
+            let (row, column) = (i / columns, i % columns);
+            let in_row = if row == rows - 1 {
+                count - row * columns
+            } else {
+                columns
+            };
+            let width = cell_w * in_row as i32 + gutter * (in_row as i32 - 1);
+            let lead = (stage.w() - width) / 2;
+            Rect::from_xywh(
+                stage.x() + lead + column as i32 * (cell_w + gutter),
+                stage.y() + row as i32 * (cell_h + gutter),
+                cell_w,
+                cell_h,
+            )
+        })
+        .collect()
+}
+
+/// Where `placed` lands in its patch of the overview: shrunk in proportion
+/// when it must be, centred at its own size when it fits.
+///
+/// Never enlarged. Blowing a small window up to fill its patch reads as a
+/// zoom into that window rather than as a view of everything, and a buffer
+/// scaled past its size goes soft.
+fn shrink_into(placed: Rect, cell: Rect) -> Rect {
+    if placed.w() <= cell.w() && placed.h() <= cell.h() {
+        return Rect::from_xywh(
+            cell.x() + (cell.w() - placed.w()) / 2,
+            cell.y() + (cell.h() - placed.h()) / 2,
+            placed.w(),
+            placed.h(),
+        );
+    }
+    crate::motion::fit_aspect(placed, cell)
+}
+
+/// `from` moved a fraction `t` of the way to `to`.
+fn blend(from: Rect, to: Rect, t: f64) -> Rect {
+    let lerp = |a: i32, b: i32| a + (f64::from(b - a) * t).round() as i32;
+    Rect::from_xywh(
+        lerp(from.x(), to.x()),
+        lerp(from.y(), to.y()),
+        lerp(from.w(), to.w()),
+        lerp(from.h(), to.h()),
     )
 }
 
@@ -651,6 +729,10 @@ impl Huginn {
                 (area.w(), area.h()),
                 crate::theme::BACKGROUND.to_rgba_f32(),
             ),
+            overview_halo: SolidColorBuffer::new(
+                (area.w(), area.h()),
+                crate::theme::accent().to_rgba_f32(),
+            ),
             focus_ring_at: None,
             motions: HashMap::new(),
             focus_ring_shown: None,
@@ -690,9 +772,10 @@ impl Huginn {
         huginn
             .settings
             .set_pins_layout(huginn.pins.position(), huginn.pins.orientation());
-        huginn
-            .settings
-            .apply_desktop_config(huginn.desktop_config.motion(), huginn.desktop_config.idle_after());
+        huginn.settings.apply_desktop_config(
+            huginn.desktop_config.motion(),
+            huginn.desktop_config.idle_after(),
+        );
         huginn
     }
 
@@ -707,8 +790,10 @@ impl Huginn {
         for ring in &mut self.focus_ring {
             ring.set_color(accent);
         }
+        self.overview_halo.set_color(accent);
 
-        self.settings.apply_desktop_config(cfg.motion(), cfg.idle_after());
+        self.settings
+            .apply_desktop_config(cfg.motion(), cfg.idle_after());
 
         if cfg.wallpaper() != self.desktop_config.wallpaper() {
             self.wallpaper = crate::wallpaper::Wallpaper::chosen_or_installed(cfg.wallpaper());
@@ -784,6 +869,7 @@ impl Huginn {
     fn apply_output_geometry(&mut self) {
         let area = self.output_area();
         self.workspace_card.resize((area.w(), area.h()));
+        self.overview_halo.resize((area.w(), area.h()));
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
         if self.help.is_some() {
@@ -1223,18 +1309,21 @@ impl Huginn {
             out.push(SceneItem::Surface(surface, rect));
         }
         if let Some(previews) = self.workspace_previews() {
-            // The centre card is first because scene order is front-to-back.
+            // The centre stage is first because scene order is front-to-back.
             // Popups and the focus ring belong to the interactive full-size
-            // desktop, not to passive workspace previews.
-            for (workspace, transform) in previews {
-                out.extend(
-                    self.render_list_for(workspace)
-                        .into_iter()
-                        .map(|(surface, rect)| {
-                            SceneItem::WorkspaceSurface(surface, rect, transform)
-                        }),
-                );
-                out.push(SceneItem::WorkspaceCard(&self.workspace_card, transform));
+            // desktop, not to the overview.
+            let (reveal, selected) = self.workspace_carousel.map_or((0.0, None), |carousel| {
+                (
+                    f64::from(carousel.reveal.value(self.uptime()).clamp(0.0, 1.0)),
+                    carousel.selected,
+                )
+            });
+            let front = self.overview_front();
+            for (workspace, card) in previews {
+                // The highlight lives on the front stage alone.
+                let highlight = selected.filter(|_| Some(workspace) == front);
+                out.extend(self.workspace_pane_items(workspace, card, reveal, highlight));
+                out.push(SceneItem::WorkspaceCard(&self.workspace_card, card));
             }
         } else {
             for (surface, rect) in self.render_list() {
@@ -2222,10 +2311,11 @@ impl Huginn {
                             // from here, not the open animation.
                             self.workspace_carousel = Some(WorkspaceCarousel {
                                 position: crate::anim::Animated::settled(
-                                    self.space.active_index() as f32,
+                                    self.space.active_index() as f32
                                 ),
                                 reveal: crate::anim::Animated::settled(0.0),
                                 closing: false,
+                                selected: None,
                             });
                             0.0
                         };
@@ -2355,10 +2445,13 @@ impl Huginn {
     /// restoring one — so they cannot disagree about what fullscreen is: the
     /// whole output, at the output's logical size, above the panels.
     ///
-    /// The configure goes out unconditionally rather than through `arrange`'s
-    /// changed-only filter. A lone window with no panels already sits at the
-    /// output's size, so its geometry does not change on the way in; the state
-    /// still has to reach it or it never learns it is fullscreen.
+    /// The configure goes out here rather than through `arrange`'s
+    /// changed-only filter, and it carries the size as well as the state. The
+    /// core writes the output-sized geometry the moment the mode flips, so by
+    /// the time `arrange` compares, nothing has "changed" — a bare
+    /// `send_configure` here would pair the fullscreen state with whatever
+    /// size was staged last, and the client would go fullscreen at its old
+    /// tile size.
     pub(crate) fn set_fullscreen(&mut self, id: WindowId, on: bool) {
         if !self.space.set_fullscreen(id, on) {
             return;
@@ -2368,8 +2461,8 @@ impl Huginn {
             surface.set_fullscreen(on);
         }
         self.arrange();
-        if let Some(surface) = self.windows.get(&id) {
-            surface.send_configure();
+        if let (Some(window), Some(surface)) = (self.space.window(id), self.windows.get(&id)) {
+            surface.configure(window.geometry);
         }
         self.refresh_focus();
         self.refresh_dock();
@@ -2527,12 +2620,26 @@ impl Huginn {
             position: crate::anim::Animated::settled(self.space.active_index() as f32),
             reveal,
             closing: false,
+            selected: None,
         });
         self.queue_redraw();
     }
 
-    /// Select the nearest card and expand it back to a normal workspace.
+    /// Settle on the nearest stage and expand it back to a normal workspace,
+    /// putting any solo's tiling back. See [`Self::dismiss_workspace_carousel`].
     pub(crate) fn close_workspace_carousel(&mut self) {
+        self.dismiss_workspace_carousel(None);
+    }
+
+    /// Leave the overview, landing on the nearest stage.
+    ///
+    /// `select` is the parting gesture. A window means "this one": it takes
+    /// the screen to itself and the rest of its workspace steps into the
+    /// wings, remembered. `None` means the opposite — whatever a previous
+    /// visit soloed is undone and the tiling comes back exactly as it stood.
+    /// Leaving empty-handed is a statement too, which is why it restores
+    /// rather than preserves.
+    fn dismiss_workspace_carousel(&mut self, select: Option<WindowId>) {
         let now = self.uptime();
         let last = self.space.workspaces().len().saturating_sub(1);
         let duration = self
@@ -2550,8 +2657,66 @@ impl Huginn {
             .reveal
             .animate_to(0.0, now, duration, crate::anim::Curve::EaseInOut);
         carousel.closing = true;
+        carousel.selected = None;
         self.space.activate_workspace(target);
+        // The solo does not fullscreen the pick — the pane grows because the
+        // rest of the workspace is put away — but it does pull any member
+        // that *was* fullscreen out of it before minimizing it, and that
+        // client has to be told. Diffed across the call rather than aimed at
+        // the pick, because the pick's own mode never changes here.
+        let members: Vec<(WindowId, bool)> = self
+            .space
+            .active_workspace()
+            .windows()
+            .iter()
+            .map(|id| {
+                let fullscreen = self
+                    .space
+                    .window(*id)
+                    .is_some_and(|w| w.mode == WindowMode::Fullscreen);
+                (*id, fullscreen)
+            })
+            .collect();
+        match select {
+            Some(id) => {
+                self.space.solo_window(id);
+            }
+            None => {
+                self.space.end_solo();
+            }
+        }
+        let changed: Vec<WindowId> = members
+            .into_iter()
+            .filter(|(id, was)| {
+                let is = self
+                    .space
+                    .window(*id)
+                    .is_some_and(|w| w.mode == WindowMode::Fullscreen);
+                if is == *was {
+                    return false;
+                }
+                if let Some(surface) = self.windows.get(id) {
+                    surface.set_fullscreen(is);
+                }
+                true
+            })
+            .map(|(id, _)| id)
+            .collect();
         self.arrange();
+        // The configure carries the geometry, not just the state — see
+        // [`Self::set_fullscreen`]: the core already wrote the new geometry,
+        // so `arrange` saw nothing change and staged no size, and the state
+        // bit alone would send the client fullscreen at its old tile size.
+        for id in changed {
+            let Some(rect) = self.space.window(id).map(|w| w.geometry) else {
+                continue;
+            };
+            if let Some(surface) = self.windows.get(&id) {
+                surface.configure(rect);
+            }
+        }
+        // The solo may have put windows away; they live in the dock now.
+        self.refresh_dock();
         self.refresh_focus();
     }
 
@@ -3004,21 +3169,25 @@ impl Huginn {
         let now = self.uptime();
         let is_glass = |id: &WindowId| {
             self.mapped.contains(id)
-                && self
-                    .space
-                    .window(*id)
-                    .is_some_and(|w| !w.is_minimized())
+                && self.space.window(*id).is_some_and(|w| !w.is_minimized())
                 && self
                     .windows
                     .get(id)
                     .and_then(|w| w.app_id())
-                    .is_some_and(|app| Self::GLASS_APP_IDS.iter().any(|g| g.eq_ignore_ascii_case(&app)))
+                    .is_some_and(|app| {
+                        Self::GLASS_APP_IDS
+                            .iter()
+                            .any(|g| g.eq_ignore_ascii_case(&app))
+                    })
         };
-        let id = self
-            .space
-            .focused()
-            .filter(is_glass)
-            .or_else(|| self.space.active_workspace().windows().iter().copied().find(is_glass))?;
+        let id = self.space.focused().filter(is_glass).or_else(|| {
+            self.space
+                .active_workspace()
+                .windows()
+                .iter()
+                .copied()
+                .find(is_glass)
+        })?;
         let rect = self.drawn_rect(id, now)?;
         Some((id, rect))
     }
@@ -3030,7 +3199,8 @@ impl Huginn {
     /// glass window asks for the full radius for as long as it is there.
     pub(crate) fn blur_radius(&self) -> f32 {
         let clock = self.uptime();
-        let panels = crate::blur::radius_for(self.launcher.reveal(clock).max(self.pinned.reveal(clock)));
+        let panels =
+            crate::blur::radius_for(self.launcher.reveal(clock).max(self.pinned.reveal(clock)));
         if panels > 0.0 || self.panel_blur_open() {
             return panels;
         }
@@ -3590,8 +3760,17 @@ impl Huginn {
             .collect()
     }
 
-    /// The visible workspace cards, centre first, with a flattened side-card
-    /// transform that reads like the edge of a record sleeve.
+    /// The visible workspace stages, centre first.
+    ///
+    /// A stage is the whole screen, not a miniature: the overview's job is to
+    /// give every window room, and shrinking the workspace into a card and
+    /// then the windows into the card spends the screen twice on frames and
+    /// once on content. So the front workspace keeps the full output for its
+    /// spread of windows, and its neighbours sit one screen-width away —
+    /// pages of a book rather than a shelf of sleeves — sliding through as
+    /// the swipe scrubs the position. A stage off centre pulls in a little
+    /// and dims, which is depth enough to say where you are without giving
+    /// any of the windows' space away.
     fn workspace_previews(&self) -> Option<Vec<(usize, WorkspacePreview)>> {
         let carousel = self.workspace_carousel?;
         let now = self.uptime();
@@ -3607,21 +3786,19 @@ impl Huginn {
                 let distance = index as f32 - position;
                 (distance.abs() <= 1.6).then(|| {
                     let front = (1.0 - f64::from(distance.abs())).clamp(0.0, 1.0);
-                    let overview_x = 0.30 + 0.46 * front;
-                    let overview_y = 0.58 + 0.18 * front;
-                    let scale_x = 1.0 + (overview_x - 1.0) * reveal;
-                    let scale_y = 1.0 + (overview_y - 1.0) * reveal;
-                    let slot = f64::from(distance) * f64::from(area.w()) * 0.48 * reveal;
-                    let offset_x = (1.0 - scale_x) * f64::from(area.w()) * 0.5 + slot;
-                    let offset_y = (1.0 - scale_y) * f64::from(area.h()) * 0.5;
+                    let overview = 0.88 + 0.12 * front;
+                    let scale = 1.0 + (overview - 1.0) * reveal;
+                    let slot = f64::from(distance) * f64::from(area.w()) * 0.96 * reveal;
+                    let offset_x = (1.0 - scale) * f64::from(area.w()) * 0.5 + slot;
+                    let offset_y = (1.0 - scale) * f64::from(area.h()) * 0.5;
                     let side = (f64::from(distance.abs()) - 0.15).clamp(0.0, 1.0);
                     let alpha = (1.0 - side * 0.48 * reveal) as f32;
                     (
                         index,
                         distance.abs(),
                         WorkspacePreview {
-                            scale_x,
-                            scale_y,
+                            scale_x: scale,
+                            scale_y: scale,
                             offset_x,
                             offset_y,
                             alpha,
@@ -3637,6 +3814,192 @@ impl Huginn {
                 .map(|(index, _, transform)| (index, transform))
                 .collect(),
         )
+    }
+
+    /// The windows of one workspace stage, each let out of its place in the
+    /// layout and given its own patch of the screen.
+    ///
+    /// Let out rather than drawn where the layout put them, because where the
+    /// layout put them is no use to an overview: tiled windows abut with
+    /// nothing to say where one ends, and a carousel workspace's panes sit
+    /// along a strip that runs past the edge of the screen. Spread across the
+    /// output with air between them, every pane is visible whole, whatever
+    /// the layout beneath it does.
+    ///
+    /// `reveal` blends each pane from where it really is to its patch, so the
+    /// panes drift apart as the overview opens and settle back as it closes,
+    /// in step with the stages they are on.
+    fn workspace_pane_items(
+        &self,
+        workspace: usize,
+        card: WorkspacePreview,
+        reveal: f64,
+        highlight: Option<WindowId>,
+    ) -> Vec<SceneItem<'_>> {
+        let windows = self.overview_windows_for(workspace);
+        let area = self.output_area();
+        let cells = overview_cells(windows.len(), area);
+        let mut out = Vec::new();
+        for ((id, surface, placed), cell) in windows.into_iter().zip(cells) {
+            let drawn = blend(placed, shrink_into(placed, cell), reveal);
+            let pane = crate::motion::fit(placed, drawn, 1.0);
+            // The renderer scales about the origin and shifts once, so the
+            // pane's transform and the stage's compose into a single one:
+            // the pane's first, then the stage's on top of it.
+            let transform = WorkspacePreview {
+                scale_x: card.scale_x * pane.scale_x,
+                scale_y: card.scale_y * pane.scale_y,
+                offset_x: card.scale_x * pane.offset_x + card.offset_x,
+                offset_y: card.scale_y * pane.offset_y + card.offset_y,
+                alpha: card.alpha,
+            };
+            out.push(SceneItem::WorkspaceSurface(surface, placed, transform));
+            if highlight == Some(id) {
+                // Behind the pane — the scene is front to back — and a few
+                // pixels proud of it on every side, so what shows is a ring.
+                const HALO: i32 = 4;
+                let ring = Rect::from_xywh(
+                    drawn.x() - HALO,
+                    drawn.y() - HALO,
+                    drawn.w() + 2 * HALO,
+                    drawn.h() + 2 * HALO,
+                );
+                out.push(SceneItem::WorkspaceCard(
+                    &self.overview_halo,
+                    WorkspacePreview {
+                        scale_x: card.scale_x * f64::from(ring.w()) / f64::from(area.w().max(1)),
+                        scale_y: card.scale_y * f64::from(ring.h()) / f64::from(area.h().max(1)),
+                        offset_x: card.scale_x * f64::from(ring.x()) + card.offset_x,
+                        offset_y: card.scale_y * f64::from(ring.y()) + card.offset_y,
+                        alpha: card.alpha,
+                    },
+                ));
+            }
+        }
+        out
+    }
+
+    /// The windows an overview stage shows, with the rect each is really at.
+    ///
+    /// Wider than [`Self::render_list_for`] by exactly the minimized windows:
+    /// the desktop hides them, but the overview's promise is that nothing
+    /// living on the workspace is out of sight there — a soloed workspace
+    /// shows every window it is keeping in the wings.
+    fn overview_windows_for(&self, workspace: usize) -> Vec<(WindowId, WlSurface, Rect)> {
+        let Some(workspace) = self.space.workspaces().get(workspace) else {
+            return Vec::new();
+        };
+        workspace
+            .windows()
+            .iter()
+            .filter(|id| self.mapped.contains(id))
+            .filter_map(|id| {
+                let surface = self.windows.get(id)?.wl_surface()?;
+                let pane = self.space.window(*id)?.geometry;
+                let placed = place_in_pane(&surface, pane);
+                Some((*id, surface, placed))
+            })
+            .collect()
+    }
+
+    /// The workspace the overview has at the front — where the highlight
+    /// lives and where a settle would land.
+    fn overview_front(&self) -> Option<usize> {
+        let carousel = self.workspace_carousel.as_ref()?;
+        let last = self.space.workspaces().len().saturating_sub(1);
+        let position = carousel.position.value(self.uptime());
+        Some(position.round().clamp(0.0, last as f32) as usize)
+    }
+
+    /// Whether the overview is up and interactive — open or opening, not on
+    /// its way out.
+    pub(crate) fn overview_open(&self) -> bool {
+        self.workspace_carousel
+            .as_ref()
+            .is_some_and(|carousel| !carousel.closing)
+    }
+
+    /// The front stage's windows and where each one's patch is, in the order
+    /// the patches read. What the highlight walks and what a click hits.
+    fn overview_thumbs(&self) -> Option<(usize, Vec<(WindowId, Rect)>)> {
+        if !self.overview_open() {
+            return None;
+        }
+        let front = self.overview_front()?;
+        let windows = self.overview_windows_for(front);
+        let cells = overview_cells(windows.len(), self.output_area());
+        Some((
+            front,
+            windows
+                .into_iter()
+                .zip(cells)
+                .map(|((id, _, placed), cell)| (id, shrink_into(placed, cell)))
+                .collect(),
+        ))
+    }
+
+    /// Move the overview's highlight one window over.
+    ///
+    /// The first press does not move: with nothing highlighted yet it lights
+    /// up the focused window — or the first patch — so the highlight appears
+    /// where you are rather than one step past it.
+    pub(crate) fn overview_move(&mut self, dir: huginn_core::geometry::Dir) {
+        let Some((front, thumbs)) = self.overview_thumbs() else {
+            return;
+        };
+        if thumbs.is_empty() {
+            return;
+        }
+        let ids: Vec<WindowId> = thumbs.iter().map(|(id, _)| *id).collect();
+        let columns = (ids.len() as f64).sqrt().ceil() as usize;
+        let current = self
+            .workspace_carousel
+            .as_ref()
+            .and_then(|carousel| carousel.selected)
+            .and_then(|selected| ids.iter().position(|id| *id == selected));
+        let next = match current {
+            None => self.space.workspaces()[front]
+                .focused()
+                .and_then(|focused| ids.iter().position(|id| *id == focused))
+                .unwrap_or(0),
+            Some(index) => match dir {
+                huginn_core::geometry::Dir::Left => index.saturating_sub(1),
+                huginn_core::geometry::Dir::Right => (index + 1).min(ids.len() - 1),
+                huginn_core::geometry::Dir::Up => index.saturating_sub(columns),
+                huginn_core::geometry::Dir::Down => (index + columns).min(ids.len() - 1),
+            },
+        };
+        if let Some(carousel) = &mut self.workspace_carousel {
+            carousel.selected = Some(ids[next]);
+        }
+        self.queue_redraw();
+    }
+
+    /// Return in the overview: take the highlighted window, or with nothing
+    /// highlighted put the tiling back and leave.
+    pub(crate) fn overview_confirm(&mut self) {
+        let selected = self
+            .workspace_carousel
+            .as_ref()
+            .and_then(|carousel| carousel.selected);
+        self.dismiss_workspace_carousel(selected);
+    }
+
+    /// A primary click while the overview is up. On a window's patch it takes
+    /// that window; anywhere else it is the dismissal — the tiling goes back.
+    /// Swallows the click either way: nothing under the overview may act on
+    /// a press aimed at it.
+    pub(crate) fn overview_click(&mut self) -> bool {
+        let Some((_, thumbs)) = self.overview_thumbs() else {
+            return false;
+        };
+        let point = self.pointer_point();
+        let hit = thumbs
+            .into_iter()
+            .find(|(_, patch)| patch.contains(point))
+            .map(|(id, _)| id);
+        self.dismiss_workspace_carousel(hit);
+        true
     }
 
     /// Bring a window's mapped state into line with whether it has a buffer.
@@ -4745,6 +5108,81 @@ fn load_frecency() -> raven_desktop::Frecency {
             tracing::warn!("could not load launch history from {}: {e}", file.display());
             raven_desktop::Frecency::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::{blend, overview_cells};
+    use huginn_core::geometry::Rect;
+
+    const AREA: Rect = Rect::from_xywh(0, 0, 1920, 1080);
+
+    #[test]
+    fn every_cell_stays_inside_the_card_and_clear_of_the_others() {
+        for count in 1..=9 {
+            let cells = overview_cells(count, AREA);
+            assert_eq!(cells.len(), count);
+            for (i, a) in cells.iter().enumerate() {
+                assert!(a.w() > 0 && a.h() > 0, "{count} panes: empty cell {a:?}");
+                assert!(
+                    a.x() >= AREA.x()
+                        && a.y() >= AREA.y()
+                        && a.x() + a.w() <= AREA.x() + AREA.w()
+                        && a.y() + a.h() <= AREA.y() + AREA.h(),
+                    "{count} panes: {a:?} left the card"
+                );
+                for b in &cells[i + 1..] {
+                    let disjoint = a.x() + a.w() <= b.x()
+                        || b.x() + b.w() <= a.x()
+                        || a.y() + a.h() <= b.y()
+                        || b.y() + b.h() <= a.y();
+                    assert!(disjoint, "{count} panes: {a:?} overlaps {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_last_row_sits_centred() {
+        // Three panes: two above, one below, the odd one in the middle
+        // rather than hanging off the left edge.
+        let cells = overview_cells(3, AREA);
+        let last = cells[2];
+        let centre = last.x() + last.w() / 2;
+        let mid = AREA.x() + AREA.w() / 2;
+        assert!(
+            (centre - mid).abs() <= 1,
+            "the odd cell sits at {centre}, not the middle {mid}"
+        );
+    }
+
+    #[test]
+    fn a_window_is_never_blown_up_past_its_real_size() {
+        // A patch bigger than the window centres it at its own size; scaling
+        // it up would read as a zoom, and the buffer would go soft.
+        let placed = Rect::from_xywh(500, 400, 300, 200);
+        let patch = Rect::from_xywh(0, 0, 900, 800);
+        let landed = super::shrink_into(placed, patch);
+        assert_eq!((landed.w(), landed.h()), (300, 200));
+        assert_eq!(landed.x(), 300, "centred in the patch");
+        assert_eq!(landed.y(), 300);
+
+        // A window too big for its patch shrinks in proportion instead.
+        let big = Rect::from_xywh(0, 0, 1800, 900);
+        let shrunk = super::shrink_into(big, Rect::from_xywh(0, 0, 600, 500));
+        assert!(shrunk.w() <= 600 && shrunk.h() <= 500);
+        assert_eq!(shrunk.w(), shrunk.h() * 2, "aspect kept");
+    }
+
+    #[test]
+    fn the_blend_starts_at_home_and_ends_in_the_cell() {
+        // At reveal zero the pane must be exactly where the layout put it, or
+        // opening the overview starts with a visible jump.
+        let placed = Rect::from_xywh(100, 200, 800, 600);
+        let cell = Rect::from_xywh(40, 40, 200, 150);
+        assert_eq!(blend(placed, cell, 0.0), placed);
+        assert_eq!(blend(placed, cell, 1.0), cell);
     }
 }
 

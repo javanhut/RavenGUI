@@ -60,7 +60,7 @@ impl Pixmap {
     /// and averaging the numbers would put a red icon at green.
     pub fn hue(&self) -> Option<f32> {
         let (mut x, mut y, mut weight) = (0.0_f32, 0.0_f32, 0.0_f32);
-        for pixel in self.data.chunks_exact(4) {
+        for pixel in self.data.as_chunks::<4>().0 {
             let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
             if a == 0 {
                 continue;
@@ -75,7 +75,9 @@ impl Pixmap {
         // icon with a coloured speck; the speck must not tint the whole.
         let coverage: f32 = self
             .data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| f32::from(p[3]) / 255.0)
             .sum();
         if weight < coverage * 0.1 || weight == 0.0 {
@@ -99,7 +101,7 @@ impl Pixmap {
         const FLOOR: f32 = 0.42;
         let mut data = Vec::with_capacity(self.data.len());
         let rows = self.height.max(1) as f32;
-        for (i, pixel) in self.data.chunks_exact(4).enumerate() {
+        for (i, pixel) in self.data.as_chunks::<4>().0.iter().enumerate() {
             let a = pixel[3];
             if a == 0 {
                 data.extend_from_slice(&[0, 0, 0, 0]);

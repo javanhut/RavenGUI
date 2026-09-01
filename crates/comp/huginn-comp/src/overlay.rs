@@ -247,7 +247,13 @@ mod tests {
             return;
         }
         let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
-        let clear = canvas.pixels.chunks_exact(4).filter(|p| p[3] == 0).count();
+        let clear = canvas
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] == 0)
+            .count();
         assert_eq!(
             clear, 0,
             "{clear} fully transparent pixels inside the panel"
@@ -267,7 +273,9 @@ mod tests {
         let accent = crate::theme::accent().to_rgba_bytes();
         let partial = canvas
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| {
                 // Somewhere strictly between the background and the accent.
                 p[0] > BG[0].min(accent[0]) && p[0] < BG[0].max(accent[0]) && p[0] != BG[0]
@@ -341,7 +349,9 @@ mod tests {
         // pixel the overlay draws is opaque enough for that to be honest.
         for pixel in compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1)
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
         {
             ppm.extend_from_slice(&pixel[..3]);
         }

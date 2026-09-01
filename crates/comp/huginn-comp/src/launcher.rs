@@ -3904,7 +3904,9 @@ mod render_tests {
         let accent = crate::theme::accent().to_rgba_bytes();
         let flooded = canvas
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] == accent[0] && p[1] == accent[1] && p[2] == accent[2])
             .count();
         // The caret and the selection ring are solid accent; a flooded tile
@@ -3953,7 +3955,9 @@ mod render_tests {
     fn ink(canvas: &Canvas) -> usize {
         canvas
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 0x50 || p[1] > 0x50 || p[2] > 0x50)
             .count()
     }
@@ -4405,7 +4409,7 @@ mod render_tests {
         }
 
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
-        for pixel in canvas.pixels.chunks_exact(4) {
+        for pixel in canvas.pixels.as_chunks::<4>().0.iter() {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write(&path, ppm).expect("writing the dump");
