@@ -45,6 +45,8 @@ mod popup;
 #[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]
+mod screenshot;
+#[cfg(target_os = "linux")]
 mod settings;
 #[cfg(target_os = "linux")]
 mod shell_protocol;

@@ -453,6 +453,7 @@ impl Nested {
                 let overview = self.state.overview_open();
                 let locked = self.state.is_locked();
                 let switcher_open = self.state.app_switcher_open();
+                let selecting_region = self.state.region_active();
                 let action = self
                     .keyboard
                     .input::<Option<Action>, _>(
@@ -482,6 +483,7 @@ impl Nested {
                                         overview,
                                         locked,
                                         switcher_open,
+                                        selecting_region,
                                     },
                                 )
                             }
@@ -506,6 +508,12 @@ impl Nested {
             WinitEvent::Input(event) => {
                 self.state.note_activity();
                 input::handle(&mut self.state, event);
+                // A finished region selection leaves the screen and rectangle
+                // here; the capture needs the renderer, which the shared input
+                // path does not have.
+                if let Some((output, rect)) = self.state.take_pending_capture() {
+                    self.capture(output, Some(rect));
+                }
             }
             _ => {}
         }
@@ -584,6 +592,14 @@ impl Nested {
                 state.volume_key(key);
                 return;
             }
+            Action::Screenshot(shot) => {
+                self.screenshot(shot);
+                return;
+            }
+            Action::CancelRegion => {
+                state.cancel_region();
+                return;
+            }
             Action::Spawn => {
                 state.launch(None, &[state.terminal_command().to_owned()]);
             }
@@ -596,6 +612,39 @@ impl Nested {
         }
         self.state.arrange();
         self.state.refresh_focus();
+    }
+
+    /// Take a screenshot, or — for a region — arm the interactive selection.
+    fn screenshot(&mut self, shot: crate::screenshot::Shot) {
+        use crate::screenshot::Shot;
+        match shot {
+            Shot::Screen => {
+                let output = self.state.focused_output_index();
+                self.capture(output, None);
+            }
+            Shot::Window => match self.state.focused_window_rect() {
+                Some(rect) => {
+                    let output = self.state.output_of_rect(rect);
+                    self.capture(output, Some(rect));
+                }
+                None => tracing::info!("screenshot: no focused window to capture"),
+            },
+            Shot::Region => {
+                self.state.begin_region_select();
+            }
+        }
+    }
+
+    /// Render `output` into a PNG, cropped to `crop` when given, and flash it.
+    fn capture(&mut self, output: usize, crop: Option<Rect>) {
+        let renderer = self.backend.renderer();
+        match crate::screenshot::capture(renderer, &self.state, output, crop) {
+            Ok(path) => {
+                tracing::info!(path = %path.display(), "screenshot saved");
+                self.state.begin_flash(output);
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "screenshot failed"),
+        }
     }
 }
 

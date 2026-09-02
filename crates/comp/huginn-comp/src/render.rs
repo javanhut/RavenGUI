@@ -102,7 +102,7 @@ pub(crate) fn elements_split(
     view: Rect,
     scale: f64,
 ) -> (Vec<HuginnElement>, Vec<HuginnElement>) {
-    let (all, boundary) = elements_with_boundary(renderer, state, fallback_cursor, view, scale);
+    let (all, boundary) = elements_with_boundary(renderer, state, fallback_cursor, view, scale, true);
     // A glass window is found by its own elements rather than by counting:
     // a surface tree yields one element per subsurface, so a scene index is
     // not an element index. Everything up to and including the last element
@@ -144,12 +144,17 @@ pub(crate) fn elements_split(
 /// The cursor is drawn before the scene, so it always lands above the
 /// boundary: blurring the pointer would be blurring the one thing the user is
 /// aiming with.
+///
+/// `include_cursor` is false only for a screenshot: the pointer is drawn by the
+/// compositor over the scene, not part of it, and a capture of the desktop
+/// should not have an arrow stamped into it. See [`capture_elements`].
 fn elements_with_boundary(
     renderer: &mut GlesRenderer,
     state: &Huginn,
     fallback_cursor: Option<&Cursor>,
     view: Rect,
     scale: f64,
+    include_cursor: bool,
 ) -> (Vec<HuginnElement>, usize) {
     let (ox, oy) = (view.x(), view.y());
     // Everything `scene` hands out is in desktop coordinates; this is the
@@ -165,8 +170,10 @@ fn elements_with_boundary(
     let mut out: Vec<HuginnElement> = Vec::new();
 
     // The cursor goes first because the scene is painted front to back, and
-    // nothing is ever meant to occlude the pointer.
-    match &state.cursor_status {
+    // nothing is ever meant to occlude the pointer. Skipped entirely for a
+    // capture, which wants the desktop without an arrow on it.
+    if include_cursor {
+        match &state.cursor_status {
         // The client drew its own cursor. Its hotspot lives in the surface's
         // own state, and ignoring it puts the arrow's tip in the wrong place.
         CursorImageStatus::Surface(surface) => {
@@ -214,6 +221,7 @@ fn elements_with_boundary(
         }
         // A client asked for no cursor at all, e.g. while typing or in a game.
         CursorImageStatus::Hidden => {}
+        }
     }
 
     let above = state.blur_boundary();
@@ -356,4 +364,22 @@ fn elements_with_boundary(
     // is on a locked session): nothing to blur, everything in front.
     let boundary = boundary.unwrap_or(out.len());
     (out, boundary)
+}
+
+/// The scene as one flat front-to-back list for a screenshot: the desktop as
+/// seen from `view`, without the pointer, and without the blur split.
+///
+/// A capture wants exactly what is on the screen, drawn once. The blur boundary
+/// is irrelevant — there is no live panel compositing to preserve, only pixels
+/// to read back — so the whole list is returned in order and drawn as-is. A
+/// glass panel over the desktop therefore shows the sharp desktop behind it
+/// rather than the blurred one, which is the one visible difference from the
+/// live frame and not one worth a second render pass to reproduce.
+pub(crate) fn capture_elements(
+    renderer: &mut GlesRenderer,
+    state: &Huginn,
+    view: Rect,
+    scale: f64,
+) -> Vec<HuginnElement> {
+    elements_with_boundary(renderer, state, None, view, scale, false).0
 }

@@ -320,6 +320,17 @@ exactly when it is wanted. Both the overlay and the line the compositor logs at
 startup are built from one table next to the keymap, and a test walks the
 keysym space to prove no binding has been added without a row in it.
 
+`Print` takes a screenshot — the whole screen, `Ctrl`+`Print` the focused
+window, `Shift`+`Print` a rectangle dragged out with the pointer. Like the help
+overlay, the compositor does it itself: a Wayland client can only read the
+screen through a capture protocol, and Huginn advertises none, so the one
+process that already holds the pixels is the one that writes the PNG. It renders
+the scene a second time into an offscreen texture, reads it back with `ExportMem`
+— the same path the udev backend uses to feed a GPU-less display — and encodes
+it into `<pictures>/Screenshots`. No `unsafe` is involved: the read-back is all
+safe smithay wrappers, so it stays out of `huginn-egl`. See
+[`docs/integration.md`](docs/integration.md).
+
 Window management lives on the `Super`+`Ctrl` layer. Plain `Super` belongs to
 applications: RavenTerminal uses it as its own leader, and a chord the
 compositor intercepts never reaches a client at all. The exception is

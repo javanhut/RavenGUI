@@ -160,6 +160,26 @@ impl Rect {
             && other.origin.y < self.bottom()
     }
 
+    /// The rectangle where `self` and `other` overlap, or `None` when they are
+    /// disjoint or merely touch at an edge.
+    ///
+    /// Distinct from [`Self::constrain_to`], which slides a rect until it fits
+    /// inside another keeping its size; this keeps only the shared area. It is
+    /// what clips a screenshot selection to the screen it was drawn on, so a
+    /// drag that ran off the edge captures what is on screen and not a region
+    /// nudged back inside it.
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.origin.x.max(other.origin.x);
+        let y = self.origin.y.max(other.origin.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        if right > x && bottom > y {
+            Some(Self::from_xywh(x, y, right - x, bottom - y))
+        } else {
+            None
+        }
+    }
+
     /// Shrink by `by` on every side. Collapses to empty rather than inverting.
     pub const fn inset(self, by: i32) -> Self {
         Self::from_xywh(
@@ -208,6 +228,24 @@ mod tests {
     fn negative_sizes_clamp_to_zero() {
         assert_eq!(Size::new(-5, -5), Size::ZERO);
         assert!(Rect::from_xywh(0, 0, 10, -1).is_empty());
+    }
+
+    #[test]
+    fn intersection_keeps_only_the_shared_area() {
+        let a = Rect::from_xywh(0, 0, 100, 100);
+        // Overlapping in a corner.
+        let b = Rect::from_xywh(80, 80, 100, 100);
+        assert_eq!(a.intersection(b), Some(Rect::from_xywh(80, 80, 20, 20)));
+        // A selection hanging off the right edge keeps its true position, not a
+        // shifted one — the difference from constrain_to.
+        let overhang = Rect::from_xywh(60, 10, 80, 20);
+        assert_eq!(
+            a.intersection(overhang),
+            Some(Rect::from_xywh(60, 10, 40, 20))
+        );
+        // Disjoint, and merely touching, are both None.
+        assert_eq!(a.intersection(Rect::from_xywh(200, 0, 10, 10)), None);
+        assert_eq!(a.intersection(Rect::from_xywh(100, 0, 10, 10)), None);
     }
 
     #[test]
