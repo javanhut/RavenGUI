@@ -60,6 +60,13 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
 
 fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     state.pointer_location = location;
+    // A region screenshot is being framed: the pointer draws the rectangle and
+    // nothing else. It does not cross outputs (the shot is fixed to the screen
+    // it began on) and it does not reach clients.
+    if state.region_active() {
+        state.region_pointer_moved();
+        return;
+    }
     state.pointer_crossed_outputs();
     // The dock watches the bottom edge. Told before the event is forwarded, so
     // a reveal and the client's own motion land in the same frame -- unless the
@@ -135,6 +142,22 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         );
         pointer.frame(state);
         state.queue_redraw();
+        return;
+    }
+
+    // A region screenshot owns the pointer while it is up: the primary button
+    // drags the rectangle out, releasing takes it, and nothing reaches a client
+    // underneath. Checked after the lock, which owns the pointer more strongly
+    // still, and before click-to-focus, which would otherwise raise a window
+    // the drag merely passed over.
+    if state.region_active() {
+        const BTN_LEFT: u32 = 0x110;
+        if event.button_code() == BTN_LEFT {
+            match button_state {
+                ButtonState::Pressed => state.region_press(),
+                ButtonState::Released => state.region_release(),
+            }
+        }
         return;
     }
 

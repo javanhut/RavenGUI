@@ -38,7 +38,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::LedState,
-        pointer::{CursorImageStatus, PointerHandle},
+        pointer::{CursorIcon, CursorImageStatus, PointerHandle},
     },
     output::Output,
     reexports::{
@@ -530,6 +530,24 @@ pub(crate) struct Huginn {
     /// highlighted window, so the highlight reads as a ring around it.
     overview_halo: SolidColorBuffer,
     focus_ring_at: Option<[Rect; 4]>,
+    /// An in-progress region screenshot, armed by `Shift`+`Print` and taken on
+    /// the pointer release. `None` the rest of the time. See
+    /// [`crate::screenshot`].
+    region: Option<RegionSelect>,
+    /// The four accent edges the region selection is drawn with, like the focus
+    /// ring's, and where they currently sit. Sized when the drag updates and
+    /// read by [`Self::scene`], the same split the focus ring uses so a `&self`
+    /// scene never has to resize a buffer.
+    region_edges: [SolidColorBuffer; 4],
+    region_edges_at: Option<[Rect; 4]>,
+    /// A screen and rectangle a finished region selection wants captured, which
+    /// the pointer path cannot do itself because the renderer lives in the
+    /// backend. Drained by the backend after it handles the release.
+    pending_capture: Option<(usize, Rect)>,
+    /// The brief white flash after a capture: which screen it covers and when it
+    /// began. It fades over [`FLASH`](Self::FLASH) and then clears itself.
+    flash: Option<(usize, Instant)>,
+    flash_buffer: SolidColorBuffer,
     /// Windows whose drawn rectangle is still on its way to the layout's.
     ///
     /// A relayout moves the layout's rectangles at once; these are what the
@@ -734,6 +752,14 @@ impl Huginn {
                 crate::theme::accent().to_rgba_f32(),
             ),
             focus_ring_at: None,
+            region: None,
+            region_edges: std::array::from_fn(|_| {
+                SolidColorBuffer::new((0, 0), crate::theme::accent().to_rgba_f32())
+            }),
+            region_edges_at: None,
+            pending_capture: None,
+            flash: None,
+            flash_buffer: SolidColorBuffer::new((area.w(), area.h()), [1.0, 1.0, 1.0, 1.0]),
             motions: HashMap::new(),
             focus_ring_shown: None,
             help: None,
@@ -1201,6 +1227,16 @@ impl Huginn {
         }
 
         let mut out = Vec::new();
+        // Above everything: the capture flash and the region-selection ring.
+        // Both are transient screenshot UI that must never be occluded or
+        // blurred, so they lead the front group. See [`Self::blur_boundary`],
+        // which counts them.
+        if let Some((rect, alpha)) = self.flash_at() {
+            out.push(SceneItem::Ring(&self.flash_buffer, rect, alpha));
+        }
+        for (buffer, rect, alpha) in self.region_ring() {
+            out.push(SceneItem::Ring(buffer, rect, alpha));
+        }
         // Front to back, and the order is the whole point:
         //
         //   help overlay   - summoned by someone who has lost track of what is
@@ -3140,7 +3176,13 @@ impl Huginn {
     /// With no panel open and a glass window on screen the renderer ignores
     /// this and splits at the window's own elements — see [`Self::glass_surface`].
     pub(crate) fn blur_boundary(&self) -> usize {
-        usize::from(self.help.is_some())
+        // The capture flash and the region ring are pushed at the very front of
+        // the scene, above the panels, so they are counted here too — the
+        // boundary is the number of items in front of it, and an undercount
+        // would push a real panel into the blurred group.
+        usize::from(self.flash_at().is_some())
+            + self.region_ring_len()
+            + usize::from(self.help.is_some())
             + usize::from(self.volume_panel.is_some())
             + usize::from(self.launcher_panel.is_some())
             + usize::from(self.pinned_panel.is_some())
@@ -3682,6 +3724,187 @@ impl Huginn {
         std::mem::take(&mut self.needs_redraw)
     }
 
+    /// How long the post-capture flash lasts. Short enough to read as a shutter
+    /// rather than a stutter.
+    const FLASH: std::time::Duration = std::time::Duration::from_millis(180);
+
+    /// The screen that has keyboard/pointer focus, as an index into
+    /// [`Self::outputs`].
+    pub(crate) fn focused_output_index(&self) -> usize {
+        self.space.focused_output().min(self.outputs.len() - 1)
+    }
+
+    /// The screen a rectangle sits on — whichever its centre falls in, or the
+    /// focused screen if it lands in none (an off-screen window).
+    pub(crate) fn output_of_rect(&self, rect: Rect) -> usize {
+        let centre = (rect.x() + rect.w() / 2, rect.y() + rect.h() / 2);
+        self.outputs
+            .iter()
+            .position(|output| {
+                let r = output.rect;
+                (r.x()..r.right()).contains(&centre.0) && (r.y()..r.bottom()).contains(&centre.1)
+            })
+            .unwrap_or_else(|| self.focused_output_index())
+    }
+
+    /// The focused window's rectangle, in global logical pixels, or `None` when
+    /// there is nothing sensible to frame — no focus, an unmapped or minimized
+    /// window. A fullscreen window is kept: it fills its screen, and capturing
+    /// that is exactly what "the window" means.
+    pub(crate) fn focused_window_rect(&self) -> Option<Rect> {
+        let id = self.space.focused()?;
+        if !self.mapped.contains(&id) {
+            return None;
+        }
+        let window = self.space.window(id)?;
+        if window.is_minimized() {
+            return None;
+        }
+        Some(
+            self.motions
+                .get(&id)
+                .map_or(window.geometry, |motion| motion.rect_at(self.uptime())),
+        )
+    }
+
+    /// Start a white flash over `output`, and ask for the frame that begins it.
+    pub(crate) fn begin_flash(&mut self, output: usize) {
+        if let Some(rect) = self.outputs.get(output).map(|o| o.rect) {
+            self.flash_buffer.resize((rect.w(), rect.h()));
+        }
+        self.flash = Some((output, Instant::now()));
+        self.queue_redraw();
+    }
+
+    /// The flash's screen rectangle and current opacity, or `None` when it is
+    /// not running.
+    fn flash_at(&self) -> Option<(Rect, f32)> {
+        let (output, started) = self.flash?;
+        let rect = self.outputs.get(output)?.rect;
+        let elapsed = started.elapsed();
+        if elapsed >= Self::FLASH {
+            return None;
+        }
+        // Fade from a half-white veil to nothing, so it reads as a blink rather
+        // than a flashbang.
+        let progress = elapsed.as_secs_f32() / Self::FLASH.as_secs_f32();
+        Some((rect, 0.5 * (1.0 - progress)))
+    }
+
+    /// Arm a region screenshot on the focused screen. Returns whether there was
+    /// a screen to arm it on.
+    pub(crate) fn begin_region_select(&mut self) -> bool {
+        if self.outputs.is_empty() {
+            return false;
+        }
+        let output = self.focused_output_index();
+        self.region = Some(RegionSelect {
+            output,
+            origin: None,
+            current: self.pointer_location,
+        });
+        // A crosshair says the pointer is now for framing, not for clicking.
+        self.cursor_status = CursorImageStatus::Named(CursorIcon::Crosshair);
+        self.update_region_ring();
+        self.queue_redraw();
+        true
+    }
+
+    /// Whether a region selection is up.
+    pub(crate) fn region_active(&self) -> bool {
+        self.region.is_some()
+    }
+
+    /// The pointer moved while selecting a region: track it.
+    pub(crate) fn region_pointer_moved(&mut self) {
+        if let Some(region) = &mut self.region {
+            region.current = self.pointer_location;
+            self.update_region_ring();
+            self.queue_redraw();
+        }
+    }
+
+    /// The primary button went down while selecting a region: fix the corner
+    /// the drag grows from.
+    pub(crate) fn region_press(&mut self) {
+        if let Some(region) = &mut self.region {
+            region.origin = Some(self.pointer_location);
+            region.current = self.pointer_location;
+            self.update_region_ring();
+            self.queue_redraw();
+        }
+    }
+
+    /// The primary button came up while selecting a region: queue the capture
+    /// and put the pointer back. A release with no meaningful drag — a click, a
+    /// one-pixel twitch — cancels instead, since a screenshot of nothing is not
+    /// what the click asked for.
+    pub(crate) fn region_release(&mut self) {
+        let Some(region) = self.region.take() else {
+            return;
+        };
+        self.region_edges_at = None;
+        self.cursor_status = CursorImageStatus::default_named();
+        self.queue_redraw();
+        if let Some(rect) = region.rect().filter(|r| r.w() > 1 && r.h() > 1) {
+            // Clamp to the screen it was drawn on, so a drag that ran off the
+            // edge does not ask the capture to read outside the framebuffer. The
+            // screen may have been unplugged mid-drag, in which case there is
+            // nothing to capture and the selection is simply dropped.
+            if let Some(bounds) = self.outputs.get(region.output).map(|o| o.rect)
+                && let Some(clipped) = rect.intersection(bounds)
+            {
+                self.pending_capture = Some((region.output, clipped));
+            }
+        }
+    }
+
+    /// Abandon a region selection without capturing.
+    pub(crate) fn cancel_region(&mut self) {
+        if self.region.take().is_some() {
+            self.region_edges_at = None;
+            self.cursor_status = CursorImageStatus::default_named();
+            self.queue_redraw();
+        }
+    }
+
+    /// Take the screen and rectangle a finished region selection left for the
+    /// backend to capture.
+    pub(crate) fn take_pending_capture(&mut self) -> Option<(usize, Rect)> {
+        self.pending_capture.take()
+    }
+
+    /// Re-measure the selection's four edges and size their buffers to match, so
+    /// the `&self` scene can read them without touching the renderer's buffers.
+    fn update_region_ring(&mut self) {
+        let edges = self.region.as_ref().and_then(RegionSelect::rect).map(|rect| {
+            let edges = rect.ring(crate::theme::FOCUS_RING_WIDTH);
+            for (buffer, edge) in self.region_edges.iter_mut().zip(edges) {
+                buffer.resize((edge.w(), edge.h()));
+            }
+            edges
+        });
+        self.region_edges_at = edges;
+    }
+
+    /// The region selection's four accent edges, ready for the scene. Empty
+    /// unless a rectangle is being dragged.
+    fn region_ring(&self) -> Vec<(&SolidColorBuffer, Rect, f32)> {
+        let Some(edges) = self.region_edges_at else {
+            return Vec::new();
+        };
+        self.region_edges
+            .iter()
+            .zip(edges)
+            .map(|(buffer, edge)| (buffer, edge, 1.0))
+            .collect()
+    }
+
+    /// How many scene items the region ring contributes: four edges, or none.
+    fn region_ring_len(&self) -> usize {
+        if self.region_edges_at.is_some() { 4 } else { 0 }
+    }
+
     /// End-of-cycle housekeeping, run by both backends.
     ///
     /// A dismissed popup leaves a dead entry in the popup tree, and a dead
@@ -3691,6 +3914,24 @@ impl Huginn {
     /// menu's teardown — several surfaces going at once — to a single sweep.
     pub(crate) fn refresh(&mut self) {
         self.popups.cleanup();
+        self.tick_flash();
+    }
+
+    /// Keep the post-capture flash animating, and clear it when it is spent.
+    ///
+    /// Run every cycle rather than every frame: an idle desktop renders on
+    /// damage only, so the fade has to ask for each of its own frames, and the
+    /// last of them is the one that takes the flash back off the screen.
+    fn tick_flash(&mut self) {
+        let Some((_, started)) = self.flash else {
+            return;
+        };
+        if started.elapsed() >= Self::FLASH {
+            self.flash = None;
+        }
+        // Either way there is a frame to draw: the next step of the fade, or the
+        // one that clears it.
+        self.queue_redraw();
     }
 
     /// Take a tile for a newly mapped X11 window.
@@ -4567,6 +4808,12 @@ impl SeatHandler for Huginn {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // While a region is being framed the crosshair is the compositor's, not
+        // the client's: a window the pointer passes over must not swap it back
+        // for a text caret or a hand mid-drag.
+        if self.region.is_some() {
+            return;
+        }
         self.cursor_status = image;
         self.queue_redraw();
     }
@@ -4918,6 +5165,35 @@ pub(crate) struct ClientLock {
     /// exactly what the protocol asks for. A screen the client never covers
     /// stays blank, which is the safe failure.
     surfaces: Vec<(String, LockSurface)>,
+}
+
+/// An in-progress region screenshot.
+///
+/// Armed on the screen that was focused when `Shift`+`Print` was pressed; the
+/// rectangle is dragged out on that screen and taken on the release. Points are
+/// in the desktop's global logical pixels, the same space the pointer lives in.
+#[derive(Debug)]
+struct RegionSelect {
+    /// The index into [`Huginn::outputs`] of the screen being captured.
+    output: usize,
+    /// The press point; `None` until the drag begins, so a bare arm draws
+    /// nothing.
+    origin: Option<Point<f64, Logical>>,
+    /// Where the pointer is now.
+    current: Point<f64, Logical>,
+}
+
+impl RegionSelect {
+    /// The selected rectangle in global logical pixels, or `None` before the
+    /// drag has started.
+    fn rect(&self) -> Option<Rect> {
+        let origin = self.origin?;
+        let x = origin.x.min(self.current.x).floor() as i32;
+        let y = origin.y.min(self.current.y).floor() as i32;
+        let w = (origin.x - self.current.x).abs().ceil() as i32;
+        let h = (origin.y - self.current.y).abs().ceil() as i32;
+        Some(Rect::from_xywh(x, y, w, h))
+    }
 }
 
 /// One screen as the compositor sees it: where it sits in the desktop, what

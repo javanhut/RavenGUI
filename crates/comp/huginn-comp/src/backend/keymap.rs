@@ -115,6 +115,14 @@ pub(crate) enum Action {
     /// has started playing something is for it to stop, and a mute key that
     /// works only after the password is a mute key that arrives late.
     Volume(crate::audio::Key),
+    /// Take a screenshot: the whole screen, the focused window, or — for
+    /// [`Shot::Region`](crate::screenshot::Shot::Region) — arm the interactive
+    /// selection the pointer finishes. On `Print`, before the `Super` layer, so
+    /// it needs no modifier; Shift and Ctrl pick region and window.
+    Screenshot(crate::screenshot::Shot),
+    /// Abandon an in-progress region selection. Escape, and only reachable while
+    /// the selection is up, which is why it has no row in [`BINDINGS`].
+    CancelRegion,
 }
 
 /// What the compositor is already doing, which decides what a key means.
@@ -146,6 +154,9 @@ pub(crate) struct Modes {
     pub locked: bool,
     /// The centered minimized-application dock owns input until dismissed.
     pub switcher_open: bool,
+    /// A region screenshot is being dragged out. Every key but Escape is
+    /// swallowed so a keystroke cannot act on a window under the selection.
+    pub selecting_region: bool,
 }
 
 /// One row of the keybinding overlay, and one clause of the startup log line.
@@ -283,6 +294,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "quit the compositor",
     },
     Binding {
+        action: Action::Screenshot(crate::screenshot::Shot::Screen),
+        chord: "Print",
+        description: "screenshot the screen (Shift: region, Ctrl: window)",
+    },
+    Binding {
         action: Action::Volume(crate::audio::Key::Raise),
         chord: "Volume keys",
         description: "raise, lower or mute the volume",
@@ -337,6 +353,23 @@ pub(crate) fn resolve(
 
     if mode.locked {
         return FilterResult::Forward;
+    }
+
+    // A region selection owns the keyboard while it is up: Escape abandons it,
+    // and every other key is swallowed rather than forwarded, so a keystroke
+    // cannot reach and act on a window under the rectangle being dragged. Before
+    // the screenshot keys below, so `Print` mid-selection does not start a
+    // second capture over the first.
+    if mode.selecting_region {
+        let action = (sym == keysyms::KEY_Escape).then_some(Action::CancelRegion);
+        return FilterResult::Intercept(action.and_then(|action| pressed(key_state, action)));
+    }
+
+    // Screenshots resolve here, before the `Super`-layer gate below, so `Print`
+    // needs no modifier. It is available over any open panel — a capture is of
+    // whatever is on the screen — but not while locked, which returned above.
+    if let Some(shot) = screenshot_key(sym, modifiers) {
+        return FilterResult::Intercept(pressed(key_state, Action::Screenshot(shot)));
     }
 
     if mode.switcher_open {
@@ -488,6 +521,25 @@ fn volume_key(sym: u32) -> Option<crate::audio::Key> {
         keysyms::KEY_XF86AudioMute => Some(Key::ToggleMute),
         _ => None,
     }
+}
+
+/// The screenshot a `Print` press asks for, from its modifiers, or `None` for
+/// any other key.
+///
+/// `Print` is the whole screen, `Shift` the interactive region, `Ctrl` the
+/// focused window — the three every desktop spells roughly this way.
+fn screenshot_key(sym: u32, modifiers: &ModifiersState) -> Option<crate::screenshot::Shot> {
+    use crate::screenshot::Shot;
+    if sym != keysyms::KEY_Print {
+        return None;
+    }
+    Some(if modifiers.shift {
+        Shot::Region
+    } else if modifiers.ctrl {
+        Shot::Window
+    } else {
+        Shot::Screen
+    })
 }
 
 /// The action, but only on the way down.
@@ -1243,6 +1295,73 @@ mod tests {
                 sym,
                 Modes::default()
             ),
+            FilterResult::Intercept(None)
+        ));
+    }
+
+    fn shift() -> ModifiersState {
+        ModifiersState {
+            shift: true,
+            ..Default::default()
+        }
+    }
+
+    fn ctrl() -> ModifiersState {
+        ModifiersState {
+            ctrl: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn print_screenshots_the_screen_with_no_modifier() {
+        use crate::screenshot::Shot;
+        // No Super, no anything: Print is one of the two keys (with the volume
+        // keys) that resolve without the Super layer.
+        assert_eq!(
+            intercepted(ModifiersState::default(), keysyms::KEY_Print),
+            Some(Action::Screenshot(Shot::Screen))
+        );
+        // Shift is a region, Ctrl is the focused window.
+        assert_eq!(
+            intercepted(shift(), keysyms::KEY_Print),
+            Some(Action::Screenshot(Shot::Region))
+        );
+        assert_eq!(
+            intercepted(ctrl(), keysyms::KEY_Print),
+            Some(Action::Screenshot(Shot::Window))
+        );
+    }
+
+    #[test]
+    fn a_locked_session_does_not_screenshot() {
+        // The lock check comes first, so Print over the lock screen reaches it
+        // like any other key rather than capturing the session behind it.
+        assert!(matches!(
+            while_locked(ModifiersState::default(), keysyms::KEY_Print, None),
+            FilterResult::Forward
+        ));
+    }
+
+    #[test]
+    fn a_region_selection_swallows_keys_but_escape_cancels() {
+        let mode = Modes {
+            selecting_region: true,
+            ..Modes::default()
+        };
+        assert!(matches!(
+            resolve(KeyState::Pressed, &ModifiersState::default(), keysyms::KEY_Escape, mode),
+            FilterResult::Intercept(Some(Action::CancelRegion))
+        ));
+        // Any other key is intercepted-but-ignored, so nothing under the
+        // rectangle being dragged sees it.
+        assert!(matches!(
+            resolve(KeyState::Pressed, &ModifiersState::default(), keysyms::KEY_a, mode),
+            FilterResult::Intercept(None)
+        ));
+        // Including a second Print: one selection at a time.
+        assert!(matches!(
+            resolve(KeyState::Pressed, &ModifiersState::default(), keysyms::KEY_Print, mode),
             FilterResult::Intercept(None)
         ));
     }

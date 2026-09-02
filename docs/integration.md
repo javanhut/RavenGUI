@@ -179,7 +179,14 @@ client cannot receive or override them:
 | `Super+Ctrl+S` | open quick settings |
 | `Super+Ctrl+H` | show or hide the keybinding list |
 | `Super+Ctrl+Esc` | quit the compositor |
+| `Print` | screenshot the screen (`Shift`: region, `Ctrl`: window) |
 | volume keys | raise, lower or mute the output volume |
+
+`Print` is the one binding besides the volume keys that resolves without the
+`Super` layer, because that is where every other desktop puts it. It is settled
+before the panels, so it captures whatever is on screen — the launcher open, a
+menu down — but after the lock, which owns every key ahead of it, so a locked
+screen cannot be photographed through the binding. See "Screenshots" below.
 
 `Super+L` is the one chord on the plain `Super` layer that is never handed back.
 `Super+C` and `Super+V` are given to a client that drives `Super` itself, since
@@ -229,6 +236,29 @@ watching to turn the row off.
 There is no way for a client to register a global chord of its own. If your
 software needs one, it currently has to be reached from a dock icon or by being
 spawned.
+
+## Screenshots
+
+`Print` takes a screenshot; the compositor does it, not a client. A Wayland
+client can only read the screen through a capture protocol, and Huginn
+advertises none (`wlr-screencopy` and `ext-image-copy-capture-v1` are both
+absent — see `docs/protocols.md`), so the screenshotter is a compositor feature
+in the same way the launcher and the help overlay are. It renders the scene a
+second time into an offscreen buffer, reads it back, and writes a PNG.
+
+| Chord | Captures |
+|---|---|
+| `Print` | the focused screen |
+| `Ctrl`+`Print` | the focused window |
+| `Shift`+`Print` | a rectangle you drag out; `Escape` cancels |
+
+Files land in `<pictures>/Screenshots`, where `<pictures>` is
+`$XDG_PICTURES_DIR`, the value in `user-dirs.dirs`, or `~/Pictures` — named
+`Screenshot-YYYY-MM-DD-HHMMSS.png`, in UTC. The pointer is not in the image, and
+a white flash confirms the capture. There is no client-facing side to this: it
+cannot be triggered over a protocol, and there is no capture protocol for other
+software to record the screen through, so screen recorders and share tools still
+do not work.
 
 ## Touchpad gestures huginn takes
 

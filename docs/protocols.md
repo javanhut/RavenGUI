@@ -127,7 +127,7 @@ find them in the registry.
 | Missing | Consequence |
 |---|---|
 | `ext-foreign-toplevel-list-v1`, `wlr-foreign-toplevel-management-v1` | No window list. Task switchers, external docks and window-list panels — waybar's taskbar, wlrctl, rofi's window mode — cannot work. |
-| `wlr-screencopy`, `ext-image-copy-capture-v1` | No screenshots and no screen sharing. |
+| `wlr-screencopy`, `ext-image-copy-capture-v1` | No *client* screen capture: no screen sharing, and no third-party screen recorder. The compositor takes its own screenshots on `Print` (see `docs/integration.md`), so there is no protocol here to do it through. |
 | `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. |
 | `zwp_primary_selection_v1` | No middle-click paste. The regular clipboard works. |
 | `text-input-v3`, `input-method-v2` | No input methods. CJK and other IME input will not work. |
