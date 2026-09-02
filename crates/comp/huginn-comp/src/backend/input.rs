@@ -78,6 +78,7 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
         state.dock_pointer_moved();
         state.launcher_pointer_moved();
         state.pinned_pointer_moved();
+        state.overview_pointer_moved();
     }
     // The launcher is compositor-drawn, so no client is under the pointer
     // while it is there as far as the scene knows — but a window behind the

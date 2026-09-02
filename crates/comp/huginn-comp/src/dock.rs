@@ -365,7 +365,7 @@ const RADIUS: f32 = 0.28;
 const MARGIN: f32 = 12.0;
 const ALPHA: u8 = 0xE6;
 /// Text size of the switcher's title caption at a 1080p output.
-const CAPTION_SIZE: f32 = 14.0;
+pub(crate) const CAPTION_SIZE: f32 = 14.0;
 /// The most of the screen, each way, the switcher's thumbnail may take.
 ///
 /// Big enough to recognise a page by; small enough that the strip beneath it

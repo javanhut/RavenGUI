@@ -102,7 +102,8 @@ pub(crate) fn elements_split(
     view: Rect,
     scale: f64,
 ) -> (Vec<HuginnElement>, Vec<HuginnElement>) {
-    let (all, boundary) = elements_with_boundary(renderer, state, fallback_cursor, view, scale, true);
+    let (all, boundary) =
+        elements_with_boundary(renderer, state, fallback_cursor, view, scale, true);
     // A glass window is found by its own elements rather than by counting:
     // a surface tree yields one element per subsurface, so a scene index is
     // not an element index. Everything up to and including the last element
@@ -174,53 +175,53 @@ fn elements_with_boundary(
     // capture, which wants the desktop without an arrow on it.
     if include_cursor {
         match &state.cursor_status {
-        // The client drew its own cursor. Its hotspot lives in the surface's
-        // own state, and ignoring it puts the arrow's tip in the wrong place.
-        CursorImageStatus::Surface(surface) => {
-            let hotspot = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<Mutex<CursorImageAttributes>>()
-                    .map(|attrs| attrs.lock().unwrap().hotspot)
-                    .unwrap_or_default()
-            });
-            let position: Point<i32, Logical> = pointer.to_i32_round::<i32>() - hotspot;
-            out.extend(
-                render_elements_from_surface_tree(
-                    renderer,
-                    surface,
-                    position.to_physical_precise_round::<f64, i32>(scale),
-                    scale,
-                    1.0,
-                    Kind::Cursor,
-                )
-                .into_iter()
-                .map(HuginnElement::Surface),
-            );
-        }
-        // Nothing has claimed the cursor, so draw the theme's default.
-        CursorImageStatus::Named(_) => {
-            if let Some(cursor) = fallback_cursor {
-                let position: Point<f64, Logical> = (
-                    pointer.x - f64::from(cursor.hotspot.x),
-                    pointer.y - f64::from(cursor.hotspot.y),
-                )
-                    .into();
-                if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    position.to_physical(scale),
-                    &cursor.buffer,
-                    None,
-                    None,
-                    None,
-                    Kind::Cursor,
-                ) {
-                    out.push(HuginnElement::Cursor(element));
+            // The client drew its own cursor. Its hotspot lives in the surface's
+            // own state, and ignoring it puts the arrow's tip in the wrong place.
+            CursorImageStatus::Surface(surface) => {
+                let hotspot = with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<Mutex<CursorImageAttributes>>()
+                        .map(|attrs| attrs.lock().unwrap().hotspot)
+                        .unwrap_or_default()
+                });
+                let position: Point<i32, Logical> = pointer.to_i32_round::<i32>() - hotspot;
+                out.extend(
+                    render_elements_from_surface_tree(
+                        renderer,
+                        surface,
+                        position.to_physical_precise_round::<f64, i32>(scale),
+                        scale,
+                        1.0,
+                        Kind::Cursor,
+                    )
+                    .into_iter()
+                    .map(HuginnElement::Surface),
+                );
+            }
+            // Nothing has claimed the cursor, so draw the theme's default.
+            CursorImageStatus::Named(_) => {
+                if let Some(cursor) = fallback_cursor {
+                    let position: Point<f64, Logical> = (
+                        pointer.x - f64::from(cursor.hotspot.x),
+                        pointer.y - f64::from(cursor.hotspot.y),
+                    )
+                        .into();
+                    if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        position.to_physical(scale),
+                        &cursor.buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Cursor,
+                    ) {
+                        out.push(HuginnElement::Cursor(element));
+                    }
                 }
             }
-        }
-        // A client asked for no cursor at all, e.g. while typing or in a game.
-        CursorImageStatus::Hidden => {}
+            // A client asked for no cursor at all, e.g. while typing or in a game.
+            CursorImageStatus::Hidden => {}
         }
     }
 
