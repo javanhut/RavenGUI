@@ -69,8 +69,7 @@ const CLEAR: Color32F = Color32F::new(0.06, 0.06, 0.09, 1.0);
 /// little-endian host, which is exactly PNG's byte order, so the mapping is
 /// copied out with no channel shuffle. The offscreen texture is created in the
 /// same format, an `RGBA8` GLES texture, which `GlesRenderer` can render into.
-const FORMAT: smithay::backend::allocator::Fourcc =
-    smithay::backend::allocator::Fourcc::Abgr8888;
+const FORMAT: smithay::backend::allocator::Fourcc = smithay::backend::allocator::Fourcc::Abgr8888;
 
 /// Capture an output, optionally cropped to a rectangle within it, and save it.
 ///
@@ -223,8 +222,7 @@ impl Capture {
     fn save(&self) -> Result<PathBuf> {
         let dir = screenshot_dir()
             .context("no directory to save a screenshot in (no HOME, no XDG_PICTURES_DIR)")?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = unique_path(&dir, &timestamp());
         encode_png(&path, self.width, self.height, &self.rgba)
             .with_context(|| format!("writing {}", path.display()))?;
@@ -401,7 +399,9 @@ mod tests {
         let base = pictures_base(
             Some(OsStr::new("/home/person")),
             None,
-            Some("# generated\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\nXDG_PICTURES_DIR=\"$HOME/Bilder\"\n"),
+            Some(
+                "# generated\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\nXDG_PICTURES_DIR=\"$HOME/Bilder\"\n",
+            ),
         );
         assert_eq!(base, Some(PathBuf::from("/home/person/Bilder")));
     }
@@ -474,7 +474,11 @@ mod tests {
             height: 2,
             rgba: vec![0; 16],
         };
-        assert!(image.cropped(Rectangle::new((0, 0).into(), (0, 0).into())).is_none());
+        assert!(
+            image
+                .cropped(Rectangle::new((0, 0).into(), (0, 0).into()))
+                .is_none()
+        );
     }
 
     #[test]

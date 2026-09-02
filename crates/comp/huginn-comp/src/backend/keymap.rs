@@ -1350,18 +1350,33 @@ mod tests {
             ..Modes::default()
         };
         assert!(matches!(
-            resolve(KeyState::Pressed, &ModifiersState::default(), keysyms::KEY_Escape, mode),
+            resolve(
+                KeyState::Pressed,
+                &ModifiersState::default(),
+                keysyms::KEY_Escape,
+                mode
+            ),
             FilterResult::Intercept(Some(Action::CancelRegion))
         ));
         // Any other key is intercepted-but-ignored, so nothing under the
         // rectangle being dragged sees it.
         assert!(matches!(
-            resolve(KeyState::Pressed, &ModifiersState::default(), keysyms::KEY_a, mode),
+            resolve(
+                KeyState::Pressed,
+                &ModifiersState::default(),
+                keysyms::KEY_a,
+                mode
+            ),
             FilterResult::Intercept(None)
         ));
         // Including a second Print: one selection at a time.
         assert!(matches!(
-            resolve(KeyState::Pressed, &ModifiersState::default(), keysyms::KEY_Print, mode),
+            resolve(
+                KeyState::Pressed,
+                &ModifiersState::default(),
+                keysyms::KEY_Print,
+                mode
+            ),
             FilterResult::Intercept(None)
         ));
     }

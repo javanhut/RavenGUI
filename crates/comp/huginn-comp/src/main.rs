@@ -36,6 +36,7 @@ mod launcher;
 mod motion;
 #[cfg(target_os = "linux")]
 mod overlay;
+mod overview;
 mod pinned;
 mod pins;
 #[cfg(target_os = "linux")]

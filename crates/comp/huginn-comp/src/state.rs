@@ -179,6 +179,55 @@ struct WorkspaceCarousel {
     /// key or the pointer puts it somewhere — and what decides, on the way
     /// out, between taking a window and putting the tiling back.
     selected: Option<huginn_core::window::WindowId>,
+    /// The window under the pointer, as of its last move. Kept apart from
+    /// `selected` so that a pointer resting on nothing leaves the arrows'
+    /// choice alone: only *leaving* a window clears the highlight.
+    hover: Option<huginn_core::window::WindowId>,
+}
+
+/// The overview's chrome, composed for what it is showing; see
+/// [`crate::overview`].
+#[derive(Debug)]
+struct OverviewChrome {
+    /// What the chrome was composed for: each window's stage, settled frame
+    /// and title. When the overview would show something else, it is redone.
+    key: Vec<(usize, WindowId, Rect, Option<String>)>,
+    /// Which stage the space labels mark as the front.
+    front: usize,
+    bar: Option<crate::overview::SpacesBar>,
+    thumbs: Vec<crate::overview::Thumb>,
+}
+
+impl OverviewChrome {
+    fn thumb(&self, workspace: usize, window: WindowId) -> Option<&crate::overview::Thumb> {
+        self.thumbs
+            .iter()
+            .find(|thumb| thumb.workspace == workspace && thumb.window == window)
+    }
+
+    /// Take the backing and ring composed for `window` on `workspace`, if
+    /// they were composed for `frame` — panels for another size would not
+    /// fit, but a window that merely retitled itself keeps its shadow.
+    fn take_panels(
+        &mut self,
+        workspace: usize,
+        window: WindowId,
+        frame: Rect,
+    ) -> Option<(crate::canvas::Panel, Option<crate::canvas::Panel>)> {
+        let same = self
+            .key
+            .iter()
+            .any(|(w, id, f, _)| *w == workspace && *id == window && *f == frame);
+        if !same {
+            return None;
+        }
+        let at = self
+            .thumbs
+            .iter()
+            .position(|thumb| thumb.workspace == workspace && thumb.window == window)?;
+        let thumb = self.thumbs.swap_remove(at);
+        Some((thumb.backing, thumb.halo))
+    }
 }
 
 /// One thumbnail above the dock: the switcher's highlighted window, or a
@@ -526,9 +575,11 @@ pub(crate) struct Huginn {
     /// focused one is fullscreen.
     focus_ring: [SolidColorBuffer; 4],
     workspace_card: SolidColorBuffer,
-    /// Accent-coloured backing drawn a few pixels proud of the overview's
-    /// highlighted window, so the highlight reads as a ring around it.
-    overview_halo: SolidColorBuffer,
+    /// Drawn over the wallpaper while the overview is up, so the spread
+    /// windows stand out from a desktop that has stepped back.
+    overview_veil: SolidColorBuffer,
+    /// The overview's labels, shadows, ring and caption, while it is up.
+    overview_chrome: Option<OverviewChrome>,
     focus_ring_at: Option<[Rect; 4]>,
     /// An in-progress region screenshot, armed by `Shift`+`Print` and taken on
     /// the pointer release. `None` the rest of the time. See
@@ -596,6 +647,16 @@ pub(crate) fn place_in_pane(surface: &WlSurface, pane: Rect) -> Rect {
     )
 }
 
+/// How far you can see through a stage's backing in the overview.
+///
+/// Faint: the point of a stage is that a neighbour sliding in reads as a
+/// page and an empty workspace is not a hole, and a wash does that. Opaque,
+/// it would hide the desktop the overview is meant to stand in front of.
+const WORKSPACE_CARD_ALPHA: u8 = 0x40;
+
+/// The veil over the wallpaper while the overview is up: black, half.
+const OVERVIEW_VEIL: [f32; 4] = [0.0, 0.0, 0.0, 0.5];
+
 /// The patches of screen the overview spreads one workspace's windows over:
 /// `count` boxes in as square a grid as holds them, inset from the screen's
 /// edges, with a short last row centred. The grid is only where the patches
@@ -608,8 +669,8 @@ fn overview_cells(count: usize, area: Rect) -> Vec<Rect> {
     }
     let columns = (count as f64).sqrt().ceil() as usize;
     let rows = count.div_ceil(columns);
-    let (margin_x, margin_y) = (area.w() / 16, area.h() / 12);
-    let gutter = area.w() / 48;
+    let (margin_x, margin_y) = (area.w() / 16, area.h() / 24);
+    let gutter = area.w() / 30;
     let stage = Rect::from_xywh(
         area.x() + margin_x,
         area.y() + margin_y,
@@ -654,6 +715,25 @@ fn shrink_into(placed: Rect, cell: Rect) -> Rect {
         );
     }
     crate::motion::fit_aspect(placed, cell)
+}
+
+/// Where the window's visible frame lands when its surface is drawn at
+/// `drawn` under `pane`'s scale.
+///
+/// `drawn` shares [`place_in_pane`]'s convention: its origin is the
+/// *surface* origin, its size the window geometry's. A client that reserves
+/// shadow margins draws its frame inset from that origin by the geometry's
+/// offset, scaled with everything else — so a ring drawn round `drawn`
+/// itself peeks out top-left and vanishes under the frame bottom-right, and
+/// a click just inside the frame's far edge misses.
+fn drawn_frame(surface: &WlSurface, pane: WorkspacePreview, drawn: Rect) -> Rect {
+    let frame = crate::popup::window_geometry(surface);
+    Rect::from_xywh(
+        drawn.x() + (f64::from(frame.loc.x) * pane.scale_x).round() as i32,
+        drawn.y() + (f64::from(frame.loc.y) * pane.scale_y).round() as i32,
+        drawn.w(),
+        drawn.h(),
+    )
 }
 
 /// `from` moved a fraction `t` of the way to `to`.
@@ -745,12 +825,12 @@ impl Huginn {
             }),
             workspace_card: SolidColorBuffer::new(
                 (area.w(), area.h()),
-                crate::theme::BACKGROUND.to_rgba_f32(),
+                crate::theme::BACKGROUND
+                    .with_alpha(WORKSPACE_CARD_ALPHA)
+                    .to_rgba_f32(),
             ),
-            overview_halo: SolidColorBuffer::new(
-                (area.w(), area.h()),
-                crate::theme::accent().to_rgba_f32(),
-            ),
+            overview_veil: SolidColorBuffer::new((area.w(), area.h()), OVERVIEW_VEIL),
+            overview_chrome: None,
             focus_ring_at: None,
             region: None,
             region_edges: std::array::from_fn(|_| {
@@ -816,7 +896,9 @@ impl Huginn {
         for ring in &mut self.focus_ring {
             ring.set_color(accent);
         }
-        self.overview_halo.set_color(accent);
+        // The ring is composed from the accent, so it is redone.
+        self.overview_chrome = None;
+        self.refresh_overview_chrome();
 
         self.settings
             .apply_desktop_config(cfg.motion(), cfg.idle_after());
@@ -895,7 +977,7 @@ impl Huginn {
     fn apply_output_geometry(&mut self) {
         let area = self.output_area();
         self.workspace_card.resize((area.w(), area.h()));
-        self.overview_halo.resize((area.w(), area.h()));
+        self.overview_veil.resize((area.w(), area.h()));
         // The overlay picks its scale from the output height, so a resize with
         // it open has to redraw it rather than just re-centre it.
         if self.help.is_some() {
@@ -1355,12 +1437,32 @@ impl Huginn {
                 )
             });
             let front = self.overview_front();
+            // The space labels stay put while the stages slide beneath them.
+            if let Some(bar) = self.overview_chrome.as_ref().and_then(|c| c.bar.as_ref()) {
+                out.push(SceneItem::Overlay(
+                    bar.panel.buffer(),
+                    bar.rect,
+                    reveal as f32,
+                ));
+            }
             for (workspace, card) in previews {
                 // The highlight lives on the front stage alone.
                 let highlight = selected.filter(|_| Some(workspace) == front);
                 out.extend(self.workspace_pane_items(workspace, card, reveal, highlight));
                 out.push(SceneItem::WorkspaceCard(&self.workspace_card, card));
             }
+            // Behind every stage: the desktop steps back as the windows come
+            // forward, and comes back as they settle.
+            out.push(SceneItem::WorkspaceCard(
+                &self.overview_veil,
+                WorkspacePreview {
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    alpha: reveal as f32,
+                },
+            ));
         } else {
             for (surface, rect) in self.render_list() {
                 out.extend(self.popups_of(&surface, rect));
@@ -2352,6 +2454,7 @@ impl Huginn {
                                 reveal: crate::anim::Animated::settled(0.0),
                                 closing: false,
                                 selected: None,
+                                hover: None,
                             });
                             0.0
                         };
@@ -2657,7 +2760,9 @@ impl Huginn {
             reveal,
             closing: false,
             selected: None,
+            hover: None,
         });
+        self.refresh_overview_chrome();
         self.queue_redraw();
     }
 
@@ -2694,6 +2799,7 @@ impl Huginn {
             .animate_to(0.0, now, duration, crate::anim::Curve::EaseInOut);
         carousel.closing = true;
         carousel.selected = None;
+        carousel.hover = None;
         self.space.activate_workspace(target);
         // The solo does not fullscreen the pick — the pane grows because the
         // rest of the workspace is put away — but it does pull any member
@@ -3337,8 +3443,12 @@ impl Huginn {
                 finish_workspace_carousel = true;
             }
         }
+        if self.workspace_carousel.is_some() {
+            self.refresh_overview_chrome();
+        }
         if finish_workspace_carousel {
             self.workspace_carousel = None;
+            self.overview_chrome = None;
             self.arrange();
             self.refresh_focus();
         }
@@ -3877,13 +3987,17 @@ impl Huginn {
     /// Re-measure the selection's four edges and size their buffers to match, so
     /// the `&self` scene can read them without touching the renderer's buffers.
     fn update_region_ring(&mut self) {
-        let edges = self.region.as_ref().and_then(RegionSelect::rect).map(|rect| {
-            let edges = rect.ring(crate::theme::FOCUS_RING_WIDTH);
-            for (buffer, edge) in self.region_edges.iter_mut().zip(edges) {
-                buffer.resize((edge.w(), edge.h()));
-            }
-            edges
-        });
+        let edges = self
+            .region
+            .as_ref()
+            .and_then(RegionSelect::rect)
+            .map(|rect| {
+                let edges = rect.ring(crate::theme::FOCUS_RING_WIDTH);
+                for (buffer, edge) in self.region_edges.iter_mut().zip(edges) {
+                    buffer.resize((edge.w(), edge.h()));
+                }
+                edges
+            });
         self.region_edges_at = edges;
     }
 
@@ -4087,7 +4201,22 @@ impl Huginn {
     ) -> Vec<SceneItem<'_>> {
         let windows = self.overview_windows_for(workspace);
         let area = self.output_area();
-        let cells = overview_cells(windows.len(), area);
+        let cells = overview_cells(windows.len(), self.overview_area());
+        // A stage's chrome is drawn in the stage's own coordinates and then
+        // carried along with it: a compositor-drawn panel takes a rectangle,
+        // so the stage's transform is applied to the rectangle here.
+        let staged = |rect: Rect| {
+            Rect::from_xywh(
+                (card.scale_x * f64::from(rect.x()) + card.offset_x).round() as i32,
+                (card.scale_y * f64::from(rect.y()) + card.offset_y).round() as i32,
+                (card.scale_x * f64::from(rect.w())).round() as i32,
+                (card.scale_y * f64::from(rect.h())).round() as i32,
+            )
+        };
+        // The chrome comes forward with the windows and goes back with
+        // them: at reveal zero the windows are exactly where the layout put
+        // them, and shadows on the tiling would be a lie.
+        let chrome_alpha = card.alpha * reveal as f32;
         let mut out = Vec::new();
         for ((id, surface, placed), cell) in windows.into_iter().zip(cells) {
             let drawn = blend(placed, shrink_into(placed, cell), reveal);
@@ -4102,30 +4231,188 @@ impl Huginn {
                 offset_y: card.scale_y * pane.offset_y + card.offset_y,
                 alpha: card.alpha,
             };
-            out.push(SceneItem::WorkspaceSurface(surface, placed, transform));
-            if highlight == Some(id) {
-                // Behind the pane — the scene is front to back — and a few
-                // pixels proud of it on every side, so what shows is a ring.
-                const HALO: i32 = 4;
-                let ring = Rect::from_xywh(
-                    drawn.x() - HALO,
-                    drawn.y() - HALO,
-                    drawn.w() + 2 * HALO,
-                    drawn.h() + 2 * HALO,
-                );
-                out.push(SceneItem::WorkspaceCard(
-                    &self.overview_halo,
-                    WorkspacePreview {
-                        scale_x: card.scale_x * f64::from(ring.w()) / f64::from(area.w().max(1)),
-                        scale_y: card.scale_y * f64::from(ring.h()) / f64::from(area.h().max(1)),
-                        offset_x: card.scale_x * f64::from(ring.x()) + card.offset_x,
-                        offset_y: card.scale_y * f64::from(ring.y()) + card.offset_y,
-                        alpha: card.alpha,
-                    },
+            let frame = drawn_frame(&surface, pane, drawn);
+            let thumb = self
+                .overview_chrome
+                .as_ref()
+                .and_then(|chrome| chrome.thumb(workspace, id));
+            if highlight == Some(id)
+                && let Some(caption) = thumb.and_then(|thumb| thumb.caption.as_ref())
+            {
+                out.push(SceneItem::Overlay(
+                    caption.buffer(),
+                    staged(crate::overview::caption_placement(caption, frame, area)),
+                    chrome_alpha,
                 ));
             }
+            out.push(SceneItem::WorkspaceSurface(surface, placed, transform));
+            let Some(thumb) = thumb else {
+                continue;
+            };
+            // Behind the pane — the scene is front to back — and proud of
+            // it on every side, so what shows is a rim.
+            if highlight == Some(id)
+                && let Some(halo) = &thumb.halo
+            {
+                out.push(SceneItem::Overlay(
+                    halo.buffer(),
+                    staged(crate::overview::halo_rect(frame, area)),
+                    chrome_alpha,
+                ));
+            }
+            out.push(SceneItem::Overlay(
+                thumb.backing.buffer(),
+                staged(crate::overview::shadow_rect(frame, area)),
+                chrome_alpha,
+            ));
         }
         out
+    }
+
+    /// The part of the screen the overview spreads windows over: the usable
+    /// area less the strip the space labels take and the room a caption
+    /// needs under the lowest row.
+    fn overview_area(&self) -> Rect {
+        let area = self.space.area();
+        let output = self.output_area();
+        let top = crate::overview::bar_room(output);
+        let bottom = crate::overview::caption_room(output);
+        Rect::from_xywh(
+            area.x(),
+            area.y() + top,
+            area.w(),
+            (area.h() - top - bottom).max(1),
+        )
+    }
+
+    /// The front stage's windows and where each one's frame settles once the
+    /// overview is fully open, in the order the patches read.
+    fn overview_settled(&self, workspace: usize) -> Vec<(WindowId, Rect)> {
+        let windows = self.overview_windows_for(workspace);
+        let cells = overview_cells(windows.len(), self.overview_area());
+        windows
+            .into_iter()
+            .zip(cells)
+            .map(|((id, surface, placed), cell)| {
+                let drawn = shrink_into(placed, cell);
+                (
+                    id,
+                    drawn_frame(&surface, crate::motion::fit(placed, drawn, 1.0), drawn),
+                )
+            })
+            .collect()
+    }
+
+    /// Bring the overview's chrome into line with what it is showing.
+    ///
+    /// Cheap when nothing changed — a comparison — and called every frame the
+    /// overview is up, so a window retitling itself or a stage sliding to
+    /// the front is caught without anyone having to remember to say so.
+    fn refresh_overview_chrome(&mut self) {
+        let Some(carousel) = self.workspace_carousel else {
+            self.overview_chrome = None;
+            return;
+        };
+        let Some(front) = self.overview_front() else {
+            return;
+        };
+        let count = self.space.workspaces().len();
+        let key: Vec<(usize, WindowId, Rect, Option<String>)> = (0..count)
+            .flat_map(|workspace| {
+                self.overview_settled(workspace)
+                    .into_iter()
+                    .map(move |(id, frame)| (workspace, id, frame))
+            })
+            .map(|(workspace, id, frame)| {
+                let title = self.windows.get(&id).and_then(|w| w.title());
+                (workspace, id, frame, title)
+            })
+            .collect();
+        let (output, density) = (self.output_area(), self.scale().advertised);
+        let stale = self
+            .overview_chrome
+            .as_ref()
+            .is_none_or(|chrome| chrome.key != key || chrome.front != front);
+        if stale {
+            let bar = crate::overview::spaces_bar(
+                &mut self.text,
+                count,
+                front,
+                self.space.area(),
+                density,
+            );
+            let thumbs = key
+                .iter()
+                .map(|(workspace, id, frame, title)| {
+                    let (backing, halo) = self
+                        .overview_chrome
+                        .as_mut()
+                        .and_then(|chrome| chrome.take_panels(*workspace, *id, *frame))
+                        .unwrap_or_else(|| {
+                            (crate::overview::backing(*frame, output, density), None)
+                        });
+                    crate::overview::Thumb {
+                        workspace: *workspace,
+                        window: *id,
+                        backing,
+                        halo,
+                        caption: title.as_deref().and_then(|title| {
+                            crate::dock::caption(
+                                &mut self.text,
+                                title,
+                                crate::overview::backing_rect(*frame, output).w(),
+                                output,
+                                density,
+                            )
+                        }),
+                    }
+                })
+                .collect();
+            self.overview_chrome = Some(OverviewChrome {
+                key,
+                front,
+                bar,
+                thumbs,
+            });
+        }
+        // The ring is composed on demand, for the window the highlight is on.
+        if let Some(selected) = carousel.selected
+            && let Some(chrome) = &mut self.overview_chrome
+            && let Some(thumb) = chrome
+                .thumbs
+                .iter_mut()
+                .find(|thumb| thumb.workspace == front && thumb.window == selected)
+            && thumb.halo.is_none()
+            && let Some((_, _, frame, _)) = chrome
+                .key
+                .iter()
+                .find(|(workspace, id, _, _)| *workspace == front && *id == selected)
+        {
+            thumb.halo = Some(crate::overview::halo(*frame, output, density));
+        }
+    }
+
+    /// Tell the overview where the pointer went: the highlight follows it
+    /// onto a window and leaves with it.
+    pub(crate) fn overview_pointer_moved(&mut self) {
+        let Some((_, thumbs)) = self.overview_thumbs() else {
+            return;
+        };
+        let point = self.pointer_point();
+        let hit = thumbs
+            .into_iter()
+            .find(|(_, frame)| frame.contains(point))
+            .map(|(id, _)| id);
+        let Some(carousel) = &mut self.workspace_carousel else {
+            return;
+        };
+        if carousel.hover == hit {
+            return;
+        }
+        carousel.hover = hit;
+        carousel.selected = hit;
+        self.refresh_overview_chrome();
+        self.queue_redraw();
     }
 
     /// The windows an overview stage shows, with the rect each is really at.
@@ -4175,16 +4462,7 @@ impl Huginn {
             return None;
         }
         let front = self.overview_front()?;
-        let windows = self.overview_windows_for(front);
-        let cells = overview_cells(windows.len(), self.output_area());
-        Some((
-            front,
-            windows
-                .into_iter()
-                .zip(cells)
-                .map(|((id, _, placed), cell)| (id, shrink_into(placed, cell)))
-                .collect(),
-        ))
+        Some((front, self.overview_settled(front)))
     }
 
     /// Move the overview's highlight one window over.
@@ -4221,6 +4499,7 @@ impl Huginn {
         if let Some(carousel) = &mut self.workspace_carousel {
             carousel.selected = Some(ids[next]);
         }
+        self.refresh_overview_chrome();
         self.queue_redraw();
     }
 
@@ -4239,10 +4518,38 @@ impl Huginn {
     /// Swallows the click either way: nothing under the overview may act on
     /// a press aimed at it.
     pub(crate) fn overview_click(&mut self) -> bool {
-        let Some((_, thumbs)) = self.overview_thumbs() else {
+        let Some((front, thumbs)) = self.overview_thumbs() else {
             return false;
         };
         let point = self.pointer_point();
+        // A space label brings that stage to the front, as in the bar it is
+        // modelled on; the overview stays up.
+        let label = self
+            .overview_chrome
+            .as_ref()
+            .and_then(|chrome| chrome.bar.as_ref())
+            .and_then(|bar| bar.labels.iter().position(|label| label.contains(point)));
+        if let Some(index) = label {
+            if index != front {
+                let now = self.uptime();
+                let duration = self
+                    .settings
+                    .motion()
+                    .duration(crate::anim::WORKSPACE_CAROUSEL_OPEN);
+                if let Some(carousel) = &mut self.workspace_carousel {
+                    carousel.position.animate_to(
+                        index as f32,
+                        now,
+                        duration,
+                        crate::anim::Curve::EaseInOut,
+                    );
+                    carousel.selected = None;
+                    carousel.hover = None;
+                }
+                self.queue_redraw();
+            }
+            return true;
+        }
         let hit = thumbs
             .into_iter()
             .find(|(_, patch)| patch.contains(point))
