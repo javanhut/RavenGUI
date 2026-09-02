@@ -343,6 +343,20 @@ pub(crate) struct Huginn {
     /// and counting the sleep as idle time would mean the idle lock also fired
     /// on every wake, racing it for no reason.
     last_input: Instant,
+    /// Whether this compositor is hosting the login screen rather than a
+    /// session -- started by `ravend` for the greeter, as the greeter
+    /// account, with nothing behind its one layer surface.
+    ///
+    /// Told, not inferred: `ravend` sets [`GREETER_ENV`] on the greeter's
+    /// compositor and on nothing else. There is nothing here to lock -- the
+    /// login screen already is what a lock screen stands in for -- and
+    /// trying anyway does damage. `raven-lock` asks `ravend` whose session
+    /// this is, is told the greeter account is not one, and exits; the blank
+    /// put up for it stays until the claim timeout reveals the greeter again;
+    /// and the idle timer, still past its mark, does it all over a minute
+    /// later. That is the login screen fading to black for ten seconds out
+    /// of every sixty, taking no keystrokes while it is dark.
+    greeter: bool,
     /// What the focused client last asked the cursor to look like.
     pub cursor_status: CursorImageStatus,
     /// Keyboards whose LEDs the compositor drives, and what they should show.
@@ -789,6 +803,7 @@ impl Huginn {
             seat,
             pointer_location: (0.0, 0.0).into(),
             last_input: Instant::now(),
+            greeter: hosting_greeter(),
             // Default until a client sets its own on pointer enter.
             cursor_status: CursorImageStatus::default_named(),
             keyboard_led_devices: Vec::new(),
@@ -1578,6 +1593,13 @@ impl Huginn {
     /// lock screen is not installed should show its desktop, not a screen
     /// nobody can ever get past.
     pub(crate) fn lock_and_launch(&mut self) -> bool {
+        if self.greeter {
+            // Every way into a lock comes through here, so this is the one
+            // place the login screen has to say no: not to the idle timer,
+            // not to `Super`+`L`, not to the resume from suspend.
+            tracing::debug!("hosting the greeter; there is no session to lock");
+            return false;
+        }
         if !self.begin_lock() {
             return false;
         }
@@ -1591,10 +1613,25 @@ impl Huginn {
             program = crate::theme::LOCK_SCREEN,
             "the lock screen would not start; leaving the session unlocked"
         );
+        self.reveal_unlocked();
+        false
+    }
+
+    /// Reveal the session after a lock that could not be kept, and start the
+    /// idle count over.
+    ///
+    /// The restart matters as much as the reveal. A failed lock leaves
+    /// `last_input` where it was, so without this the idle timer finds the
+    /// session still past its mark on its next tick and blanks it again --
+    /// a lock screen that cannot run on this machine becomes a desktop that
+    /// goes black for ten seconds out of every sixty, for as long as nobody
+    /// touches it. Counting from the reveal gives the next attempt a full
+    /// idle period, which is the most a broken lock screen should cost.
+    fn reveal_unlocked(&mut self) {
         self.lock = None;
+        self.last_input = Instant::now();
         self.refresh_focus();
         self.queue_redraw();
-        false
     }
 
     /// Input arrived; the session is not idle.
@@ -1611,9 +1648,11 @@ impl Huginn {
     /// Answered here rather than in the backend's timer so that the rule is
     /// testable and lives next to the state it reads. A session already locked
     /// is never "due": it cannot be locked twice, and asking would restart the
-    /// lock screen on top of itself.
+    /// lock screen on top of itself. Nor is the login screen, which has no
+    /// session to lock; see the `greeter` field.
     pub(crate) fn idle_lock_due(&self, now: Instant) -> bool {
         idle_due(
+            self.greeter,
             self.is_locked(),
             self.settings.idle_after().duration(),
             now.saturating_duration_since(self.last_input),
@@ -1695,9 +1734,7 @@ impl Huginn {
             "no lock screen claimed the session; revealing the desktop again. \
              Is raven-lock installed?"
         );
-        self.lock = None;
-        self.refresh_focus();
-        self.queue_redraw();
+        self.reveal_unlocked();
     }
 
     /// How many times a lock screen that died is started again before the
@@ -1757,9 +1794,7 @@ impl Huginn {
                 "the lock screen keeps dying; revealing the desktop rather than \
                  leaving a screen nobody can get past"
             );
-            self.lock = None;
-            self.refresh_focus();
-            self.queue_redraw();
+            self.reveal_unlocked();
             return false;
         }
 
@@ -1777,9 +1812,7 @@ impl Huginn {
             program = crate::theme::LOCK_SCREEN,
             "the lock screen would not start again; revealing the desktop"
         );
-        self.lock = None;
-        self.refresh_focus();
-        self.queue_redraw();
+        self.reveal_unlocked();
         false
     }
 
@@ -5377,7 +5410,29 @@ pub(crate) enum KeyboardOn {
 /// Wayland display to exist, so a rule written inside it is a rule that can
 /// only be checked by running a compositor. The three inputs are the whole of
 /// what decides this.
-fn idle_due(locked: bool, after: Option<std::time::Duration>, idle: std::time::Duration) -> bool {
+/// The variable `ravend` sets on the compositor it starts for the greeter.
+///
+/// A contract with RavenLogin, like the wallpaper path: `ravend` exports it to
+/// the greeter's compositor and to nothing else, so a session compositor never
+/// sees it. Any non-empty value counts.
+pub(crate) const GREETER_ENV: &str = "RAVEN_GREETER";
+
+/// Whether this process was started to host the greeter; see [`GREETER_ENV`].
+fn hosting_greeter() -> bool {
+    std::env::var_os(GREETER_ENV).is_some_and(|value| !value.is_empty())
+}
+
+fn idle_due(
+    greeter: bool,
+    locked: bool,
+    after: Option<std::time::Duration>,
+    idle: std::time::Duration,
+) -> bool {
+    // The login screen has no session to lock, and a lock screen started
+    // there cannot even find out whose it would be.
+    if greeter {
+        return false;
+    }
     // Already locked: it cannot be locked twice, and asking again would start
     // a second lock screen on top of the first.
     if locked {
@@ -5819,21 +5874,29 @@ mod idle_tests {
 
     #[test]
     fn a_session_locks_once_it_has_been_idle_long_enough() {
-        assert!(!idle_due(false, AFTER, Duration::from_secs(599)));
-        assert!(idle_due(false, AFTER, Duration::from_secs(600)));
-        assert!(idle_due(false, AFTER, Duration::from_secs(6000)));
+        assert!(!idle_due(false, false, AFTER, Duration::from_secs(599)));
+        assert!(idle_due(false, false, AFTER, Duration::from_secs(600)));
+        assert!(idle_due(false, false, AFTER, Duration::from_secs(6000)));
     }
 
     #[test]
     fn off_never_locks_however_long_it_sits() {
-        assert!(!idle_due(false, None, Duration::from_secs(86_400)));
+        assert!(!idle_due(false, false, None, Duration::from_secs(86_400)));
     }
 
     /// Otherwise every tick past the timeout starts another lock screen on top
     /// of the one already holding the session.
     #[test]
     fn an_already_locked_session_is_never_due() {
-        assert!(!idle_due(true, AFTER, Duration::from_secs(6000)));
+        assert!(!idle_due(false, true, AFTER, Duration::from_secs(6000)));
+    }
+
+    /// The login screen sits untouched for far longer than any timeout, and
+    /// has nothing behind it to hide. A lock attempted there fails and
+    /// blanks the greeter for the claim timeout, once a minute, for ever.
+    #[test]
+    fn the_login_screen_is_never_due() {
+        assert!(!idle_due(true, false, AFTER, Duration::from_secs(6000)));
     }
 
     #[test]

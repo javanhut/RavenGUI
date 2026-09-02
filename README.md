@@ -361,6 +361,18 @@ clock, which does not advance across a suspend: a laptop shut for the night has
 been idle for as long as it was *awake*, so the idle lock does not also fire on
 every resume and race the one the resume already does.
 
+None of that applies to the compositor RavenLogin starts to host its greeter,
+and it is told so: `ravend` exports `RAVEN_GREETER=1` to that one process and
+to nothing else, and a huginn that sees it never locks — not on idle, not on
+`Super`+`L`, not on resume. There is no session behind a login screen to hide,
+and a `raven-lock` started there cannot even learn whose session it would be:
+it asks `ravend`, is told the greeter account is not one, and exits, leaving
+the blank up until the claim timeout takes it down. Before the variable, the
+idle timer then found the greeter still idle and did it again a minute later —
+a login screen going black for ten seconds in every sixty. A failed lock now
+also restarts the idle count, so a lock screen that cannot run costs a real
+session one blank per idle period rather than one per minute.
+
 "Lock when idle" in quick settings steps that between 5, 10, 15 and 30 minutes
 and off, and it is the only way to hold it off — there is no
 `idle-inhibit-unstable-v1` here, so a full-screen film is indistinguishable
