@@ -18,6 +18,7 @@
 //! does *not* hand back to anybody, for the reason given there.
 
 use huginn_core::geometry::Dir;
+use huginn_core::workspace::Direction;
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::{FilterResult, ModifiersState, keysyms};
 
@@ -105,7 +106,16 @@ pub(crate) enum Action {
     /// A key while the pinned panel is open. Every key goes to it, for the
     /// reason every key goes to the launcher.
     Pinned(crate::pinned::Key),
-    /// Dismiss the temporary minimized-application switcher.
+    /// Open the window switcher, or step it while it is open: every window,
+    /// most recently focused first, across every workspace. `Alt`+`Tab`
+    /// forward, `Alt`+`Shift`+`Tab` back; letting go of `Alt` goes to the
+    /// highlighted window.
+    AltTab(Direction),
+    /// Go to the switcher's highlighted window. The one action produced by
+    /// a *release* — `Alt`'s — because holding `Alt` is what keeps the strip
+    /// up.
+    AcceptSwitcher,
+    /// Dismiss the application switcher, gesture or Alt-Tab, taking nothing.
     DismissSwitcher,
     /// A media key: raise, lower or mute the output volume.
     ///
@@ -152,7 +162,8 @@ pub(crate) struct Modes {
     /// The session is locked. Nothing resolves; every key is the lock
     /// screen's.
     pub locked: bool,
-    /// The centered minimized-application dock owns input until dismissed.
+    /// The centred application switcher is up, gesture or Alt-Tab, and owns
+    /// input until it commits or is dismissed.
     pub switcher_open: bool,
     /// A region screenshot is being dragged out. Every key but Escape is
     /// swallowed so a keystroke cannot act on a window under the selection.
@@ -207,6 +218,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::FocusPrev,
         chord: "Super+Ctrl+K",
         description: "focus the previous window",
+    },
+    Binding {
+        action: Action::AltTab(Direction::Forward),
+        chord: "Alt+Tab",
+        description: "switch windows, most recent first (Shift: backwards)",
     },
     Binding {
         action: Action::Move(Dir::Left),
@@ -372,9 +388,33 @@ pub(crate) fn resolve(
         return FilterResult::Intercept(pressed(key_state, Action::Screenshot(shot)));
     }
 
+    // The switcher owns the keyboard while it is up. Tab steps it, Escape
+    // drops it, and letting go of Alt takes the highlighted window — the one
+    // binding in this file that acts on a release, since holding Alt is what
+    // holds the strip. Everything else is swallowed: the desktop under it
+    // must not see keystrokes aimed at a picker. The modifier's release
+    // arrives with `alt` already false, so it is recognised by keysym; and
+    // with Shift still held xkb reports Alt as Meta, so both spellings are
+    // accepted. The gesture's strip takes the same keys, which costs it
+    // nothing: an Alt release with the gesture's strip up takes what it
+    // shows, as a tap would.
     if mode.switcher_open {
-        let action = (sym == keysyms::KEY_Escape).then_some(Action::DismissSwitcher);
-        return FilterResult::Intercept(action.and_then(|action| pressed(key_state, action)));
+        let action = match (sym, key_state) {
+            (keysyms::KEY_Escape, KeyState::Pressed) => Some(Action::DismissSwitcher),
+            (keysyms::KEY_ISO_Left_Tab, KeyState::Pressed) => {
+                Some(Action::AltTab(Direction::Backward))
+            }
+            (keysyms::KEY_Tab, KeyState::Pressed) if modifiers.shift => {
+                Some(Action::AltTab(Direction::Backward))
+            }
+            (keysyms::KEY_Tab, KeyState::Pressed) => Some(Action::AltTab(Direction::Forward)),
+            (
+                keysyms::KEY_Alt_L | keysyms::KEY_Alt_R | keysyms::KEY_Meta_L | keysyms::KEY_Meta_R,
+                KeyState::Released,
+            ) => Some(Action::AcceptSwitcher),
+            _ => None,
+        };
+        return FilterResult::Intercept(action);
     }
 
     // Quick settings takes everything, for the same reason the launcher does:
@@ -437,6 +477,23 @@ pub(crate) fn resolve(
     if let Some(character) = mode.launcher {
         let key = crate::launcher::Key::from_keysym(sym, modifiers.ctrl, character);
         return FilterResult::Intercept(pressed(key_state, Action::Launcher(key)));
+    }
+
+    // Alt+Tab. The Alt layer is otherwise untouched — nothing below reads
+    // `alt`, and everything without Super is forwarded whole — so this is
+    // the one chord taken from it, and it is the one every other desktop
+    // puts there. Not while the overview is up: it has a picker of its own,
+    // and two over each other is one too many.
+    if modifiers.alt && !modifiers.logo && !modifiers.ctrl && !mode.overview {
+        let action = match sym {
+            keysyms::KEY_ISO_Left_Tab => Some(Action::AltTab(Direction::Backward)),
+            keysyms::KEY_Tab if modifiers.shift => Some(Action::AltTab(Direction::Backward)),
+            keysyms::KEY_Tab => Some(Action::AltTab(Direction::Forward)),
+            _ => None,
+        };
+        if let Some(action) = action {
+            return FilterResult::Intercept(pressed(key_state, action));
+        }
     }
 
     if !modifiers.logo {
@@ -610,6 +667,21 @@ mod tests {
             logo: true,
             shift: true,
             ctrl: true,
+            ..Default::default()
+        }
+    }
+
+    fn alt_held() -> ModifiersState {
+        ModifiersState {
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    fn alt_shift() -> ModifiersState {
+        ModifiersState {
+            alt: true,
+            shift: true,
             ..Default::default()
         }
     }
@@ -970,6 +1042,110 @@ mod tests {
     }
 
     #[test]
+    fn the_open_switcher_steps_on_tab_and_commits_when_alt_is_let_go() {
+        let mode = Modes {
+            switcher_open: true,
+            ..Modes::default()
+        };
+        let at = |state, mods: ModifiersState, sym| resolve(state, &mods, sym, mode);
+        assert!(matches!(
+            at(KeyState::Pressed, alt_held(), keysyms::KEY_Tab),
+            FilterResult::Intercept(Some(Action::AltTab(Direction::Forward)))
+        ));
+        assert!(matches!(
+            at(KeyState::Pressed, alt_shift(), keysyms::KEY_ISO_Left_Tab),
+            FilterResult::Intercept(Some(Action::AltTab(Direction::Backward)))
+        ));
+        assert!(matches!(
+            at(KeyState::Pressed, alt_shift(), keysyms::KEY_Tab),
+            FilterResult::Intercept(Some(Action::AltTab(Direction::Backward)))
+        ));
+        // Tab's release is swallowed with its press, like every bound key.
+        assert!(matches!(
+            at(KeyState::Released, alt_held(), keysyms::KEY_Tab),
+            FilterResult::Intercept(None)
+        ));
+        // Alt going down again does nothing; Alt coming up commits — and by
+        // then the modifier state no longer says Alt, so it is the keysym
+        // that is recognised, in both the spellings xkb uses for it.
+        assert!(matches!(
+            at(KeyState::Pressed, alt_held(), keysyms::KEY_Alt_L),
+            FilterResult::Intercept(None)
+        ));
+        assert!(matches!(
+            at(
+                KeyState::Released,
+                ModifiersState::default(),
+                keysyms::KEY_Alt_L
+            ),
+            FilterResult::Intercept(Some(Action::AcceptSwitcher))
+        ));
+        assert!(matches!(
+            at(
+                KeyState::Released,
+                ModifiersState::default(),
+                keysyms::KEY_Meta_L
+            ),
+            FilterResult::Intercept(Some(Action::AcceptSwitcher))
+        ));
+    }
+
+    #[test]
+    fn alt_tab_opens_the_switcher_and_alt_shift_tab_opens_it_backwards() {
+        assert_eq!(
+            intercepted(alt_held(), keysyms::KEY_Tab),
+            Some(Action::AltTab(Direction::Forward))
+        );
+        assert_eq!(
+            intercepted(alt_shift(), keysyms::KEY_ISO_Left_Tab),
+            Some(Action::AltTab(Direction::Backward))
+        );
+        assert_eq!(
+            intercepted(alt_shift(), keysyms::KEY_Tab),
+            Some(Action::AltTab(Direction::Backward))
+        );
+        // Plain Tab and the Super layer are what they were.
+        assert!(forwarded(
+            KeyState::Pressed,
+            ModifiersState::default(),
+            keysyms::KEY_Tab
+        ));
+        assert_eq!(
+            intercepted(super_ctrl(), keysyms::KEY_Tab),
+            Some(Action::FocusNextOutput)
+        );
+        // The rest of the Alt layer is still the client's.
+        assert!(forwarded(KeyState::Pressed, alt_held(), keysyms::KEY_a));
+        assert!(forwarded(KeyState::Pressed, alt_held(), keysyms::KEY_F4));
+    }
+
+    #[test]
+    fn alt_tab_is_refused_over_the_overview_lock_and_launcher() {
+        let over = |mode: Modes| resolve(KeyState::Pressed, &alt_held(), keysyms::KEY_Tab, mode);
+        assert!(!matches!(
+            over(Modes {
+                overview: true,
+                ..Modes::default()
+            }),
+            FilterResult::Intercept(Some(Action::AltTab(_)))
+        ));
+        assert!(matches!(
+            over(Modes {
+                locked: true,
+                ..Modes::default()
+            }),
+            FilterResult::Forward
+        ));
+        assert!(matches!(
+            over(Modes {
+                launcher: Some(None),
+                ..Modes::default()
+            }),
+            FilterResult::Intercept(Some(Action::Launcher(_)))
+        ));
+    }
+
+    #[test]
     fn the_launcher_binding_is_reachable_when_it_is_closed() {
         assert_eq!(
             intercepted(super_ctrl(), keysyms::KEY_space),
@@ -1193,7 +1369,13 @@ mod tests {
         use std::mem::discriminant;
 
         let mut reachable = HashSet::new();
-        for mods in [super_held(), super_ctrl(), super_ctrl_shift()] {
+        for mods in [
+            super_held(),
+            super_ctrl(),
+            super_ctrl_shift(),
+            alt_held(),
+            alt_shift(),
+        ] {
             for sym in 0..=u32::from(u16::MAX) {
                 if let Some(action) = intercepted(mods, sym) {
                     reachable.insert(discriminant(&action));

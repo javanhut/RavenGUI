@@ -25,6 +25,7 @@ For how to actually use these, see `docs/integration.md`.
 | `wl_data_device_manager` | clipboard and drag-and-drop |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
 | `ext_session_lock_manager_v1` | locking the session. See below |
+| `ext_foreign_toplevel_list_v1` | the window list: every window that has drawn, with its title and app id, kept current as they change and withdrawn when it closes. Read-only — the protocol has no requests that act on a window. Advertised to every client, unfiltered, with the same caveat as `raven_shell_v1` |
 | `zwp_idle_inhibit_manager_v1` | holding the idle lock off. Honoured while the inhibiting surface is on screen — a toplevel that has drawn, on a workspace some screen shows, not minimized; a layer surface or popup while mapped. The idle count restarts when the last honoured inhibitor goes; one that goes without a request (a crashed client, a window put away) is noticed by the idle timer's next tick |
 
 X11 clients work: Huginn spawns XWayland and runs a window manager for it,
@@ -128,7 +129,7 @@ find them in the registry.
 
 | Missing | Consequence |
 |---|---|
-| `ext-foreign-toplevel-list-v1`, `wlr-foreign-toplevel-management-v1` | No window list. Task switchers, external docks and window-list panels — waybar's taskbar, wlrctl, rofi's window mode — cannot work. |
+| `wlr-foreign-toplevel-management-v1` | No window *management* from outside: an external dock or switcher can list windows (see `ext_foreign_toplevel_list_v1` above) but cannot activate, close or minimize one. |
 | `wlr-screencopy`, `ext-image-copy-capture-v1` | No *client* screen capture: no screen sharing, and no third-party screen recorder. The compositor takes its own screenshots on `Print` (see `docs/integration.md`), so there is no protocol here to do it through. |
 | `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. |
 | `zwp_primary_selection_v1` | No middle-click paste. The regular clipboard works. |
@@ -141,8 +142,9 @@ find them in the registry.
 | `drm-lease-v1` | No direct-lease VR headsets. |
 | `security-context-v1` | Sandboxes cannot identify themselves, which is also why privilege gating above has no mechanism to build on yet. |
 
-One of these is load-bearing for the desktop rather than for third-party
-software: without foreign-toplevel there is no way to write a switcher at all.
+The window list itself is provided — `ext_foreign_toplevel_list_v1` above —
+so a switcher or a window-list panel can be written; what it cannot yet do is
+act on what it lists.
 
 ## Deliberately not planned
 

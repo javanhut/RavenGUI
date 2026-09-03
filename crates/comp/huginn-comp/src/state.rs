@@ -33,10 +33,10 @@ use smithay::{
         gles::GlesTexture,
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_fractional_scale,
-    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_seat,
-    delegate_session_lock, delegate_shm, delegate_viewporter, delegate_xdg_decoration,
-    delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device,
+    delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_inhibit,
+    delegate_layer_shell, delegate_output, delegate_seat, delegate_session_lock, delegate_shm,
+    delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -63,6 +63,9 @@ use smithay::{
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
+        foreign_toplevel_list::{
+            ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+        },
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
@@ -301,13 +304,29 @@ struct DockPreview {
     caption: Option<crate::canvas::Panel>,
 }
 
-/// The dock promoted to the centre of the screen for gesture navigation.
+/// What the centred strip is for, which decides what it lists and what
+/// accepting it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitcherKind {
+    /// The gesture's: windows that have been put away, restored into the
+    /// active workspace.
+    Minimized,
+    /// Alt-Tab: every window, most recently focused first, across every
+    /// workspace; accepting goes to the window wherever it is.
+    AltTab,
+}
+
+/// The dock promoted to the centre of the screen: for gesture navigation
+/// among put-away windows, or for Alt-Tab among all of them.
 #[derive(Debug, Clone, Copy)]
 struct AppSwitcher {
+    kind: SwitcherKind,
     /// Index into `dock_items`, always naming a running application.
     selected: usize,
-    /// The switcher is deliberately temporary; input extends this deadline.
-    dismiss_at: std::time::Duration,
+    /// When the gesture's strip dismisses itself; input extends the
+    /// deadline. `None` for Alt-Tab, which lives exactly as long as Alt is
+    /// held.
+    dismiss_at: Option<std::time::Duration>,
 }
 
 const APP_SWITCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
@@ -409,6 +428,19 @@ pub(crate) struct Huginn {
     /// Whether the idle timer last found an inhibitor honoured, so the tick
     /// after the last one goes can start the idle count from there.
     last_inhibited: bool,
+    /// `ext_foreign_toplevel_list_v1`: every window's title and app id, for
+    /// task switchers and window lists outside the compositor. Advertised
+    /// to every client, unfiltered, with the same caveat as `raven_shell_v1`:
+    /// there is no privilege mechanism yet, and `new_with_filter` is where
+    /// one goes when there is.
+    pub foreign_toplevel_list: ForeignToplevelListState,
+    /// The handle announced for each window that has drawn, so a retitle
+    /// reaches the list and a close withdraws it.
+    foreign_handles: HashMap<WindowId, ForeignToplevelHandle>,
+    /// Every window that has had focus, most recent first. Fed by
+    /// [`Self::refresh_focus`], the one place every focus change passes
+    /// through, and read by Alt-Tab. See [`crate::switcher`].
+    focus_history: Vec<WindowId>,
     /// `ext_session_lock_manager_v1`. What `raven-lock` binds to hold the
     /// session.
     pub session_lock_state: SessionLockManagerState,
@@ -902,6 +934,9 @@ impl Huginn {
             idle_inhibit_state: IdleInhibitManagerState::new::<Self>(dh),
             inhibitors: Vec::new(),
             last_inhibited: false,
+            foreign_toplevel_list: ForeignToplevelListState::new::<Self>(dh),
+            foreign_handles: HashMap::new(),
+            focus_history: Vec::new(),
             lock: None,
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
@@ -2195,11 +2230,25 @@ impl Huginn {
             self.queue_redraw();
             return;
         }
-        self.dock_items = if self.app_switcher.is_some() {
-            crate::dock::window_items(&self.apps, &self.minimized_windows())
-        } else {
-            crate::dock::items(&self.apps, &self.running_app_ids())
+        self.dock_items = match self.app_switcher.map(|switcher| switcher.kind) {
+            Some(SwitcherKind::Minimized) => {
+                crate::dock::window_items(&self.apps, &self.minimized_windows())
+            }
+            Some(SwitcherKind::AltTab) => {
+                crate::dock::alt_tab_items(&self.apps, &self.alt_tab_windows())
+            }
+            None => crate::dock::items(&self.apps, &self.running_app_ids()),
         };
+        // A window may close while a strip is up: keep the highlight inside
+        // the strip, and drop the strip when nothing is left to show.
+        let len = self.dock_items.len();
+        if let Some(switcher) = self.app_switcher.as_mut() {
+            if len == 0 {
+                self.app_switcher = None;
+            } else {
+                switcher.selected = switcher.selected.min(len - 1);
+            }
+        }
         let selected = self.app_switcher.map(|switcher| switcher.selected);
         self.rebuild_dock_previews();
         let (area, advertised) = (self.output_area(), self.scale().advertised);
@@ -2647,8 +2696,12 @@ impl Huginn {
             tracing::debug!("a touchpad swipe began before the last one ended");
             self.swipe_end();
         }
-        if let Some(switcher) = &mut self.app_switcher {
-            switcher.dismiss_at = self.started.elapsed() + APP_SWITCHER_TIMEOUT;
+        if let Some(at) = self
+            .app_switcher
+            .as_mut()
+            .and_then(|switcher| switcher.dismiss_at.as_mut())
+        {
+            *at = self.started.elapsed() + APP_SWITCHER_TIMEOUT;
         }
         self.swipe = Some(crate::gesture::Swipe::new(fingers));
     }
@@ -2724,11 +2777,14 @@ impl Huginn {
                 let last = selectable.len().saturating_sub(1) as f32;
                 let ordinal = position.round().clamp(0.0, last) as usize;
                 if let Some(&selected) = selectable.get(ordinal)
-                    && self.app_switcher.is_some_and(|s| s.selected != selected)
+                    && let Some(switcher) = self.app_switcher
+                    && switcher.selected != selected
                 {
+                    let now = self.uptime();
                     self.app_switcher = Some(AppSwitcher {
                         selected,
-                        dismiss_at: self.uptime() + APP_SWITCHER_TIMEOUT,
+                        dismiss_at: switcher.dismiss_at.map(|_| now + APP_SWITCHER_TIMEOUT),
+                        ..switcher
                     });
                     self.refresh_dock();
                 }
@@ -2906,11 +2962,92 @@ impl Huginn {
         };
         self.workspace_carousel = None;
         self.app_switcher = Some(AppSwitcher {
+            kind: SwitcherKind::Minimized,
             selected,
-            dismiss_at: self.uptime() + APP_SWITCHER_TIMEOUT,
+            dismiss_at: Some(self.uptime() + APP_SWITCHER_TIMEOUT),
         });
         self.refresh_dock();
         self.refresh_focus();
+    }
+
+    /// Alt+Tab: open the window switcher a step in, or step the one that is
+    /// up. See [`crate::switcher`] for the order.
+    pub(crate) fn alt_tab(&mut self, dir: huginn_core::workspace::Direction) {
+        if self.app_switcher.is_some() {
+            self.step_app_switcher(dir);
+        } else {
+            self.open_alt_tab(dir);
+        }
+    }
+
+    /// Open the Alt-Tab strip with the highlight already one step from the
+    /// focused window, which is item 0: the first press is what makes a quick
+    /// Alt+Tab a swap with the window you were just in.
+    fn open_alt_tab(&mut self, dir: huginn_core::workspace::Direction) {
+        // Belt and braces with the keymap's ordering: nothing opens over the
+        // lock, the overview, or a panel that owns the keyboard.
+        if self.lock.is_some()
+            || self.workspace_carousel.is_some()
+            || self.launcher.is_open()
+            || self.settings.is_open()
+            || self.pinned.is_open()
+        {
+            return;
+        }
+        let items = crate::dock::alt_tab_items(&self.apps, &self.alt_tab_windows());
+        // One window has nothing to switch to, and a strip that flashed up
+        // to say so would be noise.
+        if items.len() < 2 {
+            return;
+        }
+        let selected = crate::switcher::step(0, dir, items.len());
+        self.dock_items = items;
+        self.dock_hover = None;
+        self.dock_hover_since = None;
+        self.dock_previews.clear();
+        self.app_switcher = Some(AppSwitcher {
+            kind: SwitcherKind::AltTab,
+            selected,
+            dismiss_at: None,
+        });
+        self.refresh_dock();
+        self.refresh_focus();
+    }
+
+    /// Move the strip's highlight one tile, wrapping at either end.
+    fn step_app_switcher(&mut self, dir: huginn_core::workspace::Direction) {
+        let selectable = self.switcher_items();
+        let now = self.uptime();
+        let Some(switcher) = self.app_switcher.as_mut() else {
+            return;
+        };
+        let at = selectable
+            .iter()
+            .position(|index| *index == switcher.selected)
+            .unwrap_or(0);
+        if let Some(&next) = selectable.get(crate::switcher::step(at, dir, selectable.len())) {
+            switcher.selected = next;
+        }
+        if let Some(at) = switcher.dismiss_at.as_mut() {
+            *at = now + APP_SWITCHER_TIMEOUT;
+        }
+        self.refresh_dock();
+    }
+
+    /// Every window that has drawn, most recently focused first, put-away
+    /// ones included — with the application each belongs to, for its icon.
+    fn alt_tab_windows(&self) -> Vec<(WindowId, Option<String>)> {
+        let all: Vec<WindowId> = self
+            .space
+            .workspaces()
+            .iter()
+            .flat_map(|workspace| workspace.windows().iter().copied())
+            .filter(|id| self.mapped.contains(id))
+            .collect();
+        crate::switcher::order(&self.focus_history, &all)
+            .into_iter()
+            .map(|id| (id, self.windows.get(&id).and_then(WindowSurface::app_id)))
+            .collect()
     }
 
     /// Close the temporary dock without restoring anything.
@@ -2922,32 +3059,42 @@ impl Huginn {
         self.refresh_focus();
     }
 
-    /// Restore the highlighted application into the current workspace.
+    /// Take the highlighted tile: restore the application into the current
+    /// workspace, or — for Alt-Tab — go to the window wherever it is.
     ///
-    /// The window comes back as an ordinary tile filling the layout — not
-    /// fullscreen. Fullscreen tells the client it owns the whole screen, and a
-    /// browser answers by hiding its tab strip and chrome, which is not what
-    /// sliding an application back up from the bar means.
-    fn accept_app_switcher(&mut self) {
+    /// A restored window comes back as an ordinary tile filling the layout —
+    /// not fullscreen. Fullscreen tells the client it owns the whole screen,
+    /// and a browser answers by hiding its tab strip and chrome, which is not
+    /// what sliding an application back up from the bar means.
+    pub(crate) fn accept_app_switcher(&mut self) {
         let Some(switcher) = self.app_switcher.take() else {
             return;
         };
         // The tile names its window outright; there is nothing to search for.
-        // Checked that it is still minimized, since the window may have been
-        // closed or restored some other way while the switcher was up.
-        let minimized = self
+        let picked = self
             .dock_items
             .get(switcher.selected)
-            .and_then(|item| item.window)
-            .filter(|id| {
-                self.space
-                    .window(*id)
-                    .is_some_and(|window| window.is_minimized())
-            });
-        if let Some(id) = minimized {
-            self.restore_window(id);
+            .and_then(|item| item.window);
+        match switcher.kind {
+            // Checked that it is still minimized, since the window may have
+            // been closed or restored some other way while the strip was up.
+            SwitcherKind::Minimized => {
+                if let Some(id) = picked.filter(|id| {
+                    self.space
+                        .window(*id)
+                        .is_some_and(|window| window.is_minimized())
+                }) {
+                    self.restore_window(id);
+                }
+            }
+            SwitcherKind::AltTab => {
+                if let Some(id) = picked {
+                    self.go_to_window(id);
+                }
+            }
         }
         self.refresh_dock();
+        self.refresh_focus();
     }
 
     /// Bring a minimized window back onto the active workspace as an ordinary
@@ -2963,10 +3110,44 @@ impl Huginn {
         if let Some(surface) = self.windows.get(&id) {
             surface.send_configure();
         }
-        // Grow out of the dock tile it was put away into, into the tile the
-        // layout just gave it. This replaces whatever `arrange` started for
-        // it: from the layout's point of view the window merely changed size,
-        // but it was not on screen to change size from.
+        self.restore_motion(id);
+        self.refresh_focus();
+    }
+
+    /// Go to a window wherever it is: show its workspace on the focused
+    /// screen, bring it out of the dock if it was put away, and focus it.
+    /// "Go to", not "bring": the window keeps its workspace, which is where
+    /// the person who put it there expects to find it next time.
+    pub(crate) fn go_to_window(&mut self, id: WindowId) {
+        let Some(index) = self
+            .space
+            .workspaces()
+            .iter()
+            .position(|workspace| workspace.windows().contains(&id))
+        else {
+            return;
+        };
+        self.space.activate_workspace(index);
+        let was_minimized = self.space.unminimize(id);
+        if was_minimized && let Some(surface) = self.windows.get(&id) {
+            surface.set_fullscreen(false);
+        }
+        self.space.active_workspace_mut().focus(id);
+        self.arrange();
+        if was_minimized {
+            if let Some(surface) = self.windows.get(&id) {
+                surface.send_configure();
+            }
+            self.restore_motion(id);
+        }
+        self.refresh_focus();
+    }
+
+    /// Grow a window just brought back out of the dock tile it was put away
+    /// into, into the tile the layout just gave it. This replaces whatever
+    /// `arrange` started for it: from the layout's point of view the window
+    /// merely changed size, but it was not on screen to change size from.
+    fn restore_motion(&mut self, id: WindowId) {
         if self.mapped.contains(&id)
             && let Some(window) = self.space.window(id)
         {
@@ -2977,7 +3158,6 @@ impl Huginn {
             self.motions
                 .insert(id, crate::motion::Motion::restore(from, to, now, instant));
         }
-        self.refresh_focus();
     }
 
     /// Open the workspace Cover Flow at the active workspace.
@@ -3459,6 +3639,18 @@ impl Huginn {
             self.open_launcher();
             return;
         }
+        // A tile in the Alt-Tab strip names its window, and a click on it is
+        // the same as letting go of Alt with it highlighted.
+        if self
+            .app_switcher
+            .is_some_and(|switcher| switcher.kind == SwitcherKind::AltTab)
+            && let Some(id) = item.window
+        {
+            self.app_switcher = None;
+            self.go_to_window(id);
+            self.refresh_dock();
+            return;
+        }
         let Some(entry) = item.entry.and_then(|i| self.apps.get(i)) else {
             return;
         };
@@ -3670,14 +3862,13 @@ impl Huginn {
     /// nothing, so an idle desktop still renders no frames.
     pub(crate) fn tick_animations(&mut self) {
         let now = self.uptime();
-        if self
-            .app_switcher
-            .is_some_and(|switcher| now >= switcher.dismiss_at)
-        {
-            self.dismiss_app_switcher();
-        } else if self.app_switcher.is_some() {
+        // The gesture's strip times out; Alt-Tab's lives as long as Alt is
+        // held and needs no frames of its own while nothing about it changes.
+        match self.app_switcher.and_then(|switcher| switcher.dismiss_at) {
+            Some(at) if now >= at => self.dismiss_app_switcher(),
             // Keep frames flowing only for the switcher's short timeout window.
-            self.queue_redraw();
+            Some(_) => self.queue_redraw(),
+            None => {}
         }
         let mut finish_workspace_carousel = false;
         if let Some(carousel) = &self.workspace_carousel {
@@ -4344,6 +4535,7 @@ impl Huginn {
     /// on it. Mirrors the tail of `toplevel_destroyed`.
     pub(crate) fn close_x11_window(&mut self, id: WindowId) {
         self.begin_close_ghost(id);
+        self.withdraw_toplevel(id);
         self.windows.remove(&id);
         self.mapped.remove(&id);
         self.decor.remove(&id);
@@ -5078,6 +5270,16 @@ impl Huginn {
     /// Give keyboard focus to the core's focused window, and mark it activated
     /// so clients draw themselves as focused.
     pub(crate) fn refresh_focus(&mut self) {
+        // The one place every focus change passes through, so the
+        // most-recent list is kept here and nowhere else. Read from the core
+        // rather than from `focused` below: that is `None` while the
+        // switcher is up, and the switcher must not forget who was focused
+        // when it opened.
+        if let Some(id) = self.space.focused() {
+            crate::switcher::note_focus(&mut self.focus_history, id);
+        }
+        crate::switcher::prune(&mut self.focus_history, |id| self.windows.contains_key(&id));
+
         let focused = self
             .app_switcher
             .is_none()
@@ -5194,8 +5396,10 @@ impl Huginn {
             );
         }
 
-        // The application switcher has no text input of its own, but the
-        // desktop it put away must not continue receiving keystrokes unseen.
+        // The application switcher — gesture or Alt-Tab — has no text input
+        // of its own, but the desktop under it must not continue receiving
+        // keystrokes unseen: a client that had Alt held gets `leave`, which
+        // is what keeps it from believing Alt is still down afterwards.
         if self.app_switcher.is_some() {
             return (None, KeyboardOn::Switcher);
         }
@@ -5352,6 +5556,11 @@ impl CompositorHandler for Huginn {
             // Focus was given to this window when it was created, but the ring
             // could not be drawn around something that was not on screen yet.
             self.refresh_focus();
+        }
+        if let Some(id) = window
+            && self.mapped.contains(&id)
+        {
+            self.announce_toplevel(id);
         }
 
         // Keep a handle on the frame the window is showing, for the close
@@ -5647,10 +5856,19 @@ impl XdgShellHandler for Huginn {
         &mut self.xdg_shell_state
     }
 
-    /// The bar shows the title, so a retitle is a redraw. The bar itself is
-    /// recomposed on the next frame, when its key no longer matches.
-    fn title_changed(&mut self, _surface: ToplevelSurface) {
-        self.queue_redraw();
+    /// The bar shows the title, so a retitle is a redraw — the bar itself is
+    /// recomposed on the next frame, when its key no longer matches — and
+    /// the window list is told.
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        if let Some(id) = self.xdg_window_id(&surface) {
+            self.sync_foreign_toplevel(id);
+        }
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        if let Some(id) = self.xdg_window_id(&surface) {
+            self.sync_foreign_toplevel(id);
+        }
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
@@ -5734,6 +5952,7 @@ impl XdgShellHandler for Huginn {
         // Before anything is forgotten: the ghost needs the surface's texture
         // and the window's place, and both go with the entries below.
         self.begin_close_ghost(id);
+        self.withdraw_toplevel(id);
         self.windows.remove(&id);
         self.mapped.remove(&id);
         self.decor.remove(&id);
@@ -6042,6 +6261,67 @@ impl SessionLockHandler for Huginn {
 
 delegate_session_lock!(Huginn);
 
+/// `ext_foreign_toplevel_list_v1`: the window list, for software outside the
+/// compositor. Read-only by design — the protocol has no requests that act on
+/// a window — so advertising it to every client costs nothing but the list.
+impl ForeignToplevelListHandler for Huginn {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list
+    }
+}
+
+delegate_foreign_toplevel_list!(Huginn);
+
+impl Huginn {
+    /// Put `id` on the list, once it has something to show. Announced at the
+    /// first buffer rather than at creation, so the title and app id a client
+    /// sets before its first commit are what the list hears first.
+    fn announce_toplevel(&mut self, id: WindowId) {
+        if self.foreign_handles.contains_key(&id) {
+            return;
+        }
+        let Some(window) = self.windows.get(&id) else {
+            return;
+        };
+        let (title, app_id) = (
+            window.title().unwrap_or_default(),
+            window.app_id().unwrap_or_default(),
+        );
+        let handle = self
+            .foreign_toplevel_list
+            .new_toplevel::<Self>(title, app_id);
+        self.foreign_handles.insert(id, handle);
+    }
+
+    /// A window's title or app id changed: tell the list, and the strip if
+    /// one is up, since its caption shows the title.
+    pub(crate) fn sync_foreign_toplevel(&mut self, id: WindowId) {
+        if let (Some(window), Some(handle)) = (self.windows.get(&id), self.foreign_handles.get(&id))
+        {
+            let (title, app_id) = (
+                window.title().unwrap_or_default(),
+                window.app_id().unwrap_or_default(),
+            );
+            if handle.title() != title || handle.app_id() != app_id {
+                handle.send_title(&title);
+                handle.send_app_id(&app_id);
+                handle.send_done();
+            }
+        }
+        if self.app_switcher.is_some() {
+            self.refresh_dock();
+        }
+        self.queue_redraw();
+    }
+
+    /// Take `id` off the list: it has closed.
+    fn withdraw_toplevel(&mut self, id: WindowId) {
+        if let Some(handle) = self.foreign_handles.remove(&id) {
+            self.foreign_toplevel_list.remove_toplevel(&handle);
+        }
+    }
+}
+
 impl IdleInhibitHandler for Huginn {
     fn inhibit(&mut self, surface: WlSurface) {
         self.inhibitors.push(surface);
@@ -6111,7 +6391,8 @@ pub(crate) enum KeyboardOn {
     Panel,
     /// A layer surface has it because it asked for it and its layer allows it.
     ExclusivePanel,
-    /// The gesture application switcher is open; no client receives keys.
+    /// The application switcher — gesture or Alt-Tab — is open; no client
+    /// receives keys.
     Switcher,
     /// The session is locked, and the lock screen has it. Nothing else can.
     Lock,

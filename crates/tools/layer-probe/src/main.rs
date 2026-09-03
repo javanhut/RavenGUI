@@ -29,6 +29,9 @@
 //!   surface once it has drawn. The compositor logs whether it honours it,
 //!   and `--cycle` shows the inhibitor stop counting while the probe is
 //!   unmapped.
+//! - **The window list.** `--list` binds `ext_foreign_toplevel_list_v1` and
+//!   prints every window as it is announced, retitled and closed — what a
+//!   bar or a switcher written outside the compositor would see.
 //!
 //! # Running it
 //!
@@ -59,6 +62,10 @@ mod linux {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use smithay_client_toolkit::reexports::protocols::ext::foreign_toplevel_list::v1::client::{
+        ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+        ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+    };
     use smithay_client_toolkit::reexports::protocols::wp::idle_inhibit::zv1::client::{
         zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
         zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
@@ -84,7 +91,7 @@ mod linux {
         shm::{Shm, ShmHandler, slot::SlotPool},
     };
     use wayland_client::{
-        Connection, Dispatch, QueueHandle,
+        Connection, Dispatch, Proxy, QueueHandle, event_created_child,
         globals::{GlobalList, registry_queue_init},
         protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     };
@@ -108,6 +115,9 @@ mod linux {
         /// Hold the idle lock off through `zwp_idle_inhibit_manager_v1`
         /// while the probe is mapped, to see the compositor honour it.
         inhibit: bool,
+        /// Bind `ext_foreign_toplevel_list_v1` and print the window list as
+        /// it changes.
+        list: bool,
     }
 
     impl Default for Args {
@@ -124,6 +134,7 @@ mod linux {
                 exclusive: -1,
                 cycle: None,
                 inhibit: false,
+                list: false,
             }
         }
     }
@@ -139,6 +150,7 @@ mod linux {
   --exclusive N   pixels to reserve, 0 for none         (default: same as size)
   --cycle N       unmap and remap every N seconds       (default: never)
   --inhibit       hold the idle lock off while mapped   (default: no)
+  --list          print the window list as it changes   (default: no)
 
 Esc exits."
         );
@@ -181,6 +193,7 @@ Esc exits."
                     args.vertical = vertical;
                 }
                 "--inhibit" => args.inhibit = true,
+                "--list" => args.list = true,
                 "--size" => args.thickness = value().parse().unwrap_or_else(|_| usage()),
                 "--exclusive" => {
                     args.exclusive = value().parse().unwrap_or_else(|_| usage());
@@ -246,9 +259,18 @@ Esc exits."
                 .expect("zwp_idle_inhibit_manager_v1 — this compositor has no idle inhibit")
         });
 
+        // Bound and then simply kept: every window arrives as an event.
+        let window_list: Option<ExtForeignToplevelListV1> = args.list.then(|| {
+            globals
+                .bind(&qh, 1..=1, ())
+                .expect("ext_foreign_toplevel_list_v1 — this compositor has no window list")
+        });
+
         let mut probe = Probe {
             inhibit_manager,
             inhibitor: None,
+            window_list,
+            windows: std::collections::HashMap::new(),
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
             output_state: OutputState::new(&globals, &qh),
@@ -304,6 +326,11 @@ Esc exits."
         /// screen.
         inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
         inhibitor: Option<ZwpIdleInhibitorV1>,
+        /// `--list`: the window list, held so the compositor keeps sending,
+        /// and what each window has said about itself so far.
+        #[allow(dead_code)]
+        window_list: Option<ExtForeignToplevelListV1>,
+        windows: std::collections::HashMap<wayland_client::backend::ObjectId, (String, String)>,
         registry_state: RegistryState,
         seat_state: SeatState,
         output_state: OutputState,
@@ -657,6 +684,60 @@ Esc exits."
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
+        }
+    }
+
+    impl Dispatch<ExtForeignToplevelListV1, ()> for Probe {
+        fn event(
+            probe: &mut Self,
+            _: &ExtForeignToplevelListV1,
+            event: ext_foreign_toplevel_list_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } => {
+                    probe
+                        .windows
+                        .insert(toplevel.id(), (String::new(), String::new()));
+                }
+                ext_foreign_toplevel_list_v1::Event::Finished => {
+                    println!("list: finished — the compositor withdrew the list");
+                }
+                _ => {}
+            }
+        }
+
+        event_created_child!(Probe, ExtForeignToplevelListV1, [
+            ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE => (ExtForeignToplevelHandleV1, ()),
+        ]);
+    }
+
+    impl Dispatch<ExtForeignToplevelHandleV1, ()> for Probe {
+        fn event(
+            probe: &mut Self,
+            handle: &ExtForeignToplevelHandleV1,
+            event: ext_foreign_toplevel_handle_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            let id = handle.id();
+            let entry = probe.windows.entry(id.clone()).or_default();
+            match event {
+                ext_foreign_toplevel_handle_v1::Event::Title { title } => entry.0 = title,
+                ext_foreign_toplevel_handle_v1::Event::AppId { app_id } => entry.1 = app_id,
+                ext_foreign_toplevel_handle_v1::Event::Done => {
+                    println!("list: window {id} is {:?} ({:?})", entry.0, entry.1);
+                }
+                ext_foreign_toplevel_handle_v1::Event::Closed => {
+                    println!("list: window {id} closed");
+                    probe.windows.remove(&id);
+                    handle.destroy();
+                }
+                _ => {}
+            }
         }
     }
 

@@ -69,8 +69,11 @@ impl Item {
         }
     }
 
+    /// The launcher button: no application and no window. A window tile
+    /// whose application has no desktop entry is not it, though it too has
+    /// no entry — see [`alt_tab_items`].
     pub(crate) const fn is_launcher(&self) -> bool {
-        self.entry.is_none()
+        self.entry.is_none() && self.window.is_none()
     }
 }
 
@@ -232,6 +235,27 @@ pub(crate) fn window_items(apps: &[Entry], windows: &[(WindowId, String)]) -> Ve
         }
     }
     items
+}
+
+/// Build the Alt-Tab strip: one tile per window, in the order given, and no
+/// launcher button.
+///
+/// The order is the caller's — most recently focused first — and is kept,
+/// since the whole point of the strip is that the first tile is the window
+/// you were just in. Unlike [`window_items`] a window whose `app_id` matches
+/// no installed application keeps its tile: the strip exists to reach every
+/// window, and a tile with no icon still has a caption to name it.
+pub(crate) fn alt_tab_items(apps: &[Entry], windows: &[(WindowId, Option<String>)]) -> Vec<Item> {
+    windows
+        .iter()
+        .map(|(id, app_id)| Item {
+            entry: app_id
+                .as_deref()
+                .and_then(|app_id| apps.iter().position(|entry| matches(entry, app_id))),
+            running: true,
+            window: Some(*id),
+        })
+        .collect()
 }
 
 /// The dock's visibility, and what the pointer is doing about it.
@@ -465,6 +489,11 @@ pub(crate) fn render(
             // Drawn rather than themed: the launcher is not an installed
             // application and has no `.desktop` file to take an icon from.
             draw_launcher_glyph(&mut canvas, x, gap, icon, scale);
+        } else if item.entry.is_none() {
+            // A window of an application with no desktop entry, in the
+            // Alt-Tab strip: nothing to take an icon from, so a plain
+            // window shape stands in. Its caption says what it is.
+            draw_window_glyph(&mut canvas, x, gap, icon, scale);
         } else if let Some(pixmap) = item
             .entry
             .and_then(|i| apps.get(i))
@@ -697,6 +726,61 @@ fn draw_launcher_glyph(canvas: &mut Canvas, x: f32, y: f32, size: f32, scale: f3
     }
 }
 
+/// A window with no icon of its own: a rounded outline with a bar across the
+/// top, in the body text colour at half strength — plainly a window, plainly
+/// not an application icon.
+fn draw_window_glyph(canvas: &mut Canvas, x: f32, y: f32, size: f32, scale: f32) {
+    let inset = size * 0.18;
+    let (w, h) = (size - inset * 2.0, size - inset * 2.0);
+    let line = (2.0 * scale).max(1.5);
+    let colour = crate::theme::TEXT.with_alpha(0x80);
+    let radius = (3.0 * scale).max(2.0);
+    let (left, top) = (x + inset, y + inset);
+    // Four edges rather than a filled shape, so it reads as a frame.
+    canvas.fill_rounded(
+        left as usize,
+        top as usize,
+        w as usize,
+        line as usize,
+        radius,
+        colour,
+    );
+    canvas.fill_rounded(
+        left as usize,
+        (top + h - line) as usize,
+        w as usize,
+        line as usize,
+        radius,
+        colour,
+    );
+    canvas.fill_rounded(
+        left as usize,
+        top as usize,
+        line as usize,
+        h as usize,
+        radius,
+        colour,
+    );
+    canvas.fill_rounded(
+        (left + w - line) as usize,
+        top as usize,
+        line as usize,
+        h as usize,
+        radius,
+        colour,
+    );
+    // The title bar, a little way down from the top edge.
+    let bar = (line * 1.5).max(2.0);
+    canvas.fill_rounded(
+        left as usize,
+        (top + line * 2.0) as usize,
+        w as usize,
+        bar as usize,
+        0.0,
+        colour,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +928,39 @@ mod tests {
         let items = items(&apps(), &["Navigator".to_owned(), "Navigator".to_owned()]);
         let firefoxes = items.iter().filter(|i| i.entry == Some(2)).count();
         assert_eq!(firefoxes, 1);
+    }
+
+    #[test]
+    fn alt_tab_tiles_keep_the_given_order_and_have_no_launcher_button() {
+        let (a, b) = ids();
+        let items = alt_tab_items(
+            &apps(),
+            &[
+                (b, Some("Navigator".to_owned())),
+                (a, Some("raven-terminal".to_owned())),
+            ],
+        );
+        assert_eq!(items.len(), 2, "one tile per window and nothing else");
+        assert!(items.iter().all(|item| !item.is_launcher()));
+        assert_eq!(items[0].window, Some(b), "the caller's order is kept");
+        assert_eq!(items[0].entry, Some(2), "Firefox's tile carries its icon");
+        assert_eq!(items[1].window, Some(a));
+        assert_eq!(items[1].entry, Some(0));
+        assert!(items.iter().all(|item| item.running));
+    }
+
+    #[test]
+    fn alt_tab_keeps_a_window_with_no_desktop_entry() {
+        let (a, _) = ids();
+        let items = alt_tab_items(&apps(), &[(a, Some("mystery".to_owned())), (a, None)]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].entry, None, "no icon to show, but the tile stays");
+        assert_eq!(items[0].window, Some(a));
+        assert!(
+            !items[0].is_launcher(),
+            "an icon-less window tile is not the launcher button"
+        );
+        assert!(Item::launcher().is_launcher());
     }
 
     #[test]

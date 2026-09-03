@@ -21,7 +21,7 @@ protocol a client speaks, not a file it edits.
 | A panel that takes typing | `keyboard_interactivity` | Works |
 | Workspace indicators | `raven_shell_v1` | Works |
 | An ordinary application window | `xdg-shell` | Works |
-| A task switcher or window list | foreign-toplevel | **Not implemented** |
+| A task switcher or window list | `ext-foreign-toplevel-list-v1` | Works, read-only: titles and app ids, no activating or closing from outside |
 | Replacing the launcher or dock | role claiming | **Not designed in** |
 | Reading the desktop's accent colour | appearance protocol | **Not implemented** |
 
@@ -164,6 +164,7 @@ client cannot receive or override them:
 | `Super+Ctrl+E` / `T` | open a terminal |
 | `Super+Ctrl+Q` / `X` | close the focused window |
 | `Super+Ctrl+J` / `K` | focus the next / previous window |
+| `Alt+Tab` / `Alt+Shift+Tab` | the window switcher: every window, most recently focused first, across every workspace; letting go of `Alt` goes to the highlighted one |
 | `Super+Ctrl+arrows` | move the focused window between tiles |
 | `Super+Ctrl+Return` | swap the focused window into the first tile |
 | `Super+Ctrl+C` | open or accept the workspace carousel |
