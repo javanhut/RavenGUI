@@ -69,10 +69,10 @@ impl Motion {
 /// want: long enough to read a page, short enough to matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum IdleAfter {
-    /// Never lock on idle. For a machine giving a presentation, or playing a
-    /// film — there is no idle-inhibit protocol here, so a video is
-    /// indistinguishable from an empty room and this is the only way to say
-    /// which it is.
+    /// Never lock on idle. For what nothing asks on behalf of: a slide left
+    /// up, a page being read across the room. A client that is playing
+    /// something holds the lock off itself, through idle-inhibit, for as
+    /// long as its window is on screen — a film needs no help here.
     Off,
     Minutes5,
     #[default]

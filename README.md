@@ -382,11 +382,18 @@ also restarts the idle count, so a lock screen that cannot run costs a real
 session one blank per idle period rather than one per minute.
 
 "Lock when idle" in quick settings steps that between 5, 10, 15 and 30 minutes
-and off, and it is the only way to hold it off — there is no
-`idle-inhibit-unstable-v1` here, so a full-screen film is indistinguishable
-from an empty room. Off is placed after the longest wait and before the
-shortest, so stepping the row to lengthen the timeout never passes through
-"never lock" on the way.
+and off. Off is placed after the longest wait and before the shortest, so
+stepping the row to lengthen the timeout never passes through "never lock" on
+the way. A client that is playing something does not need the row: it binds
+`zwp_idle_inhibit_manager_v1` and holds the lock off itself, which is
+honoured for as long as the inhibiting surface is on screen — a window that
+has drawn, on a workspace some screen shows, not put away in the dock. A film
+minimized or left on another workspace is not being watched, whatever its
+player says. When the last honoured inhibitor goes, the idle count starts from
+then, since a film that has just ended was being watched up to that moment;
+and one that goes without a request — the player crashed, the window was put
+away — is noticed by the timer's next tick, at most a minute late, which only
+ever delays the lock.
 
 The last row is "Power", which suspends, powers off or reboots the machine by
 sending one word to raven-powerd's control socket — the desktop gets a verb

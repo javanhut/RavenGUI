@@ -418,20 +418,17 @@ pub(crate) fn run() -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("session source: {e}"))?;
 
-    // Suspend. seatd has no equivalent of logind's PrepareForSleep, so this
-    // arrives as a change to a file raven-init writes; see `crate::sleep`.
-    // Nothing paused the session on the way into the suspend, which is exactly
-    // why the recovery has to be the heavier one: we still hold DRM master over
-    // a device whose state the firmware has been through, and only a full
-    // modeset can be trusted to put a picture back on the panel.
     // The idle lock. Its own timer rather than a check inside the frame loop:
     // an idle session draws no frames at all, so a check that ran per frame
     // would never run once the desktop went quiet -- which is precisely when
-    // it is supposed to fire.
+    // it is supposed to fire. Each tick first settles the inhibitors, so an
+    // inhibitor that went away without a request -- its client crashed, its
+    // window was put away -- is noticed here, at most one tick late.
     let idle_timer = Timer::from_duration(Duration::from_secs(60));
     handle
         .insert_source(idle_timer, |_, _, data: &mut Udev| {
             let now = Instant::now();
+            data.state.settle_idle_inhibit(now);
             if data.state.idle_lock_due(now) {
                 tracing::info!("idle; locking the session");
                 data.lock_session();
@@ -440,6 +437,12 @@ pub(crate) fn run() -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("idle timer: {e}"))?;
 
+    // Suspend. seatd has no equivalent of logind's PrepareForSleep, so this
+    // arrives as a change to a file raven-init writes; see `crate::sleep`.
+    // Nothing paused the session on the way into the suspend, which is exactly
+    // why the recovery has to be the heavier one: we still hold DRM master over
+    // a device whose state the firmware has been through, and only a full
+    // modeset can be trusted to put a picture back on the panel.
     crate::sleep::watch::<Udev, _>(&handle, move |data: &mut Udev| {
         // Locked *before* the display comes back, and that ordering is the
         // whole security of it. `reclaim_display` is what puts the next frame

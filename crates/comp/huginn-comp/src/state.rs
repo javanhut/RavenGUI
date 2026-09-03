@@ -34,8 +34,9 @@ use smithay::{
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_fractional_scale,
-    delegate_layer_shell, delegate_output, delegate_seat, delegate_session_lock, delegate_shm,
-    delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_seat,
+    delegate_session_lock, delegate_shm, delegate_viewporter, delegate_xdg_decoration,
+    delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -58,13 +59,14 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, with_states,
+            SurfaceAttributes, get_parent, with_states,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
+        idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
@@ -392,6 +394,21 @@ pub(crate) struct Huginn {
     /// and clients would lose their output information mid-session.
     #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
+    /// `zwp_idle_inhibit_manager_v1`. Held, not read: dropping it withdraws
+    /// the global. What a video player binds to keep the idle lock off while
+    /// something is playing; see [`Huginn::idle_inhibited`].
+    #[allow(dead_code)]
+    pub idle_inhibit_state: IdleInhibitManagerState,
+    /// The surfaces holding the idle lock off, one entry per inhibitor. A
+    /// list rather than a set because a client may create two inhibitors for
+    /// one surface and destroy them one at a time, which a set would get
+    /// wrong. Honoured only while the surface is on screen. Not pruned when
+    /// a client dies — smithay reports only an explicit destroy — so a dead
+    /// surface is skipped by `is_alive` and swept by the idle timer.
+    inhibitors: Vec<WlSurface>,
+    /// Whether the idle timer last found an inhibitor honoured, so the tick
+    /// after the last one goes can start the idle count from there.
+    last_inhibited: bool,
     /// `ext_session_lock_manager_v1`. What `raven-lock` binds to hold the
     /// session.
     pub session_lock_state: SessionLockManagerState,
@@ -882,6 +899,9 @@ impl Huginn {
             // their windows. A filter that cannot distinguish them would be a
             // check that looks like security and is not.
             session_lock_state: SessionLockManagerState::new::<Self, _>(dh, |_| true),
+            idle_inhibit_state: IdleInhibitManagerState::new::<Self>(dh),
+            inhibitors: Vec::new(),
+            last_inhibited: false,
             lock: None,
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
@@ -1744,9 +1764,72 @@ impl Huginn {
         idle_due(
             self.greeter,
             self.is_locked(),
+            self.idle_inhibited(),
             self.settings.idle_after().duration(),
             now.saturating_duration_since(self.last_input),
         )
+    }
+
+    /// Whether a client is holding the idle lock off from something on
+    /// screen: a film playing, a slide up, a game running.
+    ///
+    /// On screen is the whole test. An inhibitor is a client saying "this
+    /// window is being watched", and a window nobody can see — put away in
+    /// the dock, on a workspace no screen shows, or belonging to a client
+    /// that has gone — is not being watched whatever its owner says.
+    pub(crate) fn idle_inhibited(&self) -> bool {
+        self.inhibitors
+            .iter()
+            .any(|surface| surface.is_alive() && self.surface_shown(surface))
+    }
+
+    /// Whether `surface` is something somebody can see.
+    ///
+    /// A toplevel: one that has drawn, on a workspace some screen shows, and
+    /// not minimized. A layer surface or a popup: while it has a buffer.
+    /// Walks up to the root first, since a player may hang its inhibitor on
+    /// the subsurface its video is actually in.
+    fn surface_shown(&self, surface: &WlSurface) -> bool {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if let Some(id) = self
+            .windows
+            .iter()
+            .find(|(_, w)| w.wl_surface().as_ref() == Some(&root))
+            .map(|(id, _)| *id)
+        {
+            return self.mapped.contains(&id)
+                && self.visible_window_ids().contains(&id)
+                && self
+                    .space
+                    .window(id)
+                    .is_some_and(|window| !window.is_minimized());
+        }
+        if self.layers.iter().any(|(l, _, _)| l.wl_surface() == &root) {
+            return has_buffer(&root);
+        }
+        if self.popups.find_popup(&root).is_some() {
+            return has_buffer(&root);
+        }
+        false
+    }
+
+    /// The idle timer's bookkeeping: sweep inhibitors whose surface has
+    /// gone, and if the last honoured one went away since the previous tick,
+    /// count idleness from now. Inhibiting was presence — a film that has
+    /// just ended has been watched up to this moment, not since before it
+    /// started — and this is what notices the transitions no request
+    /// announces: a client crashing, a window put away, a workspace switched
+    /// away from. At worst a tick late, which only ever delays the lock.
+    pub(crate) fn settle_idle_inhibit(&mut self, now: Instant) {
+        self.inhibitors.retain(WlSurface::is_alive);
+        let inhibited = self.idle_inhibited();
+        if self.last_inhibited && !inhibited {
+            self.last_input = now;
+        }
+        self.last_inhibited = inhibited;
     }
 
     /// How long until [`Self::idle_lock_due`] is worth asking again.
@@ -1760,6 +1843,7 @@ impl Huginn {
     pub(crate) fn idle_check_in(&self, now: Instant) -> std::time::Duration {
         idle_wait(
             self.is_locked(),
+            self.idle_inhibited(),
             self.settings.idle_after().duration(),
             now.saturating_duration_since(self.last_input),
         )
@@ -5252,10 +5336,7 @@ impl CompositorHandler for Huginn {
             .map(|(id, _)| *id);
         let unmapping = with_states(surface, |states| {
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-            matches!(
-                attributes.current().buffer,
-                Some(BufferAssignment::Removed)
-            )
+            matches!(attributes.current().buffer, Some(BufferAssignment::Removed))
         });
         if unmapping && let Some(id) = window {
             self.begin_close_ghost(id);
@@ -5523,8 +5604,16 @@ impl Huginn {
                 crate::decor::DecorMode::Server
             },
         );
-        let content = self.space.window(id).map(huginn_core::window::Window::content);
-        tracing::debug!(window = id.raw(), ?granted, ?content, "decoration configure");
+        let content = self
+            .space
+            .window(id)
+            .map(huginn_core::window::Window::content);
+        tracing::debug!(
+            window = id.raw(),
+            ?granted,
+            ?content,
+            "decoration configure"
+        );
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(granted);
             if let Some(content) = content {
@@ -5953,6 +6042,29 @@ impl SessionLockHandler for Huginn {
 
 delegate_session_lock!(Huginn);
 
+impl IdleInhibitHandler for Huginn {
+    fn inhibit(&mut self, surface: WlSurface) {
+        self.inhibitors.push(surface);
+        tracing::debug!(
+            honoured = self.idle_inhibited(),
+            held = self.inhibitors.len(),
+            "idle inhibitor created"
+        );
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        if let Some(at) = self.inhibitors.iter().position(|s| *s == surface) {
+            self.inhibitors.remove(at);
+        }
+        // Inhibiting counted as presence, so the idle count starts over now
+        // rather than from whenever the keyboard was last touched.
+        self.note_activity();
+        tracing::debug!("idle inhibitor destroyed");
+    }
+}
+
+delegate_idle_inhibit!(Huginn);
+
 delegate_layer_shell!(Huginn);
 
 /// XWayland associating an X11 window with a Wayland surface.
@@ -6026,6 +6138,7 @@ fn hosting_greeter() -> bool {
 fn idle_due(
     greeter: bool,
     locked: bool,
+    inhibited: bool,
     after: Option<std::time::Duration>,
     idle: std::time::Duration,
 ) -> bool {
@@ -6039,24 +6152,32 @@ fn idle_due(
     if locked {
         return false;
     }
+    // A client is holding the lock off from something on screen. A film is
+    // not an empty room, whatever the keyboard says.
+    if inhibited {
+        return false;
+    }
     after.is_some_and(|after| idle >= after)
 }
 
 /// How long until [`idle_due`] is worth asking again.
 fn idle_wait(
     locked: bool,
+    inhibited: bool,
     after: Option<std::time::Duration>,
     idle: std::time::Duration,
 ) -> std::time::Duration {
     /// Long enough to cost nothing, short enough that turning the setting back
-    /// on takes effect while somebody is still sitting there. Used for the two
+    /// on takes effect while somebody is still sitting there. Used for the
     /// cases with nothing to count down to.
     const NOTHING_TO_COUNT: std::time::Duration = std::time::Duration::from_secs(60);
     /// Never reschedule tighter than this. A zero-length timer that keeps
     /// finding itself due would spin the event loop at full tilt.
     const FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
 
-    if locked {
+    // Inhibited counts as nothing to count: the coarse poll is also what
+    // notices an inhibitor going away with no request behind it.
+    if locked || inhibited {
         return NOTHING_TO_COUNT;
     }
     match after {
@@ -6475,21 +6596,51 @@ mod idle_tests {
 
     #[test]
     fn a_session_locks_once_it_has_been_idle_long_enough() {
-        assert!(!idle_due(false, false, AFTER, Duration::from_secs(599)));
-        assert!(idle_due(false, false, AFTER, Duration::from_secs(600)));
-        assert!(idle_due(false, false, AFTER, Duration::from_secs(6000)));
+        assert!(!idle_due(
+            false,
+            false,
+            false,
+            AFTER,
+            Duration::from_secs(599)
+        ));
+        assert!(idle_due(
+            false,
+            false,
+            false,
+            AFTER,
+            Duration::from_secs(600)
+        ));
+        assert!(idle_due(
+            false,
+            false,
+            false,
+            AFTER,
+            Duration::from_secs(6000)
+        ));
     }
 
     #[test]
     fn off_never_locks_however_long_it_sits() {
-        assert!(!idle_due(false, false, None, Duration::from_secs(86_400)));
+        assert!(!idle_due(
+            false,
+            false,
+            false,
+            None,
+            Duration::from_secs(86_400)
+        ));
     }
 
     /// Otherwise every tick past the timeout starts another lock screen on top
     /// of the one already holding the session.
     #[test]
     fn an_already_locked_session_is_never_due() {
-        assert!(!idle_due(false, true, AFTER, Duration::from_secs(6000)));
+        assert!(!idle_due(
+            false,
+            true,
+            false,
+            AFTER,
+            Duration::from_secs(6000)
+        ));
     }
 
     /// The login screen sits untouched for far longer than any timeout, and
@@ -6497,13 +6648,67 @@ mod idle_tests {
     /// blanks the greeter for the claim timeout, once a minute, for ever.
     #[test]
     fn the_login_screen_is_never_due() {
-        assert!(!idle_due(true, false, AFTER, Duration::from_secs(6000)));
+        assert!(!idle_due(
+            true,
+            false,
+            false,
+            AFTER,
+            Duration::from_secs(6000)
+        ));
+    }
+
+    /// A film is not an empty room: while a client on screen holds the lock
+    /// off, no amount of untouched keyboard makes the session due.
+    #[test]
+    fn an_inhibited_session_is_never_due() {
+        assert!(!idle_due(
+            false,
+            false,
+            true,
+            AFTER,
+            Duration::from_secs(6000)
+        ));
+        assert!(idle_due(
+            false,
+            false,
+            false,
+            AFTER,
+            Duration::from_secs(6000)
+        ));
+    }
+
+    /// While inhibited there is nothing to count down to, and the coarse poll
+    /// is what notices an inhibitor that went away without saying so.
+    #[test]
+    fn an_inhibited_session_polls_coarsely() {
+        assert_eq!(
+            idle_wait(false, true, AFTER, Duration::from_secs(5)),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// The lock outranks the inhibitor both ways: an inhibitor cannot unlock
+    /// a session, and a locked session polls coarsely whether or not one is
+    /// held.
+    #[test]
+    fn the_inhibitor_does_not_outrank_the_lock() {
+        assert!(!idle_due(
+            false,
+            true,
+            true,
+            AFTER,
+            Duration::from_secs(6000)
+        ));
+        assert_eq!(
+            idle_wait(true, true, AFTER, Duration::from_secs(5)),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
     fn the_next_check_is_the_time_that_is_left() {
         assert_eq!(
-            idle_wait(false, AFTER, Duration::from_secs(60)),
+            idle_wait(false, false, AFTER, Duration::from_secs(60)),
             Duration::from_secs(540)
         );
     }
@@ -6514,7 +6719,7 @@ mod idle_tests {
     #[test]
     fn the_next_check_never_comes_back_instantly() {
         for idle in [600, 601, 100_000] {
-            let wait = idle_wait(false, AFTER, Duration::from_secs(idle));
+            let wait = idle_wait(false, false, AFTER, Duration::from_secs(idle));
             assert!(
                 wait >= Duration::from_secs(1),
                 "rescheduled in {wait:?} at {idle}s idle"
@@ -6527,7 +6732,13 @@ mod idle_tests {
     #[test]
     fn nothing_to_count_still_checks_back() {
         let coarse = Duration::from_secs(60);
-        assert_eq!(idle_wait(false, None, Duration::from_secs(5)), coarse);
-        assert_eq!(idle_wait(true, AFTER, Duration::from_secs(5)), coarse);
+        assert_eq!(
+            idle_wait(false, false, None, Duration::from_secs(5)),
+            coarse
+        );
+        assert_eq!(
+            idle_wait(true, false, AFTER, Duration::from_secs(5)),
+            coarse
+        );
     }
 }

@@ -25,6 +25,10 @@
 //! - **The exclusive zone.** Space is reserved only while something is on
 //!   screen, so the tiled windows behind this should grow into the strip while
 //!   it is unmapped and give it back when it returns.
+//! - **Idle inhibit.** `--inhibit` creates a `zwp_idle_inhibitor_v1` on the
+//!   surface once it has drawn. The compositor logs whether it honours it,
+//!   and `--cycle` shows the inhibitor stop counting while the probe is
+//!   unmapped.
 //!
 //! # Running it
 //!
@@ -55,6 +59,10 @@ mod linux {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use smithay_client_toolkit::reexports::protocols::wp::idle_inhibit::zv1::client::{
+        zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+        zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+    };
     use smithay_client_toolkit::{
         compositor::{CompositorHandler, CompositorState},
         delegate_registry,
@@ -76,8 +84,8 @@ mod linux {
         shm::{Shm, ShmHandler, slot::SlotPool},
     };
     use wayland_client::{
-        Connection, QueueHandle,
-        globals::registry_queue_init,
+        Connection, Dispatch, QueueHandle,
+        globals::{GlobalList, registry_queue_init},
         protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     };
 
@@ -97,6 +105,9 @@ mod linux {
         thickness: u32,
         exclusive: i32,
         cycle: Option<Duration>,
+        /// Hold the idle lock off through `zwp_idle_inhibit_manager_v1`
+        /// while the probe is mapped, to see the compositor honour it.
+        inhibit: bool,
     }
 
     impl Default for Args {
@@ -112,6 +123,7 @@ mod linux {
                 thickness: 64,
                 exclusive: -1,
                 cycle: None,
+                inhibit: false,
             }
         }
     }
@@ -126,6 +138,7 @@ mod linux {
   --size N        thickness in pixels                   (default 64)
   --exclusive N   pixels to reserve, 0 for none         (default: same as size)
   --cycle N       unmap and remap every N seconds       (default: never)
+  --inhibit       hold the idle lock off while mapped   (default: no)
 
 Esc exits."
         );
@@ -167,6 +180,7 @@ Esc exits."
                     args.anchor = anchor;
                     args.vertical = vertical;
                 }
+                "--inhibit" => args.inhibit = true,
                 "--size" => args.thickness = value().parse().unwrap_or_else(|_| usage()),
                 "--exclusive" => {
                     args.exclusive = value().parse().unwrap_or_else(|_| usage());
@@ -225,7 +239,16 @@ Esc exits."
 
         let pool = SlotPool::new(1920 * 64 * 4, &shm).expect("shm pool");
 
+        // The inhibitor is created once the probe has drawn, since the
+        // compositor honours one only for a surface that is on screen.
+        let inhibit_manager = args.inhibit.then(|| {
+            bind_idle_inhibit(&globals, &qh)
+                .expect("zwp_idle_inhibit_manager_v1 — this compositor has no idle inhibit")
+        });
+
         let mut probe = Probe {
+            inhibit_manager,
+            inhibitor: None,
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
             output_state: OutputState::new(&globals, &qh),
@@ -268,7 +291,19 @@ Esc exits."
         println!("probe: exiting");
     }
 
+    /// Bind the idle-inhibit manager, if the compositor offers one.
+    fn bind_idle_inhibit(
+        globals: &GlobalList,
+        qh: &QueueHandle<Probe>,
+    ) -> Option<ZwpIdleInhibitManagerV1> {
+        globals.bind(qh, 1..=1, ()).ok()
+    }
+
     struct Probe {
+        /// `--inhibit`: the manager, and the inhibitor once the probe is on
+        /// screen.
+        inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
+        inhibitor: Option<ZwpIdleInhibitorV1>,
         registry_state: RegistryState,
         seat_state: SeatState,
         output_state: OutputState,
@@ -305,7 +340,7 @@ Esc exits."
         /// Paint the band and attach it. Nothing here asks for a frame callback:
         /// an idle probe should leave the compositor idle too, so that a busy
         /// compositor during a run means something.
-        fn draw(&mut self, _qh: &QueueHandle<Self>) {
+        fn draw(&mut self, qh: &QueueHandle<Self>) {
             let (w, h) = (self.width.max(1), self.height.max(1));
             let stride = w as i32 * 4;
             let Ok((buffer, canvas)) =
@@ -334,6 +369,14 @@ Esc exits."
             }
             self.layer.commit();
             self.mapped = true;
+            if let Some(manager) = &self.inhibit_manager
+                && self.inhibitor.is_none()
+            {
+                self.inhibitor = Some(manager.create_inhibitor(self.layer.wl_surface(), qh, ()));
+                println!(
+                    "probe: idle inhibitor created — the session should not lock while this is up"
+                );
+            }
         }
 
         /// Redraw only when there is something to redraw with.
@@ -588,6 +631,32 @@ Esc exits."
     impl ShmHandler for Probe {
         fn shm_state(&mut self) -> &mut Shm {
             &mut self.shm
+        }
+    }
+
+    // Neither idle-inhibit object sends events; the impls exist so the
+    // objects can be created with `()` as their data.
+    impl Dispatch<ZwpIdleInhibitManagerV1, ()> for Probe {
+        fn event(
+            _: &mut Self,
+            _: &ZwpIdleInhibitManagerV1,
+            _: <ZwpIdleInhibitManagerV1 as wayland_client::Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<ZwpIdleInhibitorV1, ()> for Probe {
+        fn event(
+            _: &mut Self,
+            _: &ZwpIdleInhibitorV1,
+            _: <ZwpIdleInhibitorV1 as wayland_client::Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
         }
     }
 

@@ -25,6 +25,7 @@ For how to actually use these, see `docs/integration.md`.
 | `wl_data_device_manager` | clipboard and drag-and-drop |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
 | `ext_session_lock_manager_v1` | locking the session. See below |
+| `zwp_idle_inhibit_manager_v1` | holding the idle lock off. Honoured while the inhibiting surface is on screen — a toplevel that has drawn, on a workspace some screen shows, not minimized; a layer surface or popup while mapped. The idle count restarts when the last honoured inhibitor goes; one that goes without a request (a crashed client, a window put away) is noticed by the idle timer's next tick |
 
 X11 clients work: Huginn spawns XWayland and runs a window manager for it,
 including override-redirect surfaces — menus, tooltips, drag icons — drawn at
@@ -135,7 +136,6 @@ find them in the registry.
 | `pointer-constraints`, `relative-pointer` | No pointer lock or warping. Games and 3D applications cannot capture the cursor. |
 | `wlr-virtual-pointer`, `virtual-keyboard-v1` | No input injection. Remote-desktop and automation tools cannot drive the session. |
 | `ext-idle-notify-v1` | A client cannot be told the session went idle. The compositor locks on its own timer, so auto-lock works — what is missing is any way for *other* software to react to idleness. |
-| `idle-inhibit-unstable-v1` | A client cannot hold the idle lock off. A full-screen video is indistinguishable from an empty room, so a film longer than the timeout locks the screen mid-play. The way out is the "Lock when idle" row in quick settings, which is a person saying what a protocol would otherwise have said for them. |
 | `tablet-v2` | Graphics tablets are not routed. |
 | `single-pixel-buffer-v1`, `content-type-v1`, `alpha-modifier-v1` | Minor optimisations unavailable. |
 | `drm-lease-v1` | No direct-lease VR headsets. |

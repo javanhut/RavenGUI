@@ -315,15 +315,27 @@ mod tests {
         assert_eq!(small, Rect::from_xywh(200, 275, 200, 150));
         assert_eq!(small.center(), rect.center());
         assert_eq!(scale_about_centre(rect, 1.0), rect);
-        assert_eq!(scale_about_centre(rect, 0.0).w(), 1, "never collapses to nothing");
+        assert_eq!(
+            scale_about_centre(rect, 0.0).w(),
+            1,
+            "never collapses to nothing"
+        );
     }
 
     #[test]
     fn appearing_starts_small_and_faint_and_ends_exact() {
         let placed = Rect::from_xywh(100, 100, 1000, 500);
         let start = appear(placed, 0.0);
-        assert!((start.scale_x - APPEAR_SCALE).abs() < 0.01, "{}", start.scale_x);
-        assert!((start.scale_y - APPEAR_SCALE).abs() < 0.01, "{}", start.scale_y);
+        assert!(
+            (start.scale_x - APPEAR_SCALE).abs() < 0.01,
+            "{}",
+            start.scale_x
+        );
+        assert!(
+            (start.scale_y - APPEAR_SCALE).abs() < 0.01,
+            "{}",
+            start.scale_y
+        );
         assert_eq!(start.alpha, 0.0);
         assert_eq!(appear_rect(placed, 0.0).center(), placed.center());
 
