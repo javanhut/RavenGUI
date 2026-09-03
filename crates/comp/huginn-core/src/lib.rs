@@ -1006,6 +1006,26 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_inset_does_not_change_what_arrange_reports() {
+        let mut s = space();
+        let a = s.open_window();
+        s.open_window();
+        s.arrange();
+        let pane = s.window(a).expect("open").geometry;
+
+        s.window_mut(a).expect("open").frame_top = 30;
+        assert!(
+            s.arrange().is_empty(),
+            "the frame is the window's own business, not the layout's"
+        );
+        let w = s.window(a).expect("open");
+        assert_eq!(w.geometry, pane, "the pane is unchanged");
+        assert_eq!(w.content().h(), pane.h() - 30);
+        assert_eq!(w.content().y(), pane.y() + 30);
+        assert_eq!(w.content().w(), pane.w());
+    }
+
+    #[test]
     fn tiled_windows_stay_inside_the_area() {
         let mut s = space();
         for _ in 0..5 {

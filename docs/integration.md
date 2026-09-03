@@ -309,6 +309,27 @@ cannot be told apart from a terminal that advertises none. Set an `app_id`.
 A focused layer surface never owns `Super`: a namespace is not an `app_id`, and
 a panel is not a terminal.
 
+## Title bars
+
+Huginn decorates windows that ask it to. Bind `zxdg_decoration_manager_v1`,
+create a `zxdg_toplevel_decoration_v1` for your toplevel, and the compositor
+draws a bar above your content — the title on the left, a close button on the
+right, in the desktop's own palette — and configures you to the pane less that
+bar. Request `client_side` on the same object and you keep the whole pane and
+draw your own. There is no dragging: the layout owns where a window goes, so
+the bar is a label and a close button and nothing more. A fullscreen window has
+no bar.
+
+A toplevel that never creates a decoration object is client-side, which is what
+the protocol says and what GTK 4 and Firefox do: they draw their own header bar
+and get no second one from the compositor. GLFW, SDL and Qt create the object
+and get the compositor's bar. An X11 window gets the bar unless its Motif hints
+say the client decorates itself.
+
+The bar is the compositor's, so a click on it never reaches you. A press on the
+bar focuses the window; the primary button on the close button sends
+`xdg_toplevel.close`, which you are free to answer with a save dialog.
+
 ## Matching the desktop
 
 Raven ships one look and it is compiled into the compositor. There is no theming
@@ -324,6 +345,7 @@ has to carry the same values:
 | Secondary text | `#8A8AA0` |
 | Gutter between tiles and at the screen edge | 8 px |
 | Focus ring thickness | 2 px |
+| Title bar height, for a window the compositor decorates | 30 px |
 | Icon theme | `breeze-dark` |
 
 Copying these into your binary means they can drift from the compositor's, which

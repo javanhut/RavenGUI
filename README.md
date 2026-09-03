@@ -417,6 +417,18 @@ The compositor runs on a calloop event loop — listening socket, display poll
 fd, and winit all as event sources — and renders only on damage, so an idle
 session costs ~0.2% of one core.
 
+Windows that ask for it are decorated by the compositor: a bar above the
+content in the desktop's own palette, with the title and a close button, and
+nothing else, since the layout owns placement. "Ask" is `zxdg_decoration_manager_v1`
+— a toplevel that creates a decoration object and does not insist on
+`client_side` gets the bar and is configured to the pane less it; one that
+never binds the global is client-side, as the protocol says, which is what GTK
+and Firefox do and why they get no second bar over their own. X11 windows get
+the bar unless their Motif hints say otherwise. The inset is
+`huginn_core::window::Window::frame_top`, the pixels and hit-testing are
+`huginn-comp/src/decor.rs`, and the bar is recomposed only when its title,
+width, density or focus changes.
+
 Not done yet, roughly in the order they matter:
 
 - **SIGTERM handling** — calloop's signal source needs its `signals` feature,

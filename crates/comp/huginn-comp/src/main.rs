@@ -23,6 +23,8 @@ mod blur;
 mod canvas;
 mod configwatch;
 #[cfg(target_os = "linux")]
+mod decor;
+#[cfg(target_os = "linux")]
 mod desktop_config;
 mod dmabuf;
 #[cfg(target_os = "linux")]

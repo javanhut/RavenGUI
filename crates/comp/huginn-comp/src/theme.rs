@@ -103,6 +103,23 @@ pub(crate) const TEXT_DIM: Color = Color::from_argb(0xFF8A_8AA0);
 /// Two is enough to see at a glance and thin enough to sit inside [`GAP`].
 pub(crate) const FOCUS_RING_WIDTH: i32 = 2;
 
+/// Height of the title bar the compositor draws for a window that asked for
+/// server-side decorations, in logical pixels. See [`crate::decor`].
+///
+/// Fixed rather than scaled with the screen: it is a layout inset that
+/// `huginn-core` subtracts from a pane, and a pane is measured in logical
+/// pixels whatever the panel's density. The text inside it grows with the
+/// screen the way every other panel's does.
+pub(crate) const TITLE_BAR_HEIGHT: i32 = 30;
+
+/// The title bar's background: the same panel colour as the dock and the
+/// launcher, so a decorated window reads as part of one desktop rather than
+/// as a window wearing somebody else's frame.
+pub(crate) const TITLE_BAR_BG: Color = BACKGROUND;
+
+/// The title's size at 1080p, in logical pixels; scaled with the screen.
+pub(crate) const TITLE_TEXT_SIZE: f32 = 13.0;
+
 /// Space between tiled windows, and between a window and the screen edge.
 ///
 /// Handed to `Space` at startup rather than read by it: `huginn-core` decides
@@ -194,6 +211,7 @@ mod tests {
             ("BORDER", BORDER),
             ("TEXT", TEXT),
             ("TEXT_DIM", TEXT_DIM),
+            ("TITLE_BAR_BG", TITLE_BAR_BG),
         ] {
             assert_eq!(color.to_rgba_bytes()[3], 0xFF, "{name} is not opaque");
         }
