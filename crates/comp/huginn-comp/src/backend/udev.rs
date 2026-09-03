@@ -168,6 +168,13 @@ struct Udev {
     /// claim timeout is the one that needs it.
     handle: LoopHandle<'static, Udev>,
     session: LibSeatSession,
+    /// The libinput context behind the input source. Kept so a session pause
+    /// can be passed on to it: seatd revokes every evdev fd when the seat is
+    /// switched away, and libinput reopens them only when told to resume.
+    /// Without that, a suspend that switches VTs -- the kernel does, with
+    /// `CONFIG_VT_CONSOLE_SLEEP` -- comes back to a lock screen that draws
+    /// but hears no keyboard, and the only way past it is the power button.
+    libinput: Libinput,
     /// The GPU we are driving, as udev identifies it. Every udev event carries
     /// a device id and most of them are about something else.
     device_id: libc::dev_t,
@@ -397,10 +404,17 @@ pub(crate) fn run() -> Result<()> {
     // VT switching. On pause we must drop DRM master and stop touching
     // devices; on activate we take it back and force a full repaint, because
     // whatever was on screen while we were away is not ours.
+    //
+    // Input goes the same way. seatd revokes the evdev fds as the seat is
+    // switched away, and libinput does nothing about that on its own: the
+    // devices sit revoked until `resume` reopens them through the session.
+    // The kernel switches VTs around a suspend, so a resume that skipped this
+    // came back to a lock screen with no keyboard behind it.
     handle
         .insert_source(session_notifier, |event, _, data: &mut Udev| match event {
             SessionEvent::PauseSession => {
                 tracing::info!("session paused; releasing devices");
+                data.libinput.suspend();
                 data.manager.pause();
                 for secondary in data.secondaries.values_mut() {
                     secondary.pause();
@@ -411,6 +425,12 @@ pub(crate) fn run() -> Result<()> {
             }
             SessionEvent::ActivateSession => {
                 tracing::info!("session activated; reclaiming devices");
+                // Input first: if the display cannot be reclaimed the session
+                // is in trouble either way, but a keyboard that works is what
+                // lets somebody type a password at whatever does come up.
+                if data.libinput.resume().is_err() {
+                    tracing::error!("libinput could not reopen the input devices after the pause");
+                }
                 // We dropped DRM master on the way out and the connectors are
                 // as we left them, so there is no need to tear them down first.
                 data.reclaim_display(false);
@@ -475,6 +495,7 @@ pub(crate) fn run() -> Result<()> {
         dh,
         handle: handle.clone(),
         session,
+        libinput,
         device_id: node.dev_id(),
         manager,
         allocator,

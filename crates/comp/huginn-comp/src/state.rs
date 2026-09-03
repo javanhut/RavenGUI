@@ -4090,6 +4090,9 @@ impl Huginn {
             "application list changed"
         );
         self.apps = apps;
+        // Whatever arrived may have brought its icon with it, and a lookup
+        // remembered as a miss from before would keep it invisible.
+        self.icons.forget();
 
         // Order matters. The launcher holds indices into the list that just
         // moved under it, so it has to be re-ranked before anything renders

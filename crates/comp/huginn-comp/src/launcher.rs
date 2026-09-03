@@ -3723,15 +3723,24 @@ pub(crate) fn fit(text: &mut Text, name: &str, size: f32, max_w: f32) -> String 
     if text.measure(name, size).0 <= max_w {
         return name.to_owned();
     }
-    let mut cut: String = name.to_owned();
-    while cut.chars().count() > 1 {
-        cut.pop();
-        let candidate = format!("{}…", cut.trim_end());
-        if text.measure(&candidate, size).0 <= max_w {
-            return candidate;
+    // The longest cut that fits, found by halving: a measurement shapes the
+    // string, and a file name can be sixty characters that would otherwise
+    // be shaped sixty times per row per keystroke.
+    let chars: Vec<char> = name.chars().collect();
+    let cut = |keep: usize| {
+        let head: String = chars[..keep].iter().collect();
+        format!("{}…", head.trim_end())
+    };
+    let (mut fits, mut top) = (0, chars.len().saturating_sub(1));
+    while fits < top {
+        let mid = top - (top - fits) / 2;
+        if text.measure(&cut(mid), size).0 <= max_w {
+            fits = mid;
+        } else {
+            top = mid - 1;
         }
     }
-    "…".to_owned()
+    cut(fits)
 }
 
 #[cfg(test)]
@@ -4414,6 +4423,148 @@ mod render_tests {
         }
         std::fs::write(&path, ppm).expect("writing the dump");
         println!("wrote {}x{} to {path}", canvas.stride, canvas.height);
+    }
+
+    /// `LAUNCHER_TIME=1 [LAUNCHER_QUERY=word] [LAUNCHER_DENSITY=2] cargo test
+    /// --release -p huginn-comp launcher_time -- --nocapture`: type the
+    /// query one character at a time against the real applications and the
+    /// real home index and print what each stage of a keystroke costs.
+    #[test]
+    fn launcher_time() {
+        if std::env::var_os("LAUNCHER_TIME").is_none() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let mut text = Text::new();
+        let apps = scan_applications();
+        println!("scan_applications: {:?} ({} apps)", t.elapsed(), apps.len());
+        let now = 0;
+        let frecency = Frecency::default();
+        let mut launcher = Launcher::default();
+        if let Some(home) = std::env::var_os("HOME") {
+            let t = std::time::Instant::now();
+            let index = FileIndex::build(
+                std::path::Path::new(&home),
+                raven_desktop::files::Limits::default(),
+            );
+            println!(
+                "FileIndex::build: {:?} ({} files)",
+                t.elapsed(),
+                index.len()
+            );
+            launcher.set_files(std::sync::Arc::new(index));
+        }
+        let density: u32 = std::env::var("LAUNCHER_DENSITY")
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(1);
+        let output = Rect::from_xywh(0, 0, 1920, 1080);
+        let icons = Icons::discover(
+            &std::env::var("RAVEN_ICON_THEME").unwrap_or_else(|_| crate::theme::ICON_THEME.into()),
+        );
+        let mut pixmaps = Pixmaps::new();
+        launcher.open(&apps, &frecency, now, None, CLOCK, STILL);
+        let query = std::env::var("LAUNCHER_QUERY").unwrap_or_else(|_| "cargo lock".into());
+        // Micro-timings of the pieces a row is drawn from.
+        {
+            let m = Metrics::for_output(output, density);
+            let icon_size = (m.size * 2.4) as u32;
+            for entry in apps.iter().take(6) {
+                let Some(name) = entry.icon.as_deref() else {
+                    continue;
+                };
+                let t = std::time::Instant::now();
+                let path = launcher_icon(&icons, name, icon_size / density, density);
+                let lookup = t.elapsed();
+                let t = std::time::Instant::now();
+                let pixmap = path.as_deref().and_then(|p| pixmaps.get(p, icon_size));
+                let get = t.elapsed();
+                let t = std::time::Instant::now();
+                let _ = pixmap.map(tinted);
+                let tint = t.elapsed();
+                println!(
+                    "icon {name:>28}: lookup {lookup:>9?} | pixmaps.get {get:>9?} | tinted {tint:>9?} -> {path:?}"
+                );
+            }
+            let mut canvas = Canvas::new(m.width, 600);
+            let t = std::time::Instant::now();
+            text.draw(
+                &mut canvas,
+                "Raven Terminal",
+                m.size,
+                10,
+                10,
+                crate::theme::TEXT,
+            );
+            println!("text.draw: {:?}", t.elapsed());
+            let t = std::time::Instant::now();
+            let _ = text.measure("Raven Terminal", m.size);
+            println!("text.measure: {:?}", t.elapsed());
+            let t = std::time::Instant::now();
+            let _ = fit(
+                &mut text,
+                "A very long application name that will not fit at all",
+                m.size,
+                100.0,
+            );
+            println!("fit(long): {:?}", t.elapsed());
+            let t = std::time::Instant::now();
+            canvas.fill_rounded(
+                0,
+                0,
+                m.width,
+                600,
+                m.radius,
+                crate::theme::BACKGROUND.with_alpha(ALPHA),
+            );
+            println!("fill_rounded {}x600: {:?}", m.width, t.elapsed());
+        }
+        for c in query.chars() {
+            let t = std::time::Instant::now();
+            launcher.press(Key::Insert(c), &apps, &frecency, now, CLOCK, STILL);
+            let pressed = t.elapsed();
+            let t = std::time::Instant::now();
+            let apps_only = search(&apps, launcher.query(), &frecency, now).len();
+            let app_search = t.elapsed();
+            let t = std::time::Instant::now();
+            let files = launcher.files().search(launcher.query(), FILES).len();
+            let file_search = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = compose(
+                &launcher,
+                &apps,
+                &mut text,
+                &icons,
+                &mut pixmaps,
+                output,
+                density,
+            );
+            let composed = t.elapsed();
+            let t = std::time::Instant::now();
+            let (canvas, _) = compose(
+                &launcher,
+                &apps,
+                &mut text,
+                &icons,
+                &mut pixmaps,
+                output,
+                density,
+            );
+            let composed_again = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = Panel::from_canvas(&canvas, density);
+            let panel = t.elapsed();
+            println!(
+                "{:>12?}  press {:>9?} | app search {:>9?} ({apps_only}) | file search {:>9?} ({files}) | compose {:>9?} / again {:>9?} | panel {:>9?}",
+                launcher.query(),
+                pressed,
+                app_search,
+                file_search,
+                composed,
+                composed_again,
+                panel
+            );
+        }
     }
 }
 

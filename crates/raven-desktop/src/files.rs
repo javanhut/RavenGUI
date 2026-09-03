@@ -36,6 +36,44 @@ pub struct File {
     /// rather than a `Vec<String>` because a hundred thousand of these add
     /// up: a vector of small strings costs an allocation per directory.
     segments: String,
+    /// Which characters `lower` contains, as [`mask`] makes it. A term
+    /// whose characters are not all in the name cannot match the name
+    /// however they are arranged, and this says so in one instruction
+    /// where the string comparison takes a few hundred: the difference
+    /// between a keystroke that scans a hundred thousand names in a
+    /// millisecond and one that takes twenty-five.
+    name_mask: u64,
+    /// The same for `segments`.
+    seg_mask: u64,
+}
+
+/// A summary of which characters `text` contains, one bit per class.
+///
+/// Letters and digits get a bit each; the punctuation a file name commonly
+/// carries gets a few; everything else shares one. Coarse is fine: the mask
+/// only ever says "cannot match", never "does", and a bit shared between
+/// two rare characters merely lets a few more names through to the real
+/// comparison. Computed over bytes, so the text and the term must both be
+/// lowercased first, which both are.
+fn mask(text: &str) -> u64 {
+    text.bytes().fold(0, |acc, b| {
+        let bit = match b {
+            b'a'..=b'z' => b - b'a',
+            b'0'..=b'9' => 26 + b - b'0',
+            b'.' => 36,
+            b'-' => 37,
+            b'_' => 38,
+            b' ' => 39,
+            b if b.is_ascii() => 40,
+            _ => 41,
+        };
+        acc | 1 << bit
+    })
+}
+
+/// Whether every character class in `term` is present in `text`.
+fn covers(text: u64, term: u64) -> bool {
+    term & !text == 0
 }
 
 /// The lowercased directory names between `root` and `path`, `/`-joined.
@@ -133,13 +171,8 @@ impl FileIndex {
                     }
                 } else if kind.is_file() {
                     let path = entry.path();
-                    files.push(File {
-                        segments: segments(root, &path),
-                        path,
-                        name: name.to_owned(),
-                        lower: name.to_lowercase(),
-                        depth,
-                    });
+                    let segments = segments(root, &path);
+                    files.push(File::new(path, name.to_owned(), segments, depth));
                     if files.len() >= limits.files {
                         break 'walk;
                     }
@@ -167,13 +200,8 @@ impl FileIndex {
                 let depth = path
                     .strip_prefix(root)
                     .map_or(0, |rel| rel.components().count().saturating_sub(1));
-                Some(File {
-                    lower: name.to_lowercase(),
-                    segments: segments(root, &path),
-                    name,
-                    path,
-                    depth,
-                })
+                let segments = segments(root, &path);
+                Some(File::new(path, name, segments, depth))
             })
             .collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -246,19 +274,28 @@ impl FileIndex {
     /// to sort. The order is exactly what a full sort would give.
     pub fn search(&self, query: &str, limit: usize) -> Vec<usize> {
         let query = query.to_lowercase();
-        let terms: Vec<&str> = query.split_whitespace().collect();
-        let Some(last) = terms.last() else {
+        let terms: Vec<(&str, u64)> = query
+            .split_whitespace()
+            .map(|term| (term, mask(term)))
+            .collect();
+        let Some((last, _)) = terms.last() else {
             return Vec::new();
         };
         if limit == 0 || last.chars().count() < MIN_TERM {
             return Vec::new();
         }
+        // Every character of every term, for the one test that rejects
+        // most of the index before any string is looked at.
+        let every = terms.iter().fold(0, |acc, (_, m)| acc | m);
         // Best first; `limit` long at most.
         let mut best: Vec<(Quality, usize, usize, usize)> = Vec::with_capacity(limit + 1);
         for (i, f) in self.files.iter().enumerate() {
+            if !covers(f.name_mask | f.seg_mask, every) {
+                continue;
+            }
             let mut quality = None;
-            for term in &terms {
-                let Some(q) = f.matches(term) else {
+            for (term, term_mask) in &terms {
+                let Some(q) = f.matches(term, *term_mask) else {
                     quality = None;
                     break;
                 };
@@ -289,16 +326,35 @@ impl FileIndex {
 }
 
 impl File {
+    fn new(path: PathBuf, name: String, segments: String, depth: usize) -> Self {
+        let lower = name.to_lowercase();
+        Self {
+            name_mask: mask(&lower),
+            seg_mask: mask(&segments),
+            lower,
+            segments,
+            path,
+            name,
+            depth,
+        }
+    }
+
     /// How well one lowercased `term` matches this file, if at all: by name
     /// at the name's own quality, else by a directory on the way to it at
-    /// the tier below a word start.
-    fn matches(&self, term: &str) -> Option<Quality> {
-        match_lowercase(&self.lower, term).or_else(|| {
-            self.segments
-                .split('/')
-                .any(|s| s.contains(term))
-                .then_some(Quality::Subsequence)
-        })
+    /// the tier below a word start. `term_mask` is [`mask`] of the term,
+    /// computed once by the caller rather than once per file.
+    fn matches(&self, term: &str, term_mask: u64) -> Option<Quality> {
+        if covers(self.name_mask, term_mask)
+            && let Some(quality) = match_lowercase(&self.lower, term)
+        {
+            return Some(quality);
+        }
+        // Within one directory name: a term with no `/` in it cannot match
+        // across the joins, so the one search over the joined string finds
+        // exactly what a search of each directory would, for the cost of
+        // one. A term with a `/` matches no directory, whose name has none.
+        (covers(self.seg_mask, term_mask) && !term.contains('/') && self.segments.contains(term))
+            .then_some(Quality::Subsequence)
     }
 }
 
@@ -317,6 +373,40 @@ mod tests {
         hits.iter()
             .map(|i| index.get(*i).unwrap().name.clone())
             .collect()
+    }
+
+    #[test]
+    fn a_directory_is_matched_one_name_at_a_time() {
+        let idx = index(&["ab/cd/x.txt", "ab-cd/y.txt"]);
+        // `b/c` reads across two directories; no directory is called that.
+        assert!(idx.search("b/c", 5).is_empty());
+        assert_eq!(names(&idx, &idx.search("b-c", 5)), ["y.txt"]);
+        assert_eq!(names(&idx, &idx.search("cd", 5)), ["y.txt", "x.txt"]);
+    }
+
+    #[test]
+    fn the_mask_only_ever_rules_out() {
+        // Everything a name could contain, in and out of the alphabet.
+        let file = File::new(
+            PathBuf::from("/home/u/Docs/Été-2.txt"),
+            "Été-2.txt".into(),
+            "docs".into(),
+            1,
+        );
+        for term in ["été", "2.t", "-2", "docs", "ét"] {
+            assert!(
+                file.matches(term, mask(term)).is_some(),
+                "{term} should match"
+            );
+        }
+        for term in ["z", "9", "_", "étés"] {
+            assert!(
+                file.matches(term, mask(term)).is_none(),
+                "{term} should not"
+            );
+        }
+        assert!(covers(mask("cargo.lock"), mask("carg")));
+        assert!(!covers(mask("cargo.lock"), mask("cargo-lock")));
     }
 
     #[test]
