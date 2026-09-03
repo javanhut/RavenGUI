@@ -45,7 +45,12 @@ pub(crate) enum Hit {
 /// The bar directly above `content`, `top` tall and as wide as the content.
 /// Zero-height when there is no frame.
 pub(crate) fn bar_rect(content: Rect, top: i32) -> Rect {
-    Rect::from_xywh(content.x(), content.y() - top.max(0), content.w(), top.max(0))
+    Rect::from_xywh(
+        content.x(),
+        content.y() - top.max(0),
+        content.w(),
+        top.max(0),
+    )
 }
 
 /// The close button: the square at the bar's right end, the bar's height on
@@ -231,7 +236,10 @@ mod tests {
         assert_eq!(bar.w(), CONTENT.w());
         assert_eq!(bar.h(), TOP);
         assert_eq!(bar.bottom(), CONTENT.y(), "no gap and no overlap");
-        assert_eq!(with_frame(CONTENT, TOP), Rect::from_xywh(100, 100, 600, 430));
+        assert_eq!(
+            with_frame(CONTENT, TOP),
+            Rect::from_xywh(100, 100, 600, 430)
+        );
         assert_eq!(bar_rect(CONTENT, 0).h(), 0, "no frame, no bar");
     }
 
@@ -243,15 +251,24 @@ mod tests {
         assert_eq!(close.y(), bar.y());
         assert_eq!(close.w(), TOP);
         assert_eq!(close.h(), TOP);
-        assert_eq!(hit(bar, Point::new(close.x() + 1, close.y() + 1)), Some(Hit::Close));
+        assert_eq!(
+            hit(bar, Point::new(close.x() + 1, close.y() + 1)),
+            Some(Hit::Close)
+        );
     }
 
     #[test]
     fn a_click_left_of_the_button_is_on_the_bar() {
         let bar = bar_rect(CONTENT, TOP);
-        assert_eq!(hit(bar, Point::new(bar.x() + 5, bar.y() + 5)), Some(Hit::Bar));
+        assert_eq!(
+            hit(bar, Point::new(bar.x() + 5, bar.y() + 5)),
+            Some(Hit::Bar)
+        );
         let close = close_rect(bar);
-        assert_eq!(hit(bar, Point::new(close.x() - 1, bar.y() + 5)), Some(Hit::Bar));
+        assert_eq!(
+            hit(bar, Point::new(close.x() - 1, bar.y() + 5)),
+            Some(Hit::Bar)
+        );
     }
 
     #[test]
@@ -292,7 +309,10 @@ mod tests {
             .iter()
             .map(|&b| u64::from(b))
             .sum();
-        assert!(light > dim, "focused {light} should out-shine unfocused {dim}");
+        assert!(
+            light > dim,
+            "focused {light} should out-shine unfocused {dim}"
+        );
         let blank: u64 = compose(&mut text, &key(None, true, 1))
             .pixels
             .iter()
@@ -310,9 +330,15 @@ mod tests {
         };
         let mut text = Text::new();
         let bars = [
-            compose(&mut text, &key(Some("Raven Terminal — ~/Development/RavenGUI"), true, 1)),
+            compose(
+                &mut text,
+                &key(Some("Raven Terminal — ~/Development/RavenGUI"), true, 1),
+            ),
             compose(&mut text, &key(Some("xterm"), false, 1)),
-            compose(&mut text, &key(Some(&"a very long title ".repeat(20)), true, 2)),
+            compose(
+                &mut text,
+                &key(Some(&"a very long title ".repeat(20)), true, 2),
+            ),
         ];
         let w = bars.iter().map(|b| b.stride).max().unwrap_or(1);
         let gap = 8;

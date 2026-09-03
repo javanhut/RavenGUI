@@ -229,9 +229,15 @@ row is no. The row cannot type a PIN, so a device that insists on one needs
 The session also locks itself after a period with no input — ten minutes by
 default, changed or turned off from the "Lock when idle" row in quick settings
 (`Super+Ctrl+S`). Every input event counts as presence, including one that
-resolves to no binding. There is no `idle-inhibit-unstable-v1`, so a client
-cannot hold this off; a video player that needs to has to ask the person
-watching to turn the row off.
+resolves to no binding. So does an inhibitor: bind
+`zwp_idle_inhibit_manager_v1` and create one for the surface that is being
+watched, and the session will not lock while that surface is on screen — a
+toplevel that has drawn, on a workspace some screen shows, not minimized; a
+layer surface or popup while it has a buffer. An inhibitor on a window nobody
+can see holds nothing off. GLFW asks for one while a window is fullscreen,
+GTK 4 through `gtk_application_inhibit`, and Firefox while a video plays, so
+most software needs nothing added. Destroy the inhibitor when the film ends:
+the idle count starts from then.
 
 There is no way for a client to register a global chord of its own. If your
 software needs one, it currently has to be reached from a dock icon or by being

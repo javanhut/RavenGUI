@@ -233,7 +233,11 @@ mod tests {
         assert_eq!(w.content(), w.geometry, "no frame, no inset");
         w.frame_top = 30;
         assert_eq!(w.content(), Rect::from_xywh(10, 50, 300, 170));
-        assert_eq!(w.geometry, Rect::from_xywh(10, 20, 300, 200), "the pane is untouched");
+        assert_eq!(
+            w.geometry,
+            Rect::from_xywh(10, 20, 300, 200),
+            "the pane is untouched"
+        );
     }
 
     #[test]
@@ -244,7 +248,11 @@ mod tests {
         w.fullscreen(Rect::from_xywh(0, 0, 1920, 1080));
         assert_eq!(w.content(), Rect::from_xywh(0, 0, 1920, 1080));
         w.unfullscreen();
-        assert_eq!(w.content(), Rect::from_xywh(10, 50, 300, 170), "the frame is back on leaving");
+        assert_eq!(
+            w.content(),
+            Rect::from_xywh(10, 50, 300, 170),
+            "the frame is back on leaving"
+        );
     }
 
     #[test]
