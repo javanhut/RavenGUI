@@ -402,17 +402,66 @@ pub(crate) fn match_lowercase(text: &str, query: &str) -> Option<Quality> {
     // A word start anywhere in the name. "term" should find "Raven Terminal",
     // which is the single most common way people search for an application
     // whose vendor prefixed its name.
-    if text
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| !word.is_empty() && word.starts_with(query))
-    {
+    if starts_a_word(text, query) {
         return Some(Quality::WordPrefix);
     }
     is_subsequence(text, query).then_some(Quality::Subsequence)
 }
 
+/// Whether `query` starts one of the words of `text` — the runs of
+/// alphanumeric characters — and lies wholly within it.
+///
+/// The same answer as splitting `text` into words and testing each, but
+/// found by looking for the query's first byte and checking what is around
+/// it: this runs once per file per keystroke over a hundred-thousand-file
+/// index, and splitting decodes and classifies every character of every
+/// name where this touches only the ones that could begin a match. The
+/// first byte of `query` is either ASCII or the lead byte of a multi-byte
+/// character, and neither can occur inside another character in UTF-8, so
+/// every position it is found at is a character boundary.
+fn starts_a_word(text: &str, query: &str) -> bool {
+    let Some(&first) = query.as_bytes().first() else {
+        // The empty query starts every word; the question is whether there
+        // is one.
+        return text.chars().any(char::is_alphanumeric);
+    };
+    // A query with a character no word contains starts no word, however
+    // the text reads. (`n.` is not a word start of `n.md`; it is a prefix,
+    // and that is decided before coming here.)
+    if !query.chars().all(char::is_alphanumeric) {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = bytes[from..].iter().position(|&b| b == first) {
+        let at = from + offset;
+        if bytes[at..].starts_with(query.as_bytes())
+            && text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric())
+        {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
 /// Whether every character of `query` appears in `text`, in order.
 fn is_subsequence(text: &str, query: &str) -> bool {
+    if query.is_ascii() {
+        // An ASCII byte only ever encodes itself, so a byte scan finds the
+        // same characters a `char` scan would, without decoding the text.
+        let mut rest = text.as_bytes();
+        for wanted in query.bytes() {
+            match rest.iter().position(|&b| b == wanted) {
+                Some(at) => rest = &rest[at + 1..],
+                None => return false,
+            }
+        }
+        return true;
+    }
     let mut chars = text.chars();
     query.chars().all(|wanted| chars.any(|c| c == wanted))
 }
@@ -798,5 +847,48 @@ not a number\t1.0\t/apps/bad-time.desktop\n\
         assert!(is_subsequence("firefox", "frfx"));
         assert!(!is_subsequence("firefox", "xof"));
         assert!(!is_subsequence("firefox", "firefoxx"));
+        // Beyond ASCII, both ways round: a query that has to be decoded,
+        // and one that does not against a text that does.
+        assert!(is_subsequence("café bar", "éb"));
+        assert!(!is_subsequence("café bar", "bé"));
+        assert!(is_subsequence("naïve", "nv"));
+        assert!(!is_subsequence("naïve", "ni"));
+    }
+
+    /// What [`starts_a_word`] replaced: split on non-alphanumerics, test
+    /// every word. The fast version must agree with it everywhere.
+    fn starts_a_word_by_splitting(text: &str, query: &str) -> bool {
+        text.split(|c: char| !c.is_alphanumeric())
+            .any(|word| !word.is_empty() && word.starts_with(query))
+    }
+
+    #[test]
+    fn a_word_start_is_found_the_way_splitting_would_find_it() {
+        let texts = [
+            "raven terminal",
+            "file roller archive manager",
+            "n.md",
+            "foo n.md",
+            "café bar",
+            "naïve-café",
+            "über_cool2go",
+            "日本語 テキスト",
+            "a",
+            "",
+            "--",
+        ];
+        let queries = [
+            "term", "roll", "man", "n", "n.", "md", "é", "caf", "ü", "cool", "2go", "テ", "本",
+            "a", "", "-", "x",
+        ];
+        for text in texts {
+            for query in queries {
+                assert_eq!(
+                    starts_a_word(text, query),
+                    starts_a_word_by_splitting(text, query),
+                    "{text:?} / {query:?}"
+                );
+            }
+        }
     }
 }

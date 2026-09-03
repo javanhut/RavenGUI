@@ -16,8 +16,9 @@
 //! directories finds nothing at all. Scalable directories are not an
 //! optimisation here; they are the only thing that works.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Extensions to try, best first.
 ///
@@ -111,6 +112,16 @@ struct Theme {
 /// themes installed. That is fine once at startup and far too slow per
 /// keystroke, which is the entire reason this is a struct you keep rather than
 /// a function you call.
+///
+/// A lookup is remembered too, and so is every directory listing it read.
+/// The index says which directories *could* hold an icon, not which do, and
+/// a name that no theme has — every application without a `-symbolic`
+/// variant, asked for one first — is settled only by probing all of them:
+/// some thousands of `stat` calls, tens of milliseconds, per icon. The
+/// launcher asks for a dozen icons per keystroke, so without the memory the
+/// keystroke costs a quarter of a second. With it the first open pays for
+/// the listings once and every draw after that is a hash lookup. See
+/// [`Icons::forget`] for when the memory is dropped.
 #[derive(Debug)]
 pub struct Icons {
     /// Theme name to its parsed index, for every theme found in every base
@@ -121,6 +132,14 @@ pub struct Icons {
     bases: Vec<PathBuf>,
     /// The theme to consult first.
     theme: String,
+    /// Every answer [`Icons::find`] has given, misses included: a miss is
+    /// the expensive answer, and the one asked again on every draw.
+    found: Mutex<HashMap<(String, u32, u32), Option<PathBuf>>>,
+    /// The names in every directory a lookup has read, `None` for one that
+    /// does not exist. Most of the directories an `index.theme` declares
+    /// are absent from most base directories, and remembering that is what
+    /// turns a miss from thousands of syscalls into none.
+    listings: Mutex<HashMap<PathBuf, Option<HashSet<String>>>>,
 }
 
 impl Icons {
@@ -167,7 +186,20 @@ impl Icons {
             themes,
             bases,
             theme: theme.to_owned(),
+            found: Mutex::new(HashMap::new()),
+            listings: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Drop everything remembered about which icons exist where.
+    ///
+    /// For when the disk may have changed under the memory: an application
+    /// installed after the last lookup brought its icon with it, and a miss
+    /// remembered from before would hide it. The application list changing
+    /// is the signal to call this on; the next draw rebuilds what it needs.
+    pub fn forget(&self) {
+        lock(&self.found).clear();
+        lock(&self.listings).clear();
     }
 
     /// Find the best file for `name` at `size` and `scale`.
@@ -179,6 +211,17 @@ impl Icons {
             let path = PathBuf::from(name);
             return path.is_file().then_some(path);
         }
+        let key = (name.to_owned(), size, scale);
+        if let Some(known) = lock(&self.found).get(&key) {
+            return known.clone();
+        }
+        let found = self.lookup(name, size, scale);
+        lock(&self.found).insert(key, found.clone());
+        found
+    }
+
+    /// [`Self::find`] without the memory: the search itself.
+    fn lookup(&self, name: &str, size: u32, scale: u32) -> Option<PathBuf> {
         // An Icon= value is occasionally written with its extension despite
         // the spec saying not to. Strip it rather than search for
         // "foo.png.svg".
@@ -193,7 +236,7 @@ impl Icons {
         // is where things land that belong to no theme at all.
         self.bases
             .iter()
-            .find_map(|base| first_existing(base, name))
+            .find_map(|base| self.first_existing(base, name))
     }
 
     /// Find the `-symbolic` variant of `name`, or `None` when the theme has
@@ -248,7 +291,7 @@ impl Icons {
         // An exact match wins outright, whatever else is available.
         for dir in dirs.iter().filter(|d| d.matches(size, scale)) {
             for base in &self.bases {
-                if let Some(found) = first_existing(&base.join(theme).join(&dir.path), name) {
+                if let Some(found) = self.first_existing(&base.join(theme).join(&dir.path), name) {
                     return Some(found);
                 }
             }
@@ -260,7 +303,7 @@ impl Icons {
             .iter()
             .filter_map(|dir| {
                 self.bases.iter().find_map(|base| {
-                    first_existing(&base.join(theme).join(&dir.path), name)
+                    self.first_existing(&base.join(theme).join(&dir.path), name)
                         .map(|path| (dir.distance(size, scale), path))
                 })
             })
@@ -270,12 +313,47 @@ impl Icons {
     }
 }
 
-/// The first of `dir/name.{svg,svgz,png,xpm}` that exists.
-fn first_existing(dir: &Path, name: &str) -> Option<PathBuf> {
-    EXTENSIONS.iter().find_map(|ext| {
-        let path = dir.join(format!("{name}.{ext}"));
-        path.is_file().then_some(path)
-    })
+impl Icons {
+    /// The first of `dir/name.{svg,svgz,png,xpm}` that exists.
+    ///
+    /// Answered from the directory's listing, read once and remembered,
+    /// rather than by a `stat` per extension per call. A name the listing
+    /// has is still checked to be a file: themes are full of symbolic links,
+    /// and a dangling one must lose to the next candidate exactly as it did
+    /// when every candidate was probed.
+    fn first_existing(&self, dir: &Path, name: &str) -> Option<PathBuf> {
+        let mut listings = lock(&self.listings);
+        let names = listings
+            .entry(dir.to_owned())
+            .or_insert_with(|| list(dir))
+            .as_ref()?;
+        EXTENSIONS.iter().find_map(|ext| {
+            let file = format!("{name}.{ext}");
+            if !names.contains(&file) {
+                return None;
+            }
+            let path = dir.join(file);
+            path.is_file().then_some(path)
+        })
+    }
+}
+
+/// The names in `dir`, or `None` if it cannot be read.
+fn list(dir: &Path) -> Option<HashSet<String>> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect(),
+    )
+}
+
+/// A cache lock, with a poisoned one treated as merely a cache.
+fn lock<T>(cache: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Drop a trailing `.png`/`.svg`/... that should not have been in `Icon=`.
@@ -604,6 +682,39 @@ Context=Applications
         let tree = Tree::new("missing");
         tree.theme("hicolor", HICOLOR);
         assert_eq!(tree.icons("hicolor").find("nothing-here", 48, 1), None);
+    }
+
+    #[test]
+    fn a_miss_is_remembered_until_forgotten() {
+        let tree = Tree::new("forget");
+        tree.theme("hicolor", HICOLOR);
+        let icons = tree.icons("hicolor");
+        assert_eq!(icons.find("late", 48, 1), None);
+        tree.icon("hicolor/scalable/apps/late.svg");
+        // The memory answers, not the disk: a keystroke must not pay for
+        // a lookup that already missed.
+        assert_eq!(icons.find("late", 48, 1), None);
+        icons.forget();
+        assert_eq!(
+            icons.find("late", 48, 1),
+            Some(tree.0.join("hicolor/scalable/apps/late.svg"))
+        );
+    }
+
+    #[test]
+    fn a_dangling_link_in_a_listing_loses_to_the_next_candidate() {
+        let tree = Tree::new("dangling");
+        tree.theme("hicolor", HICOLOR)
+            .icon("hicolor/scalable/apps/real.png");
+        std::os::unix::fs::symlink(
+            "/nowhere/at/all.svg",
+            tree.0.join("hicolor/scalable/apps/real.svg"),
+        )
+        .expect("symlink");
+        assert_eq!(
+            tree.icons("hicolor").find("real", 128, 1),
+            Some(tree.0.join("hicolor/scalable/apps/real.png"))
+        );
     }
 
     #[test]

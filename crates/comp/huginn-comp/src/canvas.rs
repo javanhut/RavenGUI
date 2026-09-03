@@ -55,14 +55,13 @@ impl Canvas {
     /// blended in, exactly as a glyph's coverage is.
     pub(crate) fn tint(&mut self, x: usize, y: usize, w: usize, h: usize, color: Color, alpha: u8) {
         let [r, g, b, _] = color.to_rgba_bytes();
-        let mix = f32::from(alpha) / 255.0;
+        let mix = u32::from(alpha);
         for row in y..(y + h).min(self.height) {
             for col in x..(x + w).min(self.stride) {
                 let offset = (row * self.stride + col) * 4;
                 for (channel, value) in [r, g, b].into_iter().enumerate() {
-                    let under = f32::from(self.pixels[offset + channel]);
-                    self.pixels[offset + channel] =
-                        (under + (f32::from(value) - under) * mix).round() as u8;
+                    let under = u32::from(self.pixels[offset + channel]);
+                    self.pixels[offset + channel] = lerp(under, u32::from(value), mix, 255) as u8;
                 }
                 // Alpha is left alone: the panel's own opacity is what it is,
                 // and a highlight must not make it more see-through.
@@ -118,21 +117,48 @@ impl Canvas {
         color: Color,
     ) {
         let radius = radius.min(w as f32 / 2.0).min(h as f32 / 2.0).max(0.0);
-        for row in y..(y + h).min(self.height) {
-            for col in x..(x + w).min(self.stride) {
-                let (lx, ly) = ((col - x) as f32 + 0.5, (row - y) as f32 + 0.5);
-                // Distance past the corner arc, negative inside it.
-                let dx = (radius - lx).max(lx - (w as f32 - radius)).max(0.0);
-                let dy = (radius - ly).max(ly - (h as f32 - radius)).max(0.0);
-                let coverage = if dx == 0.0 || dy == 0.0 {
-                    1.0
-                } else {
-                    (radius - dx.hypot(dy) + 0.5).clamp(0.0, 1.0)
-                };
-                if coverage > 0.0 {
-                    self.blend_over(col, row, color, (coverage * 255.0) as u8);
-                }
+        let (right, bottom) = ((x + w).min(self.stride), (y + h).min(self.height));
+        // The columns the corners reach into, on either side. Everything
+        // between is fully covered on every row, and a row clear of the
+        // corners top and bottom is fully covered from edge to edge: the
+        // distance is only worked out where an arc can pass, which for a
+        // launcher-sized panel is a few percent of its pixels.
+        let reach = radius.ceil() as usize;
+        let (arc_left, arc_right) = ((x + reach).min(right), right.saturating_sub(reach).max(x));
+        for row in y..bottom {
+            let ly = (row - y) as f32 + 0.5;
+            let dy = (radius - ly).max(ly - (h as f32 - radius)).max(0.0);
+            if dy == 0.0 {
+                self.blend_span(x, right, row, color, 255);
+                continue;
             }
+            let corner = |canvas: &mut Self, cols: std::ops::Range<usize>| {
+                for col in cols {
+                    let lx = (col - x) as f32 + 0.5;
+                    // Distance past the corner arc, negative inside it.
+                    let dx = (radius - lx).max(lx - (w as f32 - radius)).max(0.0);
+                    let coverage = if dx == 0.0 {
+                        1.0
+                    } else {
+                        (radius - dx.hypot(dy) + 0.5).clamp(0.0, 1.0)
+                    };
+                    if coverage > 0.0 {
+                        canvas.blend_over(col, row, color, (coverage * 255.0) as u8);
+                    }
+                }
+            };
+            corner(self, x..arc_left);
+            if arc_left < arc_right {
+                self.blend_span(arc_left, arc_right, row, color, 255);
+            }
+            corner(self, arc_left.max(arc_right)..right);
+        }
+    }
+
+    /// [`Self::blend_over`] across the columns `from..to` of one row.
+    fn blend_span(&mut self, from: usize, to: usize, row: usize, color: Color, alpha: u8) {
+        for col in from..to {
+            self.blend_over(col, row, color, alpha);
         }
     }
 
@@ -147,14 +173,15 @@ impl Canvas {
         }
         let offset = (y * self.stride + x) * 4;
         let [r, g, b, a] = color.to_rgba_bytes();
-        let coverage = f32::from(alpha) / 255.0 * (f32::from(a) / 255.0);
+        // Coverage times the colour's own alpha, out of 255 × 255.
+        let coverage = u32::from(alpha) * u32::from(a);
         for (channel, value) in [r, g, b].into_iter().enumerate() {
-            let under = f32::from(self.pixels[offset + channel]);
+            let under = u32::from(self.pixels[offset + channel]);
             self.pixels[offset + channel] =
-                (under + (f32::from(value) - under) * coverage).round() as u8;
+                lerp(under, u32::from(value), coverage, 255 * 255) as u8;
         }
-        let under = f32::from(self.pixels[offset + 3]);
-        self.pixels[offset + 3] = (under + (255.0 - under) * coverage).round() as u8;
+        let under = u32::from(self.pixels[offset + 3]);
+        self.pixels[offset + 3] = lerp(under, 255, coverage, 255 * 255) as u8;
     }
 
     /// A one-pixel border around the whole canvas, so the panel has an edge
@@ -193,11 +220,10 @@ impl crate::text::Surface for Canvas {
         }
         let offset = (y as usize * self.stride + x as usize) * 4;
         let [r, g, b, _] = color.to_rgba_bytes();
-        let coverage = f32::from(alpha) / 255.0;
+        let coverage = u32::from(alpha);
         for (channel, value) in [r, g, b].into_iter().enumerate() {
-            let under = f32::from(self.pixels[offset + channel]);
-            self.pixels[offset + channel] =
-                (under + (f32::from(value) - under) * coverage).round() as u8;
+            let under = u32::from(self.pixels[offset + channel]);
+            self.pixels[offset + channel] = lerp(under, u32::from(value), coverage, 255) as u8;
         }
         // Text is opaque where it covers, so the alpha channel takes the
         // greater of what is there and the coverage — otherwise a glyph drawn
@@ -205,6 +231,17 @@ impl crate::text::Surface for Canvas {
         let existing = self.pixels[offset + 3];
         self.pixels[offset + 3] = existing.max(alpha);
     }
+}
+
+/// `from` moved towards `to` by `amount` parts in `whole`, rounded.
+///
+/// Integer throughout: a panel is a million or so pixels at 2×, blended
+/// several times over per keystroke, and the float version with its round
+/// at the end was the most expensive thing about drawing one. The result
+/// is within one of the float answer, which is below what the eye can tell
+/// apart and what the antialiasing was already rounding away.
+fn lerp(from: u32, to: u32, amount: u32, whole: u32) -> u32 {
+    (from * (whole - amount) + to * amount + whole / 2) / whole
 }
 
 /// A finished panel: its pixels, and the logical size it occupies.
