@@ -71,6 +71,16 @@ pub struct Window {
     pub hints: SizeHints,
     pub app_id: Option<String>,
     pub title: Option<String>,
+    /// Logical pixels the compositor reserves along the top of the pane for
+    /// chrome of its own — a title bar. Zero for a client that draws its own.
+    /// Ignored while fullscreen: a fullscreen window covers the output edge
+    /// to edge, bar or no bar.
+    ///
+    /// The pane is still [`Self::geometry`]; what the client is configured to
+    /// is [`Self::content`]. Keeping the inset here rather than in the layout
+    /// means `arrange` neither knows nor cares which windows are decorated,
+    /// and a window whose decoration mode flips does not move its neighbours.
+    pub frame_top: i32,
 }
 
 impl Window {
@@ -83,11 +93,27 @@ impl Window {
             hints: SizeHints::default(),
             app_id: None,
             title: None,
+            frame_top: 0,
         }
     }
 
     pub const fn id(&self) -> WindowId {
         self.id
+    }
+
+    /// The rectangle the client gets: the pane less the frame the compositor
+    /// keeps for itself at the top. The whole pane when there is no frame or
+    /// the window is fullscreen.
+    pub fn content(&self) -> Rect {
+        if self.mode == WindowMode::Fullscreen || self.frame_top <= 0 {
+            return self.geometry;
+        }
+        Rect::from_xywh(
+            self.geometry.x(),
+            self.geometry.y() + self.frame_top,
+            self.geometry.w(),
+            self.geometry.h() - self.frame_top,
+        )
     }
 
     /// True if this window's geometry comes from the layout engine.
@@ -198,6 +224,36 @@ mod tests {
         w.unfullscreen();
         assert_eq!(w.geometry, Rect::from_xywh(10, 10, 300, 200));
         assert_eq!(w.mode, WindowMode::Tiled);
+    }
+
+    #[test]
+    fn content_is_the_pane_less_the_frame_at_the_top() {
+        let mut w = win();
+        w.geometry = Rect::from_xywh(10, 20, 300, 200);
+        assert_eq!(w.content(), w.geometry, "no frame, no inset");
+        w.frame_top = 30;
+        assert_eq!(w.content(), Rect::from_xywh(10, 50, 300, 170));
+        assert_eq!(w.geometry, Rect::from_xywh(10, 20, 300, 200), "the pane is untouched");
+    }
+
+    #[test]
+    fn fullscreen_content_ignores_the_frame() {
+        let mut w = win();
+        w.geometry = Rect::from_xywh(10, 20, 300, 200);
+        w.frame_top = 30;
+        w.fullscreen(Rect::from_xywh(0, 0, 1920, 1080));
+        assert_eq!(w.content(), Rect::from_xywh(0, 0, 1920, 1080));
+        w.unfullscreen();
+        assert_eq!(w.content(), Rect::from_xywh(10, 50, 300, 170), "the frame is back on leaving");
+    }
+
+    #[test]
+    fn a_frame_taller_than_the_pane_leaves_no_content() {
+        let mut w = win();
+        w.geometry = Rect::from_xywh(0, 0, 100, 20);
+        w.frame_top = 30;
+        assert_eq!(w.content().h(), 0);
+        assert_eq!(w.content().w(), 100);
     }
 
     #[test]

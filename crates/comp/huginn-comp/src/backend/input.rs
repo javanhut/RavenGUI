@@ -85,7 +85,14 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     // panel is, and it must not be told about a pointer the user sees as
     // being on the panel. Leaving the client is what stops its hover
     // effects tracking a pointer that is not on it.
+    // A title bar is the same: compositor-drawn, above the client it frames,
+    // and the client must not see a pointer that is on the bar. The cursor
+    // goes back to the arrow too, since whatever shape the client last asked
+    // for was for its own content.
     let under = if state.launcher_covers_pointer() || state.pinned_covers_pointer() {
+        None
+    } else if !state.is_locked() && state.decor_covers_pointer() {
+        state.cursor_status = smithay::input::pointer::CursorImageStatus::default_named();
         None
     } else {
         state.surface_under(location)
@@ -224,6 +231,30 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         } else {
             false
         };
+
+    // A title bar the compositor drew. A press anywhere on it focuses its
+    // window; the primary button on the close button asks the window to
+    // close. Nothing reaches a client: the bar is not the client's, and a
+    // press that started on chrome must not become a drag inside the window
+    // under it. Any button is swallowed, since the bar has no other use for
+    // one and a right click falling through to the content would be a click
+    // on something the user cannot see there.
+    if button_state == ButtonState::Pressed
+        && !on_popup
+        && !clicked_layer
+        && !state.pointer().is_grabbed()
+        && let Some((window, hit)) = state.decor_hit()
+    {
+        state.space.active_workspace_mut().focus(window);
+        state.refresh_focus();
+        if hit == crate::decor::Hit::Close
+            && event.button_code() == BTN_LEFT
+            && let Some(surface) = state.surface(window)
+        {
+            surface.close();
+        }
+        return;
+    }
 
     if button_state == ButtonState::Pressed
         && !on_popup

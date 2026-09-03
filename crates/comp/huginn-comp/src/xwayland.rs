@@ -210,9 +210,31 @@ impl XwmHandler for Huginn {
     fn move_request(&mut self, _xwm: smithay::xwayland::xwm::XwmId, _w: X11Surface, _button: u32) {
         self.x11_move_request();
     }
+
+    fn property_notify(
+        &mut self,
+        _xwm: smithay::xwayland::xwm::XwmId,
+        w: X11Surface,
+        property: smithay::xwayland::xwm::WmWindowProperty,
+    ) {
+        self.x11_property_notify(&w, property);
+    }
 }
 
 impl Huginn {
+    /// A window property changed. The title is on the bar and the class picks
+    /// the dock icon, so either is a redraw; the rest are nothing to us.
+    pub(crate) fn x11_property_notify(
+        &mut self,
+        _window: &X11Surface,
+        property: smithay::xwayland::xwm::WmWindowProperty,
+    ) {
+        use smithay::xwayland::xwm::WmWindowProperty;
+        if matches!(property, WmWindowProperty::Title | WmWindowProperty::Class) {
+            self.queue_redraw();
+        }
+    }
+
     /// A window exists but has not asked to be shown. Nothing to do: X11
     /// creates windows eagerly and most are never mapped.
     pub(crate) fn x11_new_window(&mut self, _window: X11Surface) {}
@@ -232,6 +254,18 @@ impl Huginn {
 
         let id = self.open_x11_window(WindowSurface::X11(window.clone()));
         tracing::debug!(window = id.raw(), class = %window.class(), "x11 window mapped");
+
+        // An X11 window has no way to ask for a frame, so it gets one unless
+        // its Motif hints say it draws its own. Before `arrange`, so the one
+        // configure that follows already carries the content size.
+        self.set_decor_mode(
+            id,
+            if window.is_decorated() {
+                crate::decor::DecorMode::Client
+            } else {
+                crate::decor::DecorMode::Server
+            },
+        );
 
         self.arrange();
         self.refresh_focus();
@@ -291,7 +325,7 @@ impl Huginn {
         _reorder: Option<Reorder>,
     ) {
         if let Some(id) = self.x11_window_id(&window)
-            && let Some(rect) = self.space.window(id).map(|w| w.geometry)
+            && let Some(rect) = self.space.window(id).map(|w| w.content())
         {
             let geo = Rectangle::<i32, Logical>::new(
                 (rect.x(), rect.y()).into(),
@@ -491,6 +525,15 @@ macro_rules! impl_xwm_handler {
                 w: smithay::xwayland::X11Surface,
             ) {
                 smithay::xwayland::XwmHandler::unfullscreen_request(&mut self.state, xwm, w);
+            }
+
+            fn property_notify(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                w: smithay::xwayland::X11Surface,
+                property: smithay::xwayland::xwm::WmWindowProperty,
+            ) {
+                smithay::xwayland::XwmHandler::property_notify(&mut self.state, xwm, w, property);
             }
 
             fn move_request(

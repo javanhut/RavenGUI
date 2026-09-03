@@ -12,6 +12,7 @@ For how to actually use these, see `docs/integration.md`.
 |---|---|
 | `wl_compositor`, `wl_subcompositor` | surfaces and subsurfaces |
 | `xdg_wm_base` | ordinary application windows |
+| `zxdg_decoration_manager_v1` | a title bar drawn by the compositor — the title and a close button, in the desktop's palette — for a toplevel that creates a decoration object and does not ask for `client_side`. A toplevel that never binds this is client-side, as the protocol says; GTK and Firefox draw their own and get no bar. See `docs/integration.md` |
 | `zwlr_layer_shell_v1` | panels, docks, bars, wallpapers |
 | `raven_shell_manager_v1` | workspace count, active index, occupancy, switching; opening quick settings |
 | `wl_shm` | shared-memory buffers |

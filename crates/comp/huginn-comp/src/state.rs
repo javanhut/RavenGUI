@@ -33,7 +33,7 @@ use smithay::{
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_fractional_scale,
     delegate_layer_shell, delegate_output, delegate_seat, delegate_session_lock, delegate_shm,
-    delegate_viewporter, delegate_xdg_shell,
+    delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -42,6 +42,7 @@ use smithay::{
     },
     output::Output,
     reexports::{
+        wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             Client, DisplayHandle, Resource,
@@ -73,7 +74,10 @@ use smithay::{
                 Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
                 WlrLayerShellState,
             },
-            xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
+            xdg::{
+                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+                decoration::{XdgDecorationHandler, XdgDecorationState},
+            },
         },
         shm::{ShmHandler, ShmState},
         viewporter::ViewporterState,
@@ -158,6 +162,14 @@ pub(crate) enum SceneItem<'a> {
     /// underneath, which is right for something that is a label rather than a
     /// window.
     Overlay(&'a MemoryRenderBuffer, Rect, f32),
+}
+
+/// One window's decoration: the mode, and the bar when the compositor draws
+/// it. See [`crate::decor`].
+#[derive(Debug)]
+struct DecorEntry {
+    mode: crate::decor::DecorMode,
+    bar: Option<crate::decor::Bar>,
 }
 
 /// The compositor transform for one workspace card.
@@ -287,6 +299,19 @@ pub(crate) fn has_buffer(surface: &WlSurface) -> bool {
 pub(crate) struct Huginn {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    /// `zxdg_decoration_manager_v1`. Held, not read: dropping it withdraws
+    /// the global, and a client that cannot find it draws its own frame.
+    /// The answers live in [`XdgDecorationHandler`] and the bars in
+    /// [`Self::decor`]; see [`crate::decor`].
+    #[allow(dead_code)]
+    pub xdg_decoration_state: XdgDecorationState,
+    /// Per window: who draws its frame, and the bar's pixels when it is us.
+    ///
+    /// A window is in here from creation; an entry's `bar` is `None` until
+    /// the window is on screen and composed. The bar is kept between frames
+    /// and recomposed only when its [`crate::decor::BarKey`] changes, so a
+    /// tile easing into place is not rasterizing text every frame.
+    decor: HashMap<WindowId, DecorEntry>,
     pub layer_shell_state: WlrLayerShellState,
     pub raven_shell: crate::shell_protocol::RavenShellState,
     pub dmabuf_state: DmabufState,
@@ -776,6 +801,8 @@ impl Huginn {
         let mut huginn = Self {
             compositor_state: CompositorState::new::<Self>(dh),
             xdg_shell_state: XdgShellState::new::<Self>(dh),
+            xdg_decoration_state: XdgDecorationState::new::<Self>(dh),
+            decor: HashMap::new(),
             layer_shell_state: WlrLayerShellState::new::<Self>(dh),
             raven_shell: crate::shell_protocol::RavenShellState::new(dh),
             dmabuf_state: DmabufState::new(),
@@ -1565,7 +1592,7 @@ impl Huginn {
                 .filter(|id| !self.mapped.contains(id))
                 .filter_map(|id| {
                     let surface = self.windows.get(&id)?.wl_surface()?;
-                    let geometry = self.space.window(id)?.geometry;
+                    let geometry = self.space.window(id)?.content();
                     Some((surface, geometry))
                 }),
         );
@@ -2151,7 +2178,7 @@ impl Huginn {
     /// Where `id`'s surface would be drawn at full size, if it has one.
     fn placed_rect(&self, id: huginn_core::window::WindowId) -> Option<Rect> {
         let surface = self.windows.get(&id)?.wl_surface()?;
-        let placed = place_in_pane(&surface, self.space.window(id)?.geometry);
+        let placed = place_in_pane(&surface, self.space.window(id)?.content());
         (placed.w() > 0 && placed.h() > 0).then_some(placed)
     }
 
@@ -2253,6 +2280,7 @@ impl Huginn {
                 continue;
             };
             let transform = crate::motion::fit(placed, motion.rect_at(now), motion.alpha_at(now));
+            out.extend(self.bar_item(*id, now));
             out.push(SceneItem::Preview(surface, placed, transform));
         }
         for id in &self.visible_window_ids() {
@@ -2270,6 +2298,10 @@ impl Huginn {
             let Some(placed) = self.placed_rect(*id) else {
                 continue;
             };
+            // The bar first: it sits above the content rather than over it, so
+            // the order is a formality, but a bar is chrome and chrome is drawn
+            // in front of what it frames.
+            out.extend(self.bar_item(*id, now));
             match self.motions.get(id) {
                 // A resize: the buffer at its natural size, its frame's
                 // corner pinned to the moving rectangle's corner, cropped
@@ -2313,7 +2345,7 @@ impl Huginn {
                         .space
                         .window(*id)
                         .expect("window checked above")
-                        .geometry;
+                        .content();
                     out.push(SceneItem::Clipped(surface, placed, pane, 1.0));
                 }
                 None => out.push(SceneItem::Surface(surface, placed)),
@@ -2634,7 +2666,7 @@ impl Huginn {
         }
         self.arrange();
         if let (Some(window), Some(surface)) = (self.space.window(id), self.windows.get(&id)) {
-            surface.configure(window.geometry);
+            surface.configure(window.content());
         }
         self.refresh_focus();
         self.refresh_dock();
@@ -2759,7 +2791,7 @@ impl Huginn {
             && let Some(window) = self.space.window(id)
         {
             let now = self.uptime();
-            let to = window.geometry;
+            let to = window.content();
             let from = crate::motion::fit_aspect(to, self.minimize_target(id));
             let instant = self.reduced_motion();
             self.motions
@@ -2883,7 +2915,7 @@ impl Huginn {
         // so `arrange` saw nothing change and staged no size, and the state
         // bit alone would send the client fullscreen at its old tile size.
         for id in changed {
-            let Some(rect) = self.space.window(id).map(|w| w.geometry) else {
+            let Some(rect) = self.space.window(id).map(|w| w.content()) else {
                 continue;
             };
             if let Some(surface) = self.windows.get(&id) {
@@ -3545,6 +3577,9 @@ impl Huginn {
         if travelling > 0 {
             self.queue_redraw();
         }
+        // Title bars are composed here, once per frame and only when
+        // something about them changed, so the scene below can borrow them.
+        self.refresh_decor();
     }
 
     /// A media key. Moves the level and shows the slider.
@@ -3838,10 +3873,10 @@ impl Huginn {
         }
         // Around where the window is *drawn*, so the ring travels with a
         // tile still on its way rather than waiting for it at the far end.
-        let rect = self
-            .motions
-            .get(&id)
-            .map_or(window.geometry, |motion| motion.rect_at(self.uptime()));
+        // A motion eases the content; the ring goes round the bar as well.
+        let rect = self.motions.get(&id).map_or(window.geometry, |motion| {
+            crate::decor::with_frame(motion.rect_at(self.uptime()), self.frame_top(id))
+        });
         Some(rect.ring(crate::theme::FOCUS_RING_WIDTH))
     }
 
@@ -3903,11 +3938,9 @@ impl Huginn {
         if window.is_minimized() {
             return None;
         }
-        Some(
-            self.motions
-                .get(&id)
-                .map_or(window.geometry, |motion| motion.rect_at(self.uptime())),
-        )
+        Some(self.motions.get(&id).map_or(window.geometry, |motion| {
+            crate::decor::with_frame(motion.rect_at(self.uptime()), self.frame_top(id))
+        }))
     }
 
     /// Start a white flash over `output`, and ask for the frame that begins it.
@@ -4097,6 +4130,7 @@ impl Huginn {
     pub(crate) fn close_x11_window(&mut self, id: WindowId) {
         self.windows.remove(&id);
         self.mapped.remove(&id);
+        self.decor.remove(&id);
         self.space.close_window(id);
         self.arrange();
         self.refresh_focus();
@@ -4149,7 +4183,7 @@ impl Huginn {
             })
             .filter_map(|id| {
                 let surface = self.windows.get(id)?.wl_surface()?;
-                let pane = self.space.window(*id)?.geometry;
+                let pane = self.space.window(*id)?.content();
                 let placed = place_in_pane(&surface, pane);
                 Some((surface, placed))
             })
@@ -4464,7 +4498,7 @@ impl Huginn {
             .filter(|id| self.mapped.contains(id))
             .filter_map(|id| {
                 let surface = self.windows.get(id)?.wl_surface()?;
-                let pane = self.space.window(*id)?.geometry;
+                let pane = self.space.window(*id)?.content();
                 let placed = place_in_pane(&surface, pane);
                 Some((*id, surface, placed))
             })
@@ -4651,7 +4685,17 @@ impl Huginn {
             })
             .filter_map(|id| Some((*id, self.drawn_rect(*id, now)?)))
             .collect();
-        let changed = self.space.arrange();
+        // The core reports panes; what the client is configured to, and what
+        // a motion eases between, is the content — the pane less any frame the
+        // compositor keeps for a title bar. `before` is already content-sized
+        // (it is where the buffer is drawn), so `changed` must be too, or a
+        // decorated window would look resized on every arrange.
+        let changed: Vec<(WindowId, Rect)> = self
+            .space
+            .arrange()
+            .into_iter()
+            .filter_map(|(id, _)| Some((id, self.space.window(id)?.content())))
+            .collect();
         self.start_motions(&before, &changed, now);
         for (id, rect) in changed {
             let Some(window) = self.windows.get(&id) else {
@@ -4976,9 +5020,226 @@ impl CompositorHandler for Huginn {
     }
 }
 
+/// Server-side decorations: the compositor's side of [`crate::decor`].
+impl Huginn {
+    /// Record who draws `id`'s frame, and reserve or release the bar's room in
+    /// its pane. Returns whether anything changed.
+    ///
+    /// No configure goes out from here. The pane did not move, so `arrange`
+    /// will report nothing; the caller sends the configure that carries the
+    /// new content size, because the XDG one also has to carry the granted
+    /// mode and the X11 one is what `arrange` sends anyway.
+    pub(crate) fn set_decor_mode(&mut self, id: WindowId, mode: crate::decor::DecorMode) -> bool {
+        let entry = self.decor.entry(id).or_insert(DecorEntry {
+            mode: crate::decor::DecorMode::Client,
+            bar: None,
+        });
+        if entry.mode == mode {
+            return false;
+        }
+        entry.mode = mode;
+        entry.bar = None;
+        if let Some(window) = self.space.window_mut(id) {
+            window.frame_top = match mode {
+                crate::decor::DecorMode::Server => crate::theme::TITLE_BAR_HEIGHT,
+                crate::decor::DecorMode::Client => 0,
+            };
+        }
+        tracing::debug!(window = id.raw(), ?mode, "decoration mode");
+        self.queue_redraw();
+        true
+    }
+
+    /// How tall `id`'s bar is right now: the frame it reserves, or nothing
+    /// while it is fullscreen, when the window covers the output edge to edge.
+    pub(crate) fn frame_top(&self, id: WindowId) -> i32 {
+        self.space.window(id).map_or(0, |window| {
+            if window.mode == WindowMode::Fullscreen {
+                0
+            } else {
+                window.frame_top
+            }
+        })
+    }
+
+    /// Where `id`'s bar is drawn at `now`, and how opaque, when it has one.
+    ///
+    /// Above the content, wherever the content is being drawn: at its pane
+    /// at rest, or riding a motion. A pane flying to or from the dock shrinks,
+    /// and the bar shrinks with it in proportion rather than staying a
+    /// full-height strip over a thumbnail.
+    fn bar_for(&self, id: WindowId, now: std::time::Duration) -> Option<(Rect, f32)> {
+        let top = self.frame_top(id);
+        if top <= 0 || !self.mapped.contains(&id) {
+            return None;
+        }
+        if self.decor.get(&id)?.mode != crate::decor::DecorMode::Server {
+            return None;
+        }
+        let window = self.space.window(id)?;
+        let motion = self.motions.get(&id);
+        if window.is_minimized() && motion.map(|m| m.kind()) != Some(crate::motion::Kind::Minimize)
+        {
+            return None;
+        }
+        let content = window.content();
+        match motion {
+            Some(motion) => {
+                let drawn = motion.rect_at(now);
+                let scaled = if motion.kind() == crate::motion::Kind::Resize || content.h() <= 0 {
+                    top
+                } else {
+                    (f64::from(top) * f64::from(drawn.h()) / f64::from(content.h())).round() as i32
+                };
+                Some((
+                    crate::decor::bar_rect(drawn, scaled.max(1)),
+                    motion.alpha_at(now),
+                ))
+            }
+            None => Some((crate::decor::bar_rect(content, top), 1.0)),
+        }
+    }
+
+    /// `id`'s bar as a scene item, when it has one that is composed.
+    fn bar_item(&self, id: WindowId, now: std::time::Duration) -> Option<SceneItem<'_>> {
+        let (rect, alpha) = self.bar_for(id, now)?;
+        let bar = self.decor.get(&id)?.bar.as_ref()?;
+        Some(SceneItem::Overlay(bar.panel.buffer(), rect, alpha))
+    }
+
+    /// Compose every bar whose look has changed since it was last composed,
+    /// and drop the bars of windows that are gone.
+    ///
+    /// Keyed on the layout's width rather than the drawn one, so a tile easing
+    /// into its pane is not rasterizing its title every frame: the renderer
+    /// stretches the one panel to wherever the bar is, the way it does the
+    /// launcher's as it grows out of the dock.
+    fn refresh_decor(&mut self) {
+        self.decor.retain(|id, _| self.windows.contains_key(id));
+        let focused = self.space.focused();
+        let visible = self.visible_window_ids();
+        let ids: Vec<WindowId> = self.decor.keys().copied().collect();
+        for id in ids {
+            let key = {
+                let Some(entry) = self.decor.get(&id) else {
+                    continue;
+                };
+                if entry.mode != crate::decor::DecorMode::Server
+                    || !self.mapped.contains(&id)
+                    || !visible.contains(&id)
+                {
+                    continue;
+                }
+                let Some(window) = self.space.window(id) else {
+                    continue;
+                };
+                if window.mode == WindowMode::Fullscreen {
+                    continue;
+                }
+                let output = &self.outputs[self.output_of_rect(window.geometry)];
+                crate::decor::BarKey {
+                    title: self.windows.get(&id).and_then(WindowSurface::title),
+                    width: window.content().w(),
+                    density: output.scale.advertised,
+                    output: output.rect,
+                    focused: focused == Some(id),
+                }
+            };
+            if self
+                .decor
+                .get(&id)
+                .and_then(|entry| entry.bar.as_ref())
+                .is_some_and(|bar| bar.key == key)
+            {
+                continue;
+            }
+            let bar = crate::decor::render(&mut self.text, key);
+            if let Some(entry) = self.decor.get_mut(&id) {
+                entry.bar = Some(bar);
+            }
+        }
+    }
+
+    /// The bar under the pointer, and which part of it. Frontmost first, the
+    /// order clicks resolve windows in. Nothing while the session is locked:
+    /// the bars are not on screen.
+    pub(crate) fn decor_hit(&self) -> Option<(WindowId, crate::decor::Hit)> {
+        if self.lock.is_some() {
+            return None;
+        }
+        let point = self.pointer_point();
+        let now = self.uptime();
+        self.visible_window_ids().into_iter().rev().find_map(|id| {
+            let (bar, _) = self.bar_for(id, now)?;
+            Some((id, crate::decor::hit(bar, point)?))
+        })
+    }
+
+    /// Whether the pointer is over a bar rather than over a client.
+    pub(crate) fn decor_covers_pointer(&self) -> bool {
+        self.decor_hit().is_some()
+    }
+
+    /// Answer a decoration request: record the mode, and configure the
+    /// content size that goes with it alongside the granted mode, in one
+    /// configure so the client never sees one without the other.
+    fn decorate(&mut self, toplevel: &ToplevelSurface, wanted: DecorationMode) {
+        let Some(id) = self.xdg_window_id(toplevel) else {
+            return;
+        };
+        // Anything but an explicit wish for its own frame gets ours.
+        let granted = if wanted == DecorationMode::ClientSide {
+            DecorationMode::ClientSide
+        } else {
+            DecorationMode::ServerSide
+        };
+        self.set_decor_mode(
+            id,
+            if granted == DecorationMode::ClientSide {
+                crate::decor::DecorMode::Client
+            } else {
+                crate::decor::DecorMode::Server
+            },
+        );
+        let content = self.space.window(id).map(huginn_core::window::Window::content);
+        tracing::debug!(window = id.raw(), ?granted, ?content, "decoration configure");
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(granted);
+            if let Some(content) = content {
+                state.size = Some((content.w(), content.h()).into());
+            }
+        });
+        // Unconditional: the first decoration configure has to go out even
+        // when the size it carries is the one already staged.
+        toplevel.send_configure();
+    }
+}
+
+impl XdgDecorationHandler for Huginn {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.decorate(&toplevel, DecorationMode::ServerSide);
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        self.decorate(&toplevel, mode);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.decorate(&toplevel, DecorationMode::ServerSide);
+    }
+}
+
+delegate_xdg_decoration!(Huginn);
+
 impl XdgShellHandler for Huginn {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
+    }
+
+    /// The bar shows the title, so a retitle is a redraw. The bar itself is
+    /// recomposed on the next frame, when its key no longer matches.
+    fn title_changed(&mut self, _surface: ToplevelSurface) {
+        self.queue_redraw();
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
@@ -5002,12 +5263,24 @@ impl XdgShellHandler for Huginn {
         // configure below is the first the client ever sees.
         self.arrange();
 
+        // Undecorated until the client says otherwise. A toplevel with no
+        // decoration object is client-side by the protocol's own words, and a
+        // client that wants a bar creates the object before its first commit,
+        // so the inset arrives before the first buffer either way.
+        self.decor.insert(
+            id,
+            DecorEntry {
+                mode: crate::decor::DecorMode::Client,
+                bar: None,
+            },
+        );
+
         WindowSurface::Xdg(surface.clone()).set_tiled(true);
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
             state.size = Some(self.space.window(id).map_or_else(
                 || (0, 0).into(),
-                |w| (w.geometry.w(), w.geometry.h()).into(),
+                |w| (w.content().w(), w.content().h()).into(),
             ));
         });
         // xdg-shell requires the client to ack a configure before its first
@@ -5049,6 +5322,7 @@ impl XdgShellHandler for Huginn {
         };
         self.windows.remove(&id);
         self.mapped.remove(&id);
+        self.decor.remove(&id);
         self.space.close_window(id);
         tracing::debug!(window = id.raw(), "toplevel destroyed");
 
