@@ -24,15 +24,17 @@ use std::sync::Mutex;
 
 use smithay::{
     backend::renderer::{
+        Renderer,
         element::{
             Kind,
             memory::MemoryRenderBufferRenderElement,
             render_elements,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+            texture::TextureRenderElement,
             utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
         },
-        gles::{GlesRenderer, element::TextureShaderElement},
+        gles::{GlesRenderer, GlesTexture, element::TextureShaderElement},
     },
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     utils::{Logical, Point, Rectangle},
@@ -63,6 +65,10 @@ render_elements! {
     Cursor = MemoryRenderBufferRenderElement<GlesRenderer>,
     /// One edge of the ring around the focused window.
     Ring = SolidColorRenderElement,
+    /// The kept last frame of a window that has closed, fading out where it
+    /// was. Transformed like a preview, but from a texture the compositor
+    /// holds rather than a surface a client does.
+    Ghost = RelocateRenderElement<RescaleRenderElement<TextureRenderElement<GlesTexture>>>,
     /// The desktop, already drawn and blurred into a texture, cropped to the
     /// panel that wants it. See [`blur_element`].
     Blur = CropRenderElement<TextureShaderElement>,
@@ -236,7 +242,37 @@ fn elements_with_boundary(
             | SceneItem::Clipped(_, rect, _, _)
             | SceneItem::Overlay(_, rect, _)
             | SceneItem::Ring(_, rect, _)
+            | SceneItem::Ghost(_, rect, _)
                 if !on_screen(rect) => {}
+            SceneItem::Ghost(snapshot, rect, transform) => {
+                let origin = Point::<i32, Logical>::from((rect.x() - ox, rect.y() - oy))
+                    .to_physical_precise_round::<f64, i32>(scale);
+                let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))
+                    .to_physical_precise_round::<f64, i32>(scale);
+                let element = TextureRenderElement::from_static_texture(
+                    snapshot.id.clone(),
+                    renderer.context_id(),
+                    origin.to_f64(),
+                    snapshot.texture.clone(),
+                    snapshot.buffer_scale,
+                    snapshot.transform,
+                    Some(transform.alpha),
+                    Some(snapshot.src),
+                    Some(snapshot.dst),
+                    None,
+                    Kind::Unspecified,
+                );
+                let element = RescaleRenderElement::from_element(
+                    element,
+                    (0, 0).into(),
+                    (transform.scale_x, transform.scale_y),
+                );
+                out.push(HuginnElement::Ghost(RelocateRenderElement::from_element(
+                    element,
+                    offset,
+                    Relocate::Relative,
+                )));
+            }
             SceneItem::Surface(surface, rect) => out.extend(
                 render_elements_from_surface_tree(
                     renderer,

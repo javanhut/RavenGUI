@@ -270,6 +270,11 @@ pub(crate) fn run() -> Result<()> {
     );
 
     let mut state = Huginn::new(&dh, Rect::from_xywh(0, 0, 0, 0));
+    // The key a surface's imported texture is filed under, for the close
+    // animation's snapshots. The primary's: every screen is rendered on it,
+    // other GPUs being fed through a bridge, so its textures are the ones
+    // that exist.
+    state.set_render_context(renderer.context_id());
 
     // XWayland. Started here rather than after the backend is up because it is
     // asynchronous either way: this only spawns the server and registers the
