@@ -54,6 +54,45 @@ pub(crate) trait AsHuginn {
     fn as_huginn(&mut self) -> &mut Huginn;
 }
 
+/// Make sure `/tmp/.X11-unix` exists before smithay tries to bind in it.
+///
+/// smithay binds `/tmp/.X11-unix/X<n>` for each candidate display and never
+/// creates the directory. On a distro with systemd-tmpfiles that is fine; on
+/// Raven, where `/tmp` is a fresh tmpfs every boot, it meant every bind failed
+/// with `NotFound`, `XWayland::spawn` gave up with "Could not find a free
+/// socket for the XServer", and X11-only clients such as Steam died with
+/// "Unable to open a connection to X". Init now creates it at boot; this is
+/// the fallback for images whose init predates that, and for running huginn
+/// nested on some other system. Same shape as wlroots' `open_sockets`: create
+/// it world-writable with the sticky bit, and refuse to use it if it turns out
+/// to be something other than a directory.
+fn ensure_socket_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::path::Path::new("/tmp/.X11-unix");
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => return,
+        Ok(_) => {
+            tracing::warn!("/tmp/.X11-unix exists but is not a directory; XWayland will not start");
+            return;
+        }
+        Err(_) => {}
+    }
+    if let Err(e) = std::fs::create_dir(dir) {
+        // Lost a race with someone else creating it is fine; anything else is
+        // reported here and again, less specifically, by `XWayland::spawn`.
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            tracing::warn!("could not create /tmp/.X11-unix: {e}");
+        }
+        return;
+    }
+    // Sticky and world-writable, like /tmp: other users' X servers must be able
+    // to add their own sockets without being able to remove ours.
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)) {
+        tracing::warn!("could not set permissions on /tmp/.X11-unix: {e}");
+    }
+}
+
 /// Spawn XWayland and start the window manager when it signals ready.
 ///
 /// Fail-soft throughout, deliberately: a compositor that refuses to start
@@ -64,6 +103,7 @@ pub(crate) fn start<D>(dh: &DisplayHandle, handle: &LoopHandle<'static, D>)
 where
     D: XwmHandler + XWaylandShellHandler + AsHuginn + 'static,
 {
+    ensure_socket_dir();
     let (xwayland, client) = match XWayland::spawn(
         dh,
         None,
