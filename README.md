@@ -108,9 +108,17 @@ the buffer that callback would have produced.
 Mapping tracks both directions, since a client may unmap by attaching a null
 buffer and map again later.
 
-**Not yet implemented:** §5's animation clauses. There are no open or close
-animations, so there is nothing yet to hold until the first buffer or to run out
-from the last one. `sync_mapped` is where both will hang.
+§5's animation clauses hang off `sync_mapped`, as the shape above implies. A
+window that has just drawn its first frame fades and grows into its pane over
+150 ms from 94% of its size; one that goes — a toplevel destroyed, or a buffer
+taken away — fades and shrinks out over 120 ms from where it was. The close
+animation needs a picture of a window that no longer exists, so the compositor
+clones the texture the renderer had already imported for the surface's last
+buffer (`Snapshot` in `state.rs`) at the last moment the surface still has it:
+at the top of `commit` for an unmap, before the buffer handler clears it, and
+at the top of `toplevel_destroyed`. The main surface only; subsurfaces vanish
+at once. Neither animation sends a configure, both honour reduced motion by
+having zero duration, and an idle desktop holds no entries for either.
 
 ## Tiling
 

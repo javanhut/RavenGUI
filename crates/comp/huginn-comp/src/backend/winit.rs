@@ -106,6 +106,9 @@ pub(crate) fn run() -> Result<()> {
 
     let size = backend.window_size();
     let mut state = Huginn::new(&dh, Rect::from_xywh(0, 0, size.w, size.h));
+    // The key a surface's imported texture is filed under, for the close
+    // animation's snapshots.
+    state.set_render_context(backend.renderer().context_id());
 
     // XWayland. Started here rather than after the backend is up because it is
     // asynchronous either way: this only spawns the server and registers the

@@ -27,11 +27,9 @@ pub(crate) enum Curve {
     /// interface feels like it responded rather than like it played.
     EaseOut,
     /// Slow at both ends. For something moving between two places the user is
-    /// watching, where the departure matters as much as the arrival.
-    ///
-    /// Unused so far — it is what the carousel's workspace-to-workspace motion
-    /// wants, and that does not exist yet.
-    #[allow(dead_code)]
+    /// watching, where the departure matters as much as the arrival — and for
+    /// a window on its way out, which should leave the way it arrived rather
+    /// than vanish with a jolt.
     EaseInOut,
     /// Overshoots slightly and settles back. What makes a panel feel like an
     /// object with mass instead of a value being assigned.
@@ -281,6 +279,18 @@ pub(crate) const WORKSPACE_CAROUSEL_CLOSE: Duration = Duration::from_millis(220)
 /// waiting for nothing.
 pub(crate) const PANEL_CLOSE: Duration = Duration::from_millis(110);
 
+/// How long a window takes to appear once it has drawn its first frame: a
+/// fade in and a slight growth into its pane. §5: "~150ms, ease-out". Short
+/// enough that a window opened by a keystroke is there by the time the eye
+/// looks for it, long enough that it arrived from somewhere rather than
+/// being switched on.
+pub(crate) const WINDOW_OPEN: Duration = Duration::from_millis(150);
+
+/// How long a window takes to leave. Shorter than opening, as with panels:
+/// closing is an instruction already given, and the desktop reflows around
+/// the gap at the same time, so a long farewell would be a long overlap.
+pub(crate) const WINDOW_CLOSE: Duration = Duration::from_millis(120);
+
 /// How long the focus ring stays fully visible after focus moves. Long enough
 /// to be seen without looking for it, short enough that it is gone before the
 /// eye has settled on the window it marked.
@@ -297,6 +307,17 @@ mod tests {
 
     fn at(ms: u64) -> Duration {
         Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn ease_in_out_starts_and_ends_at_rest() {
+        assert_eq!(Curve::EaseInOut.ease(0.0), 0.0);
+        assert_eq!(Curve::EaseInOut.ease(1.0), 1.0);
+        assert!((Curve::EaseInOut.ease(0.5) - 0.5).abs() < 1e-6);
+        // Slow at the start: the first tenth covers far less than a tenth.
+        assert!(Curve::EaseInOut.ease(0.1) < 0.05);
+        // And slow at the end, symmetrically.
+        assert!(Curve::EaseInOut.ease(0.9) > 0.95);
     }
 
     #[test]

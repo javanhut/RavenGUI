@@ -239,6 +239,46 @@ pub(crate) fn fit(placed: Rect, drawn: Rect, alpha: f32) -> WorkspacePreview {
     }
 }
 
+/// How small a window is at the start of its opening, and the end of its
+/// closing, as a fraction of its pane. Slight on purpose: enough that the
+/// window visibly arrives, not so much that it reads as being thrown at the
+/// screen.
+pub(crate) const APPEAR_SCALE: f64 = 0.94;
+
+/// `rect` scaled by `factor` about its own centre.
+pub(crate) fn scale_about_centre(rect: Rect, factor: f64) -> Rect {
+    let (w, h) = (
+        (f64::from(rect.w()) * factor).round() as i32,
+        (f64::from(rect.h()) * factor).round() as i32,
+    );
+    Rect::from_xywh(
+        rect.x() + (rect.w() - w) / 2,
+        rect.y() + (rect.h() - h) / 2,
+        w.max(1),
+        h.max(1),
+    )
+}
+
+/// The rectangle a window `t` of the way through appearing is drawn in:
+/// [`APPEAR_SCALE`] of `placed` at `t == 0`, exactly `placed` at `t == 1`.
+pub(crate) fn appear_rect(placed: Rect, t: f32) -> Rect {
+    let t = f64::from(t.clamp(0.0, 1.0));
+    scale_about_centre(placed, APPEAR_SCALE + (1.0 - APPEAR_SCALE) * t)
+}
+
+/// A window `t` of the way in: small and invisible at 0, exactly `placed` and
+/// opaque at 1. `t` is the eased progress, so the caller picks the curve.
+pub(crate) fn appear(placed: Rect, t: f32) -> WorkspacePreview {
+    let t = t.clamp(0.0, 1.0);
+    fit(placed, appear_rect(placed, t), t)
+}
+
+/// The reverse: a window `t` of the way out, exactly `placed` at 0 and small
+/// and gone at 1.
+pub(crate) fn vanish(placed: Rect, t: f32) -> WorkspacePreview {
+    appear(placed, 1.0 - t.clamp(0.0, 1.0))
+}
+
 /// The largest rectangle with `shape`'s aspect ratio that fits centred in
 /// `within`.
 ///
@@ -266,6 +306,48 @@ mod tests {
 
     fn at(ms: u64) -> Duration {
         Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn scaling_about_the_centre_keeps_the_centre() {
+        let rect = Rect::from_xywh(100, 200, 400, 300);
+        let small = scale_about_centre(rect, 0.5);
+        assert_eq!(small, Rect::from_xywh(200, 275, 200, 150));
+        assert_eq!(small.center(), rect.center());
+        assert_eq!(scale_about_centre(rect, 1.0), rect);
+        assert_eq!(scale_about_centre(rect, 0.0).w(), 1, "never collapses to nothing");
+    }
+
+    #[test]
+    fn appearing_starts_small_and_faint_and_ends_exact() {
+        let placed = Rect::from_xywh(100, 100, 1000, 500);
+        let start = appear(placed, 0.0);
+        assert!((start.scale_x - APPEAR_SCALE).abs() < 0.01, "{}", start.scale_x);
+        assert!((start.scale_y - APPEAR_SCALE).abs() < 0.01, "{}", start.scale_y);
+        assert_eq!(start.alpha, 0.0);
+        assert_eq!(appear_rect(placed, 0.0).center(), placed.center());
+
+        let end = appear(placed, 1.0);
+        assert_eq!(end.scale_x, 1.0);
+        assert_eq!(end.scale_y, 1.0);
+        assert_eq!(end.offset_x, 0.0);
+        assert_eq!(end.offset_y, 0.0);
+        assert_eq!(end.alpha, 1.0);
+        assert_eq!(appear_rect(placed, 1.0), placed);
+    }
+
+    #[test]
+    fn vanishing_is_the_mirror_of_appearing() {
+        let placed = Rect::from_xywh(0, 0, 640, 480);
+        for t in [0.0_f32, 0.25, 0.5, 0.9, 1.0] {
+            let out = vanish(placed, t);
+            let back = appear(placed, 1.0 - t);
+            assert_eq!(out.scale_x, back.scale_x);
+            assert_eq!(out.offset_y, back.offset_y);
+            assert_eq!(out.alpha, back.alpha);
+        }
+        assert_eq!(vanish(placed, 0.0).alpha, 1.0);
+        assert_eq!(vanish(placed, 1.0).alpha, 0.0);
     }
 
     #[test]

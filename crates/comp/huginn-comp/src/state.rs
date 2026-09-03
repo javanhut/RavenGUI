@@ -28,7 +28,9 @@ use huginn_core::{
 };
 use smithay::{
     backend::renderer::{
-        element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
+        ContextId,
+        element::{Id as ElementId, memory::MemoryRenderBuffer, solid::SolidColorBuffer},
+        gles::GlesTexture,
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_fractional_scale,
@@ -54,7 +56,10 @@ use smithay::{
     utils::{Logical, Point},
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
+        compositor::{
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes, with_states,
+        },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
         fractional_scale::{
@@ -162,6 +167,45 @@ pub(crate) enum SceneItem<'a> {
     /// underneath, which is right for something that is a label rather than a
     /// window.
     Overlay(&'a MemoryRenderBuffer, Rect, f32),
+    /// A window that is gone, still fading out: its last buffer as a texture
+    /// the compositor kept, drawn where the surface was — the second
+    /// rectangle — and transformed like a preview. A picture, not a window:
+    /// invisible to hit testing and owed no frame callback, since there is no
+    /// client behind it any more.
+    Ghost(&'a Snapshot, Rect, WorkspacePreview),
+}
+
+/// What the renderer needs to draw a surface after the surface is gone.
+///
+/// The texture is the one the renderer imported for the surface's last
+/// buffer, cloned out of its surface state before the state was reset; it is
+/// reference-counted, so the clone keeps the GPU texture alive on its own.
+/// The main surface only — subsurfaces have textures of their own and are
+/// not collected, so a popover or a video pane vanishes at close rather than
+/// fading with its parent, which is the cheap and honest end of that trade.
+#[derive(Debug)]
+pub(crate) struct Snapshot {
+    pub texture: GlesTexture,
+    pub buffer_scale: i32,
+    pub transform: smithay::utils::Transform,
+    pub src: smithay::utils::Rectangle<f64, Logical>,
+    pub dst: smithay::utils::Size<i32, Logical>,
+    /// One element identity per ghost, kept for its whole fade, so the damage
+    /// tracker sees one thing changing rather than a new element every frame.
+    pub id: ElementId,
+}
+
+/// A window on its way out. See [`Huginn::begin_close_ghost`].
+#[derive(Debug)]
+struct ClosingWindow {
+    snapshot: Snapshot,
+    /// Where the surface was drawn when it went.
+    placed: Rect,
+    /// Its title bar, if it had one, fading with it.
+    bar: Option<crate::decor::Bar>,
+    frame_top: i32,
+    /// 0 at the moment it went, 1 when it is gone.
+    progress: crate::anim::Animated,
 }
 
 /// One window's decoration: the mode, and the bar when the compositor draws
@@ -645,6 +689,20 @@ pub(crate) struct Huginn {
     /// for why this is the compositor's job and not the client's. Emptied as
     /// each arrives, so an idle desktop holds none.
     motions: HashMap<WindowId, crate::motion::Motion>,
+    /// Windows that have just drawn their first frame, fading and growing
+    /// into their panes. Emptied as each arrives; see [`Self::sync_mapped`].
+    opening: HashMap<WindowId, crate::anim::Animated>,
+    /// Windows that have just gone, fading and shrinking out of theirs.
+    /// Emptied as each finishes; see [`Self::begin_close_ghost`].
+    closing: Vec<ClosingWindow>,
+    /// The frame each mapped window last showed, refreshed on every commit,
+    /// so a window whose client has already gone can still be faded out.
+    /// See [`CompositorHandler::commit`].
+    last_frames: HashMap<WindowId, Snapshot>,
+    /// The renderer's context, which is the key a surface's imported texture
+    /// is filed under. Handed over by the backend once it has a renderer;
+    /// `None` before then, when there is nothing on screen to snapshot.
+    render_context: Option<ContextId<GlesTexture>>,
     /// Which window the ring was last shown on, and when it appeared. The
     /// ring is a cue that focus *moved*, not a permanent frame: it is shown
     /// when the focused window changes and fades out shortly after. Tracked
@@ -883,6 +941,10 @@ impl Huginn {
             flash: None,
             flash_buffer: SolidColorBuffer::new((area.w(), area.h()), [1.0, 1.0, 1.0, 1.0]),
             motions: HashMap::new(),
+            opening: HashMap::new(),
+            closing: Vec::new(),
+            last_frames: HashMap::new(),
+            render_context: None,
             focus_ring_shown: None,
             help: None,
             wallpaper: crate::wallpaper::Wallpaper::chosen_or_installed(desktop_config.wallpaper()),
@@ -1549,6 +1611,7 @@ impl Huginn {
             }
             SceneItem::Clipped(surface, rect, clip, _) => Some((surface, rect, Some(clip))),
             SceneItem::Preview(..)
+            | SceneItem::Ghost(..)
             | SceneItem::Ring(..)
             | SceneItem::Overlay(..)
             | SceneItem::WorkspaceCard(..) => None,
@@ -2265,7 +2328,10 @@ impl Huginn {
     /// its motion's rectangle if it has one and at its pane if not.
     fn window_items(&self) -> Vec<SceneItem<'_>> {
         let now = self.uptime();
-        let mut out = Vec::new();
+        // Windows on their way out go in front: they were on top a moment ago
+        // and are fading, and a pane reflowing underneath must not paint over
+        // a farewell.
+        let mut out = self.closing_items(now);
         // A ghost: the layout no longer has the window, but the screen still
         // does until it reaches the dock. A picture rather than a surface,
         // since there is nothing there to click on any more.
@@ -2298,10 +2364,40 @@ impl Huginn {
             let Some(placed) = self.placed_rect(*id) else {
                 continue;
             };
+            // A window still making its entrance, and not also being
+            // reflowed: drawn small and faint, growing into its pane, and
+            // hit-tested at the pane it is about to fill. Its bar arrives
+            // with it. A window that is both opening and being resized —
+            // opened into a pane that was just split — keeps the resize's
+            // drawing and takes only the fade, so the two do not fight over
+            // where its edges are.
+            let appearing = self
+                .opening
+                .get(id)
+                .filter(|open| !open.is_settled(now))
+                .map(|open| open.value(now));
+            if let Some(t) = appearing
+                && !self.motions.contains_key(id)
+            {
+                let drawn = crate::motion::appear_rect(placed, t);
+                out.extend(self.bar_item_at(*id, drawn, t));
+                out.push(SceneItem::WorkspaceSurface(
+                    surface,
+                    placed,
+                    crate::motion::appear(placed, t),
+                ));
+                continue;
+            }
+            let fade = appearing.unwrap_or(1.0);
             // The bar first: it sits above the content rather than over it, so
             // the order is a formality, but a bar is chrome and chrome is drawn
             // in front of what it frames.
-            out.extend(self.bar_item(*id, now));
+            out.extend(self.bar_item(*id, now).map(|item| match item {
+                SceneItem::Overlay(buffer, rect, alpha) => {
+                    SceneItem::Overlay(buffer, rect, alpha * fade)
+                }
+                other => other,
+            }));
             match self.motions.get(id) {
                 // A resize: the buffer at its natural size, its frame's
                 // corner pinned to the moving rectangle's corner, cropped
@@ -2319,7 +2415,7 @@ impl Huginn {
                         surface,
                         origin,
                         drawn,
-                        motion.alpha_at(now),
+                        motion.alpha_at(now) * fade,
                     ));
                 }
                 // Coming back from the dock: genuinely growing, so scaled,
@@ -3577,9 +3673,44 @@ impl Huginn {
         if travelling > 0 {
             self.queue_redraw();
         }
+        // Windows arriving and leaving, the same way: kept while they move,
+        // dropped once they have arrived or gone, and the frame after that
+        // draws the ordinary window or nothing. An idle desktop holds none.
+        let entrances = self.opening.len() + self.closing.len();
+        self.opening.retain(|_, open| !open.is_settled(now));
+        self.closing.retain(|ghost| !ghost.progress.is_settled(now));
+        if entrances > 0 {
+            self.queue_redraw();
+        }
         // Title bars are composed here, once per frame and only when
         // something about them changed, so the scene below can borrow them.
         self.refresh_decor();
+        self.refresh_last_frames();
+    }
+
+    /// Give every visible window a kept frame once the renderer has imported
+    /// one for it. `commit` keeps them fresh from then on; this covers a
+    /// window whose only commit came before its first draw — which is every
+    /// window's first commit, and the last one a client that draws once and
+    /// waits for input ever makes. Runs on frames that are being drawn anyway:
+    /// a window's entrance keeps them coming for long enough.
+    fn refresh_last_frames(&mut self) {
+        if self.render_context.is_none() {
+            return;
+        }
+        let wanted: Vec<WindowId> = self
+            .visible_window_ids()
+            .into_iter()
+            .filter(|id| self.mapped.contains(id) && !self.last_frames.contains_key(id))
+            .collect();
+        for id in wanted {
+            let Some(surface) = self.windows.get(&id).and_then(WindowSurface::wl_surface) else {
+                continue;
+            };
+            if let Some(snapshot) = self.snapshot(&surface) {
+                self.last_frames.insert(id, snapshot);
+            }
+        }
     }
 
     /// A media key. Moves the level and shows the slider.
@@ -4128,9 +4259,12 @@ impl Huginn {
     /// Drop an X11 window out of the layout and re-run the passes that depend
     /// on it. Mirrors the tail of `toplevel_destroyed`.
     pub(crate) fn close_x11_window(&mut self, id: WindowId) {
+        self.begin_close_ghost(id);
         self.windows.remove(&id);
         self.mapped.remove(&id);
         self.decor.remove(&id);
+        self.opening.remove(&id);
+        self.last_frames.remove(&id);
         self.space.close_window(id);
         self.arrange();
         self.refresh_focus();
@@ -4656,7 +4790,138 @@ impl Huginn {
                 "toplevel map state"
             );
         }
+        // The first frame a window has ever shown: fade and grow it into its
+        // pane, from now. Only a window somebody can see — one on a workspace
+        // in the wings would finish its entrance unwatched and then jump when
+        // the workspace came round. Under reduced motion the duration is
+        // zero, and a zero-length animation is already finished.
+        if changed && self.mapped.contains(&id) && self.visible_window_ids().contains(&id) {
+            let now = self.uptime();
+            let mut open = crate::anim::Animated::settled(0.0);
+            open.animate_to(
+                1.0,
+                now,
+                self.settings.motion().duration(crate::anim::WINDOW_OPEN),
+                crate::anim::Curve::EaseOut,
+            );
+            self.opening.insert(id, open);
+        }
         changed
+    }
+
+    /// Where a window's imported texture is filed: the backend's renderer
+    /// context. Called once, when the backend has one.
+    pub(crate) fn set_render_context(&mut self, context: ContextId<GlesTexture>) {
+        self.render_context = Some(context);
+    }
+
+    /// The surface's last frame, as a texture the compositor can keep drawing
+    /// after the surface is gone. `None` when nothing was ever imported for
+    /// it, or the backend has not said which renderer to ask.
+    fn snapshot(&self, surface: &WlSurface) -> Option<Snapshot> {
+        let context = self.render_context.clone()?;
+        with_renderer_surface_state(surface, |state| {
+            let texture = state.texture::<GlesTexture>(context)?.clone();
+            let view = state.view()?;
+            Some(Snapshot {
+                texture,
+                buffer_scale: state.buffer_scale(),
+                transform: state.buffer_transform(),
+                src: view.src,
+                dst: view.dst,
+                id: ElementId::new(),
+            })
+        })?
+    }
+
+    /// A window is going: keep its last frame and start it fading out where
+    /// it was. Must run while the surface still has its texture — before the
+    /// commit that takes the buffer away is processed, or before the toplevel
+    /// is forgotten — which is why the call sites are where they are.
+    ///
+    /// Nothing happens for a window nobody could see: not mapped, or on a
+    /// workspace no screen shows. And nothing happens without a texture, in
+    /// which case the window simply stops being drawn, as it always did.
+    fn begin_close_ghost(&mut self, id: WindowId) {
+        if !self.mapped.contains(&id) || !self.visible_window_ids().contains(&id) {
+            return;
+        }
+        if self
+            .space
+            .window(id)
+            .is_none_or(huginn_core::window::Window::is_minimized)
+        {
+            return;
+        }
+        let Some(surface) = self.windows.get(&id).and_then(WindowSurface::wl_surface) else {
+            return;
+        };
+        let Some(placed) = self.placed_rect(id) else {
+            return;
+        };
+        // The surface's texture if it still has one, else the last frame it
+        // was seen with; a fresh element identity either way, since the ghost
+        // is a new thing on screen.
+        let Some(mut snapshot) = self
+            .snapshot(&surface)
+            .or_else(|| self.last_frames.remove(&id))
+        else {
+            tracing::debug!(window = id.raw(), "closing with no texture to keep");
+            return;
+        };
+        snapshot.id = ElementId::new();
+        tracing::debug!(window = id.raw(), ?placed, "closing; ghost kept");
+        let now = self.uptime();
+        let mut progress = crate::anim::Animated::settled(0.0);
+        progress.animate_to(
+            1.0,
+            now,
+            self.settings.motion().duration(crate::anim::WINDOW_CLOSE),
+            crate::anim::Curve::EaseInOut,
+        );
+        // Whatever it was doing on the way in or across is over; the ghost
+        // is the only thing left to draw for it.
+        self.opening.remove(&id);
+        self.motions.remove(&id);
+        let frame_top = self.frame_top(id);
+        let bar = self.decor.get_mut(&id).and_then(|entry| entry.bar.take());
+        self.closing.push(ClosingWindow {
+            snapshot,
+            placed,
+            bar,
+            frame_top,
+            progress,
+        });
+        self.queue_redraw();
+    }
+
+    /// The ghosts of closed windows as scene items, frontmost first: each
+    /// drawn where it was, shrinking and fading, with its bar going the same
+    /// way above it.
+    fn closing_items(&self, now: std::time::Duration) -> Vec<SceneItem<'_>> {
+        let mut out = Vec::new();
+        for ghost in &self.closing {
+            let t = ghost.progress.value(now);
+            let drawn = crate::motion::appear_rect(ghost.placed, 1.0 - t);
+            if let Some(bar) = &ghost.bar
+                && ghost.frame_top > 0
+            {
+                let top = (f64::from(ghost.frame_top) * f64::from(drawn.h())
+                    / f64::from(ghost.placed.h().max(1)))
+                .round() as i32;
+                out.push(SceneItem::Overlay(
+                    bar.panel.buffer(),
+                    crate::decor::bar_rect(drawn, top.max(1)),
+                    1.0 - t,
+                ));
+            }
+            out.push(SceneItem::Ghost(
+                &ghost.snapshot,
+                ghost.placed,
+                crate::motion::vanish(ghost.placed, t),
+            ));
+        }
+        out
     }
 
     /// Ask the core to lay out the active workspace and configure whatever
@@ -4976,6 +5241,26 @@ impl CompositorHandler for Huginn {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // A window unmapping by attaching no buffer. Its texture is still in
+        // the surface state at this point and is cleared by the buffer
+        // handler below, so the ghost has to be taken first — this is the
+        // last moment the frame it is showing can be kept.
+        let window = self
+            .windows
+            .iter()
+            .find(|(_, w)| w.wl_surface().as_ref() == Some(surface))
+            .map(|(id, _)| *id);
+        let unmapping = with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            matches!(
+                attributes.current().buffer,
+                Some(BufferAssignment::Removed)
+            )
+        });
+        if unmapping && let Some(id) = window {
+            self.begin_close_ghost(id);
+        }
+
         on_commit_buffer_handler::<Self>(surface);
         self.queue_redraw();
 
@@ -4986,6 +5271,21 @@ impl CompositorHandler for Huginn {
             // Focus was given to this window when it was created, but the ring
             // could not be drawn around something that was not on screen yet.
             self.refresh_focus();
+        }
+
+        // Keep a handle on the frame the window is showing, for the close
+        // animation. A client that exits — or is killed — has its surface
+        // state torn down before the compositor hears the toplevel is gone,
+        // so by then there is nothing left to snapshot; this is the frame the
+        // ghost shows instead. The texture here is the one the renderer
+        // imported for the *previous* buffer, since the one just attached is
+        // imported at the next draw, and a reference is all this costs: it is
+        // the same texture the surface state holds, shared rather than copied.
+        if let Some(id) = window
+            && self.mapped.contains(&id)
+            && let Some(snapshot) = self.snapshot(surface)
+        {
+            self.last_frames.insert(id, snapshot);
         }
 
         // Moves a popup from unmapped to mapped once its parent is known, which
@@ -5105,6 +5405,28 @@ impl Huginn {
         let (rect, alpha) = self.bar_for(id, now)?;
         let bar = self.decor.get(&id)?.bar.as_ref()?;
         Some(SceneItem::Overlay(bar.panel.buffer(), rect, alpha))
+    }
+
+    /// `id`'s bar above a content rectangle drawn at `drawn` rather than at
+    /// rest, scaled with it: for a window growing into its pane.
+    fn bar_item_at(&self, id: WindowId, drawn: Rect, alpha: f32) -> Option<SceneItem<'_>> {
+        let top = self.frame_top(id);
+        if top <= 0 {
+            return None;
+        }
+        let entry = self.decor.get(&id)?;
+        if entry.mode != crate::decor::DecorMode::Server {
+            return None;
+        }
+        let bar = entry.bar.as_ref()?;
+        let content = self.space.window(id)?.content();
+        let scaled =
+            (f64::from(top) * f64::from(drawn.h()) / f64::from(content.h().max(1))).round() as i32;
+        Some(SceneItem::Overlay(
+            bar.panel.buffer(),
+            crate::decor::bar_rect(drawn, scaled.max(1)),
+            alpha,
+        ))
     }
 
     /// Compose every bar whose look has changed since it was last composed,
@@ -5320,9 +5642,14 @@ impl XdgShellHandler for Huginn {
         let Some(id) = self.xdg_window_id(&surface) else {
             return;
         };
+        // Before anything is forgotten: the ghost needs the surface's texture
+        // and the window's place, and both go with the entries below.
+        self.begin_close_ghost(id);
         self.windows.remove(&id);
         self.mapped.remove(&id);
         self.decor.remove(&id);
+        self.opening.remove(&id);
+        self.last_frames.remove(&id);
         self.space.close_window(id);
         tracing::debug!(window = id.raw(), "toplevel destroyed");
 
