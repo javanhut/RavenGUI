@@ -226,12 +226,14 @@ impl Huginn {
     /// the dock icon, so either is a redraw; the rest are nothing to us.
     pub(crate) fn x11_property_notify(
         &mut self,
-        _window: &X11Surface,
+        window: &X11Surface,
         property: smithay::xwayland::xwm::WmWindowProperty,
     ) {
         use smithay::xwayland::xwm::WmWindowProperty;
-        if matches!(property, WmWindowProperty::Title | WmWindowProperty::Class) {
-            self.queue_redraw();
+        if matches!(property, WmWindowProperty::Title | WmWindowProperty::Class)
+            && let Some(id) = self.x11_window_id(window)
+        {
+            self.sync_foreign_toplevel(id);
         }
     }
 

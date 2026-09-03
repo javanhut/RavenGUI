@@ -432,6 +432,20 @@ The compositor runs on a calloop event loop — listening socket, display poll
 fd, and winit all as event sources — and renders only on damage, so an idle
 session costs ~0.2% of one core.
 
+`Alt`+`Tab` is the window switcher, and it is the one chord taken from the
+`Alt` layer, which is otherwise the application's. It lists every window that
+has drawn, on every workspace, most recently focused first, so the first press
+swaps to the window you were just in; `Shift` steps the other way, `Escape`
+takes nothing, and letting go of `Alt` goes to the highlighted window — *goes
+to*: its workspace comes to the focused screen and a put-away window comes out
+of the dock, but nothing is moved between workspaces. It is the gesture
+switcher's strip with a different list behind it, drawn by the compositor for
+the same reason the launcher is, and keyboard focus is dropped while it is up
+so the window underneath never sees the keystrokes — nor a stuck `Alt`, since
+losing focus is what tells a client to forget its modifiers. The same list is
+exported over `ext_foreign_toplevel_list_v1`, read-only and unfiltered, for a
+bar or a switcher written outside the compositor.
+
 Windows that ask for it are decorated by the compositor: a bar above the
 content in the desktop's own palette, with the title and a close button, and
 nothing else, since the layout owns placement. "Ask" is `zxdg_decoration_manager_v1`

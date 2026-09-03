@@ -1724,6 +1724,8 @@ impl Udev {
             Action::Pinned(key) => state.pinned_key(key),
             Action::Launcher(key) => state.launcher_key(key),
             Action::DismissSwitcher => state.dismiss_app_switcher(),
+            Action::AltTab(dir) => state.alt_tab(dir),
+            Action::AcceptSwitcher => state.accept_app_switcher(),
             Action::Volume(key) => {
                 state.volume_key(key);
                 return;

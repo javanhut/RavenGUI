@@ -58,6 +58,8 @@ mod sleep;
 #[cfg(target_os = "linux")]
 mod state;
 #[cfg(target_os = "linux")]
+mod switcher;
+#[cfg(target_os = "linux")]
 mod text;
 #[cfg(target_os = "linux")]
 mod theme;
