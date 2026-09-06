@@ -43,7 +43,7 @@ struct Metrics {
 }
 
 fn metrics(area: Rect, gap: i32, columns: u32, count: usize) -> Metrics {
-    let inner = area.inset(gap);
+    let inner = area.inset(crate::edge_gap(gap));
     let gap = gap.max(0);
     let visible = columns.max(1).min(count.max(1) as u32) as i32;
 
@@ -249,6 +249,13 @@ mod tests {
 
     const SCREEN: Rect = Rect::from_xywh(0, 0, 1000, 600);
     const GAP: i32 = 10;
+    /// What the strip leaves between a pane and the screen edge: half of what
+    /// it leaves between two panes. Named rather than written out, so these
+    /// tests move with [`crate::edge_gap`] instead of pinning a number that
+    /// only the layout gets to choose.
+    const EDGE: i32 = crate::edge_gap(GAP);
+    /// The far edge of the usable strip.
+    const FAR: i32 = SCREEN.right() - EDGE;
 
     fn id(n: u64) -> WindowId {
         WindowId::from_raw(n)
@@ -274,17 +281,17 @@ mod tests {
         assert_eq!(laid.len(), 1);
         // The area inset by the gutter, and no narrower: `columns` is capped at
         // the number of windows so one pane is not left beside a hole.
-        assert_eq!(laid[0].1, Rect::from_xywh(10, 10, 980, 580));
+        assert_eq!(laid[0].1, SCREEN.inset(EDGE));
     }
 
     #[test]
     fn two_panes_split_the_area_with_a_gap_between_them() {
         let laid = arrange(&ids(2), Some(id(1)), SCREEN, GAP, 2, 0);
         let (w, gap_between) = (laid[0].1.w(), laid[1].1.x() - laid[0].1.right());
-        assert_eq!(w, 485, "980 minus one gap, halved");
-        assert_eq!(laid[1].1.w(), 485, "both columns are the same width");
+        assert_eq!(w, 490, "990 minus one gap, halved");
+        assert_eq!(laid[1].1.w(), 490, "both columns are the same width");
         assert_eq!(gap_between, GAP);
-        assert_eq!(laid[1].1.right(), 990, "the strip reaches the far gutter");
+        assert_eq!(laid[1].1.right(), FAR, "the strip reaches the far gutter");
     }
 
     #[test]
@@ -303,7 +310,7 @@ mod tests {
     #[test]
     fn the_strip_starts_unscrolled_when_the_first_pane_has_focus() {
         let laid = arrange(&ids(6), Some(id(1)), SCREEN, GAP, 2, 0);
-        assert_eq!(xs(&laid)[0], 10, "the first pane sits at the left gutter");
+        assert_eq!(xs(&laid)[0], EDGE, "the first pane sits at the left gutter");
     }
 
     #[test]
@@ -335,7 +342,7 @@ mod tests {
         let laid = arrange_at(&windows, SCREEN, GAP, 2, out);
         let two = laid.iter().find(|(w, _)| *w == id(2)).expect("pane 2").1;
         assert!(
-            two.x() >= 10 && two.right() <= 990,
+            two.x() >= EDGE && two.right() <= FAR,
             "pane 2 is fully on screen"
         );
 
@@ -355,7 +362,7 @@ mod tests {
             "the strip scrolls back for a pane off to the left"
         );
         let laid = arrange_at(&windows, SCREEN, GAP, 2, back);
-        assert_eq!(laid[0].1.x(), 10, "pane 1 ends up at the left gutter");
+        assert_eq!(laid[0].1.x(), EDGE, "pane 1 ends up at the left gutter");
     }
 
     #[test]
@@ -380,7 +387,7 @@ mod tests {
         let windows = ids(3);
         let target = target_offset(&windows, Some(id(1)), SCREEN, GAP, 2, 99_999);
         let laid = arrange_at(&windows, SCREEN, GAP, 2, target);
-        assert_eq!(laid[0].1.x(), 10, "pane 1 is reachable again");
+        assert_eq!(laid[0].1.x(), EDGE, "pane 1 is reachable again");
     }
 
     #[test]
@@ -390,10 +397,10 @@ mod tests {
         let windows = ids(6);
         let laid = arrange(&windows, Some(id(6)), SCREEN, GAP, 2, 0);
         let last = laid.last().unwrap().1;
-        assert_eq!(last.right(), 990, "the final pane ends at the far gutter");
+        assert_eq!(last.right(), FAR, "the final pane ends at the far gutter");
         // Two columns, so the pane before it is the other visible one and sits
         // at the left gutter. Everything earlier is off screen to the left.
-        assert_eq!(xs(&laid)[4], 10);
+        assert_eq!(xs(&laid)[4], EDGE);
         assert!(
             xs(&laid)[..4].iter().all(|x| *x < 0),
             "the rest scrolled off"
@@ -419,10 +426,10 @@ mod tests {
     #[test]
     fn an_unfocused_strip_stays_where_it_is() {
         let at_rest = arrange(&ids(6), None, SCREEN, GAP, 2, 0);
-        assert_eq!(xs(&at_rest)[0], 10, "at rest it shows its start");
+        assert_eq!(xs(&at_rest)[0], EDGE, "at rest it shows its start");
         // And scrolled, it stays scrolled: losing focus is not a reason to move.
         let scrolled = arrange(&ids(6), None, SCREEN, GAP, 2, 495);
-        assert_eq!(xs(&scrolled)[0], 10 - 495);
+        assert_eq!(xs(&scrolled)[0], EDGE - 495);
     }
 
     #[test]
@@ -431,7 +438,7 @@ mod tests {
         assert_eq!(laid.len(), 3);
         assert_eq!(
             xs(&laid)[0],
-            10,
+            EDGE,
             "no scroll, rather than a panic or an empty layout"
         );
     }
@@ -439,16 +446,16 @@ mod tests {
     #[test]
     fn one_column_gives_a_pane_the_whole_area() {
         let laid = arrange(&ids(4), Some(id(2)), SCREEN, GAP, 1, 0);
-        assert_eq!(laid[0].1.w(), 980);
+        assert_eq!(laid[0].1.w(), 990);
         let second = laid[1].1;
-        assert_eq!(second.x(), 10, "the focused pane fills the viewport");
+        assert_eq!(second.x(), EDGE, "the focused pane fills the viewport");
     }
 
     #[test]
     fn zero_columns_is_treated_as_one_rather_than_dividing_by_it() {
         let laid = arrange(&ids(3), Some(id(1)), SCREEN, GAP, 0, 0);
         assert_eq!(laid.len(), 3);
-        assert_eq!(laid[0].1.w(), 980);
+        assert_eq!(laid[0].1.w(), 990);
     }
 
     #[test]
@@ -486,7 +493,7 @@ mod tests {
         let laid = arrange_at(&windows, SCREEN, GAP, 2, end);
         assert_eq!(
             laid.last().unwrap().1.right(),
-            990,
+            FAR,
             "flush with the far gutter"
         );
         // And it agrees with what focusing the last pane asks for, which is the
@@ -511,7 +518,7 @@ mod tests {
         // recomputed here, so the test cannot disagree with the geometry.
         let laid = arrange_at(&windows, SCREEN, GAP, 2, 0);
         let stride = laid[1].1.x() - laid[0].1.x();
-        assert_eq!(stride, 495);
+        assert_eq!(stride, 500);
 
         // A third of the way across: still nearer where it started.
         let (pane, offset) = snap(&windows, SCREEN, GAP, 2, stride / 3).expect("panes to rest on");

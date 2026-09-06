@@ -20,6 +20,7 @@
 //! renormalises to the shape its new count calls for instead of keeping the
 //! hole-shaped tree a collapse would leave.
 
+use crate::edge_gap;
 use crate::geometry::Rect;
 use crate::window::WindowId;
 
@@ -427,12 +428,13 @@ impl Tiles {
 
     /// Where every window goes, given the pane's area.
     ///
-    /// `gap` is applied at the edges as well as between tiles, so a single
-    /// window is inset from the screen rather than flush against it.
+    /// The edges are inset too, so a single window floats off the screen edge
+    /// rather than sitting flush against it — but by [`edge_gap`] rather than
+    /// by the whole `gap` that falls between two tiles.
     pub fn arrange(&self, area: Rect, gap: i32) -> Vec<(WindowId, Rect)> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
-            root.arrange(area.inset(gap), gap, &mut out);
+            root.arrange(area.inset(edge_gap(gap)), gap, &mut out);
         }
         out
     }
@@ -444,6 +446,9 @@ mod tests {
 
     const SCREEN: Rect = Rect::from_xywh(0, 0, 1000, 600);
     const GAP: i32 = 10;
+    /// What the grid leaves between a tile and the screen edge: half of what
+    /// it leaves between two tiles. See [`crate::edge_gap`].
+    const EDGE: i32 = crate::edge_gap(GAP);
 
     fn id(n: u64) -> WindowId {
         WindowId::from_raw(n)
@@ -467,11 +472,11 @@ mod tests {
     }
 
     #[test]
-    fn one_window_fills_the_pane_inset_by_the_gap() {
+    fn one_window_fills_the_pane_inset_by_the_edge_share_of_the_gap() {
         let tiles = tiled(1);
         let laid = tiles.arrange(SCREEN, GAP);
         assert_eq!(laid.len(), 1);
-        assert_eq!(laid[0].1, SCREEN.inset(GAP));
+        assert_eq!(laid[0].1, SCREEN.inset(EDGE));
     }
 
     #[test]
@@ -637,7 +642,7 @@ mod tests {
         assert!(tiles.remove(id(2)));
         let laid = tiles.arrange(SCREEN, GAP);
         assert_eq!(laid.len(), 1);
-        assert_eq!(laid[0].1, SCREEN.inset(GAP), "the survivor reclaims it");
+        assert_eq!(laid[0].1, SCREEN.inset(EDGE), "the survivor reclaims it");
     }
 
     #[test]

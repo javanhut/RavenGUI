@@ -50,6 +50,23 @@ const DEFAULT_WORKSPACES: u64 = 9;
 /// Gutter used until the compositor supplies its own. See [`Space::set_gap`].
 const DEFAULT_GAP: i32 = 8;
 
+/// The share of a layout gutter spent between a window and the screen edge.
+///
+/// Half of what falls between two windows, not all of it. The interior gutter
+/// is one band separating two clients that would otherwise run together, and
+/// it has to earn its width. The edge band separates a client from the bezel,
+/// which is already a boundary, so the same number laid there reads heavier
+/// than it does inside and spends screen on a frame that draws nothing. Half
+/// keeps the windows visibly off the edge without ringing the desktop.
+///
+/// Lives here rather than in either layout because both of them inset by it —
+/// `tiles` before it splits and `strip` before it measures its columns — and
+/// two layouts framing the desktop differently is the kind of difference you
+/// see when you switch between them and cannot name.
+pub(crate) const fn edge_gap(gap: i32) -> i32 {
+    gap / 2
+}
+
 /// One screen the desktop spans, in logical coordinates shared by every
 /// screen.
 ///
@@ -988,6 +1005,9 @@ mod tests {
     use geometry::Size;
 
     const SCREEN: Rect = Rect::from_xywh(0, 0, 1920, 1080);
+    /// What a layout leaves between a window and the screen edge: half the
+    /// gutter it leaves between two windows. See [`edge_gap`].
+    const EDGE: i32 = edge_gap(DEFAULT_GAP);
 
     fn space() -> Space {
         Space::new(SCREEN)
@@ -1089,7 +1109,7 @@ mod tests {
         s.arrange();
         assert_eq!(
             s.window(w).expect("still open").geometry,
-            SCREEN.inset(DEFAULT_GAP),
+            SCREEN.inset(EDGE),
             "a client hint must not make its pane leave a hole"
         );
     }
@@ -1306,7 +1326,7 @@ mod tests {
         assert_eq!(s.focused(), Some(a));
         assert_eq!(
             s.window(a).unwrap().geometry,
-            SCREEN.inset(DEFAULT_GAP),
+            SCREEN.inset(EDGE),
             "a is the lone pane, not app fullscreen"
         );
         assert!(
@@ -1358,7 +1378,7 @@ mod tests {
         assert!(s.solo_window(b), "the pick can move while soloed");
         s.arrange();
         assert_eq!(s.solo(), Some(b));
-        assert_eq!(s.window(b).unwrap().geometry, SCREEN.inset(DEFAULT_GAP));
+        assert_eq!(s.window(b).unwrap().geometry, SCREEN.inset(EDGE));
         assert!(
             s.window(a).unwrap().is_minimized(),
             "the old pick steps back"
@@ -1810,7 +1830,11 @@ mod tests {
 
         // Which is to say: at the end, the final pane sits at the right edge.
         s.arrange();
-        assert_eq!(s.window(windows[5]).unwrap().geometry.right(), 992);
+        assert_eq!(
+            s.window(windows[5]).unwrap().geometry.right(),
+            1000 - EDGE,
+            "flush with the far gutter of the 1000-wide strip screen"
+        );
     }
 
     #[test]
@@ -1938,10 +1962,7 @@ mod tests {
         let changed = s.arrange();
         assert!(s.window(second).unwrap().is_minimized());
         assert_eq!(s.focused(), Some(first));
-        assert_eq!(
-            s.window(first).unwrap().geometry,
-            Rect::from_xywh(8, 8, 1904, 1064)
-        );
+        assert_eq!(s.window(first).unwrap().geometry, SCREEN.inset(EDGE));
         assert!(changed.iter().all(|(id, _)| *id != second));
     }
 
