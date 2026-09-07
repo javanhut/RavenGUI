@@ -249,6 +249,15 @@ pub(crate) const BINDINGS: &[Binding] = &[
         chord: "Super+Ctrl+1..9",
         description: "go to a workspace",
     },
+    // The one pointer binding in the table. It carries `Workspace` because
+    // that is what it does, which also keeps `bindings_cover_every_action`
+    // honest: the discriminant is already reachable from the digits above, so
+    // the row is documentation rather than a second claim about the keymap.
+    Binding {
+        action: Action::Workspace(0),
+        chord: "Super+wheel",
+        description: "go to the workspace either side",
+    },
     Binding {
         action: Action::SendToWorkspace(0),
         chord: "Super+Ctrl+Shift+1..9",
