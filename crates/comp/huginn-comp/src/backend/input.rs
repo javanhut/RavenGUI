@@ -281,6 +281,9 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
 
 fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
     let source = event.source();
+    if wheel_workspace::<B>(state, event, source) {
+        return;
+    }
     let mut frame = AxisFrame::new(event.time_msec()).source(source);
 
     for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -303,4 +306,55 @@ fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
     let pointer = state.pointer();
     pointer.axis(state, frame);
     pointer.frame(state);
+}
+
+/// `Super`+wheel: step through the workspaces, and do not tell the client.
+///
+/// This is the mouse's three-finger swipe. A trackpad has the gesture and a
+/// mouse does not, so without this the only way to the workspace next door
+/// with a mouse in hand is a key.
+///
+/// Wheels only. A touchpad's two-finger scroll arrives here as
+/// [`AxisSource::Finger`] with no v120 to count, and the device it comes from
+/// already has the swipe — taking it would add a second, worse way to do the
+/// same thing on the one pointer that needs it least.
+///
+/// Exactly Super: `Super`+`Ctrl` is the compositor's keyboard prefix, but the
+/// wheel is not a key and has no keysym to disambiguate, so the plainest chord
+/// is the right one. Requiring the other modifiers to be *absent* leaves
+/// `Super`+`Shift`+wheel and the rest free for whatever wants them later,
+/// including the client.
+///
+/// Returns whether the event was taken.
+fn wheel_workspace<B: InputBackend>(
+    state: &mut Huginn,
+    event: &B::PointerAxisEvent,
+    source: AxisSource,
+) -> bool {
+    if !matches!(source, AxisSource::Wheel | AxisSource::WheelTilt) {
+        return false;
+    }
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return false;
+    };
+    let mods = keyboard.modifier_state();
+    if !mods.logo || mods.ctrl || mods.alt || mods.shift {
+        return false;
+    }
+    // Vertical first: it is the wheel every mouse has, and a device that
+    // reports both at once is tilting while scrolling, which is one gesture
+    // too many to guess at. Zero is skipped rather than banked — libinput
+    // names both axes on an event that moved one of them.
+    let Some((axis, v120)) = [Axis::Vertical, Axis::Horizontal]
+        .into_iter()
+        .find_map(|axis| {
+            let amount = event.amount_v120(axis)?;
+            (amount != 0.0).then_some((axis, amount as i32))
+        })
+    else {
+        // A wheel with no discrete travel at all is one this cannot count in
+        // notches, so it goes to the client rather than being swallowed.
+        return false;
+    };
+    state.wheel_workspace(axis, v120)
 }

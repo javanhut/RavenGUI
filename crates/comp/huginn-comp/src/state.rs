@@ -27,6 +27,7 @@ use huginn_core::{
     window::{WindowId, WindowMode},
 };
 use smithay::{
+    backend::input::Axis as ScrollAxis,
     backend::renderer::{
         ContextId,
         element::{Id as ElementId, memory::MemoryRenderBuffer, solid::SolidColorBuffer},
@@ -569,6 +570,8 @@ pub(crate) struct Huginn {
     swipe: Option<crate::gesture::Swipe>,
     /// Recognises the gesture that temporarily summons the application dock.
     double_tap: crate::gesture::DoubleTap,
+    /// Wheel travel banked towards the next `Super`+wheel workspace step.
+    wheel: crate::wheel::Notches,
     /// Finger count retained between a hold begin/end pair.
     hold_fingers: Option<u32>,
     /// Present while the temporary application switcher is visible.
@@ -966,6 +969,7 @@ impl Huginn {
             workspace_carousel: None,
             swipe: None,
             double_tap: crate::gesture::DoubleTap::default(),
+            wheel: crate::wheel::Notches::default(),
             hold_fingers: None,
             app_switcher: None,
             carousel_on: None,
@@ -1745,6 +1749,19 @@ impl Huginn {
             tracing::debug!("hosting the greeter; there is no session to lock");
             return false;
         }
+        if !unlockable() {
+            // The same one place, for the other refusal. `Super`+`L` and the
+            // resume from suspend reach this without consulting the idle rule,
+            // so without it here a live desktop still blanks itself on a
+            // keystroke or a lid, and stays blank until the claim timeout
+            // gives up on a lock screen that has nothing to ask.
+            tracing::warn!(
+                socket = RAVEND_VERIFY_SOCKET,
+                "nothing on this machine can check a password; leaving the session \
+                 unlocked rather than putting up a screen with no way past it"
+            );
+            return false;
+        }
         if !self.begin_lock() {
             return false;
         }
@@ -1788,16 +1805,26 @@ impl Huginn {
         self.last_input = Instant::now();
     }
 
+    /// Whether this session can be locked at all.
+    ///
+    /// Two ways it cannot. The login screen has no session to lock -- see the
+    /// `greeter` field -- and a session with no `ravend` behind it has nothing
+    /// that could ever unlock it; see [`unlockable`]. Both are permanent
+    /// enough to be worth asking before the blank goes up rather than after.
+    pub(crate) fn lockable(&self) -> bool {
+        !self.greeter && unlockable()
+    }
+
     /// Whether the session has been idle long enough to lock itself.
     ///
     /// Answered here rather than in the backend's timer so that the rule is
     /// testable and lives next to the state it reads. A session already locked
     /// is never "due": it cannot be locked twice, and asking would restart the
-    /// lock screen on top of itself. Nor is the login screen, which has no
-    /// session to lock; see the `greeter` field.
+    /// lock screen on top of itself. Nor is one that cannot be locked; see
+    /// [`Self::lockable`].
     pub(crate) fn idle_lock_due(&self, now: Instant) -> bool {
         idle_due(
-            self.greeter,
+            self.lockable(),
             self.is_locked(),
             self.idle_inhibited(),
             self.settings.idle_after().duration(),
@@ -1877,6 +1904,7 @@ impl Huginn {
     /// somebody changing the setting.
     pub(crate) fn idle_check_in(&self, now: Instant) -> std::time::Duration {
         idle_wait(
+            self.lockable(),
             self.is_locked(),
             self.idle_inhibited(),
             self.settings.idle_after().duration(),
@@ -3285,6 +3313,77 @@ impl Huginn {
         // The solo may have put windows away; they live in the dock now.
         self.refresh_dock();
         self.refresh_focus();
+    }
+
+    /// Mouse counterpart to the three-finger swipe: `Super`+wheel steps
+    /// through the workspaces.
+    ///
+    /// `axis` is aliased `ScrollAxis` here because the bare `Axis` this module
+    /// reaches for far more often is the tiling one.
+    ///
+    /// `v120` is the wheel travel libinput reports on `axis`; whole steps are
+    /// banked out of it by [`crate::wheel::Notches`], so a free-spinning wheel
+    /// moves one workspace per detent rather than one per event. Positive is
+    /// down and right, which is forwards on both axes.
+    ///
+    /// Returns whether the event belongs to this binding — true whenever the
+    /// compositor is in a state where the wheel is its own, *including* the
+    /// part-detents that bank without moving anything. Those have to be taken
+    /// too: forwarding the travel that did not reach a workspace would scroll
+    /// the client under the pointer by the remainder, which reads as the
+    /// binding leaking into the application.
+    ///
+    /// A panel, the launcher, the lock screen or a region selection owns
+    /// input while it is up, exactly as it owns the keyboard in
+    /// [`crate::backend::keymap::resolve`], so the wheel is left alone there.
+    pub(crate) fn wheel_workspace(&mut self, axis: ScrollAxis, v120: i32) -> bool {
+        if self.is_locked()
+            || self.launcher.is_open()
+            || self.settings.is_open()
+            || self.pinned.is_open()
+            || self.region_active()
+            || self.app_switcher_open()
+        {
+            return false;
+        }
+        // A device is free to report nonsense travel, and the overview arm
+        // below walks one step at a time. Nobody spins a wheel a hundred
+        // workspaces in one event, and the clamp costs nothing when they do
+        // not: every real notch is one step.
+        const MOST: i32 = 32;
+        let steps = self.wheel.take(axis, v120).clamp(-MOST, MOST);
+        if steps == 0 {
+            return true;
+        }
+        // With the overview up the notch steers it rather than going behind
+        // it. Activating a workspace underneath an open overview would leave
+        // the row pointing at one workspace and the compositor on another,
+        // and the next Return would take the one the user was not looking at.
+        if self.overview_open() {
+            let dir = if steps > 0 {
+                huginn_core::geometry::Dir::Right
+            } else {
+                huginn_core::geometry::Dir::Left
+            };
+            for _ in 0..steps.unsigned_abs() {
+                self.overview_move(dir);
+            }
+            return true;
+        }
+        // Clamped at the ends rather than wrapped, which is what the swipe
+        // does: the row stops and the fingers keep going. A wheel that wrapped
+        // would answer one notch too many past the last workspace with a jump
+        // all the way back to the first.
+        let last = self.space.workspaces().len().saturating_sub(1) as i32;
+        let active = self.space.active_index() as i32;
+        let target = active.saturating_add(steps).clamp(0, last);
+        if target == active {
+            return true;
+        }
+        self.space.activate_workspace(target as usize);
+        self.arrange();
+        self.refresh_focus();
+        true
     }
 
     /// Keyboard counterpart: first press opens, second accepts the centre card.
@@ -6401,12 +6500,6 @@ pub(crate) enum KeyboardOn {
     Lock,
 }
 
-/// Whether an idle session is due to lock.
-///
-/// Free-standing rather than a method for one reason: a `Huginn` needs a
-/// Wayland display to exist, so a rule written inside it is a rule that can
-/// only be checked by running a compositor. The three inputs are the whole of
-/// what decides this.
 /// The variable `ravend` sets on the compositor it starts for the greeter.
 ///
 /// A contract with RavenLogin, like the wallpaper path: `ravend` exports it to
@@ -6419,16 +6512,54 @@ fn hosting_greeter() -> bool {
     std::env::var_os(GREETER_ENV).is_some_and(|value| !value.is_empty())
 }
 
+/// The socket `ravend` answers "is this the password of the account asking?"
+/// on, and the only thing `raven-lock` can ask.
+///
+/// A second contract with RavenLogin, like [`GREETER_ENV`] above; the path is
+/// `raven_greet_proto::VERIFY_SOCKET_PATH` there. Written out here rather than
+/// depended on, because a compositor that could not build without the login
+/// daemon's crate would be a heavier coupling than a path in a constant.
+pub(crate) const RAVEND_VERIFY_SOCKET: &str = "/run/raven-lock/verify.sock";
+
+/// Whether a locked session could be unlocked again.
+///
+/// A lock screen with no `ravend` behind it draws a password box that can
+/// never say yes: `raven-lock` has nowhere to ask, so no answer is the right
+/// one. The escape hatches do eventually reveal the desktop -- an unclaimed
+/// blank is abandoned, and a lock screen that keeps dying gives up -- but both
+/// are recoveries from a mistake, and each costs seconds of black screen. On
+/// an idle timer that repeats every time the machine is left alone.
+///
+/// So this asks first. It is what makes the live ISO behave: there is no
+/// `ravend` on a live boot, on purpose, because there is no account there
+/// anybody has been given a password for. It also covers the installed machine
+/// whose login daemon died or could not bind, where the honest answer is the
+/// same one.
+///
+/// Asked at each lock rather than cached at startup: `ravend` is a restarting
+/// service, and a session that outlived one restart should lock again
+/// afterwards.
+fn unlockable() -> bool {
+    std::path::Path::new(RAVEND_VERIFY_SOCKET).exists()
+}
+
+/// Whether an idle session is due to lock.
+///
+/// Free-standing rather than a method for one reason: a `Huginn` needs a
+/// Wayland display to exist, so a rule written inside it is a rule that can
+/// only be checked by running a compositor. The four inputs are the whole of
+/// what decides this.
 fn idle_due(
-    greeter: bool,
+    lockable: bool,
     locked: bool,
     inhibited: bool,
     after: Option<std::time::Duration>,
     idle: std::time::Duration,
 ) -> bool {
-    // The login screen has no session to lock, and a lock screen started
-    // there cannot even find out whose it would be.
-    if greeter {
+    // Nothing here can be locked: the login screen, which has no session and
+    // could not find out whose it would be, or a session with no `ravend` to
+    // let anybody back in. See `Huginn::lockable`.
+    if !lockable {
         return false;
     }
     // Already locked: it cannot be locked twice, and asking again would start
@@ -6446,6 +6577,7 @@ fn idle_due(
 
 /// How long until [`idle_due`] is worth asking again.
 fn idle_wait(
+    lockable: bool,
     locked: bool,
     inhibited: bool,
     after: Option<std::time::Duration>,
@@ -6460,8 +6592,12 @@ fn idle_wait(
     const FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
 
     // Inhibited counts as nothing to count: the coarse poll is also what
-    // notices an inhibitor going away with no request behind it.
-    if locked || inhibited {
+    // notices an inhibitor going away with no request behind it. So does a
+    // session that cannot be locked at all -- and that one has to be here as
+    // well as in `idle_due`, or an idle live desktop reschedules itself at the
+    // one-second floor forever, finding itself past its mark and refused every
+    // time. The coarse poll is what picks up a `ravend` that has come back.
+    if !lockable || locked || inhibited {
         return NOTHING_TO_COUNT;
     }
     match after {
@@ -6881,21 +7017,21 @@ mod idle_tests {
     #[test]
     fn a_session_locks_once_it_has_been_idle_long_enough() {
         assert!(!idle_due(
-            false,
+            true,
             false,
             false,
             AFTER,
             Duration::from_secs(599)
         ));
         assert!(idle_due(
-            false,
+            true,
             false,
             false,
             AFTER,
             Duration::from_secs(600)
         ));
         assert!(idle_due(
-            false,
+            true,
             false,
             false,
             AFTER,
@@ -6906,7 +7042,7 @@ mod idle_tests {
     #[test]
     fn off_never_locks_however_long_it_sits() {
         assert!(!idle_due(
-            false,
+            true,
             false,
             false,
             None,
@@ -6919,7 +7055,7 @@ mod idle_tests {
     #[test]
     fn an_already_locked_session_is_never_due() {
         assert!(!idle_due(
-            false,
+            true,
             true,
             false,
             AFTER,
@@ -6927,13 +7063,16 @@ mod idle_tests {
         ));
     }
 
-    /// The login screen sits untouched for far longer than any timeout, and
-    /// has nothing behind it to hide. A lock attempted there fails and
-    /// blanks the greeter for the claim timeout, once a minute, for ever.
+    /// The login screen and the live desktop, which are the same case here.
+    ///
+    /// The login screen sits untouched for far longer than any timeout and has
+    /// nothing behind it to hide; the live desktop has no `ravend` to unlock
+    /// it. A lock attempted in either blanks the screen for the claim timeout,
+    /// once a minute, for ever.
     #[test]
-    fn the_login_screen_is_never_due() {
+    fn a_session_that_cannot_be_locked_is_never_due() {
         assert!(!idle_due(
-            true,
+            false,
             false,
             false,
             AFTER,
@@ -6946,14 +7085,14 @@ mod idle_tests {
     #[test]
     fn an_inhibited_session_is_never_due() {
         assert!(!idle_due(
-            false,
+            true,
             false,
             true,
             AFTER,
             Duration::from_secs(6000)
         ));
         assert!(idle_due(
-            false,
+            true,
             false,
             false,
             AFTER,
@@ -6966,7 +7105,7 @@ mod idle_tests {
     #[test]
     fn an_inhibited_session_polls_coarsely() {
         assert_eq!(
-            idle_wait(false, true, AFTER, Duration::from_secs(5)),
+            idle_wait(true, false, true, AFTER, Duration::from_secs(5)),
             Duration::from_secs(60)
         );
     }
@@ -6977,14 +7116,14 @@ mod idle_tests {
     #[test]
     fn the_inhibitor_does_not_outrank_the_lock() {
         assert!(!idle_due(
-            false,
+            true,
             true,
             true,
             AFTER,
             Duration::from_secs(6000)
         ));
         assert_eq!(
-            idle_wait(true, true, AFTER, Duration::from_secs(5)),
+            idle_wait(true, true, true, AFTER, Duration::from_secs(5)),
             Duration::from_secs(60)
         );
     }
@@ -6992,7 +7131,7 @@ mod idle_tests {
     #[test]
     fn the_next_check_is_the_time_that_is_left() {
         assert_eq!(
-            idle_wait(false, false, AFTER, Duration::from_secs(60)),
+            idle_wait(true, false, false, AFTER, Duration::from_secs(60)),
             Duration::from_secs(540)
         );
     }
@@ -7003,7 +7142,7 @@ mod idle_tests {
     #[test]
     fn the_next_check_never_comes_back_instantly() {
         for idle in [600, 601, 100_000] {
-            let wait = idle_wait(false, false, AFTER, Duration::from_secs(idle));
+            let wait = idle_wait(true, false, false, AFTER, Duration::from_secs(idle));
             assert!(
                 wait >= Duration::from_secs(1),
                 "rescheduled in {wait:?} at {idle}s idle"
@@ -7014,14 +7153,25 @@ mod idle_tests {
     /// With nothing counting down, the only thing being waited for is somebody
     /// changing the setting — so keep looking, but cheaply.
     #[test]
+    fn a_session_that_cannot_be_locked_polls_coarsely() {
+        // The bug this is for: `idle_due` alone would refuse, `idle_wait`
+        // would answer "one second, you are past your mark", and a live
+        // desktop left alone would ask and be refused once a second forever.
+        assert_eq!(
+            idle_wait(false, false, false, AFTER, Duration::from_secs(6000)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
     fn nothing_to_count_still_checks_back() {
         let coarse = Duration::from_secs(60);
         assert_eq!(
-            idle_wait(false, false, None, Duration::from_secs(5)),
+            idle_wait(true, false, false, None, Duration::from_secs(5)),
             coarse
         );
         assert_eq!(
-            idle_wait(true, false, AFTER, Duration::from_secs(5)),
+            idle_wait(true, true, false, AFTER, Duration::from_secs(5)),
             coarse
         );
     }
