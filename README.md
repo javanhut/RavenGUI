@@ -315,6 +315,25 @@ Nothing tracks these two files — `rvn owns /usr/bin/huginn` reports no owner,
 because the `gui` stage installs them directly. Replacing them corrupts no
 package database, and equally nothing but `restore` will put them back.
 
+### Is it smooth?
+
+Smooth is a p99, not an average. Once a minute, for every screen that drew
+anything in that minute, huginn logs the frame-time percentiles: how long it
+took to build and submit each frame (`render`) and how long the page flip then
+took to reach the panel (`present`), p50, p99 and max in milliseconds, plus
+how many frames it built that turned out to have nothing new in them
+(`skipped`). The same report is written to `$XDG_RUNTIME_DIR/huginn/frametime`
+so it can be read without the log:
+
+```sh
+cat /run/user/$(id -u)/huginn/frametime
+grep 'frame times' /var/log/raven/ravend.log | tail
+```
+
+A quiet minute logs nothing. A `skipped` count that keeps climbing on an idle
+desktop means something is marking the screen dirty for no reason, which is
+the first thing to look at when the machine feels busier than it looks.
+
 ## Status
 
 Working: Huginn runs nested via the winit backend, hosts xdg-shell clients and

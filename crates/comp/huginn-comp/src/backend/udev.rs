@@ -158,6 +158,11 @@ struct Screen {
     awaiting_flip: bool,
     /// Something changed since the last frame we sent.
     dirty: bool,
+    /// When the frame in flight was queued, so its vblank can say how long the
+    /// flip took to land. See `crate::frametime`.
+    submitted_at: Option<Instant>,
+    /// This screen's frame-time samples since the last report.
+    stats: crate::frametime::FrameStats,
 }
 
 struct Udev {
@@ -456,6 +461,18 @@ pub(crate) fn run() -> Result<()> {
             TimeoutAction::ToDuration(data.state.idle_check_in(now))
         })
         .map_err(|e| anyhow::anyhow!("idle timer: {e}"))?;
+
+    // Frame-time percentiles, once a minute, for every screen that drew
+    // anything in that minute. To the log, and to $XDG_RUNTIME_DIR/huginn/
+    // frametime for `cat`. A quiet minute writes nothing to the log; the file
+    // keeps the last report that had something in it.
+    let frametime_timer = Timer::from_duration(FRAMETIME_INTERVAL);
+    handle
+        .insert_source(frametime_timer, |_, _, data: &mut Udev| {
+            data.report_frametimes();
+            TimeoutAction::ToDuration(FRAMETIME_INTERVAL)
+        })
+        .map_err(|e| anyhow::anyhow!("frame-time timer: {e}"))?;
 
     // Suspend. seatd has no equivalent of logind's PrepareForSleep, so this
     // arrives as a change to a file raven-init writes; see `crate::sleep`.
@@ -809,6 +826,9 @@ fn refresh_mhz(mode: &smithay::reexports::drm::control::Mode) -> i32 {
 /// that is a few hundred milliseconds out of suspend and still bringing
 /// its disk back.
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often frame-time percentiles are reported. See `crate::frametime`.
+const FRAMETIME_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Udev {
     /// Withdraw a screen's `wl_output` global without destroying it.
@@ -1213,6 +1233,8 @@ impl Udev {
                 rect: Rect::from_xywh(0, 0, scale.logical.w, scale.logical.h),
                 awaiting_flip: false,
                 dirty: true,
+                submitted_at: None,
+                stats: crate::frametime::FrameStats::default(),
             },
         );
         Ok(())
@@ -1429,6 +1451,9 @@ impl Udev {
     }
 
     fn render(&mut self, key: ScreenKey) {
+        // Measured from here to the queued flip: everything the compositor
+        // does to put a frame together. See `crate::frametime`.
+        let started = Instant::now();
         // Advance animations before assembling the scene, so this frame shows
         // where they are now rather than where they were last frame.
         self.state.tick_animations();
@@ -1539,9 +1564,14 @@ impl Udev {
             Ok(true) => {
                 screen.awaiting_flip = true;
                 screen.dirty = false;
+                screen.submitted_at = Some(Instant::now());
+                screen.stats.record_render(started.elapsed());
             }
             // Nothing changed on screen; do not burn a page flip on it.
-            Ok(false) => screen.dirty = false,
+            Ok(false) => {
+                screen.dirty = false;
+                screen.stats.record_skipped();
+            }
             Err(e) => {
                 tracing::warn!(name = %screen.name, error = %format!("{e:#}"), "presenting frame")
             }
@@ -1558,10 +1588,68 @@ impl Udev {
         }
     }
 
+    /// One interval's frame-time report: a log line per screen that drew
+    /// something, and the runtime file rewritten with every screen.
+    fn report_frametimes(&mut self) {
+        let mut rows = Vec::new();
+        for screen in self.screens.values_mut() {
+            if screen.stats.is_quiet() {
+                continue;
+            }
+            let report = screen.stats.take_report();
+            if let (Some(render), Some(present)) = (report.render, report.present) {
+                tracing::info!(
+                    target: "huginn::frametime",
+                    screen = %screen.name,
+                    frames = report.frames,
+                    skipped = report.skipped,
+                    render_p50_ms = crate::frametime::tenths(render.p50),
+                    render_p99_ms = crate::frametime::tenths(render.p99),
+                    render_max_ms = crate::frametime::tenths(render.max),
+                    present_p50_ms = crate::frametime::tenths(present.p50),
+                    present_p99_ms = crate::frametime::tenths(present.p99),
+                    present_max_ms = crate::frametime::tenths(present.max),
+                    "frame times"
+                );
+            } else if let Some(render) = report.render {
+                tracing::info!(
+                    target: "huginn::frametime",
+                    screen = %screen.name,
+                    frames = report.frames,
+                    skipped = report.skipped,
+                    render_p50_ms = crate::frametime::tenths(render.p50),
+                    render_p99_ms = crate::frametime::tenths(render.p99),
+                    render_max_ms = crate::frametime::tenths(render.max),
+                    "frame times (no flips landed)"
+                );
+            } else if report.skipped > 0 {
+                // Frames built with nothing new in them, and no flips: something
+                // is marking the screen dirty for no reason.
+                tracing::info!(
+                    target: "huginn::frametime",
+                    screen = %screen.name,
+                    skipped = report.skipped,
+                    "frames built with nothing to show"
+                );
+            }
+            rows.push((screen.name.clone(), report));
+        }
+        if rows.is_empty() {
+            return;
+        }
+        let text = crate::frametime::render_text(FRAMETIME_INTERVAL, &rows);
+        if let Err(e) = crate::frametime::write_report(&text) {
+            tracing::debug!(error = %e, "writing the frame-time report");
+        }
+    }
+
     fn on_vblank(&mut self, dev: libc::dev_t, crtc: crtc::Handle) {
         let key = (dev, crtc);
         if let Some(screen) = self.screens.get_mut(&key) {
             screen.awaiting_flip = false;
+            if let Some(at) = screen.submitted_at.take() {
+                screen.stats.record_present(at.elapsed());
+            }
             let submitted = match &screen.scanout {
                 ScreenScanout::Primary(drm) | ScreenScanout::Gpu { drm, .. } => {
                     drm.frame_submitted().map(|_| ())
