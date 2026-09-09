@@ -135,6 +135,14 @@ the first and not the second. A **fullscreen window is in both**: it keeps its
 tile so that leaving fullscreen puts it back exactly where it was, which is what
 §2's "fullscreen is a layout state inside the current pane" requires.
 
+A window going fullscreen in a split takes the split with it. The rest of its
+workspace is put away — the same solo the overview's pick uses, remembered
+tiling included — and leaving fullscreen brings them back exactly as they
+stood. Windows are drawn in workspace order, so without this a tile later in
+the order painted over the film. The solo is the fullscreen's own: one the
+overview already gave the same window is not ended by the client leaving
+fullscreen, and a window alone on its workspace starts none.
+
 The tree is a cache, never an authority. `Space::arrange` reconciles it against
 the membership list and each window's mode before reading it, so a missed update
 costs a frame of staleness rather than a window tiled into a slot it no longer

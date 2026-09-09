@@ -573,6 +573,11 @@ pub(crate) struct Huginn {
     /// input, not window management: `huginn-core` is told where the strip
     /// should be, and has no interest in how many fingers said so.
     swipe: Option<crate::gesture::Swipe>,
+    /// Windows whose going fullscreen put the rest of their split away. The
+    /// solo those started is theirs to end: leaving fullscreen undoes it,
+    /// and a solo the overview started for the same window is left alone.
+    /// See [`Self::set_fullscreen`].
+    fullscreen_solo: HashSet<WindowId>,
     /// Whether `swipe` is a `Super`+left drag rather than fingers on a pad.
     /// The drag rides the same recogniser and the same handlers; this only
     /// says whose lift ends it — the button's, not libinput's — and that a
@@ -984,6 +989,7 @@ impl Huginn {
             carousel_scroll: crate::anim::Animated::settled(0.0),
             workspace_carousel: None,
             swipe: None,
+            fullscreen_solo: HashSet::new(),
             drag: false,
             double_tap: crate::gesture::DoubleTap::default(),
             wheel: crate::wheel::Notches::default(),
@@ -2973,6 +2979,17 @@ impl Huginn {
     /// `send_configure` here would pair the fullscreen state with whatever
     /// size was staged last, and the client would go fullscreen at its old
     /// tile size.
+    ///
+    /// A window going fullscreen in a split takes the split with it: the
+    /// rest of its workspace is put away, as the overview's pick puts its
+    /// neighbours away, and leaving fullscreen brings them back into the
+    /// tiling exactly as it stood. Without this the window covers the output
+    /// in the layout but is drawn in workspace order, and a tile that comes
+    /// later paints over the film — which is what a fullscreen request was
+    /// asking not to happen. The solo is recorded as this window's, so a
+    /// solo the overview already gave the same window is not ended by its
+    /// client leaving fullscreen, and a lone window on its workspace starts
+    /// none: there is nothing to put away.
     pub(crate) fn set_fullscreen(&mut self, id: WindowId, on: bool) {
         if !self.space.set_fullscreen(id, on) {
             return;
@@ -2980,6 +2997,28 @@ impl Huginn {
         tracing::debug!(window = id.raw(), on, "fullscreen");
         if let Some(surface) = self.windows.get(&id) {
             surface.set_fullscreen(on);
+        }
+        if on {
+            if let Some(workspace) = self.space.workspace_of(id)
+                && self.space.workspaces()[workspace].solo() != Some(id)
+                && self.space.workspaces()[workspace]
+                    .windows()
+                    .iter()
+                    .any(|other| {
+                        *other != id && self.space.window(*other).is_some_and(|w| !w.is_minimized())
+                    })
+            {
+                self.fullscreen_solo.insert(id);
+                self.change_solo(workspace, |space| {
+                    space.solo_window_on(workspace, id);
+                });
+            }
+        } else if self.fullscreen_solo.remove(&id)
+            && let Some(workspace) = self.space.workspace_of(id)
+        {
+            self.change_solo(workspace, |space| {
+                space.end_solo_of(id);
+            });
         }
         self.arrange();
         if let (Some(window), Some(surface)) = (self.space.window(id), self.windows.get(&id)) {
@@ -3312,14 +3351,37 @@ impl Huginn {
         carousel.selected = None;
         carousel.hover = None;
         self.space.activate_workspace(target);
-        // The solo does not fullscreen the pick — the pane grows because the
-        // rest of the workspace is put away — but it does pull any member
-        // that *was* fullscreen out of it before minimizing it, and that
-        // client has to be told. Diffed across the call rather than aimed at
-        // the pick, because the pick's own mode never changes here.
-        let members: Vec<(WindowId, bool)> = self
-            .space
-            .active_workspace()
+        // The overview's solo is the overview's to end, so a fullscreen
+        // request's record of its own solo is stale once the overview has
+        // taken the workspace one way or the other.
+        self.fullscreen_solo.clear();
+        self.change_solo(target, |space| match select {
+            Some(id) => {
+                space.solo_window(id);
+            }
+            None => {
+                space.end_solo();
+            }
+        });
+        // The solo may have put windows away; they live in the dock now.
+        self.refresh_dock();
+        self.refresh_focus();
+    }
+
+    /// Start or end a solo on `workspace` through `change`, and tell every
+    /// client the change pulled out of fullscreen.
+    ///
+    /// The solo does not fullscreen the pick — the pane grows because the
+    /// rest of the workspace is put away — but it does pull any member that
+    /// *was* fullscreen out of it before minimizing it, and that client has
+    /// to be told. Diffed across the call rather than aimed at the pick,
+    /// because the pick's own mode never changes here. Arranges afterwards;
+    /// the caller refreshes the dock and focus.
+    fn change_solo(&mut self, workspace: usize, change: impl FnOnce(&mut huginn_core::Space)) {
+        let Some(ws) = self.space.workspaces().get(workspace) else {
+            return;
+        };
+        let members: Vec<(WindowId, bool)> = ws
             .windows()
             .iter()
             .map(|id| {
@@ -3330,14 +3392,7 @@ impl Huginn {
                 (*id, fullscreen)
             })
             .collect();
-        match select {
-            Some(id) => {
-                self.space.solo_window(id);
-            }
-            None => {
-                self.space.end_solo();
-            }
-        }
+        change(&mut self.space);
         let changed: Vec<WindowId> = members
             .into_iter()
             .filter(|(id, was)| {
@@ -3368,9 +3423,6 @@ impl Huginn {
                 surface.configure(rect);
             }
         }
-        // The solo may have put windows away; they live in the dock now.
-        self.refresh_dock();
-        self.refresh_focus();
     }
 
     /// Mouse counterpart to the three-finger swipe: `Super`+wheel steps
