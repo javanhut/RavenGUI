@@ -280,22 +280,22 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         action: Action::Workspace(0),
         chord: "Super+wheel",
-        description: "go to the workspace either side; steps the overview and the switcher",
+        description: "go to the workspace either side; slides the overview",
     },
     Binding {
         action: Action::MinimizeFocused,
-        chord: "Super+click",
-        description: "put the window under the pointer away to the dock",
-    },
-    Binding {
-        action: Action::ToggleCarousel,
         chord: "Super+right click",
-        description: "open or close the workspace overview",
+        description: "put the window under the pointer away; closes an open picker",
     },
     Binding {
         action: Action::OpenMinimized,
+        chord: "Super+click / drag",
+        description: "tap: the put-away windows (tap a tile to bring one back); drag: the three-finger swipe",
+    },
+    Binding {
+        action: Action::ToggleCarousel,
         chord: "Super+middle click",
-        description: "show or hide the put-away windows",
+        description: "open or close the workspace overview",
     },
     Binding {
         action: Action::SendToWorkspace(0),

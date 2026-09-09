@@ -1,13 +1,27 @@
 //! Mouse buttons with `Super` held: the three-finger gestures for a pointer
 //! that has no fingers.
 //!
-//! A touchpad puts a window away with three fingers down, opens the overview
-//! with three fingers up, and summons the put-away windows with a three-finger
-//! double tap. A mouse can do none of that, and a desktop where the best
+//! A touchpad puts a window away with three fingers down, summons the
+//! put-away windows with a three-finger double tap and brings one back with
+//! three fingers up, and opens the overview with three fingers up on a bare
+//! desktop. A mouse can do none of that, and a desktop where the best
 //! behaviours are reachable from one kind of pointer and not the other is a
-//! desktop that feels broken on the machine that happens to have a mouse. So
-//! each vertical gesture has a button here, and [`crate::wheel`] gives the
-//! sideways one to the wheel.
+//! desktop that feels broken on the machine that happens to have a mouse.
+//!
+//! The mapping reads like the gestures rather than like a list of features.
+//! `Super`+left is the fingers. Held and moved, it *is* the three-finger
+//! swipe — the pointer's travel goes to the same [`crate::gesture::Swipe`]
+//! the touchpad feeds, so the carousel follows the mouse sideways, the
+//! overview reveal follows it up, down puts the window away on release, and
+//! inside the strip sideways moves the highlight and up accepts. Pressed and
+//! released without travelling, it is the *tap*: it brings up the strip of
+//! put-away windows, and a second tap on a tile brings that window back.
+//! `Super`+right click is *down* on its own: the window under the pointer
+//! goes away, or whatever picker is up goes away. The wheel is sideways
+//! travel through the workspaces, and with the strip up a notch up brings
+//! the highlighted window back. That leaves the middle button for the
+//! overview, the one gesture that has a key already. See [`crate::wheel`]
+//! for the wheel's half.
 //!
 //! # Exactly `Super`
 //!
@@ -32,22 +46,39 @@ pub(crate) const BTN_LEFT: u32 = 0x110;
 pub(crate) const BTN_RIGHT: u32 = 0x111;
 pub(crate) const BTN_MIDDLE: u32 = 0x112;
 
+/// How many pointer pixels make one touchpad unit of swipe travel.
+///
+/// libinput reports swipe deltas in the same accelerated units as pointer
+/// motion, so one is the honest starting point: a mouse moved an inch drives
+/// the carousel about as far as three fingers moved an inch. The one knob to
+/// turn if a drag feels long or twitchy — the thresholds themselves live in
+/// [`crate::gesture`] and are the touchpad's.
+const PIXELS_PER_UNIT: f64 = 1.0;
+
+/// Pointer travel as swipe travel.
+pub(crate) fn travel(dx: f64, dy: f64) -> (f64, f64) {
+    (dx / PIXELS_PER_UNIT, dy / PIXELS_PER_UNIT)
+}
+
 /// What a `Super`+button press means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Click {
-    /// Put the window under the pointer away to the dock: three fingers down.
+    /// The fingers landing. Moved before release it is the three-finger
+    /// swipe; released where it landed it is the tap: show the put-away
+    /// windows in the centred strip, and — with the strip already up — take
+    /// the tile under the pointer, or dismiss the strip if it landed on none.
+    Fingers,
+    /// Down: put the window under the pointer away to the dock. Over an open
+    /// picker it closes the picker instead, as three fingers down close the
+    /// overview.
     ///
     /// The window under the pointer rather than the focused one, because a
     /// pointer names a window in a way three fingers on a pad cannot, and a
     /// click that put away a window other than the one it landed on would
     /// read as a misfire.
-    PutAway,
-    /// Open the overview, or close it if it is up: three fingers up, and
-    /// three fingers down over an open overview.
+    Down,
+    /// Open the overview, or close it if it is up.
     Overview,
-    /// Show the put-away windows in the centred strip, or dismiss the strip if
-    /// it is up: the three-finger double tap.
-    PutAwayList,
 }
 
 /// The binding a button press with `mods` held stands for, or `None` for a
@@ -57,9 +88,9 @@ pub(crate) fn binding(button: u32, mods: &ModifiersState) -> Option<Click> {
         return None;
     }
     match button {
-        BTN_LEFT => Some(Click::PutAway),
-        BTN_RIGHT => Some(Click::Overview),
-        BTN_MIDDLE => Some(Click::PutAwayList),
+        BTN_LEFT => Some(Click::Fingers),
+        BTN_RIGHT => Some(Click::Down),
+        BTN_MIDDLE => Some(Click::Overview),
         _ => None,
     }
 }
@@ -77,9 +108,9 @@ mod tests {
 
     #[test]
     fn super_and_a_button_is_a_gesture() {
-        assert_eq!(binding(BTN_LEFT, &super_held()), Some(Click::PutAway));
-        assert_eq!(binding(BTN_RIGHT, &super_held()), Some(Click::Overview));
-        assert_eq!(binding(BTN_MIDDLE, &super_held()), Some(Click::PutAwayList));
+        assert_eq!(binding(BTN_LEFT, &super_held()), Some(Click::Fingers));
+        assert_eq!(binding(BTN_RIGHT, &super_held()), Some(Click::Down));
+        assert_eq!(binding(BTN_MIDDLE, &super_held()), Some(Click::Overview));
     }
 
     #[test]
@@ -123,5 +154,27 @@ mod tests {
         // BTN_SIDE, BTN_EXTRA: the thumb buttons a browser already binds.
         assert_eq!(binding(0x113, &super_held()), None);
         assert_eq!(binding(0x114, &super_held()), None);
+    }
+
+    /// A drag drives the touchpad's recogniser, so its travel has to reach
+    /// the touchpad's thresholds: a screen-width drag is several workspaces,
+    /// and the pointer settling under a pressed button is none.
+    #[test]
+    fn drag_travel_lands_in_the_swipes_range() {
+        let mut swipe = crate::gesture::Swipe::new(crate::gesture::CAROUSEL_FINGERS);
+        let (dx, dy) = travel(2.0, -1.0);
+        assert!(swipe.takes_hold(dx, dy).is_none(), "jitter must not commit");
+        let mut swipe = crate::gesture::Swipe::new(crate::gesture::CAROUSEL_FINGERS);
+        let (dx, dy) = travel(-1920.0, 0.0);
+        assert_eq!(
+            swipe.takes_hold(dx, dy),
+            Some(crate::gesture::Hold::Horizontal)
+        );
+        swipe.drives(0.0);
+        let position = swipe.position().unwrap();
+        assert!(
+            (2.0..=12.0).contains(&position),
+            "a screen-width drag moved the row {position} workspaces"
+        );
     }
 }

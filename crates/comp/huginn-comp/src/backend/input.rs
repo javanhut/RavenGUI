@@ -25,7 +25,13 @@ use crate::state::Huginn;
 pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) {
     match event {
         InputEvent::PointerMotion { event } => {
-            let location = state.clamp_pointer(state.pointer_location + event.delta());
+            // A `Super`+left drag is fed the raw delta, not the clamped
+            // one: the swipe should keep travelling when the pointer has
+            // run into the edge of the screen, as fingers keep travelling
+            // when the cursor they are not drawing has.
+            let delta = event.delta();
+            state.drag_moved(delta.x, delta.y);
+            let location = state.clamp_pointer(state.pointer_location + delta);
             motion(state, location, event.time_msec());
         }
         InputEvent::PointerMotionAbsolute { event } => {
@@ -36,6 +42,10 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
             let extent: Size<i32, Logical> = (area.w(), area.h()).into();
             let origin: Point<f64, Logical> = (f64::from(area.x()), f64::from(area.y())).into();
             let location = state.clamp_pointer(event.position_transformed(extent) + origin);
+            // No raw delta here; the difference in position is the best
+            // there is, and a nested window's edge is where it ends.
+            let delta = location - state.pointer_location;
+            state.drag_moved(delta.x, delta.y);
             motion(state, location, event.time_msec());
         }
         InputEvent::PointerButton { event } => button::<B>(state, &event),
@@ -117,11 +127,25 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     let serial = SERIAL_COUNTER.next_serial();
     let button_state = event.state();
 
+    // The button that began a `Super`+left drag ends it, however `Super`
+    // stands by then and whatever has happened since — a lock included,
+    // which is why this is first. The release is the compositor's, as the
+    // press was: a client must not see the up of a button it never saw go
+    // down.
+    if button_state == ButtonState::Released
+        && event.button_code() == crate::mouse::BTN_LEFT
+        && state.drag_active()
+    {
+        state.drag_end();
+        state.queue_redraw();
+        return;
+    }
+
     // Tap-to-click touchpads encode three fingers as a middle-button press.
     // Touchpads only — the devices that report gestures — because on a mouse
     // a double middle click is two pastes of the primary selection, and a
     // strip opening over them would be the touchpad's shortcut leaking onto
-    // a device that has a binding of its own for it: `Super`+middle, below.
+    // a device that has a binding of its own for it: `Super`+click, below.
     if button_state == ButtonState::Pressed
         && event.button_code() == crate::mouse::BTN_MIDDLE
         && event.device().has_capability(DeviceCapability::Gesture)
@@ -332,8 +356,9 @@ fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
 ///
 /// This is the mouse's three-finger swipe. A trackpad has the gesture and a
 /// mouse does not, so without this the only way to the workspace next door
-/// with a mouse in hand is a key. And as the swipe does, the wheel steps
-/// whichever row is up: the overview's stages, or the switcher's tiles.
+/// with a mouse in hand is a key. And as the fingers do, the wheel drives
+/// whichever picker is up: it slides the overview's row, and a notch up
+/// brings the strip's highlighted window back.
 ///
 /// Wheels only. A touchpad's two-finger scroll arrives here as
 /// [`AxisSource::Finger`] with no v120 to count, and the device it comes from
