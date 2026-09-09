@@ -37,6 +37,8 @@ mod launcher;
 #[cfg(target_os = "linux")]
 mod motion;
 #[cfg(target_os = "linux")]
+mod mouse;
+#[cfg(target_os = "linux")]
 mod overlay;
 mod overview;
 mod pinned;

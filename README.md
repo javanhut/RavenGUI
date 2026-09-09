@@ -357,6 +357,15 @@ terminal can swallow is worse than not having a lock chord — it fails precisel
 when somebody is walking away from a machine they believe they just locked. So
 that chord is reserved, and RavenTerminal may not use it.
 
+The touchpad gestures — three fingers sideways for the workspaces, up for the
+overview, down to put a window away, a double tap for the put-away strip —
+each have a key and a mouse button, so a machine with a mouse loses nothing:
+`Super`+`Ctrl`+`M` and `Super`+`Ctrl`+`Shift`+`M` on the keyboard, and on the
+mouse `Super`+wheel, `Super`+click, `Super`+right click and `Super`+middle
+click, under the same exactly-`Super` rule the wheel already had. The rules
+are `huginn-comp/src/mouse.rs` and `wheel.rs`, pure and tested; the full
+table is in [`docs/integration.md`](docs/integration.md).
+
 While the session is locked, no binding resolves at all: every key is the lock
 screen's, checked before the launcher and quick settings, which would otherwise
 swallow the keystrokes and leave no way to type a password.

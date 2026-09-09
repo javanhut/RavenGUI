@@ -11,9 +11,9 @@
 
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
-        GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, PointerAxisEvent,
-        PointerButtonEvent, PointerMotionEvent,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
+        GestureBeginEvent, GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent,
+        PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::pointer::{AxisFrame, ButtonEvent, MotionEvent},
     utils::{Logical, Point, SERIAL_COUNTER, Size},
@@ -118,8 +118,14 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     let button_state = event.state();
 
     // Tap-to-click touchpads encode three fingers as a middle-button press.
-    const BTN_MIDDLE: u32 = 0x112;
-    if button_state == ButtonState::Pressed && event.button_code() == BTN_MIDDLE {
+    // Touchpads only — the devices that report gestures — because on a mouse
+    // a double middle click is two pastes of the primary selection, and a
+    // strip opening over them would be the touchpad's shortcut leaking onto
+    // a device that has a binding of its own for it: `Super`+middle, below.
+    if button_state == ButtonState::Pressed
+        && event.button_code() == crate::mouse::BTN_MIDDLE
+        && event.device().has_capability(DeviceCapability::Gesture)
+    {
         state.middle_tap(event.time_msec());
     }
 
@@ -166,6 +172,20 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
                 ButtonState::Released => state.region_release(),
             }
         }
+        return;
+    }
+
+    // `Super`+a button is the mouse's three-finger gesture — see
+    // [`crate::mouse`]. After the lock and the region selection, which own
+    // the pointer outright, and before everything that reads the desktop: a
+    // press that put a window away must not also focus what was under it.
+    // Releases are not bound, so a swallowed press's release still goes
+    // through, exactly as a dock click's does.
+    if button_state == ButtonState::Pressed
+        && let Some(keyboard) = state.seat.get_keyboard()
+        && let Some(click) = crate::mouse::binding(event.button_code(), &keyboard.modifier_state())
+        && state.mouse_click(click)
+    {
         return;
     }
 
@@ -312,18 +332,19 @@ fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
 ///
 /// This is the mouse's three-finger swipe. A trackpad has the gesture and a
 /// mouse does not, so without this the only way to the workspace next door
-/// with a mouse in hand is a key.
+/// with a mouse in hand is a key. And as the swipe does, the wheel steps
+/// whichever row is up: the overview's stages, or the switcher's tiles.
 ///
 /// Wheels only. A touchpad's two-finger scroll arrives here as
 /// [`AxisSource::Finger`] with no v120 to count, and the device it comes from
 /// already has the swipe — taking it would add a second, worse way to do the
 /// same thing on the one pointer that needs it least.
 ///
-/// Exactly Super: `Super`+`Ctrl` is the compositor's keyboard prefix, but the
-/// wheel is not a key and has no keysym to disambiguate, so the plainest chord
-/// is the right one. Requiring the other modifiers to be *absent* leaves
-/// `Super`+`Shift`+wheel and the rest free for whatever wants them later,
-/// including the client.
+/// Exactly Super, on the desktop: `Super`+`Ctrl` is the compositor's keyboard
+/// prefix, but the wheel is not a key and has no keysym to disambiguate, so
+/// the plainest chord is the right one. What the other chords mean while a
+/// picker is up is [`Huginn::wheel_workspace`]'s to decide, which is why the
+/// classification is passed along rather than settled here.
 ///
 /// Returns whether the event was taken.
 fn wheel_workspace<B: InputBackend>(
@@ -337,10 +358,7 @@ fn wheel_workspace<B: InputBackend>(
     let Some(keyboard) = state.seat.get_keyboard() else {
         return false;
     };
-    let mods = keyboard.modifier_state();
-    if !mods.logo || mods.ctrl || mods.alt || mods.shift {
-        return false;
-    }
+    let chord = crate::wheel::Chord::of(&keyboard.modifier_state());
     // Vertical first: it is the wheel every mouse has, and a device that
     // reports both at once is tilting while scrolling, which is one gesture
     // too many to guess at. Zero is skipped rather than banked — libinput
@@ -356,5 +374,5 @@ fn wheel_workspace<B: InputBackend>(
         // notches, so it goes to the client rather than being swallowed.
         return false;
     };
-    state.wheel_workspace(axis, v120)
+    state.wheel_workspace(axis, v120, chord)
 }

@@ -19,9 +19,44 @@
 //! early or late depending on where the previous one happened to stop.
 
 use smithay::backend::input::Axis;
+use smithay::input::keyboard::ModifiersState;
 
 /// The v120 travel of one detent of an ordinary wheel.
 const DETENT: i32 = 120;
+
+/// Which keys are down while the wheel turns, as far as the bindings care.
+///
+/// Three cases rather than the modifier flags themselves, because that is
+/// how many the compositor tells apart: exactly `Super` is the workspace
+/// binding wherever the wheel is; nothing at all is the client's wheel,
+/// unless a picker is up with nothing under it to scroll; and anything else
+/// is left alone — except by the switcher's strip, which takes the wheel
+/// whatever is held, since `Alt` is down for the whole of an Alt-Tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chord {
+    /// `Super` alone.
+    Super,
+    /// No modifier at all.
+    Bare,
+    /// Any other combination.
+    Other,
+}
+
+impl Chord {
+    /// Classify the modifiers held while the wheel turned.
+    ///
+    /// Requiring the other modifiers to be *absent* from [`Chord::Super`]
+    /// leaves `Super`+`Shift`+wheel and the rest free for whatever wants
+    /// them later, including the client. Lock keys are not modifiers here:
+    /// Caps Lock must not disarm a binding.
+    pub(crate) fn of(mods: &ModifiersState) -> Self {
+        match (mods.logo, mods.ctrl || mods.alt || mods.shift) {
+            (true, false) => Self::Super,
+            (false, false) => Self::Bare,
+            _ => Self::Other,
+        }
+    }
+}
 
 /// Wheel travel banked towards the next whole step.
 #[derive(Debug, Clone, Copy, Default)]
@@ -126,5 +161,36 @@ mod tests {
         let mut n = Notches::default();
         n.take(Axis::Vertical, DETENT + 7);
         assert_eq!(n.take(Axis::Vertical, i32::MAX), i32::MAX / DETENT);
+    }
+
+    #[test]
+    fn the_chord_is_exactly_super_bare_or_something_else() {
+        let none = ModifiersState::default();
+        assert_eq!(Chord::of(&none), Chord::Bare);
+        assert_eq!(
+            Chord::of(&ModifiersState { logo: true, ..none }),
+            Chord::Super
+        );
+        assert_eq!(
+            Chord::of(&ModifiersState {
+                logo: true,
+                shift: true,
+                ..none
+            }),
+            Chord::Other
+        );
+        assert_eq!(
+            Chord::of(&ModifiersState { alt: true, ..none }),
+            Chord::Other
+        );
+        // Caps Lock is not a modifier as far as the wheel is concerned.
+        assert_eq!(
+            Chord::of(&ModifiersState {
+                logo: true,
+                caps_lock: true,
+                ..none
+            }),
+            Chord::Super
+        );
     }
 }
