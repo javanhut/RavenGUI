@@ -76,10 +76,16 @@ mod window;
 mod xwayland;
 
 fn main() {
+    // Info by default. The session log is what an installed system keeps in
+    // /var/log/raven/ravend.log, and at debug every window decoration and
+    // every popup reposition went into it: on one desktop, half the lines
+    // written were debug, and the warnings that mattered sat between them.
+    // RUST_LOG still overrides, and `imlazy run` sets it to debug for
+    // development; see lazy.toml.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "huginn=debug,smithay=warn".into()),
+                .unwrap_or_else(|_| "huginn=info,smithay=warn".into()),
         )
         .init();
 

@@ -36,6 +36,8 @@ alias = ["status"]
 desc = "Run the compositor nested in the current session"
 run = ["cargo run {{comp}}"]
 alias = ["nested"]
+# Nested, for development: the debug log that production no longer writes.
+env = { RUST_LOG = "huginn=debug,smithay=warn" }
 
 [commands.probe]
 desc = "Run the layer-shell probe against a nested compositor (WAYLAND_DISPLAY=wayland-N)"
