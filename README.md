@@ -334,6 +334,18 @@ A quiet minute logs nothing. A `skipped` count that keeps climbing on an idle
 desktop means something is marking the screen dirty for no reason, which is
 the first thing to look at when the machine feels busier than it looks.
 
+### Log level
+
+Info by default; that is what an installed system keeps in
+`/var/log/raven/ravend.log`. `RUST_LOG` overrides it, in the usual
+`tracing` syntax, and `imlazy run` sets `huginn=debug` for the nested
+development compositor:
+
+```sh
+RUST_LOG=huginn=debug,smithay=info huginn     # by hand
+RUST_LOG=huginn::frametime=info,huginn=warn   # only the frame-time reports
+```
+
 ## Status
 
 Working: Huginn runs nested via the winit backend, hosts xdg-shell clients and
