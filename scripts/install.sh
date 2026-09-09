@@ -36,7 +36,15 @@ PREFIX=${PREFIX:-/usr/bin}
 BINARIES=(huginn)
 PROFILE=release
 
-if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+# Escalation is per step: cargo runs as you, and only the copies below go
+# through sudo. Running the whole script as root is how ~/.cargo and target/
+# end up owned by root, so it is refused rather than tolerated.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "install.sh: do not run this as root. It builds as you and asks for" >&2
+    echo "sudo only for the copy into $PREFIX. Run it plain: ./scripts/install.sh" >&2
+    exit 1
+fi
+SUDO="sudo"
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
