@@ -656,11 +656,18 @@ impl Space {
     /// screen's when the window is on no workspace.
     fn output_of(&self, id: WindowId) -> Rect {
         let index = self
-            .workspaces
-            .iter()
-            .find(|ws| ws.windows().contains(&id))
-            .map_or(self.focused_output(), Workspace::output);
+            .workspace_of(id)
+            .map_or(self.focused_output(), |index| {
+                self.workspaces[index].output()
+            });
         self.outputs[index].output
+    }
+
+    /// The index of the workspace holding window `id`, if any does.
+    pub fn workspace_of(&self, id: WindowId) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|ws| ws.windows().contains(&id))
     }
 
     /// Send the focused window to workspace `index`, keeping the current
@@ -689,19 +696,33 @@ impl Space {
     /// mid-solo. Returns whether `id` was here to be soloed; call
     /// [`Self::arrange`] afterwards.
     pub fn solo_window(&mut self, id: WindowId) -> bool {
-        if !self.windows.contains_key(&id) || !self.workspaces[self.active].windows().contains(&id)
+        self.solo_window_on(self.active, id)
+    }
+
+    /// [`Self::solo_window`] on workspace `index` rather than the active one.
+    ///
+    /// For the solo a fullscreen request starts: a client may go fullscreen
+    /// on a workspace no screen is showing — a player told to by a remote,
+    /// a game finishing a load — and the rest of *its* workspace is what has
+    /// to step aside, not the rest of whichever one happens to be active.
+    /// Returns whether `id` was there to be soloed; call [`Self::arrange`]
+    /// afterwards.
+    pub fn solo_window_on(&mut self, index: usize, id: WindowId) -> bool {
+        if index >= self.workspaces.len()
+            || !self.windows.contains_key(&id)
+            || !self.workspaces[index].windows().contains(&id)
         {
             return false;
         }
-        let members: Vec<WindowId> = self.workspaces[self.active].windows().to_vec();
-        let previous = self.workspaces[self.active].solo_mut().take();
+        let members: Vec<WindowId> = self.workspaces[index].windows().to_vec();
+        let previous = self.workspaces[index].solo_mut().take();
         let (tiles, mut hidden) = match previous {
             Some(prev) if prev.window == id => {
-                *self.workspaces[self.active].solo_mut() = Some(prev);
+                *self.workspaces[index].solo_mut() = Some(prev);
                 return true;
             }
             Some(prev) => (prev.tiles, prev.hidden),
-            None => (self.workspaces[self.active].tiles().clone(), Vec::new()),
+            None => (self.workspaces[index].tiles().clone(), Vec::new()),
         };
 
         // The pick comes out of hiding — a previous solo may have put it
@@ -729,18 +750,32 @@ impl Space {
                 }
             }
         }
-        *self.workspaces[self.active].solo_mut() = Some(workspace::Solo {
+        *self.workspaces[index].solo_mut() = Some(workspace::Solo {
             window: id,
             tiles,
             hidden,
         });
-        self.workspaces[self.active].focus(id);
+        self.workspaces[index].focus(id);
         true
     }
 
     /// The window soloed on the active workspace, if one is.
     pub fn solo(&self) -> Option<WindowId> {
         self.workspaces[self.active].solo()
+    }
+
+    /// End the solo `id` holds, on whichever workspace it holds it. Returns
+    /// whether it held one; call [`Self::arrange`] afterwards.
+    ///
+    /// Named by the window rather than the workspace because the caller that
+    /// started it — a fullscreen request — knows the window and not where it
+    /// has since been sent, and a solo that has changed hands to another
+    /// window in the meantime is that window's to end, not this one's.
+    pub fn end_solo_of(&mut self, id: WindowId) -> bool {
+        match self.workspaces.iter().position(|ws| ws.solo() == Some(id)) {
+            Some(index) => self.end_solo_on(index),
+            None => false,
+        }
     }
 
     /// Put the active workspace back the way [`Self::solo_window`] found it:
@@ -1335,6 +1370,66 @@ mod tests {
         );
         assert!(s.window(b).unwrap().is_minimized());
         assert!(s.window(c).unwrap().is_minimized());
+    }
+
+    /// The fullscreen case: the pick keeps its fullscreen through the solo,
+    /// the rest of the split steps aside, and ending the solo by the window's
+    /// name brings the split back exactly.
+    #[test]
+    fn a_fullscreen_window_can_solo_its_split_and_give_it_back() {
+        let (mut s, a, b, c) = a_b_c();
+        s.arrange();
+        let before: Vec<Rect> = [a, b, c]
+            .iter()
+            .map(|id| s.window(*id).unwrap().geometry)
+            .collect();
+
+        assert!(s.set_fullscreen(b, true));
+        assert!(s.solo_window_on(s.active_index(), b));
+        s.arrange();
+        assert_eq!(s.solo(), Some(b));
+        assert!(
+            s.window(b).unwrap().mode == WindowMode::Fullscreen,
+            "the solo must not take the pick's own fullscreen away"
+        );
+        assert!(s.window(a).unwrap().is_minimized());
+        assert!(s.window(c).unwrap().is_minimized());
+
+        assert!(s.set_fullscreen(b, false));
+        assert!(s.end_solo_of(b));
+        s.arrange();
+        assert_eq!(s.solo(), None);
+        for (id, geometry) in [a, b, c].iter().zip(before) {
+            assert_eq!(s.window(*id).unwrap().geometry, geometry);
+            assert!(!s.window(*id).unwrap().is_minimized());
+        }
+        assert!(!s.end_solo_of(b), "nothing left to end");
+    }
+
+    /// A request from a workspace no screen shows solos *that* workspace.
+    #[test]
+    fn a_solo_can_start_on_a_workspace_that_is_not_active() {
+        let mut s = space();
+        let a = s.open_window();
+        let b = s.open_window();
+        s.activate_workspace(1);
+        let c = s.open_window();
+        s.arrange();
+
+        assert_eq!(s.workspace_of(a), Some(0));
+        assert_eq!(s.workspace_of(c), Some(1));
+        assert!(s.solo_window_on(0, a));
+        s.arrange();
+        assert_eq!(s.active_index(), 1, "the active workspace is left alone");
+        assert_eq!(s.solo(), None, "and holds no solo of its own");
+        assert_eq!(s.workspaces()[0].solo(), Some(a));
+        assert!(s.window(b).unwrap().is_minimized());
+        assert!(!s.window(c).unwrap().is_minimized());
+
+        assert!(!s.solo_window_on(1, a), "a is not on workspace 1");
+        assert!(!s.solo_window_on(99, a), "no such workspace");
+        assert!(s.end_solo_of(a));
+        assert!(!s.window(b).unwrap().is_minimized());
     }
 
     #[test]
