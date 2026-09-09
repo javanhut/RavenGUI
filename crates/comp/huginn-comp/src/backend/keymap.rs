@@ -117,6 +117,18 @@ pub(crate) enum Action {
     AcceptSwitcher,
     /// Dismiss the application switcher, gesture or Alt-Tab, taking nothing.
     DismissSwitcher,
+    /// Put the focused window away to the dock: three fingers down, for a
+    /// keyboard.
+    MinimizeFocused,
+    /// Show the put-away windows in the centred strip, ready to bring one
+    /// back: the three-finger double tap, for a keyboard. Once it is up the
+    /// arrows or Tab step it and Return takes the highlighted one, the way
+    /// three fingers up does.
+    OpenMinimized,
+    /// Bring the workspace either side to the front of the overview: three
+    /// fingers sideways while it is up. Only reachable while the overview
+    /// is, which is why it has no row in [`BINDINGS`].
+    OverviewShift(Direction),
     /// A media key: raise, lower or mute the output volume.
     ///
     /// Resolved before every mode but the lock — and, unlike everything else
@@ -240,6 +252,16 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "open or accept the workspace carousel",
     },
     Binding {
+        action: Action::MinimizeFocused,
+        chord: "Super+Ctrl+M",
+        description: "put the focused window away to the dock",
+    },
+    Binding {
+        action: Action::OpenMinimized,
+        chord: "Super+Ctrl+Shift+M",
+        description: "show the put-away windows (arrows step, Return brings one back)",
+    },
+    Binding {
         action: Action::EnterResize,
         chord: "Super+Ctrl+R",
         description: "resize the focused window with the arrows",
@@ -249,14 +271,31 @@ pub(crate) const BINDINGS: &[Binding] = &[
         chord: "Super+Ctrl+1..9",
         description: "go to a workspace",
     },
-    // The one pointer binding in the table. It carries `Workspace` because
-    // that is what it does, which also keeps `bindings_cover_every_action`
-    // honest: the discriminant is already reachable from the digits above, so
-    // the row is documentation rather than a second claim about the keymap.
+    // The pointer bindings in the table: the three-finger gestures, for a
+    // mouse. Each carries the action it does, which also keeps
+    // `bindings_cover_every_action` honest: every discriminant here is
+    // already reachable from a key above, so the rows are documentation
+    // rather than a second claim about the keymap. See `crate::mouse` and
+    // `crate::wheel`.
     Binding {
         action: Action::Workspace(0),
         chord: "Super+wheel",
-        description: "go to the workspace either side",
+        description: "go to the workspace either side; steps the overview and the switcher",
+    },
+    Binding {
+        action: Action::MinimizeFocused,
+        chord: "Super+click",
+        description: "put the window under the pointer away to the dock",
+    },
+    Binding {
+        action: Action::ToggleCarousel,
+        chord: "Super+right click",
+        description: "open or close the workspace overview",
+    },
+    Binding {
+        action: Action::OpenMinimized,
+        chord: "Super+middle click",
+        description: "show or hide the put-away windows",
     },
     Binding {
         action: Action::SendToWorkspace(0),
@@ -407,16 +446,27 @@ pub(crate) fn resolve(
     // accepted. The gesture's strip takes the same keys, which costs it
     // nothing: an Alt release with the gesture's strip up takes what it
     // shows, as a tap would.
+    //
+    // The arrows step it too, and Return takes the highlighted tile. Those
+    // are for the strip that `Super`+`Ctrl`+`Shift`+`M` opens, which has no
+    // Alt to let go of: three fingers sideways and up, for a keyboard. They
+    // cost the Alt-Tab strip nothing either — Return with Alt still held
+    // takes the tile, and the release that follows finds no strip to act on.
     if mode.switcher_open {
         let action = match (sym, key_state) {
             (keysyms::KEY_Escape, KeyState::Pressed) => Some(Action::DismissSwitcher),
-            (keysyms::KEY_ISO_Left_Tab, KeyState::Pressed) => {
+            (keysyms::KEY_ISO_Left_Tab | keysyms::KEY_Left, KeyState::Pressed) => {
                 Some(Action::AltTab(Direction::Backward))
             }
             (keysyms::KEY_Tab, KeyState::Pressed) if modifiers.shift => {
                 Some(Action::AltTab(Direction::Backward))
             }
-            (keysyms::KEY_Tab, KeyState::Pressed) => Some(Action::AltTab(Direction::Forward)),
+            (keysyms::KEY_Tab | keysyms::KEY_Right, KeyState::Pressed) => {
+                Some(Action::AltTab(Direction::Forward))
+            }
+            (keysyms::KEY_Return | keysyms::KEY_KP_Enter, KeyState::Pressed) => {
+                Some(Action::AcceptSwitcher)
+            }
             (
                 keysyms::KEY_Alt_L | keysyms::KEY_Alt_R | keysyms::KEY_Meta_L | keysyms::KEY_Meta_R,
                 KeyState::Released,
@@ -449,8 +499,11 @@ pub(crate) fn resolve(
 
     // The overview owns only the keys that steer it — highlight with the
     // arrows, Return to take the highlighted window, Escape to put the
-    // tiling back. Everything else falls through, so the chords still work:
-    // `Super`+`Ctrl`+`C` still accepts, the digits still jump workspaces.
+    // tiling back, and Tab to bring the workspace either side to the front,
+    // which is what three fingers sideways do while it is up. Tab is free
+    // here because Alt-Tab is refused over the overview. Everything else
+    // falls through, so the chords still work: `Super`+`Ctrl`+`C` still
+    // accepts, the digits still jump workspaces.
     if mode.overview {
         let action = match sym {
             keysyms::KEY_Left => Some(Action::OverviewMove(Dir::Left)),
@@ -459,6 +512,9 @@ pub(crate) fn resolve(
             keysyms::KEY_Down => Some(Action::OverviewMove(Dir::Down)),
             keysyms::KEY_Return => Some(Action::OverviewConfirm),
             keysyms::KEY_Escape => Some(Action::OverviewCancel),
+            keysyms::KEY_ISO_Left_Tab => Some(Action::OverviewShift(Direction::Backward)),
+            keysyms::KEY_Tab if modifiers.shift => Some(Action::OverviewShift(Direction::Backward)),
+            keysyms::KEY_Tab => Some(Action::OverviewShift(Direction::Forward)),
             _ => None,
         };
         if let Some(action) = action {
@@ -547,6 +603,10 @@ pub(crate) fn resolve(
         // Ctrl is what separates this from `Super`+`C`, which is copy: the
         // branch above returns before this one whenever Ctrl is not held.
         keysyms::KEY_c | keysyms::KEY_C => Action::ToggleCarousel,
+        // M for minimize. Shift is the reverse, as it is for the digits and
+        // Tab: put a window away, or show the put-away ones to bring one back.
+        keysyms::KEY_m | keysyms::KEY_M if modifiers.shift => Action::OpenMinimized,
+        keysyms::KEY_m | keysyms::KEY_M => Action::MinimizeFocused,
         keysyms::KEY_h | keysyms::KEY_H => Action::ToggleHelp,
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
         keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
@@ -1416,6 +1476,95 @@ mod tests {
             "an action is reachable by a key but missing from BINDINGS, so the \
              overlay and the log line will not mention it"
         );
+    }
+
+    #[test]
+    fn super_ctrl_m_puts_the_focused_window_away_and_shift_brings_one_back() {
+        assert_eq!(
+            intercepted(super_ctrl(), keysyms::KEY_m),
+            Some(Action::MinimizeFocused)
+        );
+        // Shift capitalises the letter on most layouts and leaves it alone on
+        // the rest; both spellings are the same chord.
+        assert_eq!(
+            intercepted(super_ctrl_shift(), keysyms::KEY_M),
+            Some(Action::OpenMinimized)
+        );
+        assert_eq!(
+            intercepted(super_ctrl_shift(), keysyms::KEY_m),
+            Some(Action::OpenMinimized)
+        );
+        // Plain Super+M is the application's, like the rest of the layer.
+        assert!(forwarded(KeyState::Pressed, super_held(), keysyms::KEY_m));
+    }
+
+    /// The strip the chord opens has no Alt to let go of, so it needs a key
+    /// that takes the tile and keys that step it without Tab.
+    #[test]
+    fn the_open_switcher_steps_on_the_arrows_and_takes_the_tile_on_return() {
+        let mode = Modes {
+            switcher_open: true,
+            ..Modes::default()
+        };
+        let at = |sym| resolve(KeyState::Pressed, &ModifiersState::default(), sym, mode);
+        assert!(matches!(
+            at(keysyms::KEY_Right),
+            FilterResult::Intercept(Some(Action::AltTab(Direction::Forward)))
+        ));
+        assert!(matches!(
+            at(keysyms::KEY_Left),
+            FilterResult::Intercept(Some(Action::AltTab(Direction::Backward)))
+        ));
+        assert!(matches!(
+            at(keysyms::KEY_Return),
+            FilterResult::Intercept(Some(Action::AcceptSwitcher))
+        ));
+        assert!(matches!(
+            at(keysyms::KEY_KP_Enter),
+            FilterResult::Intercept(Some(Action::AcceptSwitcher))
+        ));
+        // The release is swallowed and does nothing, like every other key's.
+        assert!(matches!(
+            resolve(
+                KeyState::Released,
+                &ModifiersState::default(),
+                keysyms::KEY_Return,
+                mode
+            ),
+            FilterResult::Intercept(None)
+        ));
+    }
+
+    #[test]
+    fn the_overview_brings_the_next_stage_to_the_front_on_tab() {
+        assert!(matches!(
+            while_overviewing(ModifiersState::default(), keysyms::KEY_Tab),
+            FilterResult::Intercept(Some(Action::OverviewShift(Direction::Forward)))
+        ));
+        assert!(matches!(
+            while_overviewing(ModifiersState::default(), keysyms::KEY_ISO_Left_Tab),
+            FilterResult::Intercept(Some(Action::OverviewShift(Direction::Backward)))
+        ));
+        let shift = ModifiersState {
+            shift: true,
+            ..ModifiersState::default()
+        };
+        assert!(matches!(
+            while_overviewing(shift, keysyms::KEY_Tab),
+            FilterResult::Intercept(Some(Action::OverviewShift(Direction::Backward)))
+        ));
+        // Alt+Tab over the overview shifts its stage rather than opening a
+        // second picker on top of the first.
+        assert!(matches!(
+            while_overviewing(alt_held(), keysyms::KEY_Tab),
+            FilterResult::Intercept(Some(Action::OverviewShift(Direction::Forward)))
+        ));
+        // And with the overview down, Tab is nobody's.
+        assert!(forwarded(
+            KeyState::Pressed,
+            ModifiersState::default(),
+            keysyms::KEY_Tab
+        ));
     }
 
     #[test]

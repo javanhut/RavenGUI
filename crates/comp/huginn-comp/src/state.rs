@@ -2683,6 +2683,27 @@ impl Huginn {
         ) {
             self.refresh_dock();
         }
+        // The strip's highlight follows the pointer, as the overview's does:
+        // a mouse points, so the tile under it is the one meant. Only a tile
+        // with a window can be chosen, and only movement chooses — a strip
+        // that opens under a resting pointer leaves the highlight where the
+        // gesture or the chord put it until the pointer actually moves.
+        if over_dock && let Some(switcher) = self.app_switcher {
+            let hit = self
+                .dock_rect()
+                .and_then(|rect| self.dock.item_at(pointer.x, rect, self.dock_items.len()));
+            if let Some(index) = hit
+                && index != switcher.selected
+                && self.switcher_items().contains(&index)
+            {
+                self.app_switcher = Some(AppSwitcher {
+                    selected: index,
+                    dismiss_at: switcher.dismiss_at.map(|_| now + APP_SWITCHER_TIMEOUT),
+                    ..switcher
+                });
+                self.refresh_dock();
+            }
+        }
         // Pictures of the hovered application's windows. Only the ordinary
         // dock: the switcher chooses its own picture, by selection.
         let hover = if self.app_switcher.is_none() && over_dock {
@@ -2944,8 +2965,9 @@ impl Huginn {
             .map(|(id, _)| *id)
     }
 
-    /// Put only the highlighted pane in the background, leaving the workspace usable.
-    fn minimize_focused(&mut self) {
+    /// Put only the highlighted pane in the background, leaving the workspace
+    /// usable. Three fingers down, and `Super`+`Ctrl`+`M`.
+    pub(crate) fn minimize_focused(&mut self) {
         if let Some(id) = self.space.focused() {
             self.minimize_window(id);
         }
@@ -2982,7 +3004,11 @@ impl Huginn {
     }
 
     /// Temporarily promote the minimized-application dock over the workspace.
-    fn open_app_switcher(&mut self) {
+    /// Show the put-away windows in the centred strip: the three-finger
+    /// double tap, `Super`+`Ctrl`+`Shift`+`M`, and `Super`+middle click.
+    /// Nothing happens when nothing is put away — a strip that flashed up
+    /// empty would be noise.
+    pub(crate) fn open_app_switcher(&mut self) {
         self.dock_items = crate::dock::window_items(&self.apps, &self.minimized_windows());
         let selected = self.switcher_items().into_iter().next();
         let Some(selected) = selected else {
@@ -3336,18 +3362,36 @@ impl Huginn {
     /// A panel, the launcher, the lock screen or a region selection owns
     /// input while it is up, exactly as it owns the keyboard in
     /// [`crate::backend::keymap::resolve`], so the wheel is left alone there.
-    pub(crate) fn wheel_workspace(&mut self, axis: ScrollAxis, v120: i32) -> bool {
+    ///
+    /// `chord` is what was held while the wheel turned, and who the wheel
+    /// belongs to depends on what is up. The switcher's strip takes it
+    /// whatever is held, because `Alt` is down for the whole of an Alt-Tab
+    /// and nothing under the strip is there to scroll. The overview takes it
+    /// bare or with `Super`, for the second reason. The desktop takes it with
+    /// exactly `Super`, and a bare wheel there is the client's, untouched and
+    /// unbanked.
+    pub(crate) fn wheel_workspace(
+        &mut self,
+        axis: ScrollAxis,
+        v120: i32,
+        chord: crate::wheel::Chord,
+    ) -> bool {
+        use crate::wheel::Chord;
         if self.is_locked()
             || self.launcher.is_open()
             || self.settings.is_open()
             || self.pinned.is_open()
             || self.region_active()
-            || self.app_switcher_open()
         {
             return false;
         }
-        // A device is free to report nonsense travel, and the overview arm
-        // below walks one step at a time. Nobody spins a wheel a hundred
+        let switcher = self.app_switcher_open();
+        let overview = self.overview_open();
+        if !(switcher || (overview && chord != Chord::Other) || chord == Chord::Super) {
+            return false;
+        }
+        // A device is free to report nonsense travel, and the picker arms
+        // below walk one step at a time. Nobody spins a wheel a hundred
         // workspaces in one event, and the clamp costs nothing when they do
         // not: every real notch is one step.
         const MOST: i32 = 32;
@@ -3355,19 +3399,29 @@ impl Huginn {
         if steps == 0 {
             return true;
         }
-        // With the overview up the notch steers it rather than going behind
-        // it. Activating a workspace underneath an open overview would leave
-        // the row pointing at one workspace and the compositor on another,
-        // and the next Return would take the one the user was not looking at.
-        if self.overview_open() {
+        // With a strip up the notch steps its highlight: three fingers
+        // sideways, for a wheel. Forwards is down and right, as it is for
+        // the workspaces.
+        if switcher {
             let dir = if steps > 0 {
-                huginn_core::geometry::Dir::Right
+                huginn_core::workspace::Direction::Forward
             } else {
-                huginn_core::geometry::Dir::Left
+                huginn_core::workspace::Direction::Backward
             };
             for _ in 0..steps.unsigned_abs() {
-                self.overview_move(dir);
+                self.step_app_switcher(dir);
             }
+            return true;
+        }
+        // With the overview up the notch brings the workspace either side to
+        // the front, which is what the wheel does everywhere else and what
+        // three fingers sideways do here. Not the highlight: a mouse
+        // highlights by pointing, so a wheel that walked the patches would
+        // fight the hover, and activating a workspace *behind* the overview
+        // would leave the row pointing at one workspace and the compositor
+        // on another.
+        if overview {
+            self.overview_shift_by(steps);
             return true;
         }
         // Clamped at the ends rather than wrapped, which is what the swipe
@@ -3384,6 +3438,143 @@ impl Huginn {
         self.arrange();
         self.refresh_focus();
         true
+    }
+
+    /// Go to workspace `index`: `Super`+`Ctrl`+a digit.
+    ///
+    /// With the overview up the digit brings that stage to the front instead
+    /// of switching underneath it, for the reason given in
+    /// [`Self::wheel_workspace`]: the row and the compositor must not come to
+    /// point at different workspaces, or the next Return takes a window off a
+    /// workspace nobody was looking at. Callers arrange and refresh focus
+    /// afterwards, as they did when this was the bare call.
+    pub(crate) fn go_to_workspace(&mut self, index: usize) {
+        if self.overview_open() {
+            self.overview_bring(index);
+        } else {
+            self.space.activate_workspace(index);
+        }
+    }
+
+    /// Bring the workspace `dir` of the front one to the front of the
+    /// overview: Tab and Shift+Tab while it is up.
+    pub(crate) fn overview_shift(&mut self, dir: huginn_core::workspace::Direction) {
+        self.overview_shift_by(match dir {
+            huginn_core::workspace::Direction::Forward => 1,
+            huginn_core::workspace::Direction::Backward => -1,
+        });
+    }
+
+    /// Bring the stage `steps` over to the front of the overview, clamped at
+    /// the ends the way the swipe is — the row stops and the wheel keeps
+    /// going. Counted from where the row is *heading*, not where it is, so
+    /// three quick notches land three stages over rather than wherever the
+    /// first slide happened to be when the second notch arrived.
+    fn overview_shift_by(&mut self, steps: i32) {
+        let Some(carousel) = &self.workspace_carousel else {
+            return;
+        };
+        let last = self.space.workspaces().len().saturating_sub(1) as i32;
+        let heading = carousel.position.target().round().clamp(0.0, last as f32) as i32;
+        let target = heading.saturating_add(steps).clamp(0, last);
+        self.overview_bring(target as usize);
+    }
+
+    /// Slide the overview's row until stage `index` is at the front, as a
+    /// space label does when clicked. The highlight goes: it named a window
+    /// on the stage that just left. The overview stays up — this is a look,
+    /// not a choice, and Return or a click makes the choice afterwards.
+    fn overview_bring(&mut self, index: usize) {
+        let last = self.space.workspaces().len().saturating_sub(1);
+        let index = index.min(last);
+        let now = self.uptime();
+        let duration = self
+            .settings
+            .motion()
+            .duration(crate::anim::WORKSPACE_CAROUSEL_OPEN);
+        let Some(carousel) = &mut self.workspace_carousel else {
+            return;
+        };
+        if carousel.position.target().round() as usize == index && carousel.position.is_settled(now)
+        {
+            return;
+        }
+        carousel
+            .position
+            .animate_to(index as f32, now, duration, crate::anim::Curve::EaseInOut);
+        carousel.selected = None;
+        carousel.hover = None;
+        self.queue_redraw();
+    }
+
+    /// `Super`+a mouse button: the three-finger gestures for a pointer that
+    /// has no fingers. See [`crate::mouse`] for which button is which.
+    ///
+    /// Returns whether the press was taken. A panel, the launcher, the lock
+    /// screen or a region selection owns input while it is up, as they do for
+    /// the wheel and the keyboard, and the dock's own click wins over all
+    /// three: an icon means what it means, `Super` or not.
+    pub(crate) fn mouse_click(&mut self, click: crate::mouse::Click) -> bool {
+        use crate::mouse::Click;
+        if self.is_locked()
+            || self.launcher.is_open()
+            || self.settings.is_open()
+            || self.pinned.is_open()
+            || self.region_active()
+        {
+            return false;
+        }
+        if self.dock_click().is_some() {
+            return false;
+        }
+        match click {
+            // Three fingers down: the window under the pointer goes to the
+            // dock. With a picker up the click is the picker's — a patch in
+            // the overview or a tile in the strip is taken, not put away —
+            // so it falls through to the ordinary click. A title bar counts
+            // as its window: the bar is the compositor's, and the pointer on
+            // it is on the window as far as anyone looking can tell.
+            Click::PutAway => {
+                if self.overview_open() || self.app_switcher_open() {
+                    return false;
+                }
+                let Some(id) = self
+                    .decor_hit()
+                    .map(|(id, _)| id)
+                    .or_else(|| self.window_under(self.pointer_location))
+                else {
+                    return false;
+                };
+                self.minimize_window(id);
+                true
+            }
+            // Three fingers up, and three fingers down over an open overview:
+            // open it, or put the tiling back and close it. With the strip
+            // up the click is the strip's, as above.
+            Click::Overview => {
+                if self.app_switcher_open() {
+                    return false;
+                }
+                if self.overview_open() {
+                    self.close_workspace_carousel();
+                } else {
+                    self.open_workspace_carousel();
+                }
+                true
+            }
+            // The three-finger double tap: show the put-away windows, or
+            // dismiss the strip if it is already up. Taken even when nothing
+            // is put away and nothing opens, so the press does not fall
+            // through as a middle click and paste into the window under it.
+            Click::PutAwayList => {
+                if self.app_switcher_open() {
+                    self.dismiss_app_switcher();
+                } else {
+                    self.open_app_switcher();
+                }
+                true
+            }
+        }
     }
 
     /// Keyboard counterpart: first press opens, second accepts the centre card.
@@ -3738,16 +3929,22 @@ impl Huginn {
             self.open_launcher();
             return;
         }
-        // A tile in the Alt-Tab strip names its window, and a click on it is
-        // the same as letting go of Alt with it highlighted.
-        if self
-            .app_switcher
-            .is_some_and(|switcher| switcher.kind == SwitcherKind::AltTab)
-            && let Some(id) = item.window
+        // A tile in either strip names its window, and a click on it is the
+        // same as accepting with it highlighted: letting go of Alt, three
+        // fingers up, Return. Through `accept_app_switcher` rather than
+        // beside it, so a click and a key cannot come to mean different
+        // things — the gesture's strip used to send a click here down the
+        // application path below, which brought back *a* window of that
+        // application rather than the one the tile showed.
+        if let Some(switcher) = self.app_switcher
+            && item.window.is_some()
+            && let Some(index) = self.dock_items.iter().position(|tile| tile == item)
         {
-            self.app_switcher = None;
-            self.go_to_window(id);
-            self.refresh_dock();
+            self.app_switcher = Some(AppSwitcher {
+                selected: index,
+                ..switcher
+            });
+            self.accept_app_switcher();
             return;
         }
         let Some(entry) = item.entry.and_then(|i| self.apps.get(i)) else {
@@ -5097,7 +5294,7 @@ impl Huginn {
     /// Swallows the click either way: nothing under the overview may act on
     /// a press aimed at it.
     pub(crate) fn overview_click(&mut self) -> bool {
-        let Some((front, thumbs)) = self.overview_thumbs() else {
+        let Some((_, thumbs)) = self.overview_thumbs() else {
             return false;
         };
         let point = self.pointer_point();
@@ -5109,24 +5306,7 @@ impl Huginn {
             .and_then(|chrome| chrome.bar.as_ref())
             .and_then(|bar| bar.labels.iter().position(|label| label.contains(point)));
         if let Some(index) = label {
-            if index != front {
-                let now = self.uptime();
-                let duration = self
-                    .settings
-                    .motion()
-                    .duration(crate::anim::WORKSPACE_CAROUSEL_OPEN);
-                if let Some(carousel) = &mut self.workspace_carousel {
-                    carousel.position.animate_to(
-                        index as f32,
-                        now,
-                        duration,
-                        crate::anim::Curve::EaseInOut,
-                    );
-                    carousel.selected = None;
-                    carousel.hover = None;
-                }
-                self.queue_redraw();
-            }
+            self.overview_bring(index);
             return true;
         }
         let hit = thumbs

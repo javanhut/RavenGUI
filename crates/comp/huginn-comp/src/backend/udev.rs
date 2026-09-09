@@ -1716,9 +1716,7 @@ impl Udev {
                     surface.close();
                 }
             }
-            Action::Workspace(i) => {
-                state.space.activate_workspace(i);
-            }
+            Action::Workspace(i) => state.go_to_workspace(i),
             Action::SendToWorkspace(i) => {
                 state.space.send_focused_to_workspace(i);
             }
@@ -1747,6 +1745,9 @@ impl Udev {
             Action::DismissSwitcher => state.dismiss_app_switcher(),
             Action::AltTab(dir) => state.alt_tab(dir),
             Action::AcceptSwitcher => state.accept_app_switcher(),
+            Action::MinimizeFocused => state.minimize_focused(),
+            Action::OpenMinimized => state.open_app_switcher(),
+            Action::OverviewShift(dir) => state.overview_shift(dir),
             Action::Volume(key) => {
                 state.volume_key(key);
                 return;

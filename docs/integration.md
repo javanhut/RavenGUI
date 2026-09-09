@@ -168,6 +168,8 @@ client cannot receive or override them:
 | `Super+Ctrl+arrows` | move the focused window between tiles |
 | `Super+Ctrl+Return` | swap the focused window into the first tile |
 | `Super+Ctrl+C` | open or accept the workspace carousel |
+| `Super+Ctrl+M` | put the focused window away to the dock |
+| `Super+Ctrl+Shift+M` | show the put-away windows in the centered dock; arrows step, `Return` brings one back |
 | `Super+Ctrl+P` | open the settings application |
 | `Super+Ctrl+I` | open the software store (`raven-store`) |
 | `Super+Ctrl+R` | resize the focused window with the arrows |
@@ -182,6 +184,17 @@ client cannot receive or override them:
 | `Super+Ctrl+Esc` | quit the compositor |
 | `Print` | screenshot the screen (`Shift`: region, `Ctrl`: window) |
 | volume keys | raise, lower or mute the output volume |
+
+And these pointer chords, which never reach the client under the pointer.
+Plain buttons and a plain wheel are yours; so is every other modifier
+combination.
+
+| Chord | Does |
+|---|---|
+| `Super`+wheel | go to the workspace either side; steps the overview's stages and the switcher's tiles |
+| `Super`+click | put the window under the pointer away to the dock |
+| `Super`+right click | open or close the workspace overview |
+| `Super`+middle click | show or hide the put-away windows |
 
 `Print` is the one binding besides the volume keys that resolves without the
 `Super` layer, because that is where every other desktop puts it. It is settled
@@ -269,20 +282,34 @@ do not work.
 
 ## Touchpad gestures huginn takes
 
-| Gesture | Does |
-|---|---|
-| three fingers sideways | preview and switch between workspaces |
-| three fingers down | minimize the focused pane without closing it |
-| three-finger double tap | temporarily show minimized applications in a centered dock |
-| sideways while the centered dock is open | highlight a minimized application |
-| three fingers up while the centered dock is open | restore the highlighted application into the current workspace |
+Every gesture has a key and a mouse button that do the same thing, so a
+machine with no touchpad loses nothing. The pointer bindings follow the
+`Super`+wheel rule: exactly `Super`, with `Ctrl`, `Alt` and `Shift` up, and a
+plain button or wheel is the application's.
+
+| Gesture | Does | Keyboard | Mouse |
+|---|---|---|---|
+| three fingers sideways | preview and switch between workspaces | `Super+Ctrl+C`, then the digits or `Tab` / `Shift+Tab` | `Super`+wheel; over the overview, the wheel with or without `Super` |
+| three fingers up | open the overview | `Super+Ctrl+C` | `Super`+right click |
+| three fingers down | minimize the focused pane without closing it | `Super+Ctrl+M` | `Super`+click on the window (or its title bar) |
+| three fingers down while the overview is open | close the overview, putting the tiling back | `Escape` | `Super`+right click, or a click on nothing |
+| three-finger double tap | temporarily show minimized applications in a centered dock | `Super+Ctrl+Shift+M` | `Super`+middle click |
+| sideways while the centered dock is open | highlight a minimized application | `Left` / `Right`, `Tab` / `Shift+Tab` | hover a tile, or the wheel with anything held |
+| three fingers up while the centered dock is open | restore the highlighted application into the current workspace | `Return` | click the tile |
 
 The current workspace shrinks into a centred card while the workspaces beside
 it appear as narrow, dimmed side cards. The row follows the fingers and settles
 onto the workspace nearest where they lift; that workspace then expands to fill
 the output. Each card is a complete workspace, not a window from the current
 workspace. `Super+Ctrl+C` opens the same view from the keyboard and a second
-press accepts the centred workspace.
+press accepts the centred workspace. While it is up, `Tab`, the wheel and
+`Super+Ctrl+1..9` slide the row rather than switching workspace behind the
+overview, so the row and the compositor never point at different workspaces.
+
+A mouse's double middle click does *not* open the centered dock. The
+three-finger double tap arrives from a tap-to-click touchpad as a middle
+button, and only a device that reports gestures is read that way; on a mouse
+the same two presses are two pastes of the primary selection and nothing else.
 
 **A three-finger swipe never reaches a client.** Huginn advertises no
 `pointer-gestures-unstable-v1` global, so no client can see swipe, pinch or hold
