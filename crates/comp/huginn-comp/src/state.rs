@@ -332,6 +332,11 @@ struct AppSwitcher {
 
 const APP_SWITCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// How long the wheel is ignored after a notch up takes a window out of the
+/// strip. Longer than the run of events a free-spinning wheel reports for one
+/// flick, and shorter than the gap before anyone deliberately turns it again.
+const WHEEL_QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Applications that drive the `Super` layer themselves.
 ///
 /// `Super`+`C` in RavenTerminal is already copy — `Super` is its leader, the
@@ -568,10 +573,21 @@ pub(crate) struct Huginn {
     /// input, not window management: `huginn-core` is told where the strip
     /// should be, and has no interest in how many fingers said so.
     swipe: Option<crate::gesture::Swipe>,
+    /// Whether `swipe` is a `Super`+left drag rather than fingers on a pad.
+    /// The drag rides the same recogniser and the same handlers; this only
+    /// says whose lift ends it — the button's, not libinput's — and that a
+    /// lift with no travel behind it was a tap. See [`Self::drag_begin`].
+    drag: bool,
     /// Recognises the gesture that temporarily summons the application dock.
     double_tap: crate::gesture::DoubleTap,
     /// Wheel travel banked towards the next `Super`+wheel workspace step.
     wheel: crate::wheel::Notches,
+    /// Until when the wheel is swallowed after a notch up took the strip's
+    /// highlighted window. A free-spinning wheel reports one flick as a run
+    /// of events, and the ones after the first would otherwise arrive on a
+    /// bare desktop with `Super` still held and switch workspace — one
+    /// gesture, two commands. `None` when nothing is being ignored.
+    wheel_quiet_until: Option<std::time::Duration>,
     /// Finger count retained between a hold begin/end pair.
     hold_fingers: Option<u32>,
     /// Present while the temporary application switcher is visible.
@@ -968,8 +984,10 @@ impl Huginn {
             carousel_scroll: crate::anim::Animated::settled(0.0),
             workspace_carousel: None,
             swipe: None,
+            drag: false,
             double_tap: crate::gesture::DoubleTap::default(),
             wheel: crate::wheel::Notches::default(),
+            wheel_quiet_until: None,
             hold_fingers: None,
             app_switcher: None,
             carousel_on: None,
@@ -2742,9 +2760,12 @@ impl Huginn {
     /// leaving the workspace switcher open with nothing controlling it.
     pub(crate) fn swipe_begin(&mut self, fingers: u32) {
         if self.swipe.is_some() {
-            tracing::debug!("a touchpad swipe began before the last one ended");
+            tracing::debug!("a swipe began before the last one ended");
             self.swipe_end();
         }
+        // Whatever this is, it is not the mouse's drag any more; a button
+        // release arriving later must not end the fingers' swipe for them.
+        self.drag = false;
         if let Some(at) = self
             .app_switcher
             .as_mut()
@@ -2772,7 +2793,18 @@ impl Huginn {
                         .unwrap_or(0) as f32;
                     swipe.drives(origin);
                 } else {
-                    let origin = self.space.active_index() as f32;
+                    // From where the row *is*, when the overview is already
+                    // up: Tab, the wheel or a digit may have slid it away
+                    // from the active workspace, and a swipe that snapped it
+                    // back to the active index before following the fingers
+                    // would lurch. With no overview the two are the same.
+                    let now = self.uptime();
+                    let origin = self
+                        .workspace_carousel
+                        .as_ref()
+                        .map_or(self.space.active_index() as f32, |carousel| {
+                            carousel.position.value(now)
+                        });
                     self.open_workspace_carousel();
                     swipe.drives(origin);
                 }
@@ -3005,7 +3037,7 @@ impl Huginn {
 
     /// Temporarily promote the minimized-application dock over the workspace.
     /// Show the put-away windows in the centred strip: the three-finger
-    /// double tap, `Super`+`Ctrl`+`Shift`+`M`, and `Super`+middle click.
+    /// double tap, `Super`+`Ctrl`+`Shift`+`M`, and `Super`+click.
     /// Nothing happens when nothing is put away — a strip that flashed up
     /// empty would be noise.
     pub(crate) fn open_app_switcher(&mut self) {
@@ -3390,6 +3422,15 @@ impl Huginn {
         if !(switcher || (overview && chord != Chord::Other) || chord == Chord::Super) {
             return false;
         }
+        // The tail of the flick that just took a window out of the strip.
+        // Swallowed, not banked: it was part of a gesture that has finished.
+        let now = self.uptime();
+        if let Some(until) = self.wheel_quiet_until {
+            if now < until {
+                return true;
+            }
+            self.wheel_quiet_until = None;
+        }
         // A device is free to report nonsense travel, and the picker arms
         // below walk one step at a time. Nobody spins a wheel a hundred
         // workspaces in one event, and the clamp costs nothing when they do
@@ -3399,17 +3440,31 @@ impl Huginn {
         if steps == 0 {
             return true;
         }
-        // With a strip up the notch steps its highlight: three fingers
-        // sideways, for a wheel. Forwards is down and right, as it is for
-        // the workspaces.
+        // With a strip up the wheel is the fingers. Up brings the
+        // highlighted window back, as three fingers up do — one notch is
+        // enough, and the rest of the travel dies with the strip. Down is
+        // swallowed and does nothing, as three fingers down do there. A tilt
+        // wheel steps the highlight sideways, for the mouse that has one;
+        // the rest highlight by pointing.
         if switcher {
-            let dir = if steps > 0 {
-                huginn_core::workspace::Direction::Forward
-            } else {
-                huginn_core::workspace::Direction::Backward
-            };
-            for _ in 0..steps.unsigned_abs() {
-                self.step_app_switcher(dir);
+            match axis {
+                ScrollAxis::Vertical => {
+                    if steps < 0 {
+                        self.accept_app_switcher();
+                        self.wheel = crate::wheel::Notches::default();
+                        self.wheel_quiet_until = Some(now + WHEEL_QUIET);
+                    }
+                }
+                ScrollAxis::Horizontal => {
+                    let dir = if steps > 0 {
+                        huginn_core::workspace::Direction::Forward
+                    } else {
+                        huginn_core::workspace::Direction::Backward
+                    };
+                    for _ in 0..steps.unsigned_abs() {
+                        self.step_app_switcher(dir);
+                    }
+                }
             }
             return true;
         }
@@ -3524,19 +3579,34 @@ impl Huginn {
         {
             return false;
         }
+        // The fingers landing: nothing is decided until they lift. Taken
+        // wherever they land — a dock icon, a strip tile, an overview patch
+        // included — because what a press there means depends on whether
+        // it moves, and the release settles it in [`Self::drag_end`].
+        if click == Click::Fingers {
+            self.drag_begin();
+            return true;
+        }
+        // On the dock, or on a tile of the strip, the other buttons are the
+        // dock's: an icon means what it means.
         if self.dock_click().is_some() {
             return false;
         }
         match click {
-            // Three fingers down: the window under the pointer goes to the
-            // dock. With a picker up the click is the picker's — a patch in
-            // the overview or a tile in the strip is taken, not put away —
-            // so it falls through to the ordinary click. A title bar counts
-            // as its window: the bar is the compositor's, and the pointer on
-            // it is on the window as far as anyone looking can tell.
-            Click::PutAway => {
-                if self.overview_open() || self.app_switcher_open() {
-                    return false;
+            Click::Fingers => unreachable!("taken above"),
+            // Down. A picker up goes away, as three fingers down close the
+            // overview. Otherwise the window under the pointer goes to the
+            // dock. A title bar counts as its window: the bar is the
+            // compositor's, and the pointer on it is on the window as far as
+            // anyone looking can tell.
+            Click::Down => {
+                if self.app_switcher_open() {
+                    self.dismiss_app_switcher();
+                    return true;
+                }
+                if self.overview_open() {
+                    self.close_workspace_carousel();
+                    return true;
                 }
                 let Some(id) = self
                     .decor_hit()
@@ -3548,9 +3618,9 @@ impl Huginn {
                 self.minimize_window(id);
                 true
             }
-            // Three fingers up, and three fingers down over an open overview:
-            // open it, or put the tiling back and close it. With the strip
-            // up the click is the strip's, as above.
+            // Three fingers up on a bare desktop: open the overview, or put
+            // the tiling back and close it. With the strip up the click is
+            // the strip's and falls through.
             Click::Overview => {
                 if self.app_switcher_open() {
                     return false;
@@ -3562,18 +3632,81 @@ impl Huginn {
                 }
                 true
             }
-            // The three-finger double tap: show the put-away windows, or
-            // dismiss the strip if it is already up. Taken even when nothing
-            // is put away and nothing opens, so the press does not fall
-            // through as a middle click and paste into the window under it.
-            Click::PutAwayList => {
-                if self.app_switcher_open() {
-                    self.dismiss_app_switcher();
-                } else {
-                    self.open_app_switcher();
-                }
-                true
-            }
+        }
+    }
+
+    /// `Super`+left went down: the mouse's fingers landed.
+    ///
+    /// This begins a swipe on the touchpad's own recogniser, so from here a
+    /// drag is a three-finger swipe in every respect — [`Self::swipe_update`]
+    /// drives the carousel, the reveal or the strip from the pointer's travel
+    /// exactly as it does from the fingers'. A press on a window focuses it,
+    /// as any press does, which is what makes a drag down put away the window
+    /// it started on rather than whichever happened to be focused.
+    fn drag_begin(&mut self) {
+        if !self.overview_open()
+            && !self.app_switcher_open()
+            && let Some(id) = self
+                .decor_hit()
+                .map(|(id, _)| id)
+                .or_else(|| self.window_under(self.pointer_location))
+        {
+            self.space.active_workspace_mut().focus(id);
+            self.refresh_focus();
+        }
+        self.swipe_begin(crate::gesture::CAROUSEL_FINGERS);
+        self.drag = true;
+    }
+
+    /// Whether a `Super`+left drag is in progress, so the release that ends
+    /// it is the compositor's.
+    pub(crate) fn drag_active(&self) -> bool {
+        self.drag
+    }
+
+    /// The pointer moved with the button still down.
+    pub(crate) fn drag_moved(&mut self, dx: f64, dy: f64) {
+        if !self.drag {
+            return;
+        }
+        let (dx, dy) = crate::mouse::travel(dx, dy);
+        self.swipe_update(dx, dy);
+    }
+
+    /// The button came up: the fingers lifted.
+    ///
+    /// A drag that committed to an axis ends as the swipe ends — the row
+    /// settles, the reveal snaps, the window goes to the dock or comes back.
+    /// One that never travelled far enough to commit was a tap, and the tap
+    /// is what the plain click used to be: a dock icon or strip tile is
+    /// taken, the overview is clicked, the strip is dismissed, or the strip
+    /// is brought up.
+    pub(crate) fn drag_end(&mut self) {
+        if !std::mem::take(&mut self.drag) {
+            return;
+        }
+        // Locked mid-drag: nothing this began may finish. The swipe is
+        // dropped rather than ended, so a half-open overview is not opened
+        // over the lock screen — the lock already stopped compositing it.
+        if self.is_locked() {
+            self.swipe = None;
+            return;
+        }
+        let claimed = self.swipe.as_ref().is_some_and(|swipe| {
+            swipe.position().is_some() || swipe.vertical().is_some() || swipe.reveal().is_some()
+        });
+        self.swipe_end();
+        if claimed {
+            return;
+        }
+        if let Some(item) = self.dock_click() {
+            self.activate_dock_item(&item);
+        } else if self.overview_open() {
+            self.overview_click();
+        } else if self.app_switcher_open() {
+            self.dismiss_app_switcher();
+        } else {
+            self.open_app_switcher();
         }
     }
 

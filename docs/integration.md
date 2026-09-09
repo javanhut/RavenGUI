@@ -191,10 +191,10 @@ combination.
 
 | Chord | Does |
 |---|---|
-| `Super`+wheel | go to the workspace either side; steps the overview's stages and the switcher's tiles |
-| `Super`+click | put the window under the pointer away to the dock |
-| `Super`+right click | open or close the workspace overview |
-| `Super`+middle click | show or hide the put-away windows |
+| `Super`+wheel | go to the workspace either side; slides the overview's row |
+| `Super`+right click | put the window under the pointer away to the dock; closes an open picker |
+| `Super`+click | tap: show the put-away windows, and take a tile; drag: the three-finger swipe, sideways, up or down |
+| `Super`+middle click | open or close the workspace overview |
 
 `Print` is the one binding besides the volume keys that resolves without the
 `Super` layer, because that is where every other desktop puts it. It is settled
@@ -289,13 +289,29 @@ plain button or wheel is the application's.
 
 | Gesture | Does | Keyboard | Mouse |
 |---|---|---|---|
-| three fingers sideways | preview and switch between workspaces | `Super+Ctrl+C`, then the digits or `Tab` / `Shift+Tab` | `Super`+wheel; over the overview, the wheel with or without `Super` |
-| three fingers up | open the overview | `Super+Ctrl+C` | `Super`+right click |
-| three fingers down | minimize the focused pane without closing it | `Super+Ctrl+M` | `Super`+click on the window (or its title bar) |
-| three fingers down while the overview is open | close the overview, putting the tiling back | `Escape` | `Super`+right click, or a click on nothing |
-| three-finger double tap | temporarily show minimized applications in a centered dock | `Super+Ctrl+Shift+M` | `Super`+middle click |
-| sideways while the centered dock is open | highlight a minimized application | `Left` / `Right`, `Tab` / `Shift+Tab` | hover a tile, or the wheel with anything held |
-| three fingers up while the centered dock is open | restore the highlighted application into the current workspace | `Return` | click the tile |
+| three fingers sideways | preview and switch between workspaces | `Super+Ctrl+C`, then the digits or `Tab` / `Shift+Tab` | `Super`+left drag sideways; `Super`+wheel; over the overview, the wheel with or without `Super` |
+| three fingers up | open the overview | `Super+Ctrl+C` | `Super`+left drag up; `Super`+middle click |
+| three fingers down | minimize the focused pane without closing it | `Super+Ctrl+M` | `Super`+left drag down; `Super`+right click on the window (or its title bar) |
+| three fingers down while the overview is open | close the overview, putting the tiling back | `Escape` | `Super`+left drag down; `Super`+right click; a click on nothing |
+| three-finger double tap | temporarily show minimized applications in a centered dock | `Super+Ctrl+Shift+M` | `Super`+click |
+| sideways while the centered dock is open | highlight a minimized application | `Left` / `Right`, `Tab` / `Shift+Tab` | `Super`+left drag sideways; hover a tile; a tilt wheel |
+| three fingers up while the centered dock is open | restore the highlighted application into the current workspace | `Return` | `Super`+left drag up; wheel up; `Super`+click the tile |
+| — | dismiss the centered dock | `Escape` | `Super`+click away from it, or `Super`+right click |
+
+The mouse's half reads like the gestures. **`Super`+left is the fingers.**
+Held and moved, it is the three-finger swipe outright: the pointer's travel
+is fed to the same recogniser the touchpad feeds, so the carousel follows the
+mouse sideways and settles where it is let go, the overview reveal follows it
+up and snaps open or shut, a drag down puts away the window it started on,
+and inside the strip sideways moves the highlight and up brings the window
+back. Pressed and released without travelling, it is the *tap*: once for the
+strip, again on a tile to bring that window back. The drag is fed raw pointer
+deltas, so it keeps travelling after the cursor has hit the screen edge.
+`Super`+right click is *down* on its own: the window under it goes away, or
+whatever picker is up goes away. The wheel is sideways travel through the
+workspaces, and with the strip up, *up* brings back the highlighted window —
+one notch, and the rest of that flick is swallowed so a free-spinning wheel
+cannot carry on into a workspace switch after the strip has gone.
 
 The current workspace shrinks into a centred card while the workspaces beside
 it appear as narrow, dimmed side cards. The row follows the fingers and settles

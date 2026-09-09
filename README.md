@@ -361,10 +361,15 @@ The touchpad gestures — three fingers sideways for the workspaces, up for the
 overview, down to put a window away, a double tap for the put-away strip —
 each have a key and a mouse button, so a machine with a mouse loses nothing:
 `Super`+`Ctrl`+`M` and `Super`+`Ctrl`+`Shift`+`M` on the keyboard, and on the
-mouse `Super`+wheel, `Super`+click, `Super`+right click and `Super`+middle
-click, under the same exactly-`Super` rule the wheel already had. The rules
-are `huginn-comp/src/mouse.rs` and `wheel.rs`, pure and tested; the full
-table is in [`docs/integration.md`](docs/integration.md).
+mouse a mapping that reads like the gestures — `Super`+left held and moved
+*is* the three-finger swipe, fed to the same recogniser from the pointer's
+travel, and tapped it brings up the put-away strip and picks from it;
+`Super`+right click is *down* and puts the window under it away; the wheel
+brings the strip's highlighted window back with a notch up; and
+`Super`+middle click is the overview — under the same exactly-`Super` rule
+the wheel already had. The
+rules are `huginn-comp/src/mouse.rs` and `wheel.rs`, pure and tested; the
+full table is in [`docs/integration.md`](docs/integration.md).
 
 While the session is locked, no binding resolves at all: every key is the lock
 screen's, checked before the launcher and quick settings, which would otherwise
