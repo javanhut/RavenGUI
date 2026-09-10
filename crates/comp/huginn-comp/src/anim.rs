@@ -148,9 +148,8 @@ impl Animated {
     /// Where it is heading.
     ///
     /// Lets a caller ask "is this opening or closing?" without waiting for it
-    /// to arrive. Read by tests today; the carousel needs it to decide which
-    /// workspace a fling is bound for.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// to arrive: the carousel needs it to decide which workspace a fling is
+    /// bound for, and the found pointer to know whether it is still growing.
     pub(crate) fn target(&self) -> f32 {
         self.to
     }

@@ -429,7 +429,10 @@ brings the strip's highlighted window back with a notch up; and
 `Super`+middle click is the overview — under the same exactly-`Super` rule
 the wheel already had. The
 rules are `huginn-comp/src/mouse.rs` and `wheel.rs`, pure and tested; the
-full table is in [`docs/integration.md`](docs/integration.md).
+full table is in [`docs/integration.md`](docs/integration.md). A pointer that
+has been lost is found by shaking it: a few quick back-and-forths and it grows
+to three times its size until the shaking stops, tip held in place, with the
+client under it none the wiser. That rule is `shake.rs`, pure and tested too.
 
 While the session is locked, no binding resolves at all: every key is the lock
 screen's, checked before the launcher and quick settings, which would otherwise

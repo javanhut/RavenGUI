@@ -55,6 +55,8 @@ mod screenshot;
 #[cfg(target_os = "linux")]
 mod settings;
 #[cfg(target_os = "linux")]
+mod shake;
+#[cfg(target_os = "linux")]
 mod shell_protocol;
 #[cfg(target_os = "linux")]
 mod sleep;

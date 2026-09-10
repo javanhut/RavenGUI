@@ -196,6 +196,15 @@ combination.
 | `Super`+click | tap: show the put-away windows, and take a tile; drag: the three-finger swipe, sideways, up or down |
 | `Super`+middle click | open or close the workspace overview |
 
+One pointer motion is the compositor's without any chord at all. **Shake the
+pointer** — a few quick back-and-forths, in any direction — and it grows to
+three times its size, holds for most of a second after the shaking stops, and
+shrinks back. The arrow's tip stays put, so it can be used while it is large.
+Clients see nothing of it: the pointer moves exactly as it did, and only the
+compositor's drawing of it changes. A pointer a client has hidden is not
+enlarged, since that client is drawing its own. The rule is
+`huginn-comp/src/shake.rs`, pure and tested.
+
 `Print` is the one binding besides the volume keys that resolves without the
 `Super` layer, because that is where every other desktop puts it. It is settled
 before the panels, so it captures whatever is on screen — the launcher open, a

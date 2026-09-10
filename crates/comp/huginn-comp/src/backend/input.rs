@@ -31,6 +31,9 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
             // when the cursor they are not drawing has.
             let delta = event.delta();
             state.drag_moved(delta.x, delta.y);
+            // Raw as well, for the same reason: a pointer shaken against the
+            // edge of the screen is still being shaken.
+            state.pointer_moved_by(delta.x, delta.y, event.time_msec());
             let location = state.clamp_pointer(state.pointer_location + delta);
             motion(state, location, event.time_msec());
         }
@@ -46,6 +49,7 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
             // there is, and a nested window's edge is where it ends.
             let delta = location - state.pointer_location;
             state.drag_moved(delta.x, delta.y);
+            state.pointer_moved_by(delta.x, delta.y, event.time_msec());
             motion(state, location, event.time_msec());
         }
         InputEvent::PointerButton { event } => button::<B>(state, &event),
