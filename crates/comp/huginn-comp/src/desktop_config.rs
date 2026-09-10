@@ -12,14 +12,18 @@
 //! - `appearance.accent` — [`crate::theme::accent`]: focus ring, dock
 //!   indicator, panel highlights.
 //! - `appearance.smooth_animations` — [`crate::settings::Motion`].
-//! - `appearance.blur` — whether glass windows get the desktop blurred behind
-//!   them; see `Huginn::glass_window`.
+//! - `appearance.blur` — whether the desktop is blurred behind the launcher,
+//!   the pinned panel and glass windows; see `Huginn::blur_radius` and
+//!   `Huginn::glass_window`. The one key whose default is not compiled in:
+//!   when the file does not mention it, the backend's reading of the hardware
+//!   decides ([`crate::backend::gpu_class`]), which is why it is kept as an
+//!   `Option` here rather than resolved at parse time.
 //! - `appearance.wallpaper` — the compositor's own background, behind whatever
 //!   `ravencanvasd` draws when it is running.
 //! - `general.terminal` — what the spawn binding launches.
 //! - `general.lock_after_minutes` — [`crate::settings::IdleAfter`].
 //!
-//! The rest of the file (theme mode, blur, shadows, scale, …) is for the
+//! The rest of the file (theme mode, shadows, scale, …) is for the
 //! applications and the bar, which read it themselves.
 
 use std::path::PathBuf;
@@ -35,8 +39,12 @@ pub(crate) struct Appearance {
     /// `#RRGGBB`.
     pub accent: String,
     pub smooth_animations: bool,
-    /// Blur the desktop behind translucent ("glass") windows that ask for it.
-    pub blur: bool,
+    /// Blur the desktop behind the panels and the translucent ("glass")
+    /// windows that ask for it.
+    /// `None` is "the file does not say", which serde's `default` gives an
+    /// absent key and never a present one — `raven-settings` writes every
+    /// key it knows, so a saved file always says.
+    pub blur: Option<bool>,
     /// Absolute path of an image, or empty for the machine's wallpaper.
     pub wallpaper: String,
 }
@@ -46,7 +54,7 @@ impl Default for Appearance {
         Self {
             accent: String::new(),
             smooth_animations: true,
-            blur: true,
+            blur: None,
             wallpaper: String::new(),
         }
     }
@@ -114,6 +122,11 @@ impl DesktopConfig {
         parse_hex(&self.appearance.accent)
     }
 
+    /// Blur, with `hardware` standing in when the file is silent.
+    pub(crate) fn blur(&self, hardware: bool) -> bool {
+        self.appearance.blur.unwrap_or(hardware)
+    }
+
     pub(crate) fn motion(&self) -> Motion {
         if self.appearance.smooth_animations {
             Motion::Full
@@ -164,6 +177,21 @@ mod tests {
         assert_eq!(cfg.idle_after(), IdleAfter::Minutes10);
         assert_eq!(cfg.terminal(), crate::theme::TERMINAL);
         assert_eq!(cfg.wallpaper(), None);
+        assert_eq!(cfg.appearance.blur, None);
+    }
+
+    #[test]
+    fn blur_follows_the_hardware_only_when_unset() {
+        let silent = DesktopConfig::parse("[appearance]\naccent = \"#F7768E\"\n").unwrap();
+        assert!(silent.blur(true));
+        assert!(!silent.blur(false));
+
+        // What the settings application writes, on an integrated GPU: the
+        // file wins, both ways.
+        let on = DesktopConfig::parse("[appearance]\nblur = true\n").unwrap();
+        assert!(on.blur(false));
+        let off = DesktopConfig::parse("[appearance]\nblur = false\n").unwrap();
+        assert!(!off.blur(true));
     }
 
     #[test]

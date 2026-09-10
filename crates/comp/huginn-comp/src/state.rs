@@ -644,6 +644,10 @@ pub(crate) struct Huginn {
     wallpaper_panels: Vec<Option<crate::canvas::Panel>>,
     /// What `~/.config/raven/desktop.toml` said when last read.
     desktop_config: crate::desktop_config::DesktopConfig,
+    /// Whether blur is on when the file does not say. On until the backend
+    /// has looked at the GPU ([`Huginn::set_gpu_class`]); the nested backend
+    /// never does, and keeps the compiled-in look.
+    blur_by_default: bool,
 
     /// Whether the arrows are currently resizing the focused window.
     ///
@@ -1032,6 +1036,7 @@ impl Huginn {
             help: None,
             wallpaper: crate::wallpaper::Wallpaper::chosen_or_installed(desktop_config.wallpaper()),
             desktop_config,
+            blur_by_default: true,
             wallpaper_panels: Vec::new(),
             resizing: false,
             socket: String::new(),
@@ -4234,10 +4239,18 @@ impl Huginn {
     /// its glass look is only glass with something soft behind it.
     const GLASS_APP_IDS: &'static [&'static str] = &["raven-settings", "com.ravensettings.Raven"];
 
-    /// The glass window on screen, if `desktop.toml` allows blur and one is
-    /// mapped and not put away: the focused one first, else any.
+    /// Whether the desktop blurs at all: `desktop.toml`'s say, else the
+    /// hardware's. Every path into the blur pass — the panels' radius, the
+    /// patch it is cropped to, the glass window — asks here, so "off" means
+    /// the offscreen render never runs, not just that one caller skips it.
+    fn blur_enabled(&self) -> bool {
+        self.desktop_config.blur(self.blur_by_default)
+    }
+
+    /// The glass window on screen, if blur is on and one is mapped and not
+    /// put away: the focused one first, else any.
     pub(crate) fn glass_window(&self) -> Option<(WindowId, Rect)> {
-        if !self.desktop_config.appearance.blur {
+        if !self.blur_enabled() {
             return None;
         }
         let now = self.uptime();
@@ -4271,7 +4284,16 @@ impl Huginn {
     /// Zero when no panel is open, which is what lets the renderer take the
     /// ordinary path unchanged for the overwhelming majority of frames. A
     /// glass window asks for the full radius for as long as it is there.
+    ///
+    /// Zero also when blur is off ([`Self::blur_enabled`]): the renderer
+    /// runs the pass only for a positive radius, so this is the switch that
+    /// spares an integrated GPU the offscreen render while a panel is up. The
+    /// panel is drawn at its usual alpha over the sharp desktop, which is the
+    /// same look a shader that failed to compile leaves — see `blur.rs`.
     pub(crate) fn blur_radius(&self) -> f32 {
+        if !self.blur_enabled() {
+            return 0.0;
+        }
         let clock = self.uptime();
         let panels =
             crate::blur::radius_for(self.launcher.reveal(clock).max(self.pinned.reveal(clock)));
@@ -4292,12 +4314,15 @@ impl Huginn {
     /// The whole desktop is blurred into the texture regardless — the blur
     /// kernel needs the pixels past the panel's edge to soften the ones just
     /// inside it — but only this much of the texture is drawn. `None` when
-    /// there is no panel, or it is still too small to blur, and the renderer
-    /// draws the desktop sharp.
+    /// blur is off, there is no panel, or it is still too small to blur, and
+    /// the renderer draws the desktop sharp.
     ///
     /// Computed from the same placement [`Huginn::scene`] pushes, so the blur
     /// cannot drift from the panel as it animates.
     pub(crate) fn blur_rect(&self) -> Option<Rect> {
+        if !self.blur_enabled() {
+            return None;
+        }
         let clock = self.uptime();
         if let Some(panel) = self.launcher_panel.as_ref() {
             return crate::launcher::blur_rect(crate::launcher::placement(
@@ -5556,6 +5581,13 @@ impl Huginn {
     /// context. Called once, when the backend has one.
     pub(crate) fn set_render_context(&mut self, context: ContextId<GlesTexture>) {
         self.render_context = Some(context);
+    }
+
+    /// What the backend found out about the GPU, which sets the defaults for
+    /// the effects `desktop.toml` leaves unset. Called once, before the first
+    /// frame; a reload of the file keeps it.
+    pub(crate) fn set_gpu_class(&mut self, class: crate::backend::gpu_class::GpuClass) {
+        self.blur_by_default = class.blur_by_default();
     }
 
     /// The surface's last frame, as a texture the compositor can keep drawing

@@ -197,16 +197,37 @@ whenever it changes (`huginn-comp/src/desktop_config.rs`, `configwatch.rs`).
 Of that file the compositor honours the accent, animations, the idle lock
 timeout, the terminal the spawn chord opens, a wallpaper of its own for
 when `ravencanvasd` is not running, and `blur` — which blurs the desktop
-behind *glass* windows (translucent clients that ask for it by `app_id`;
-Raven Settings today) using the launcher's blur pass. Clients' own minimize
+behind the launcher, the pinned panel and *glass* windows (translucent
+clients that ask for it by `app_id`; Raven Settings today); off, the panels
+draw at their usual alpha over the sharp desktop. Clients' own minimize
 buttons (`xdg_toplevel.set_minimized`) go to the dock like the gesture. Every key is optional, an absent file is
 the compiled-in look, and a file that does not parse is logged and ignored
-rather than half-applied. The rest of the file — theme mode, blur, scale, the
-bar — is for the applications and RoostBar, which read it themselves.
+rather than half-applied. The rest of the file — theme mode, shadows,
+transparency, scale, the bar — is for the applications and RoostBar, which
+read it themselves.
+
+`blur` is the one key whose default follows the hardware rather than being
+compiled in. The pass is a full-screen offscreen render and two shader passes
+over it for every frame a panel or glass window is up, which an integrated
+GPU sharing its memory with the CPU feels. So when the file does not mention
+`blur`, the udev backend classes the GPU it opened from
+`/sys/class/drm/<card>/device` — the kernel driver, the PCI address, and for
+AMD the size of dedicated VRAM (`huginn-comp/src/backend/gpu_class.rs` lists
+the rules) — and blur starts off on an integrated GPU (`i915`/`xe` at the
+iGPU's slot, an AMD APU, any SoC) and on otherwise, including on anything it
+does not recognise. Off means the offscreen pass never runs — not for the
+launcher, the pinned panel or a glass window. The decision is logged once at
+startup. A `blur = true`
+or `blur = false` in the file always wins, and since Raven Settings writes
+every key it knows, saving anything there pins the choice; the nested winit
+backend, which has no DRM device to look at, keeps blur on. Shadows and
+transparency are not gated: the compositor does not read those keys, and the
+one shadow it draws itself — under the overview's cards — is a pre-composed
+texture, one quad per window.
 
 This is still a deliberate constraint rather than an unfinished feature. A
 format a user can write is a format that must not change between releases,
-which is why the compositor's share of it is five keys with defaults, and why
+which is why the compositor's share of it is six keys with defaults, and why
 the file is written by a program that knows the schema rather than by hand.
 
 What this constrains is configuration, not extension. Software written outside
