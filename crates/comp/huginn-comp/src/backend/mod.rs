@@ -2,6 +2,7 @@
 
 pub(crate) mod chord;
 pub(crate) mod gpu;
+pub(crate) mod gpu_class;
 pub(crate) mod input;
 pub(crate) mod keymap;
 pub(crate) mod udev;

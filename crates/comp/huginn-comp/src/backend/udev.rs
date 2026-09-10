@@ -95,6 +95,7 @@ use huginn_core::{
 use crate::backend::advertise;
 use crate::backend::chord;
 use crate::backend::gpu::{self, Bridge, DumbSurface, Scanout, Secondary};
+use crate::backend::gpu_class;
 use crate::backend::input;
 use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
@@ -242,6 +243,14 @@ pub(crate) fn run() -> Result<()> {
         .context("no GPU found for this seat")?;
     let node = DrmNode::from_path(&gpu_path).context("opening the GPU as a DRM node")?;
     tracing::info!(path = ?gpu_path, ?node, "primary GPU");
+    let gpu_info = gpu_class::classify(&gpu_path);
+    tracing::info!(
+        class = ?gpu_info.class,
+        driver = gpu_info.driver.as_deref().unwrap_or("none"),
+        vendor = gpu_info.vendor.as_deref().unwrap_or("not PCI"),
+        blur_by_default = gpu_info.class.blur_by_default(),
+        "GPU class; desktop.toml overrides the defaults it sets"
+    );
 
     // The fd comes from the session rather than a plain open: that is what
     // carries DRM master, and what lets logind revoke it on VT switch.
@@ -287,6 +296,7 @@ pub(crate) fn run() -> Result<()> {
     // other GPUs being fed through a bridge, so its textures are the ones
     // that exist.
     state.set_render_context(renderer.context_id());
+    state.set_gpu_class(gpu_info.class);
 
     // XWayland. Started here rather than after the backend is up because it is
     // asynchronous either way: this only spawns the server and registers the
