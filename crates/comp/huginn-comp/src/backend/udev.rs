@@ -968,6 +968,23 @@ impl Udev {
     /// because a dock that will not come up must not take the laptop's own
     /// screen down with it.
     fn add_device(&mut self, path: &std::path::Path) {
+        // Only a primary node (cardN) drives connectors. udev also announces
+        // render nodes (renderDN) for the same GPU, and on a resume they are
+        // re-announced along with everything else; opening one as a display
+        // device fails with "Error loading resource handles" and a
+        // permission error, which read like the GPU had gone wrong when
+        // nothing had.
+        match DrmNode::from_path(path) {
+            Ok(node) if node.ty() == NodeType::Primary => {}
+            Ok(node) => {
+                tracing::debug!(?path, ty = ?node.ty(), "not a display node; ignored");
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(?path, error = %e, "not a DRM node; ignored");
+                return;
+            }
+        }
         let mut session = self.session.clone();
         let (mut secondary, notifier) = match Secondary::open(&mut session, path) {
             Ok(opened) => opened,
