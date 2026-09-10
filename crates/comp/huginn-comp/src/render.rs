@@ -63,6 +63,11 @@ render_elements! {
     WorkspaceCard = RelocateRenderElement<RescaleRenderElement<SolidColorRenderElement>>,
     /// The cursor, when no client has supplied its own.
     Cursor = MemoryRenderBufferRenderElement<GlesRenderer>,
+    /// The same cursor, enlarged about its hotspot while it is being found.
+    /// See [`crate::shake`].
+    FoundCursor = RescaleRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    /// A client's own cursor, enlarged the same way.
+    FoundClientCursor = RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     /// One edge of the ring around the focused window.
     Ring = SolidColorRenderElement,
     /// The kept last frame of a window that has closed, fading out where it
@@ -179,7 +184,15 @@ fn elements_with_boundary(
     // The cursor goes first because the scene is painted front to back, and
     // nothing is ever meant to occlude the pointer. Skipped entirely for a
     // capture, which wants the desktop without an arrow on it.
+    //
+    // A pointer being found is drawn larger, scaled about the hotspot so the
+    // tip stays exactly where the pointer is: it is still a pointer, and a
+    // click while it is large lands where it looks like it will. Exactly 1 —
+    // which is what a settled size is — takes the ordinary path, so a frame
+    // on an idle desktop costs what it always did.
     if include_cursor {
+        let found = state.pointer_size();
+        let origin = pointer.to_physical(scale).to_i32_round();
         match &state.cursor_status {
             // The client drew its own cursor. Its hotspot lives in the surface's
             // own state, and ignoring it puts the arrow's tip in the wrong place.
@@ -192,18 +205,23 @@ fn elements_with_boundary(
                         .unwrap_or_default()
                 });
                 let position: Point<i32, Logical> = pointer.to_i32_round::<i32>() - hotspot;
-                out.extend(
-                    render_elements_from_surface_tree(
-                        renderer,
-                        surface,
-                        position.to_physical_precise_round::<f64, i32>(scale),
-                        scale,
-                        1.0,
-                        Kind::Cursor,
-                    )
-                    .into_iter()
-                    .map(HuginnElement::Surface),
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    surface,
+                    position.to_physical_precise_round::<f64, i32>(scale),
+                    scale,
+                    1.0,
+                    Kind::Cursor,
                 );
+                if found == 1.0 {
+                    out.extend(elements.into_iter().map(HuginnElement::Surface));
+                } else {
+                    out.extend(elements.into_iter().map(|element| {
+                        HuginnElement::FoundClientCursor(RescaleRenderElement::from_element(
+                            element, origin, found,
+                        ))
+                    }));
+                }
             }
             // Nothing has claimed the cursor, so draw the theme's default.
             CursorImageStatus::Named(_) => {
@@ -222,7 +240,13 @@ fn elements_with_boundary(
                         None,
                         Kind::Cursor,
                     ) {
-                        out.push(HuginnElement::Cursor(element));
+                        if found == 1.0 {
+                            out.push(HuginnElement::Cursor(element));
+                        } else {
+                            out.push(HuginnElement::FoundCursor(
+                                RescaleRenderElement::from_element(element, origin, found),
+                            ));
+                        }
                     }
                 }
             }

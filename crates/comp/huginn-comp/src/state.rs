@@ -583,6 +583,16 @@ pub(crate) struct Huginn {
     /// says whose lift ends it — the button's, not libinput's — and that a
     /// lift with no travel behind it was a tap. See [`Self::drag_begin`].
     drag: bool,
+    /// Recognises the pointer being shaken to be found. See [`crate::shake`].
+    shake: crate::shake::Shake,
+    /// How large the pointer is drawn, as a multiple of its size. 1 at rest;
+    /// it pops up when a shake is recognised and eases back once the shaking
+    /// has stopped. Read at draw time, so the motion needs only frames.
+    pointer_size: crate::anim::Animated,
+    /// When the found pointer starts shrinking back, while it is enlarged.
+    /// Pushed back by every further shake, so a pointer that keeps being
+    /// waved stays large until the waving stops.
+    pointer_found_until: Option<std::time::Duration>,
     /// Recognises the gesture that temporarily summons the application dock.
     double_tap: crate::gesture::DoubleTap,
     /// Wheel travel banked towards the next `Super`+wheel workspace step.
@@ -995,6 +1005,9 @@ impl Huginn {
             swipe: None,
             fullscreen_solo: HashSet::new(),
             drag: false,
+            shake: crate::shake::Shake::default(),
+            pointer_size: crate::anim::Animated::settled(1.0),
+            pointer_found_until: None,
             double_tap: crate::gesture::DoubleTap::default(),
             wheel: crate::wheel::Notches::default(),
             wheel_quiet_until: None,
@@ -3715,6 +3728,82 @@ impl Huginn {
         self.drag = true;
     }
 
+    /// How many times its usual size the pointer is drawn right now.
+    ///
+    /// 1 except while it is being found — see [`Self::pointer_moved_by`].
+    pub(crate) fn pointer_size(&self) -> f64 {
+        f64::from(self.pointer_size.value(self.uptime()))
+    }
+
+    /// The pointer moved by `(dx, dy)`, per the input backend's clock.
+    ///
+    /// Feeds the shake recogniser, and on a shake pops the pointer up to
+    /// [`Self::FOUND_SIZE`] and arms the hold that brings it back. Every
+    /// motion goes in, drag or not: the pointer is as easy to lose with a
+    /// button down as up. A pointer the client has hidden is not fed —
+    /// it cannot be lost, since it is not being looked for, and a game that
+    /// hides the cursor and reads relative motion would otherwise be
+    /// shaking it constantly.
+    pub(crate) fn pointer_moved_by(&mut self, dx: f64, dy: f64, time_msec: u32) {
+        if matches!(self.cursor_status, CursorImageStatus::Hidden) {
+            return;
+        }
+        if !self.shake.moved(dx, dy, time_msec) {
+            return;
+        }
+        let now = self.uptime();
+        let held = self.pointer_found_until.is_some();
+        self.pointer_found_until = Some(now + Self::FOUND_HOLD);
+        // A pointer already large is left large: retargeting a value that is
+        // already there is a no-op in `animate_to`, but one on its way back
+        // down would restart the pop from part way, which reads as a twitch.
+        if !held || self.pointer_size.target() < Self::FOUND_SIZE {
+            self.pointer_size.animate_to(
+                Self::FOUND_SIZE,
+                now,
+                self.settings.motion().duration(Self::FOUND_GROW),
+                crate::anim::Curve::Spring,
+            );
+        }
+        self.queue_redraw();
+    }
+
+    /// How large a found pointer is, as a multiple of its size. Big enough to
+    /// be seen from across the room on a large screen, and still a pointer
+    /// rather than a banner: the arrow's tip stays put, so it can be used at
+    /// this size, and people do.
+    const FOUND_SIZE: f32 = 3.0;
+    /// How long the pointer stays large after the last shake. Long enough to
+    /// find it after the eye has stopped chasing the motion, short enough
+    /// that it is back to normal by the time it is being used.
+    const FOUND_HOLD: std::time::Duration = std::time::Duration::from_millis(900);
+    /// The pop: fast, with the spring's one overshoot, so it draws the eye.
+    const FOUND_GROW: std::time::Duration = std::time::Duration::from_millis(180);
+    /// The return: unhurried and without a bounce. Nothing needs the eye now.
+    const FOUND_SHRINK: std::time::Duration = std::time::Duration::from_millis(240);
+
+    /// The found pointer's clock, run once a frame from
+    /// [`Self::tick_animations`]. Starts the shrink when the hold is up, and
+    /// keeps frames flowing while it is held or moving — the hold is a timer
+    /// with nothing else to wake it, as the app switcher's dismissal is.
+    fn tick_found_pointer(&mut self, now: std::time::Duration) {
+        if let Some(until) = self.pointer_found_until {
+            if now >= until {
+                self.pointer_found_until = None;
+                self.pointer_size.animate_to(
+                    1.0,
+                    now,
+                    self.settings.motion().duration(Self::FOUND_SHRINK),
+                    crate::anim::Curve::EaseInOut,
+                );
+            }
+            self.queue_redraw();
+        }
+        if !self.pointer_size.is_settled(now) {
+            self.queue_redraw();
+        }
+    }
+
     /// Whether a `Super`+left drag is in progress, so the release that ends
     /// it is the compositor's.
     pub(crate) fn drag_active(&self) -> bool {
@@ -4404,6 +4493,7 @@ impl Huginn {
         if self.settings.is_animating(now) {
             self.refresh_settings();
         }
+        self.tick_found_pointer(now);
         self.tick_volume(now);
         if let Some(since) = self.dock_hover_since {
             if now.saturating_sub(since) >= crate::dock::PREVIEW_DELAY {
