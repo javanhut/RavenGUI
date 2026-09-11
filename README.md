@@ -434,6 +434,30 @@ has been lost is found by shaking it: a few quick back-and-forths and it grows
 to three times its size until the shaking stops, tip held in place, with the
 client under it none the wiser. That rule is `shake.rs`, pure and tested too.
 
+The lift is half the gesture. While the fingers are down the row and the
+overview's reveal follow them exactly — never eased towards, which would put
+the interface a fixed distance behind the hand — and past either end of the
+row the fingers meet a rubber band rather than a wall. When they lift, the
+recogniser reports how fast they were going, and the row sets off at that
+speed: a critically damped spring pulls it to a stage, so there is no seam
+where the drag stopped and the animation began, and a key pressed before it
+has landed bends it rather than restarting it. Which stage is decided the way
+a scroll view decides where a fling stops — from where the speed was carrying
+the row, at most one stage past the fingers — so a quick flick that moved the
+row a quarter of a stage still turns the page, a drag past halfway flicked
+back goes back, and a row held still and let go lands on the nearest stage
+with no bounce, because nothing threw it. A thrown row lands with one soft
+overshoot, at Apple's damping for a thrown drawer. The reveal reads the lift
+the same way: a flick decides by its direction, and only fingers at rest fall
+back to the direction the swipe set out in. The launcher, quick settings,
+the pinned panel and the dock ride the same kind of spring, one shared
+`Reveal`, critically damped both ways: none of them was thrown, so none of
+them bounces, and a panel dismissed while still arriving turns round with the
+speed it has instead of stopping and setting off again. Every value here is a
+closed-form spring in `anim.rs` and every rule a pure function in
+`gesture.rs`, both tested at chosen instants, and reduced motion still puts
+everything at its destination at once.
+
 While the session is locked, no binding resolves at all: every key is the lock
 screen's, checked before the launcher and quick settings, which would otherwise
 swallow the keystrokes and leave no way to type a password.

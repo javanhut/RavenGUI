@@ -225,7 +225,7 @@ pub(crate) struct Launcher {
     menu: Option<usize>,
     /// 0 fully collapsed onto its origin, 1 fully open. §4: fade and scale up
     /// from the dock icon over ~150ms, and reverse the same motion to dismiss.
-    reveal: crate::anim::Animated,
+    reveal: crate::anim::Reveal,
     /// Where it grows from, in output coordinates.
     ///
     /// The dock's launcher icon when the dock is up. Captured at open rather
@@ -259,7 +259,7 @@ impl Default for Launcher {
             recent: Vec::new(),
             now: 0,
             menu: None,
-            reveal: crate::anim::Animated::settled(0.0),
+            reveal: crate::anim::Reveal::hidden(),
             origin: None,
             layout: Layout::default(),
             pinned: Vec::new(),
@@ -491,23 +491,13 @@ impl Launcher {
         self.menu = None;
         self.origin = origin;
         self.refresh(entries, frecency, now, Keep::Top);
-        self.reveal.animate_to(
-            1.0,
-            clock,
-            motion.duration(crate::anim::LAUNCHER_OPEN),
-            crate::anim::Curve::EaseOut,
-        );
+        self.reveal.open(clock, motion.is_reduced());
     }
 
     /// Dismiss it, reversing the motion it arrived with. §4.
     pub(crate) fn close(&mut self, clock: std::time::Duration, motion: crate::settings::Motion) {
         self.open = false;
-        self.reveal.animate_to(
-            0.0,
-            clock,
-            motion.duration(crate::anim::PANEL_CLOSE),
-            crate::anim::Curve::EaseOut,
-        );
+        self.reveal.close(clock, motion.is_reduced());
         // The query is deliberately NOT cleared here: the panel is still on
         // screen shrinking away, and emptying it mid-animation would show the
         // placeholder for the last few frames of a dismissal.

@@ -163,11 +163,16 @@ mod tests {
     fn drag_travel_lands_in_the_swipes_range() {
         let mut swipe = crate::gesture::Swipe::new(crate::gesture::CAROUSEL_FINGERS);
         let (dx, dy) = travel(2.0, -1.0);
-        assert!(swipe.takes_hold(dx, dy).is_none(), "jitter must not commit");
+        assert!(
+            swipe
+                .takes_hold(dx, dy, std::time::Duration::ZERO)
+                .is_none(),
+            "jitter must not commit"
+        );
         let mut swipe = crate::gesture::Swipe::new(crate::gesture::CAROUSEL_FINGERS);
         let (dx, dy) = travel(-1920.0, 0.0);
         assert_eq!(
-            swipe.takes_hold(dx, dy),
+            swipe.takes_hold(dx, dy, std::time::Duration::ZERO),
             Some(crate::gesture::Hold::Horizontal)
         );
         swipe.drives(0.0);

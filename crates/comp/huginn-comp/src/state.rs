@@ -234,8 +234,14 @@ pub(crate) struct WorkspacePreview {
 
 #[derive(Debug, Clone, Copy)]
 struct WorkspaceCarousel {
-    position: crate::anim::Animated,
-    reveal: crate::anim::Animated,
+    /// Which stage is at the front, in stages, with fractions between. A
+    /// spring rather than a curve so that fingers lifting off the row leave
+    /// it moving at their speed — see [`crate::gesture`] — and so that a key
+    /// pressed while it is still settling bends it rather than restarts it.
+    position: crate::anim::Spring,
+    /// How far the desktop has shrunk into the overview: 0 is the desktop, 1
+    /// the overview. A spring for the same reasons.
+    reveal: crate::anim::Spring,
     closing: bool,
     /// The window the highlight is on, steered by the arrows. `None` until a
     /// key or the pointer puts it somewhere — and what decides, on the way
@@ -245,6 +251,42 @@ struct WorkspaceCarousel {
     /// `selected` so that a pointer resting on nothing leaves the arrows'
     /// choice alone: only *leaving* a window clears the highlight.
     hover: Option<huginn_core::window::WindowId>,
+}
+
+impl WorkspaceCarousel {
+    /// How hard the row is pulled to a stage. Settles a one-stage slide in
+    /// about a quarter of a second, the length the close used to be played
+    /// over, and reads as an ease-out that happens to be interruptible.
+    const POSITION_STIFFNESS: f32 = 700.0;
+    /// The reveal's pull. Stiffer: it moves scale, not distance, and a shrink
+    /// that lags the fingers reads as the desktop being slow to answer.
+    const REVEAL_STIFFNESS: f32 = 900.0;
+    /// How close, in stages or reveals, counts as arrived. A stage is a
+    /// screen width, so a thousandth is a pixel or two at any size there is.
+    const TOLERANCE: f32 = 0.001;
+    /// How far past either end the row can be dragged, in stages. Enough to
+    /// feel the row give under the fingers, not enough to look like a stage
+    /// that is missing.
+    const EDGE_GIVE: f32 = 0.3;
+    /// Faster than this, in stages per second, a lift is a throw and lands
+    /// with [`Self::THROW_DAMPING`]; slower is a placement and lands dead.
+    /// Overshoot on something that was not thrown reads as a wobble.
+    const THROW: f32 = 1.5;
+    /// The bounce a thrown row lands with. Apple's number for a drawer.
+    const THROW_DAMPING: f32 = 0.8;
+
+    /// At rest, with stage `position` at the front and the reveal at `reveal`.
+    fn at(position: f32, reveal: f32) -> Self {
+        Self {
+            position: crate::anim::Spring::at_rest(position, Self::POSITION_STIFFNESS)
+                .with_tolerance(Self::TOLERANCE),
+            reveal: crate::anim::Spring::at_rest(reveal, Self::REVEAL_STIFFNESS)
+                .with_tolerance(Self::TOLERANCE),
+            closing: false,
+            selected: None,
+            hover: None,
+        }
+    }
 }
 
 /// The overview's chrome, composed for what it is showing; see
@@ -2807,7 +2849,8 @@ impl Huginn {
         let Some(mut swipe) = self.swipe.take() else {
             return;
         };
-        match swipe.takes_hold(dx, dy) {
+        let now = self.uptime();
+        match swipe.takes_hold(dx, dy, now) {
             Some(crate::gesture::Hold::Horizontal) => {
                 if let Some(switcher) = self.app_switcher {
                     let selectable = self.switcher_items();
@@ -2822,7 +2865,6 @@ impl Huginn {
                     // from the active workspace, and a swipe that snapped it
                     // back to the active index before following the fingers
                     // would lurch. With no overview the two are the same.
-                    let now = self.uptime();
                     let origin = self
                         .workspace_carousel
                         .as_ref()
@@ -2837,7 +2879,6 @@ impl Huginn {
             // application switcher up the fingers are its commands — accept,
             // minimize — which act on the lift, so nothing is taken here.
             Some(crate::gesture::Hold::Vertical) if self.app_switcher.is_none() => {
-                let now = self.uptime();
                 match swipe.vertical() {
                     Some(crate::gesture::Vertical::Up) => {
                         let origin = if let Some(carousel) = &mut self.workspace_carousel {
@@ -2850,15 +2891,8 @@ impl Huginn {
                         } else {
                             // Born pinned shut: the fingers drive the reveal
                             // from here, not the open animation.
-                            self.workspace_carousel = Some(WorkspaceCarousel {
-                                position: crate::anim::Animated::settled(
-                                    self.space.active_index() as f32
-                                ),
-                                reveal: crate::anim::Animated::settled(0.0),
-                                closing: false,
-                                selected: None,
-                                hover: None,
-                            });
+                            self.workspace_carousel =
+                                Some(WorkspaceCarousel::at(self.space.active_index() as f32, 0.0));
                             0.0
                         };
                         swipe.drives_reveal(origin);
@@ -2894,9 +2928,20 @@ impl Huginn {
                     self.refresh_dock();
                 }
             } else {
+                // Past either end the row gives a little rather than stopping
+                // dead, and less the further it is pulled: a hard stop reads
+                // as frozen, a band reads as "there is nothing more here".
+                // Computed from the raw position each time, so fingers that
+                // go past the end and come back find the row exactly under
+                // them again.
                 let last = self.space.workspaces().len().saturating_sub(1) as f32;
                 if let Some(carousel) = &mut self.workspace_carousel {
-                    carousel.position.jump_to(position.clamp(0.0, last));
+                    carousel.position.jump_to(crate::anim::rubberband_within(
+                        position,
+                        0.0,
+                        last,
+                        WorkspaceCarousel::EDGE_GIVE,
+                    ));
                     self.queue_redraw();
                 }
             }
@@ -2919,11 +2964,18 @@ impl Huginn {
         let Some(swipe) = self.swipe.take() else {
             return;
         };
-        if let Some(open) = swipe.reveal_commits() {
+        let now = self.uptime();
+        if let Some(open) = swipe.reveal_commits(now) {
             // The lift settles the reveal the fingers were driving: on to
-            // fully open, or back down to the workspace it came from. Closing
-            // re-activates the workspace the overview opened on, which is the
-            // one already active — a snap-back changes nothing but pixels.
+            // fully open, or back down to the workspace it came from, setting
+            // off at the speed the fingers had so there is no seam between
+            // the drag and the settle. Closing re-activates the workspace the
+            // overview opened on, which is the one already active — a
+            // snap-back changes nothing but pixels.
+            if let Some(carousel) = &mut self.workspace_carousel {
+                let velocity = swipe.velocity(now).unwrap_or(0.0);
+                carousel.reveal.launch(velocity, now);
+            }
             if open {
                 self.open_workspace_carousel();
             } else {
@@ -2943,11 +2995,27 @@ impl Huginn {
             }
             return;
         }
-        if swipe.position().is_none() {
+        let Some(landing) = swipe.landing(now) else {
             return;
-        }
+        };
         if self.app_switcher.is_none() {
-            self.close_workspace_carousel();
+            // The row sets off at the fingers' speed and lands where that
+            // speed was taking it. A throw lands with a little bounce, the
+            // way a thrown thing does; a placement lands dead, because a
+            // bounce on something that was set down reads as a wobble.
+            let velocity = swipe.velocity(now).unwrap_or(0.0);
+            if let Some(carousel) = &mut self.workspace_carousel {
+                let damping = if velocity.abs() >= WorkspaceCarousel::THROW {
+                    WorkspaceCarousel::THROW_DAMPING
+                } else {
+                    1.0
+                };
+                carousel.position.set_damping(damping, now);
+                carousel.position.launch(velocity, now);
+            }
+            let last = self.space.workspaces().len().saturating_sub(1) as f32;
+            let landing = landing.clamp(0.0, last) as usize;
+            self.dismiss_workspace_carousel(None, Some(landing));
         }
     }
 
@@ -3306,30 +3374,20 @@ impl Huginn {
     /// Open the workspace Cover Flow at the active workspace.
     pub(crate) fn open_workspace_carousel(&mut self) {
         let now = self.uptime();
-        let duration = self
-            .settings
-            .motion()
-            .duration(crate::anim::WORKSPACE_CAROUSEL_OPEN);
+        let instant = self.reduced_motion();
         if let Some(carousel) = &mut self.workspace_carousel {
             // A fresh gesture may arrive while the previous selection is still
-            // expanding. Reverse that motion from its current value instead of
-            // letting the old close finish underneath the new fingers.
-            carousel
-                .reveal
-                .animate_to(1.0, now, duration, crate::anim::Curve::EaseOut);
+            // expanding. Reverse that motion from its current value and with
+            // its current speed instead of letting the old close finish
+            // underneath the new fingers.
+            carousel.reveal.go_to(1.0, now, instant);
             carousel.closing = false;
             self.queue_redraw();
             return;
         }
-        let mut reveal = crate::anim::Animated::settled(0.0);
-        reveal.animate_to(1.0, now, duration, crate::anim::Curve::EaseOut);
-        self.workspace_carousel = Some(WorkspaceCarousel {
-            position: crate::anim::Animated::settled(self.space.active_index() as f32),
-            reveal,
-            closing: false,
-            selected: None,
-            hover: None,
-        });
+        let mut carousel = WorkspaceCarousel::at(self.space.active_index() as f32, 0.0);
+        carousel.reveal.go_to(1.0, now, instant);
+        self.workspace_carousel = Some(carousel);
         self.refresh_overview_chrome();
         self.queue_redraw();
     }
@@ -3337,7 +3395,7 @@ impl Huginn {
     /// Settle on the nearest stage and expand it back to a normal workspace,
     /// putting any solo's tiling back. See [`Self::dismiss_workspace_carousel`].
     pub(crate) fn close_workspace_carousel(&mut self) {
-        self.dismiss_workspace_carousel(None);
+        self.dismiss_workspace_carousel(None, None);
     }
 
     /// Leave the overview, landing on the nearest stage.
@@ -3348,23 +3406,27 @@ impl Huginn {
     /// visit soloed is undone and the tiling comes back exactly as it stood.
     /// Leaving empty-handed is a statement too, which is why it restores
     /// rather than preserves.
-    fn dismiss_workspace_carousel(&mut self, select: Option<WindowId>) {
+    ///
+    /// `land` is the stage to settle on when the caller knows better than
+    /// the nearest — a lift with the fingers still moving, whose speed was
+    /// carrying the row somewhere. `None` lands on the nearest stage, and
+    /// without a bounce: nothing threw it.
+    fn dismiss_workspace_carousel(&mut self, select: Option<WindowId>, land: Option<usize>) {
         let now = self.uptime();
+        let instant = self.reduced_motion();
         let last = self.space.workspaces().len().saturating_sub(1);
-        let duration = self
-            .settings
-            .motion()
-            .duration(crate::anim::WORKSPACE_CAROUSEL_CLOSE);
         let Some(carousel) = &mut self.workspace_carousel else {
             return;
         };
-        let target = carousel.position.value(now).round().clamp(0.0, last as f32) as usize;
-        carousel
-            .position
-            .animate_to(target as f32, now, duration, crate::anim::Curve::EaseInOut);
-        carousel
-            .reveal
-            .animate_to(0.0, now, duration, crate::anim::Curve::EaseInOut);
+        let target = match land {
+            Some(stage) => stage.min(last),
+            None => {
+                carousel.position.set_damping(1.0, now);
+                carousel.position.value(now).round().clamp(0.0, last as f32) as usize
+            }
+        };
+        carousel.position.go_to(target as f32, now, instant);
+        carousel.reveal.go_to(0.0, now, instant);
         carousel.closing = true;
         carousel.selected = None;
         carousel.hover = None;
@@ -3613,10 +3675,7 @@ impl Huginn {
         let last = self.space.workspaces().len().saturating_sub(1);
         let index = index.min(last);
         let now = self.uptime();
-        let duration = self
-            .settings
-            .motion()
-            .duration(crate::anim::WORKSPACE_CAROUSEL_OPEN);
+        let instant = self.reduced_motion();
         let Some(carousel) = &mut self.workspace_carousel else {
             return;
         };
@@ -3624,9 +3683,10 @@ impl Huginn {
         {
             return;
         }
-        carousel
-            .position
-            .animate_to(index as f32, now, duration, crate::anim::Curve::EaseInOut);
+        // A key is not a throw: whatever bounce the last gesture left in the
+        // row, this slide lands dead.
+        carousel.position.set_damping(1.0, now);
+        carousel.position.go_to(index as f32, now, instant);
         carousel.selected = None;
         carousel.hover = None;
         self.queue_redraw();
@@ -5590,7 +5650,7 @@ impl Huginn {
             .workspace_carousel
             .as_ref()
             .and_then(|carousel| carousel.selected);
-        self.dismiss_workspace_carousel(selected);
+        self.dismiss_workspace_carousel(selected, None);
     }
 
     /// A primary click while the overview is up. On a window's patch it takes
@@ -5617,7 +5677,7 @@ impl Huginn {
             .into_iter()
             .find(|(_, patch)| patch.contains(point))
             .map(|(id, _)| id);
-        self.dismiss_workspace_carousel(hit);
+        self.dismiss_workspace_carousel(hit, None);
         true
     }
 

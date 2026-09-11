@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use huginn_core::geometry::Rect;
 
-use crate::anim::{Animated, Curve};
+use crate::anim::Reveal;
 use crate::canvas::{Canvas, Panel};
 use crate::text::Text;
 
@@ -43,15 +43,21 @@ pub(crate) enum Motion {
 impl Motion {
     /// The duration to actually use for an animation nominally `wanted` long.
     ///
-    /// Zero under reduced motion, which every animation already handles: a
-    /// zero-length [`Animated`] is simply already finished. That is why there
-    /// is no `if reduced { skip }` at any call site — the one place motion is
-    /// turned off is here.
+    /// Zero under reduced motion, which every curve already handles: a
+    /// zero-length [`crate::anim::Animated`] is simply already finished. That
+    /// is why there is no `if reduced { skip }` at any call site — the one
+    /// place motion is turned off is here, and in [`Self::is_reduced`], which
+    /// is the same question asked by a spring, which has no duration to zero.
     pub(crate) fn duration(self, wanted: Duration) -> Duration {
         match self {
             Self::Full => wanted,
             Self::Reduced => Duration::ZERO,
         }
+    }
+
+    /// Whether a spring should skip to its target rather than move.
+    pub(crate) fn is_reduced(self) -> bool {
+        self == Self::Reduced
     }
 
     fn toggled(self) -> Self {
@@ -899,7 +905,7 @@ pub(crate) struct Settings {
     selected: usize,
     controls: Vec<Box<dyn Control>>,
     /// 0 closed, 1 open. Drives the reveal.
-    reveal: Animated,
+    reveal: Reveal,
 }
 
 impl Default for Settings {
@@ -953,7 +959,7 @@ impl Settings {
                 // not a shutdown.
                 Box::new(PowerRow::new(power)),
             ],
-            reveal: Animated::settled(0.0),
+            reveal: Reveal::hidden(),
         }
     }
 }
@@ -1076,24 +1082,12 @@ impl Settings {
         for control in &mut self.controls {
             control.disarm();
         }
-        let motion = self.motion();
-        self.reveal.animate_to(
-            1.0,
-            now,
-            motion.duration(crate::anim::LAUNCHER_OPEN),
-            Curve::Spring,
-        );
+        self.reveal.open(now, self.motion().is_reduced());
     }
 
     pub(crate) fn close(&mut self, now: Duration) {
         self.open = false;
-        let motion = self.motion();
-        self.reveal.animate_to(
-            0.0,
-            now,
-            motion.duration(crate::anim::PANEL_CLOSE),
-            Curve::EaseOut,
-        );
+        self.reveal.close(now, self.motion().is_reduced());
     }
 
     pub(crate) fn press(&mut self, key: Key, now: Duration) -> Outcome {
@@ -1154,8 +1148,8 @@ impl Settings {
                 // turned them off, not on the next thing to animate — landing
                 // the change one interaction late reads as the switch having
                 // done nothing.
-                if self.motion() == Motion::Reduced {
-                    self.reveal.jump_to(1.0);
+                if self.motion().is_reduced() {
+                    self.reveal.show_now();
                 }
                 Outcome::Redraw
             }
@@ -1437,8 +1431,8 @@ mod tests {
         let settings = opened();
         assert!(settings.reveal(T0) < 0.5, "it was already there at t=0");
         assert!(settings.is_animating(T0));
-        assert!((settings.reveal(ms(200)) - 1.0).abs() < 1e-3);
-        assert!(!settings.is_animating(ms(200)));
+        assert!((settings.reveal(ms(300)) - 1.0).abs() < 1e-3);
+        assert!(!settings.is_animating(ms(300)));
     }
 
     #[test]

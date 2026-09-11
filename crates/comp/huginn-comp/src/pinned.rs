@@ -119,7 +119,7 @@ pub(crate) struct Pinned {
     /// The actions menu, if it is up: which item is highlighted.
     menu: Option<usize>,
     /// 0 collapsed, 1 open.
-    reveal: crate::anim::Animated,
+    reveal: crate::anim::Reveal,
     /// Where the last redraw put things; see [`Layout`].
     layout: Layout,
 }
@@ -133,7 +133,7 @@ impl Default for Pinned {
             orientation: Orientation::default(),
             position: Position::default(),
             menu: None,
-            reveal: crate::anim::Animated::settled(0.0),
+            reveal: crate::anim::Reveal::hidden(),
             layout: Layout::default(),
         }
     }
@@ -246,24 +246,14 @@ impl Pinned {
         self.selected = 0;
         self.menu = None;
         self.refresh(apps, pins);
-        self.reveal.animate_to(
-            1.0,
-            clock,
-            motion.duration(crate::anim::LAUNCHER_OPEN),
-            crate::anim::Curve::EaseOut,
-        );
+        self.reveal.open(clock, motion.is_reduced());
     }
 
     /// Dismiss it, reversing the motion it arrived with.
     pub(crate) fn close(&mut self, clock: std::time::Duration, motion: crate::settings::Motion) {
         self.open = false;
         self.menu = None;
-        self.reveal.animate_to(
-            0.0,
-            clock,
-            motion.duration(crate::anim::PANEL_CLOSE),
-            crate::anim::Curve::EaseOut,
-        );
+        self.reveal.close(clock, motion.is_reduced());
     }
 
     /// Re-resolve the pins against the application list and take the
