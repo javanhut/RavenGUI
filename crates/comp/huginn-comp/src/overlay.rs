@@ -28,13 +28,8 @@ const BASE_SIZE: f32 = 15.0;
 /// second colour that could drift from the first.
 const OVERLAY_ALPHA: u8 = 0xF2;
 
-// The palette, resolved from the one theme at compile time. There is nothing
-// to vary: the desktop ships one look, so this is a constant rather than a
-// value threaded down from a caller.
-const BG: [u8; 4] = crate::theme::BACKGROUND
-    .with_alpha(OVERLAY_ALPHA)
-    .to_rgba_bytes();
-const BORDER: [u8; 4] = crate::theme::BORDER.to_rgba_bytes();
+/// Corner radius at 1×: the panel radius every other floating surface has.
+const RADIUS: f32 = crate::theme::PANEL_RADIUS;
 
 const TITLE: &str = "Huginn keybindings";
 const FOOTER: &str = "Super+Ctrl+H closes this. Plain Super belongs to the focused application.";
@@ -106,8 +101,7 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
         .ceil() as usize;
 
     let mut canvas = Canvas::new(w, h);
-    canvas.fill(0, 0, w, h, BG);
-    canvas.frame(BORDER);
+    canvas.material(0, 0, w, h, RADIUS * px, OVERLAY_ALPHA);
 
     let mut y = pad;
     text.draw(
@@ -119,12 +113,13 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
         crate::theme::accent(),
     );
     y += line + line_gap;
-    canvas.fill(
+    canvas.tint(
         pad as usize,
         y as usize,
         body_w as usize,
         rule as usize,
-        BORDER,
+        crate::theme::RULE,
+        0x14,
     );
     y += rule + line_gap;
 
@@ -247,12 +242,20 @@ mod tests {
             return;
         }
         let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
+        // The corners are rounded, and outside the arc is the desktop by
+        // design; everything else inside the panel must be painted.
+        let reach = RADIUS.ceil() as usize;
+        let (w, h) = (canvas.stride, canvas.height);
+        let in_corner = |x: usize, y: usize| {
+            (x < reach || x + reach >= w) && (y < reach || y + reach >= h)
+        };
         let clear = canvas
             .pixels
             .as_chunks::<4>()
             .0
             .iter()
-            .filter(|p| p[3] == 0)
+            .enumerate()
+            .filter(|(i, p)| p[3] == 0 && !in_corner(i % w, i / w))
             .count();
         assert_eq!(
             clear, 0,
@@ -271,6 +274,7 @@ mod tests {
         }
         let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let accent = crate::theme::accent().to_rgba_bytes();
+        let bg = crate::theme::BACKGROUND.to_rgba_bytes();
         let partial = canvas
             .pixels
             .as_chunks::<4>()
@@ -278,7 +282,7 @@ mod tests {
             .iter()
             .filter(|p| {
                 // Somewhere strictly between the background and the accent.
-                p[0] > BG[0].min(accent[0]) && p[0] < BG[0].max(accent[0]) && p[0] != BG[0]
+                p[0] > bg[0].min(accent[0]) && p[0] < bg[0].max(accent[0]) && p[0] != bg[0]
             })
             .count();
         assert!(

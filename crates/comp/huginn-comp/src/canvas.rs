@@ -155,6 +155,92 @@ impl Canvas {
         }
     }
 
+    /// Outline a rectangle with rounded corners, `width` pixels thick,
+    /// antialiased on both edges.
+    ///
+    /// The stroke is the difference of two rounded rectangles — the shape and
+    /// the same shape inset by `width` — evaluated per pixel as a signed
+    /// distance, so the arcs and the straight runs get the same coverage
+    /// ramp. Only the band a stroke can pass through is visited: the rows
+    /// near the top and bottom edges in full, and for the rows between, the
+    /// few columns at either side.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stroke_rounded(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        radius: f32,
+        width: f32,
+        color: Color,
+    ) {
+        if w == 0 || h == 0 || width <= 0.0 {
+            return;
+        }
+        let (wf, hf) = (w as f32, h as f32);
+        let radius = radius.min(wf / 2.0).min(hf / 2.0).max(0.0);
+        let inner_r = (radius - width).max(0.0);
+        let reach = (radius.max(width) + 1.5).ceil() as usize;
+        let (right, bottom) = ((x + w).min(self.stride), (y + h).min(self.height));
+        let side = (width + 1.5).ceil() as usize;
+        for row in y..bottom {
+            let ly = (row - y) as f32 + 0.5;
+            let full = row < y + reach || row + reach >= y + h;
+            let paint = |canvas: &mut Self, cols: std::ops::Range<usize>| {
+                for col in cols {
+                    let lx = (col - x) as f32 + 0.5;
+                    let outer = rounded_coverage(lx, ly, wf, hf, radius);
+                    let inner = rounded_coverage(
+                        lx - width,
+                        ly - width,
+                        wf - width * 2.0,
+                        hf - width * 2.0,
+                        inner_r,
+                    );
+                    let coverage = (outer - inner).clamp(0.0, 1.0);
+                    if coverage > 0.0 {
+                        canvas.blend_over(col, row, color, (coverage * 255.0) as u8);
+                    }
+                }
+            };
+            if full {
+                paint(self, x..right);
+            } else {
+                paint(self, x..(x + side).min(right));
+                paint(self, right.saturating_sub(side).max(x)..right);
+            }
+        }
+    }
+
+    /// Paint the desktop's one material into a rectangle: the translucent
+    /// ground, a hairline of light around it, and a brighter catch-light
+    /// along the top edge between the corner arcs.
+    ///
+    /// Every floating panel goes through here — the dock, the launcher, the
+    /// pinned panel, the overlay, a caption — which is what keeps them one
+    /// surface rather than five that agree today. `alpha` is the ground's
+    /// opacity; see [`crate::theme::PANEL_ALPHA`].
+    pub(crate) fn material(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        radius: f32,
+        alpha: u8,
+    ) {
+        use crate::theme;
+        self.fill_rounded(x, y, w, h, radius, theme::BACKGROUND.with_alpha(alpha));
+        self.stroke_rounded(x, y, w, h, radius, 1.0, theme::HAIRLINE);
+        // The catch-light sits just inside the hairline, clear of the arcs,
+        // so it reads as light on the top edge and not as a second border.
+        let inset = radius.ceil() as usize;
+        if h > 2 && w > inset * 2 {
+            self.blend_span(x + inset, x + w - inset, y + 1, theme::CATCH_LIGHT, 255);
+        }
+    }
+
     /// [`Self::blend_over`] across the columns `from..to` of one row.
     fn blend_span(&mut self, from: usize, to: usize, row: usize, color: Color, alpha: u8) {
         for col in from..to {
@@ -182,19 +268,6 @@ impl Canvas {
         }
         let under = u32::from(self.pixels[offset + 3]);
         self.pixels[offset + 3] = lerp(under, 255, coverage, 255 * 255) as u8;
-    }
-
-    /// A one-pixel border around the whole canvas, so the panel has an edge
-    /// rather than bleeding into whatever is behind it.
-    pub(crate) fn frame(&mut self, color: [u8; 4]) {
-        for col in 0..self.stride {
-            self.set(col, 0, color);
-            self.set(col, self.height - 1, color);
-        }
-        for row in 0..self.height {
-            self.set(0, row, color);
-            self.set(self.stride - 1, row, color);
-        }
     }
 
     /// Write one pixel, ignoring anything off the canvas.
@@ -231,6 +304,26 @@ impl crate::text::Surface for Canvas {
         let existing = self.pixels[offset + 3];
         self.pixels[offset + 3] = existing.max(alpha);
     }
+}
+
+/// How much of the pixel centred at (`lx`, `ly`) a `w`×`h` rectangle with
+/// corners of `radius`, its top-left at the origin, covers: 1 inside, 0
+/// outside, and a one-pixel ramp across the edge.
+///
+/// A signed distance to the rounded box, which handles the arcs and the
+/// straight runs with one formula, so a stroke built from two of these has
+/// the same weight all the way round.
+fn rounded_coverage(lx: f32, ly: f32, w: f32, h: f32, radius: f32) -> f32 {
+    if w <= 0.0 || h <= 0.0 {
+        return 0.0;
+    }
+    let radius = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    let (cx, cy) = (lx - w / 2.0, ly - h / 2.0);
+    let (qx, qy) = (cx.abs() - (w / 2.0 - radius), cy.abs() - (h / 2.0 - radius));
+    let outside = qx.max(0.0).hypot(qy.max(0.0));
+    let inside = qx.max(qy).min(0.0);
+    let distance = outside + inside - radius;
+    (0.5 - distance).clamp(0.0, 1.0)
 }
 
 /// `from` moved towards `to` by `amount` parts in `whole`, rounded.
@@ -301,5 +394,55 @@ impl Panel {
         let x = output.x() + (output.w() - self.width).max(0) / 2;
         let y = output.y() + (output.h() - self.height).max(0) / 2;
         Rect::from_xywh(x, y, self.width, self.height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded_coverage_is_full_inside_and_empty_outside() {
+        assert_eq!(rounded_coverage(10.0, 10.0, 40.0, 30.0, 8.0), 1.0);
+        assert_eq!(rounded_coverage(-5.0, 10.0, 40.0, 30.0, 8.0), 0.0);
+        // The very corner of the bounding box lies outside the arc.
+        assert_eq!(rounded_coverage(0.5, 0.5, 40.0, 30.0, 8.0), 0.0);
+        // A straight edge gets a one-pixel ramp centred on the boundary.
+        let edge = rounded_coverage(20.0, 0.0, 40.0, 30.0, 8.0);
+        assert!((edge - 0.5).abs() < 0.01, "edge coverage was {edge}");
+    }
+
+    #[test]
+    fn stroke_paints_the_edge_and_leaves_the_middle_clear() {
+        let mut canvas = Canvas::new(40, 30);
+        canvas.stroke_rounded(0, 0, 40, 30, 6.0, 1.0, Color::from_argb(0xFFFF_FFFF));
+        let alpha = |x: usize, y: usize| canvas.pixels[(y * 40 + x) * 4 + 3];
+        assert!(alpha(20, 0) > 200, "top edge was {}", alpha(20, 0));
+        assert!(alpha(0, 15) > 200, "left edge was {}", alpha(0, 15));
+        assert_eq!(alpha(20, 15), 0, "the middle must stay clear");
+        assert_eq!(alpha(20, 3), 0, "one pixel in from the edge must stay clear");
+        // The corner pixel is outside the arc and gets nothing.
+        assert_eq!(alpha(0, 0), 0);
+    }
+
+    #[test]
+    fn material_is_opaque_where_the_ground_is_and_lit_along_the_top() {
+        let mut canvas = Canvas::new(60, 40);
+        canvas.material(0, 0, 60, 40, 8.0, 0xD8);
+        let px = |x: usize, y: usize| {
+            let o = (y * 60 + x) * 4;
+            [
+                canvas.pixels[o],
+                canvas.pixels[o + 1],
+                canvas.pixels[o + 2],
+                canvas.pixels[o + 3],
+            ]
+        };
+        // The ground carries the panel alpha.
+        assert_eq!(px(30, 20)[3], 0xD8);
+        // The catch-light row is brighter than the ground beneath it.
+        assert!(px(30, 1)[0] > px(30, 20)[0]);
+        // Outside the arc nothing is painted.
+        assert_eq!(px(0, 0)[3], 0);
     }
 }
