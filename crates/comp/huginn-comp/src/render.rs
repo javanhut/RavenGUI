@@ -224,17 +224,27 @@ fn elements_with_boundary(
                 }
             }
             // Nothing has claimed the cursor, so draw the theme's default.
+            //
+            // While being found it is drawn from the theme's bitmap for that
+            // size when there is one, scaled only by whatever the theme's
+            // size falls short of the size wanted — the ordinary bitmap
+            // stretched threefold is blurred and stepped at once. See
+            // [`crate::pointer::Found`].
             CursorImageStatus::Named(_) => {
                 if let Some(cursor) = fallback_cursor {
-                    let position: Point<f64, Logical> = (
-                        pointer.x - f64::from(cursor.hotspot.x),
-                        pointer.y - f64::from(cursor.hotspot.y),
-                    )
-                        .into();
+                    let (buffer, hotspot, rescale): (_, Point<f64, Logical>, _) =
+                        match &cursor.found {
+                            Some(big) if found != 1.0 => {
+                                (&big.buffer, big.hotspot, found / big.magnification)
+                            }
+                            _ => (&cursor.buffer, cursor.hotspot.to_f64(), found),
+                        };
+                    let position: Point<f64, Logical> =
+                        (pointer.x - hotspot.x, pointer.y - hotspot.y).into();
                     if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
                         renderer,
                         position.to_physical(scale),
-                        &cursor.buffer,
+                        buffer,
                         None,
                         None,
                         None,
@@ -244,7 +254,7 @@ fn elements_with_boundary(
                             out.push(HuginnElement::Cursor(element));
                         } else {
                             out.push(HuginnElement::FoundCursor(
-                                RescaleRenderElement::from_element(element, origin, found),
+                                RescaleRenderElement::from_element(element, origin, rescale),
                             ));
                         }
                     }

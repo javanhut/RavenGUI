@@ -33,6 +33,31 @@ pub(crate) struct Cursor {
     /// The output density the bitmap was picked for. A backend compares this
     /// against the output's advertised scale to know when to load again.
     pub density: u32,
+    /// The same cursor at the size it is drawn while being found, when the
+    /// theme ships one. See [`Found`].
+    pub found: Option<Found>,
+}
+
+/// A cursor's bitmap for while it is being found. See [`crate::shake`].
+///
+/// A theme ships its cursor at several sizes, each drawn for that size rather
+/// than resampled from another, so a pointer to be shown three times as large
+/// is far sharper taken from the theme at three times the size than stretched
+/// from the ordinary bitmap on the GPU — which is what a 24-pixel arrow at 3×
+/// looks like: blurred and stepped at once.
+#[derive(Debug)]
+pub(crate) struct Found {
+    pub buffer: MemoryRenderBuffer,
+    /// Offset from the pointer position to the top-left of the bitmap, in
+    /// logical pixels, unrounded: a rounding error here is multiplied by the
+    /// magnification, and the tip of a found pointer has to be exactly where
+    /// the ordinary one's was.
+    pub hotspot: Point<f64, Logical>,
+    /// How many times larger than the ordinary bitmap this one draws. The
+    /// theme need not ship exactly the size asked for, so the renderer scales
+    /// this bitmap by `wanted / magnification`, which makes the pointer the
+    /// size wanted whatever size the theme had.
+    pub magnification: f64,
 }
 
 impl Cursor {
@@ -78,6 +103,11 @@ impl Cursor {
     /// A theme that ships no size that large gives a smaller cursor rather
     /// than a blurry one, which is the better of the two failures.
     ///
+    /// The found pointer's bitmap is picked the same way at
+    /// [`Huginn::FOUND_SIZE`] times the size, if the theme has anything
+    /// larger than the ordinary one; if not, the renderer stretches the
+    /// ordinary one, which is blurry but is still a large pointer.
+    ///
     /// Returns `None` rather than failing the compositor: a missing cursor
     /// theme is a cosmetic problem, and refusing to start over it would be a
     /// far worse one.
@@ -93,15 +123,44 @@ impl Cursor {
 
         // Themes ship several sizes; take the closest to what was asked for
         // rather than assuming the first is sensible.
-        let image = images
-            .iter()
-            .min_by_key(|i| i.size.abs_diff(size * density))
-            .filter(|i| i.width > 0 && i.height > 0)?;
+        let closest = |wanted: u32| {
+            images
+                .iter()
+                .filter(|i| i.width > 0 && i.height > 0)
+                .min_by_key(|i| i.size.abs_diff(wanted))
+        };
+        let image = closest(size * density)?;
 
+        let wanted_found = ((size * density) as f32 * Huginn::FOUND_SIZE).round() as u32;
+        let found = closest(wanted_found)
+            // The same or a smaller bitmap is no sharper than stretching the
+            // ordinary one, and costs a buffer.
+            .filter(|big| big.width > image.width)
+            .map(|big| Found {
+                buffer: Self::buffer(big, density),
+                hotspot: (
+                    f64::from(big.xhot) / f64::from(density),
+                    f64::from(big.yhot) / f64::from(density),
+                )
+                    .into(),
+                magnification: f64::from(big.width) / f64::from(image.width),
+            });
+
+        Some(Self {
+            buffer: Self::buffer(image, density),
+            hotspot: ((image.xhot / density) as i32, (image.yhot / density) as i32).into(),
+            density,
+            found,
+        })
+    }
+
+    /// A theme image as a buffer the renderer can draw, marked at `density`
+    /// so that it covers `width / density` logical pixels.
+    fn buffer(image: &xcursor::parser::Image, density: u32) -> MemoryRenderBuffer {
         // pixels_rgba is R,G,B,A in byte order, which is DRM's ABGR8888 —
         // little-endian A<<24|B<<16|G<<8|R. Reading this as Argb8888 gives a
         // blue-tinted cursor with the alpha channel in the wrong place.
-        let buffer = MemoryRenderBuffer::from_slice(
+        MemoryRenderBuffer::from_slice(
             &image.pixels_rgba,
             Fourcc::Abgr8888,
             (image.width as i32, image.height as i32),
@@ -111,13 +170,7 @@ impl Cursor {
             // carry alpha. Claiming opacity would let the damage tracker skip
             // whatever is behind the cursor and leave a trail.
             None,
-        );
-
-        Some(Self {
-            buffer,
-            hotspot: ((image.xhot / density) as i32, (image.yhot / density) as i32).into(),
-            density,
-        })
+        )
     }
 }
 
