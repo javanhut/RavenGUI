@@ -107,7 +107,6 @@ pub(crate) struct Bar {
 const PAD: f32 = 10.0;
 /// The bar's background: the panel colour, the same as the dock and launcher.
 const BG: [u8; 4] = theme::TITLE_BAR_BG.to_rgba_bytes();
-const RULE: [u8; 4] = theme::BORDER.to_rgba_bytes();
 /// The close glyph. A multiplication sign rather than an `x`: it is
 /// symmetric, and every sans-serif font has one.
 const CLOSE: &str = "\u{00D7}";
@@ -152,7 +151,8 @@ pub(crate) fn compose(text: &mut Text, key: &BarKey) -> Canvas {
     canvas.fill(0, 0, w, h, BG);
     // A hairline along the bottom, where the bar meets the content.
     let rule = (px as usize).max(1);
-    canvas.fill(0, h.saturating_sub(rule), w, rule, RULE);
+    // The hairline every panel has, where the bar meets the window.
+    canvas.tint(0, h.saturating_sub(rule), w, rule, theme::RULE, 0x14);
 
     if !text.is_usable() {
         return canvas;
@@ -285,9 +285,12 @@ mod tests {
         let canvas = compose(&mut text, &key(Some("hello"), true, 2));
         assert_eq!(canvas.stride, 600 * 2);
         assert_eq!(canvas.height, (theme::TITLE_BAR_HEIGHT * 2) as usize);
-        // The bottom rows are the rule, whatever font there is.
+        // The bottom rows are the rule, whatever font there is: the
+        // background lifted by the hairline, so lighter than the bar and
+        // still opaque.
         let last = (canvas.height - 1) * canvas.stride * 4;
-        assert_eq!(&canvas.pixels[last..last + 4], &RULE);
+        let rule = &canvas.pixels[last..last + 4];
+        assert!(rule[0] > BG[0] && rule[3] == 0xFF, "rule pixel was {rule:?}");
         // The top-left corner is background: no text starts flush with the edge.
         assert_eq!(&canvas.pixels[0..4], &BG);
         let panel = render(&mut text, key(Some("hello"), true, 2)).panel;

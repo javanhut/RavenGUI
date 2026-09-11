@@ -380,7 +380,7 @@ const GAP: f32 = 10.0;
 const RADIUS: f32 = 0.28;
 /// Distance from the bottom of the screen when fully up.
 const MARGIN: f32 = 12.0;
-const ALPHA: u8 = 0xE6;
+const ALPHA: u8 = crate::theme::PANEL_ALPHA;
 /// Text size of the switcher's title caption at a 1080p output.
 pub(crate) const CAPTION_SIZE: f32 = 14.0;
 /// The most of the screen, each way, the switcher's thumbnail may take.
@@ -456,26 +456,28 @@ pub(crate) fn render(
     let w = ((icon + gap) * items.len() as f32 + gap) as usize;
 
     let mut canvas = Canvas::new(w.max(1), h.max(1));
-    canvas.fill_rounded(
-        0,
-        0,
-        w,
-        h,
-        h as f32 * RADIUS,
-        crate::theme::BACKGROUND.with_alpha(ALPHA),
-    );
+    canvas.material(0, 0, w, h, h as f32 * RADIUS, ALPHA);
 
     for (index, item) in items.iter().enumerate() {
         let x = gap + (icon + gap) * index as f32;
         if selected == Some(index) {
-            let inset = (3.0 * scale).max(2.0);
-            canvas.fill_rounded(
+            // The accent wash, ringed in the accent — the launcher's tiles
+            // are chosen the same way.
+            let inset = (4.0 * scale).max(3.0);
+            let (sx, sy, sw) = (
                 (x - inset) as usize,
                 (gap - inset) as usize,
                 (icon + inset * 2.0) as usize,
-                (icon + inset * 2.0) as usize,
-                icon * 0.24,
-                crate::theme::accent().with_alpha(0x70),
+            );
+            canvas.fill_rounded(sx, sy, sw, sw, icon * 0.26, crate::theme::selection());
+            canvas.stroke_rounded(
+                sx,
+                sy,
+                sw,
+                sw,
+                icon * 0.26,
+                (1.5 * scale).max(1.5),
+                crate::theme::accent(),
             );
         }
         if item.is_launcher() {
@@ -558,14 +560,7 @@ pub(crate) fn caption(
     }
     let (pw, ph) = ((w + pad * 2.0) as usize, (h + pad) as usize);
     let mut canvas = Canvas::new(pw.max(1), ph.max(1));
-    canvas.fill_rounded(
-        0,
-        0,
-        pw,
-        ph,
-        ph as f32 * 0.5,
-        crate::theme::BACKGROUND.with_alpha(ALPHA),
-    );
+    canvas.material(0, 0, pw, ph, ph as f32 * 0.5, ALPHA);
     text.draw(
         &mut canvas,
         &title,
@@ -689,14 +684,7 @@ pub(crate) fn preview_frame(frame: Rect, output: Rect, density: u32) -> Panel {
     );
     let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
     let mut canvas = Canvas::new(w.max(1), h.max(1));
-    canvas.fill_rounded(
-        0,
-        0,
-        w,
-        h,
-        PREVIEW_BORDER * scale * 1.5,
-        crate::theme::BACKGROUND.with_alpha(ALPHA),
-    );
+    canvas.material(0, 0, w, h, PREVIEW_BORDER * scale * 1.5, ALPHA);
     Panel::from_canvas(&canvas, density)
 }
 
@@ -1297,14 +1285,7 @@ mod dump {
         let mut canvas = Canvas::new(w, h);
         // Opaque behind it so the PPM (which drops alpha) shows the rounding.
         canvas.fill(0, 0, w, h, [0x0A, 0x0A, 0x10, 0xFF]);
-        canvas.fill_rounded(
-            0,
-            0,
-            w,
-            h,
-            h as f32 * RADIUS,
-            crate::theme::BACKGROUND.with_alpha(ALPHA),
-        );
+        canvas.material(0, 0, w, h, h as f32 * RADIUS, ALPHA);
         for (index, item) in items.iter().enumerate() {
             let x = gap + (icon + gap) * index as f32;
             if item.is_launcher() {

@@ -94,9 +94,48 @@ pub(crate) const BACKGROUND: Color = Color::from_argb(0xFF16_161F);
 /// Hairline borders.
 pub(crate) const BORDER: Color = Color::from_argb(0xFF2A_2A3A);
 /// Body text.
-pub(crate) const TEXT: Color = Color::from_argb(0xFFD0_D0E0);
+pub(crate) const TEXT: Color = Color::from_argb(0xFFE8_E8F0);
 /// Secondary text: footers, hints, anything deliberately quieter.
-pub(crate) const TEXT_DIM: Color = Color::from_argb(0xFF8A_8AA0);
+pub(crate) const TEXT_DIM: Color = Color::from_argb(0xFF9A_9AB0);
+
+// ---------------------------------------------------------------------------
+// The material
+// ---------------------------------------------------------------------------
+// Every floating panel — dock, launcher, pinned panel, keybinding overlay,
+// caption pills — is one material: a translucent layer of [`BACKGROUND`]
+// over the blurred desktop, edged with a hairline of light rather than a
+// drawn border, and lit along its top edge as a real sheet of glass would
+// be. The GTK applications describe the same material in CSS
+// (`raven-glass.css`), and RoostBar draws it with the same numbers, which
+// is what makes a window, a bar and a panel read as one desktop.
+
+/// Opacity of a panel's ground.
+///
+/// Low enough that the blurred desktop behind shows through as a frosted
+/// tint, high enough that text stays legible over a busy wallpaper. The
+/// launcher asserts a band around this; see `launcher::ALPHA`.
+pub(crate) const PANEL_ALPHA: u8 = 0xD8;
+/// Corner radius of a floating panel at a 1080p output, in logical pixels.
+pub(crate) const PANEL_RADIUS: f32 = 22.0;
+/// The edge: white at a whisper, drawn one pixel wide around the ground.
+pub(crate) const HAIRLINE: Color = Color::from_argb(0x1CFF_FFFF);
+/// The catch-light: a brighter pixel along the top edge, inside the
+/// hairline, between the corner arcs. What says "glass" rather than "grey".
+pub(crate) const CATCH_LIGHT: Color = Color::from_argb(0x30FF_FFFF);
+/// A well: a field, a tile, a list group, set a shade *lighter* into the
+/// ground rather than darker, the way a translucent layer over a
+/// translucent layer looks.
+pub(crate) const WELL: Color = Color::from_argb(0x14FF_FFFF);
+/// A well under the pointer, or otherwise raised.
+pub(crate) const WELL_RAISED: Color = Color::from_argb(0x22FF_FFFF);
+/// A hairline inside a panel: between rows, under a heading.
+pub(crate) const RULE: Color = Color::from_argb(0x14FF_FFFF);
+
+/// The selection wash: the accent at the strength a selected row or tile is
+/// tinted with. The accent's one job inside a panel, apart from the caret.
+pub(crate) fn selection() -> Color {
+    accent().with_alpha(0x3A)
+}
 
 /// Thickness of the focus ring, in logical pixels.
 ///

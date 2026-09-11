@@ -2396,13 +2396,10 @@ pub(crate) const RADIUS: f32 = 22.0;
 /// stays legible over a busy wallpaper. At the old `0xF2` the blur was there
 /// and invisible: a 95%-opaque panel hides whatever is behind it, blurred or
 /// not.
-pub(crate) const ALPHA: u8 = 0xD8;
+pub(crate) const ALPHA: u8 = crate::theme::PANEL_ALPHA;
 // Legibility bounds the alpha from below; above the upper bound the panel
 // hides the blur behind it and the blur pass is pure cost.
 const _: () = assert!(ALPHA >= 0xC0 && ALPHA <= 0xE0);
-/// The tile and field fill: a shade lighter than the panel, so they read as
-/// wells set into it rather than as lines drawn on it.
-pub(crate) const WELL_ALPHA: u8 = 0x70;
 /// The footer's key hints, in the order they are read. The grid also
 /// answers to sideways arrows, and says so; the menu says what it does.
 const GRID_HINTS: &[(&str, &str)] = &[
@@ -2573,11 +2570,11 @@ fn compose(
         width,
         row,
         field,
-        radius,
         inner,
         gap,
         heading,
         footer,
+        ..
     } = m;
     // A menu of `items` actions: its heading, the rows, a little air below.
     let entry_menu_h = |items: usize| m.menu_height(items);
@@ -2646,23 +2643,26 @@ fn compose(
     let slot_of = |target: Target| launcher.visible.iter().position(|t| *t == target);
     let rect =
         |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
-    canvas.fill_rounded(
-        0,
-        0,
-        width,
-        height,
-        radius,
-        crate::theme::BACKGROUND.with_alpha(ALPHA),
-    );
+    draw_ground(&mut canvas, &m, width, height);
 
-    // The field, as a pill set into the panel.
+    // The field, as a pill set into the panel: a well, a shade lighter
+    // than the ground, with the same hairline the panel has.
     canvas.fill_rounded(
         pad as usize,
         pad as usize,
         inner as usize,
         field as usize,
         field / 2.0,
-        crate::theme::BORDER.with_alpha(WELL_ALPHA),
+        crate::theme::WELL,
+    );
+    canvas.stroke_rounded(
+        pad as usize,
+        pad as usize,
+        inner as usize,
+        field as usize,
+        field / 2.0,
+        1.0,
+        crate::theme::HAIRLINE,
     );
 
     // The query, or a hint in the dim colour. A field that looks empty and a
@@ -2758,13 +2758,10 @@ fn compose(
         }
 
         if recent > 0 {
-            canvas.fill(
-                pad as usize,
+            canvas.tint(pad as usize,
                 y as usize,
                 inner as usize,
-                1,
-                crate::theme::BORDER.to_rgba_bytes(),
-            );
+                1, crate::theme::RULE, 0x14);
             y += gap;
             text.draw(
                 &mut canvas,
@@ -2792,7 +2789,7 @@ fn compose(
                         inner as usize,
                         row as usize,
                         row * 0.25,
-                        crate::theme::accent().with_alpha(0x2E),
+                        crate::theme::selection(),
                     );
                 }
                 if let Some(pixmap) = entry
@@ -2887,13 +2884,10 @@ fn compose(
                 target == Some(Target::Result),
             );
             y += row;
-            canvas.fill(
-                pad as usize,
+            canvas.tint(pad as usize,
                 y as usize,
                 inner as usize,
-                1,
-                crate::theme::BORDER.to_rgba_bytes(),
-            );
+                1, crate::theme::RULE, 0x14);
             y += gap;
         }
 
@@ -2910,13 +2904,10 @@ fn compose(
         }
 
         if !launcher.file_hits().is_empty() {
-            canvas.fill(
-                pad as usize,
+            canvas.tint(pad as usize,
                 y as usize,
                 inner as usize,
-                1,
-                crate::theme::BORDER.to_rgba_bytes(),
-            );
+                1, crate::theme::RULE, 0x14);
             y += gap;
             text.draw(
                 &mut canvas,
@@ -2949,7 +2940,7 @@ fn compose(
                         inner as usize,
                         row as usize,
                         row * 0.25,
-                        crate::theme::accent().with_alpha(0x2E),
+                        crate::theme::selection(),
                     );
                 }
                 if let Some(icon) = &file_icon {
@@ -3009,13 +3000,10 @@ fn compose(
         // The fallback, last: run what was typed. Under a hairline of its
         // own so it reads as a different kind of offer from the files.
         if launcher.offers_command() {
-            canvas.fill(
-                pad as usize,
+            canvas.tint(pad as usize,
                 y as usize,
                 inner as usize,
-                1,
-                crate::theme::BORDER.to_rgba_bytes(),
-            );
+                1, crate::theme::RULE, 0x14);
             y += gap;
             let label = fit(
                 text,
@@ -3148,14 +3136,7 @@ impl Metrics {
 /// Paint the panel's ground: the rounded, frosted rectangle everything else
 /// sits on.
 pub(crate) fn draw_ground(canvas: &mut Canvas, m: &Metrics, width: usize, height: usize) {
-    canvas.fill_rounded(
-        0,
-        0,
-        width,
-        height,
-        m.radius,
-        crate::theme::BACKGROUND.with_alpha(ALPHA),
-    );
+    canvas.material(0, 0, width, height, m.radius, ALPHA);
 }
 
 /// A section heading — "Suggested", "Recent", "Files" — at `y`.
@@ -3172,13 +3153,10 @@ pub(crate) fn draw_heading(canvas: &mut Canvas, text: &mut Text, m: &Metrics, y:
 
 /// A hairline across the panel's inner width at `y`.
 pub(crate) fn draw_rule(canvas: &mut Canvas, m: &Metrics, y: f32) {
-    canvas.fill(
-        m.pad as usize,
+    canvas.tint(m.pad as usize,
         y as usize,
         m.inner as usize,
-        1,
-        crate::theme::BORDER.to_rgba_bytes(),
-    );
+        1, crate::theme::RULE, 0x14);
 }
 
 /// A suggestion tile: icon over label, in a well, ringed when selected.
@@ -3204,45 +3182,18 @@ pub(crate) fn draw_tile(
         ..
     } = *m;
     let corner = tile_h * 0.16;
+    let (x_px, y_px, w_px, h_px) = (x as usize, ty as usize, tile_w as usize, tile_h as usize);
     if selected {
-        // A ring: the accent drawn a little larger, and the tile's
-        // own fill on top of it. Two fills rather than a stroke,
-        // because the canvas has no stroke and this is the same
-        // shape the dock's selection uses.
-        let ring = (2.0 * scale).max(2.0);
-        canvas.fill_rounded(
-            (x - ring) as usize,
-            (ty - ring) as usize,
-            (tile_w + ring * 2.0) as usize,
-            (tile_h + ring * 2.0) as usize,
-            corner + ring,
-            crate::theme::accent(),
-        );
-        canvas.fill_rounded(
-            x as usize,
-            ty as usize,
-            tile_w as usize,
-            tile_h as usize,
-            corner,
-            crate::theme::BACKGROUND,
-        );
-        canvas.fill_rounded(
-            x as usize,
-            ty as usize,
-            tile_w as usize,
-            tile_h as usize,
-            corner,
-            crate::theme::accent().with_alpha(0x2E),
-        );
+        // The accent wash, ringed in the accent: the same treatment the
+        // dock gives its selected item, so a chosen thing looks chosen the
+        // same way everywhere.
+        let ring = (1.5 * scale).max(1.5);
+        canvas.fill_rounded(x_px, y_px, w_px, h_px, corner, crate::theme::selection());
+        canvas.stroke_rounded(x_px, y_px, w_px, h_px, corner, ring, crate::theme::accent());
     } else {
-        canvas.fill_rounded(
-            x as usize,
-            ty as usize,
-            tile_w as usize,
-            tile_h as usize,
-            corner,
-            crate::theme::BORDER.with_alpha(WELL_ALPHA),
-        );
+        // A well: a shade lighter than the ground, edged with the hairline.
+        canvas.fill_rounded(x_px, y_px, w_px, h_px, corner, crate::theme::WELL);
+        canvas.stroke_rounded(x_px, y_px, w_px, h_px, corner, 1.0, crate::theme::HAIRLINE);
     }
     let icon_size = (size * 2.4) as u32;
     let label_size = size * 0.95;
@@ -3308,7 +3259,7 @@ pub(crate) fn draw_app_row(
             inner as usize,
             row as usize,
             row * 0.25,
-            crate::theme::accent().with_alpha(0x2E),
+            crate::theme::selection(),
         );
     }
     // The icon, if the theme has one. An application with no icon
@@ -3399,21 +3350,25 @@ pub(crate) fn draw_menu(
     let my = (bottom - menu_h).max(top);
     let corner = row * 0.4;
     let edge = 1.0_f32.max(scale * 0.75);
-    canvas.fill_rounded(
-        (mx - edge) as usize,
-        (my - edge) as usize,
-        (menu_w + edge * 2.0) as usize,
-        (menu_h + edge * 2.0) as usize,
-        corner + edge,
-        crate::theme::BORDER,
-    );
+    // A menu floats over the panel, so it is the material one layer up:
+    // near-opaque, with a brighter hairline so its edge reads against the
+    // panel it sits on.
     canvas.fill_rounded(
         mx as usize,
         my as usize,
         menu_w as usize,
         menu_h as usize,
         corner,
-        crate::theme::BACKGROUND,
+        crate::theme::BACKGROUND.with_alpha(0xF6),
+    );
+    canvas.stroke_rounded(
+        mx as usize,
+        my as usize,
+        menu_w as usize,
+        menu_h as usize,
+        corner,
+        edge,
+        crate::theme::HAIRLINE.with_alpha(0x44),
     );
     let title = fit(text, title, size * 0.85, menu_w - gap * 2.0);
     text.draw(
@@ -3436,7 +3391,7 @@ pub(crate) fn draw_menu(
                 (menu_w - gap) as usize,
                 row as usize,
                 row * 0.25,
-                crate::theme::accent().with_alpha(0x2E),
+                crate::theme::selection(),
             );
         }
         let label = fit(text, label, size, menu_w - gap * 2.0);
@@ -3503,7 +3458,7 @@ pub(crate) fn draw_footer(
             chip_w as usize,
             chip_h as usize,
             4.0 * scale,
-            crate::theme::BORDER,
+            crate::theme::WELL_RAISED,
         );
         text.draw(
             canvas,
@@ -3568,7 +3523,7 @@ fn glyph_row(
             inner as usize,
             row as usize,
             row * 0.25,
-            crate::theme::accent().with_alpha(0x2E),
+            crate::theme::selection(),
         );
     }
     let icon_size = size * 1.5;

@@ -1190,6 +1190,8 @@ const WIDTH: f32 = 340.0;
 const PAD: f32 = 16.0;
 const BASE_SIZE: f32 = 15.0;
 const ALPHA: u8 = 0xF2;
+/// Corner radius at 1×: the same radius every other floating panel has.
+const RADIUS: f32 = crate::theme::PANEL_RADIUS;
 const TITLE: &str = "Quick settings";
 /// Marks a control that is not wired to anything yet.
 const STUB: &str = "not connected";
@@ -1223,14 +1225,7 @@ fn compose(
 
     let height = (pad * 2.0 + header + row * settings.controls.len() as f32) as usize;
     let mut canvas = Canvas::new(width, height.max(1));
-    canvas.fill(
-        0,
-        0,
-        width,
-        height,
-        crate::theme::BACKGROUND.with_alpha(ALPHA).to_rgba_bytes(),
-    );
-    canvas.frame(crate::theme::BORDER.to_rgba_bytes());
+    canvas.material(0, 0, width, height, RADIUS * scale, ALPHA);
 
     text.draw(
         &mut canvas,
@@ -1240,12 +1235,13 @@ fn compose(
         pad as i32,
         crate::theme::accent(),
     );
-    canvas.fill(
+    canvas.tint(
         pad as usize,
         (pad + header - size * 0.6) as usize,
         width - (pad * 2.0) as usize,
         1,
-        crate::theme::BORDER.to_rgba_bytes(),
+        crate::theme::RULE,
+        0x14,
     );
 
     let mut y = pad + header;
@@ -1253,20 +1249,16 @@ fn compose(
         let reading = control.read();
         let highlighted = index == settings.selected;
         if highlighted {
-            canvas.tint(
-                1,
+            // The selection wash, as a rounded row inside the padding: the
+            // same shape a launcher result has when it is chosen.
+            let inset = pad * 0.5;
+            canvas.fill_rounded(
+                inset as usize,
                 y as usize,
-                width - 2,
+                width - (inset * 2.0) as usize,
                 row as usize,
-                crate::theme::accent(),
-                0x2E,
-            );
-            canvas.fill(
-                1,
-                y as usize,
-                (3.0 * scale) as usize,
-                row as usize,
-                crate::theme::accent().to_rgba_bytes(),
+                row * 0.25,
+                crate::theme::selection(),
             );
         }
 
@@ -1296,7 +1288,7 @@ fn compose(
                     track_w as usize,
                     track_h as usize,
                     track_h / 2.0,
-                    crate::theme::BORDER,
+                    crate::theme::WELL_RAISED,
                 );
                 let filled = (track_w * fraction.clamp(0.0, 1.0)).round();
                 if filled >= 1.0 {
