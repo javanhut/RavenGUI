@@ -35,6 +35,22 @@
 //!     through a motion the user meant for something else, and is what lets
 //!     the overview reveal ride the vertical travel without ever fighting the
 //!     row for the same fingers.
+//!
+//! # The lift carries the speed of the fingers
+//!
+//! A swipe ends with the fingers still moving, and what they were doing at
+//! that instant is the second half of the gesture: a row let go of at speed
+//! was thrown, one let go of at rest was placed. So the swipe keeps a running
+//! estimate of its speed, weighted to its last few reports, and at the lift
+//! reports a velocity
+//! ([`Swipe::velocity`]) for the animation to set off at, and a landing stage
+//! ([`Swipe::landing`]) chosen from where that speed would have *carried* the
+//! row rather than from where the fingers happened to be — the same
+//! projection a scroll view uses to decide where a fling stops. A flick that
+//! moved the row a quarter of a stage still lands on the next one, which is
+//! what makes it feel thrown rather than dropped and snatched back.
+
+use std::time::Duration;
 
 /// Fingers that mean the carousel.
 ///
@@ -69,6 +85,31 @@ const REVEAL_RETURN: f32 = 0.1;
 
 /// Longest gap between taps that still reads as a double tap.
 const DOUBLE_TAP_MSEC: u32 = 500;
+
+/// How far back the velocity estimate remembers, as the time constant of
+/// its weighting: a report this old counts about a third as much as the
+/// newest.
+///
+/// Long enough that the jitter of one report does not decide the speed,
+/// short enough that a swipe reversed in its last fifty milliseconds — the
+/// hand saying "no" at the end — reports the reversal and not the run-up.
+const VELOCITY_MEMORY: Duration = Duration::from_millis(24);
+
+/// Fingers that have not moved for this long before lifting were resting,
+/// and a rest has no velocity: a row held still and let go must not fling.
+/// libinput reports nothing for fingers that are still, so this is how a
+/// rest is seen at all.
+const VELOCITY_STALE: Duration = Duration::from_millis(60);
+
+/// Faster than this, in reveals per second, a lift decides the reveal by the
+/// way it was going rather than by where it was: an upward drag that ends
+/// with a flick down was changed to a close on the way, whatever it opened.
+const REVEAL_FLICK: f32 = 2.0;
+
+/// The most a flick can carry the row past the fingers, in stages. One: a
+/// throw goes to the next stage, not across the row, as a page turns to
+/// the next page however hard it is flicked.
+const CARRY: f32 = 1.0;
 
 /// Recognition state for the three-finger double-tap shortcut.
 #[derive(Debug, Clone, Copy, Default)]
@@ -121,6 +162,55 @@ pub(crate) enum Hold {
     Vertical,
 }
 
+/// A running estimate of how fast the fingers are moving.
+///
+/// Each report's speed is folded into the estimate with a weight that
+/// depends on how long it covers, so the estimate follows the last
+/// [`VELOCITY_MEMORY`] or so of the swipe and forgets the rest. Two values
+/// rather than a history, so the swipe stays a plain copyable value.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    /// Touchpad units per second, along each axis.
+    velocity: (f64, f64),
+    /// When the last report arrived.
+    last: Option<Duration>,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            velocity: (0.0, 0.0),
+            last: None,
+        }
+    }
+
+    /// Fold in a report of `(dx, dy)` at `now`.
+    fn report(&mut self, dx: f64, dy: f64, now: Duration) {
+        let Some(last) = self.last.replace(now) else {
+            return;
+        };
+        let dt = now.saturating_sub(last).as_secs_f64();
+        if dt <= 0.0 {
+            return;
+        }
+        // A report covering longer than the memory replaces the estimate
+        // outright; a short one nudges it. Continuous in `dt`, so the rate
+        // libinput happens to report at does not change what is measured.
+        let weight = 1.0 - (-dt / VELOCITY_MEMORY.as_secs_f64()).exp();
+        let (vx, vy) = (dx / dt, dy / dt);
+        self.velocity.0 += weight * (vx - self.velocity.0);
+        self.velocity.1 += weight * (vy - self.velocity.1);
+    }
+
+    /// The speed at `now`, or none if the fingers had stopped by then.
+    fn velocity(&self, now: Duration) -> (f64, f64) {
+        match self.last {
+            Some(last) if now.saturating_sub(last) <= VELOCITY_STALE => self.velocity,
+            _ => (0.0, 0.0),
+        }
+    }
+}
+
 /// A touchpad swipe from the moment the fingers land to the moment they lift.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Swipe {
@@ -128,6 +218,8 @@ pub(crate) struct Swipe {
     /// units. Accumulated rather than used per-frame because the axis decision
     /// is about the shape of the whole motion, not the last few pixels of it.
     travel: (f64, f64),
+    /// How fast the fingers are going, for the lift.
+    pace: Pace,
     claim: Claim,
 }
 
@@ -139,6 +231,7 @@ impl Swipe {
     pub(crate) fn new(fingers: u32) -> Self {
         Self {
             travel: (0.0, 0.0),
+            pace: Pace::new(),
             claim: if fingers == CAROUSEL_FINGERS {
                 Claim::Undecided
             } else {
@@ -147,14 +240,16 @@ impl Swipe {
         }
     }
 
-    /// Add a frame of finger travel, and report whether this is the update that
-    /// proved the swipe horizontal — the moment to take hold of the row.
+    /// Add a frame of finger travel at `now`, and report whether this is the
+    /// update that proved the swipe horizontal — the moment to take hold of
+    /// the row.
     ///
     /// True at most once per swipe: the caller answers it with [`Self::drives`]
     /// and the swipe is decided from then on.
-    pub(crate) fn takes_hold(&mut self, dx: f64, dy: f64) -> Option<Hold> {
+    pub(crate) fn takes_hold(&mut self, dx: f64, dy: f64, now: Duration) -> Option<Hold> {
         self.travel.0 += dx;
         self.travel.1 += dy;
+        self.pace.report(dx, dy, now);
 
         if self.claim != Claim::Undecided {
             return None;
@@ -197,6 +292,35 @@ impl Swipe {
         Some(origin - (self.travel.0 / UNITS_PER_WORKSPACE) as f32)
     }
 
+    /// How fast what the swipe is driving was moving at `now`, in its own
+    /// units per second — stages for the row, reveals for the overview — or
+    /// `None` while the swipe drives nothing. Positive the way the value
+    /// grows, so it can be handed straight to the value's spring.
+    pub(crate) fn velocity(&self, now: Duration) -> Option<f32> {
+        let (vx, vy) = self.pace.velocity(now);
+        match self.claim {
+            Claim::Carousel { .. } => Some(-(vx / UNITS_PER_WORKSPACE) as f32),
+            Claim::Reveal { .. } => Some(-(vy / UNITS_PER_REVEAL) as f32),
+            _ => None,
+        }
+    }
+
+    /// The stage the row should settle on if the fingers lift at `now`, or
+    /// `None` while the swipe is not driving the row.
+    ///
+    /// Not the nearest stage to the fingers: the nearest to where their speed
+    /// would have carried the row, so a flick lands a stage over though the
+    /// fingers only moved it a little, and a drag past halfway that is
+    /// flicked back goes back. Never more than [`CARRY`] past the fingers,
+    /// however hard the throw. The row's ends are the caller's to apply, as
+    /// they are for [`Self::position`].
+    pub(crate) fn landing(&self, now: Duration) -> Option<f32> {
+        let position = self.position()?;
+        let velocity = self.velocity(now)?;
+        let carried = crate::anim::project(velocity, crate::anim::PAGED_DECELERATION);
+        Some((position + carried.clamp(-CARRY, CARRY)).round())
+    }
+
     /// The vertical command this swipe committed to, if any.
     pub(crate) fn vertical(&self) -> Option<Vertical> {
         let Claim::Vertical(direction) = self.claim else {
@@ -231,18 +355,28 @@ impl Swipe {
         Some((origin - (self.travel.1 / UNITS_PER_REVEAL) as f32).clamp(0.0, 1.0))
     }
 
-    /// Whether a reveal-driving swipe ends with the overview open.
+    /// Whether a reveal-driving swipe ending at `now` leaves the overview
+    /// open.
     ///
-    /// The direction the swipe set out in decides — a flick does not have to
-    /// drag the reveal past halfway to mean it — unless the fingers came back
-    /// to within [`REVEAL_RETURN`] of where they started, which is a change of
-    /// mind, not a command. The threshold is clamped into the reveal's range
-    /// so a drag that began near either end still has a line it can cross.
-    pub(crate) fn reveal_commits(&self) -> Option<bool> {
+    /// Fingers still moving at the lift decide by the way they were going:
+    /// a flick is the clearest statement a gesture makes, and one that
+    /// reverses the drag it ends is a change of mind mid-motion. Fingers at
+    /// rest decide by the direction the swipe set out in — a flick does not
+    /// have to drag the reveal past halfway to mean it — unless they came
+    /// back to within [`REVEAL_RETURN`] of where they started, which is the
+    /// slower change of mind. The threshold is clamped into the reveal's
+    /// range so a drag that began near either end still has a line it can
+    /// cross.
+    pub(crate) fn reveal_commits(&self, now: Duration) -> Option<bool> {
         let Claim::Reveal { origin, direction } = self.claim else {
             return None;
         };
         let at = self.reveal()?;
+        if let Some(velocity) = self.velocity(now)
+            && velocity.abs() >= REVEAL_FLICK
+        {
+            return Some(velocity > 0.0);
+        }
         Some(match direction {
             Vertical::Up => at > (origin + REVEAL_RETURN).min(1.0 - REVEAL_RETURN),
             Vertical::Down => at > (origin - REVEAL_RETURN).max(REVEAL_RETURN),
@@ -254,12 +388,26 @@ impl Swipe {
 mod tests {
     use super::*;
 
+    /// How far apart the reports of a swipe are: libinput at a touchpad's
+    /// usual rate.
+    const STEP: Duration = Duration::from_millis(8);
+
+    /// The clock at the `n`th report.
+    fn tick(n: usize) -> Duration {
+        STEP * n as u32
+    }
+
+    /// When a swipe of `n` reports lifts, with the fingers still moving.
+    fn lift(n: usize) -> Duration {
+        tick(n.saturating_sub(1))
+    }
+
     /// Feed `travel` to a fresh three-finger swipe one step at a time, taking
     /// hold at `origin` if it asks to, and report where it ends up.
     fn swipe(origin: f32, travel: &[(f64, f64)]) -> Swipe {
         let mut s = Swipe::new(CAROUSEL_FINGERS);
-        for (dx, dy) in travel {
-            if s.takes_hold(*dx, *dy) == Some(Hold::Horizontal) {
+        for (n, (dx, dy)) in travel.iter().enumerate() {
+            if s.takes_hold(*dx, *dy, tick(n)) == Some(Hold::Horizontal) {
                 s.drives(origin);
             }
         }
@@ -300,7 +448,7 @@ mod tests {
         for fingers in [1, 2, 4, 5] {
             let mut s = Swipe::new(fingers);
             assert!(
-                s.takes_hold(-200.0, 0.0).is_none(),
+                s.takes_hold(-200.0, 0.0, Duration::ZERO).is_none(),
                 "{fingers} fingers must not take the row"
             );
             assert_eq!(s.position(), None);
@@ -314,8 +462,8 @@ mod tests {
         // had already travelled.
         let mut s = Swipe::new(CAROUSEL_FINGERS);
         let mut claims = 0;
-        for _ in 0..20 {
-            if s.takes_hold(-5.0, 0.0) == Some(Hold::Horizontal) {
+        for n in 0..20 {
+            if s.takes_hold(-5.0, 0.0, tick(n)) == Some(Hold::Horizontal) {
                 claims += 1;
                 s.drives(2.0);
             }
@@ -343,19 +491,25 @@ mod tests {
     /// it as the reveal drag from `origin` the moment it proves vertical.
     fn reveal_swipe(origin: f32, travel: &[(f64, f64)]) -> Swipe {
         let mut s = Swipe::new(CAROUSEL_FINGERS);
-        for (dx, dy) in travel {
-            if s.takes_hold(*dx, *dy) == Some(Hold::Vertical) {
+        for (n, (dx, dy)) in travel.iter().enumerate() {
+            if s.takes_hold(*dx, *dy, tick(n)) == Some(Hold::Vertical) {
                 s.drives_reveal(origin);
             }
         }
         s
     }
 
+    /// Whether `s`, of `n` reports, commits when lifted with the fingers at
+    /// rest — well after the last report, so no velocity is read.
+    fn commits_at_rest(s: &Swipe) -> Option<bool> {
+        s.reveal_commits(Duration::from_secs(10))
+    }
+
     #[test]
     fn an_upward_swipe_drives_the_reveal_with_the_fingers() {
         let s = reveal_swipe(0.0, &[(0.0, -35.0), (1.0, -35.0)]);
         assert!((s.reveal().unwrap() - 0.5).abs() < 0.001);
-        assert_eq!(s.reveal_commits(), Some(true));
+        assert_eq!(commits_at_rest(&s), Some(true));
     }
 
     #[test]
@@ -363,26 +517,26 @@ mod tests {
         // Committing must not require dragging past halfway: the direction
         // the swipe set out in is the intent.
         let s = reveal_swipe(0.0, &[(0.0, -30.0)]);
-        assert_eq!(s.reveal_commits(), Some(true));
+        assert_eq!(commits_at_rest(&s), Some(true));
     }
 
     #[test]
     fn an_up_swipe_that_comes_back_down_is_a_change_of_mind() {
         let s = reveal_swipe(0.0, &[(0.0, -80.0), (0.0, 75.0)]);
-        assert_eq!(s.reveal_commits(), Some(false));
+        assert_eq!(commits_at_rest(&s), Some(false));
     }
 
     #[test]
     fn a_downward_swipe_from_open_closes_the_overview() {
         let s = reveal_swipe(1.0, &[(0.0, 40.0)]);
         assert!(s.reveal().unwrap() < 1.0, "the reveal must follow the drag");
-        assert_eq!(s.reveal_commits(), Some(false));
+        assert_eq!(commits_at_rest(&s), Some(false));
     }
 
     #[test]
     fn a_down_swipe_that_comes_back_up_leaves_the_overview_open() {
         let s = reveal_swipe(1.0, &[(0.0, 60.0), (0.0, -55.0)]);
-        assert_eq!(s.reveal_commits(), Some(true));
+        assert_eq!(commits_at_rest(&s), Some(true));
     }
 
     #[test]
@@ -390,7 +544,7 @@ mod tests {
         // The origin sits below the return margin, so the naive threshold
         // would be negative and the clamped reveal could never land under it.
         let s = reveal_swipe(0.05, &[(0.0, 40.0)]);
-        assert_eq!(s.reveal_commits(), Some(false));
+        assert_eq!(commits_at_rest(&s), Some(false));
     }
 
     #[test]
@@ -405,7 +559,7 @@ mod tests {
         // minimizes or accepts on the lift, and drives nothing meanwhile.
         let s = swipe(0.0, &[(0.0, 20.0)]);
         assert_eq!(s.reveal(), None);
-        assert_eq!(s.reveal_commits(), None);
+        assert_eq!(commits_at_rest(&s), None);
         assert_eq!(s.vertical(), Some(Vertical::Down));
     }
 
@@ -431,5 +585,125 @@ mod tests {
         assert!(!taps.tap(3, 600), "the accepted pair must reset");
         assert!(!taps.tap(3, 1_200), "a late second tap starts a new pair");
         assert!(taps.tap(3, 1_400));
+    }
+
+    #[test]
+    fn a_swipe_at_rest_has_no_velocity_and_lands_on_the_nearest_stage() {
+        // Dragged four tenths of a stage and held still before lifting: a
+        // placement, and the row goes back to where it was.
+        let mut s = swipe(1.0, &[(-36.0, 0.0), (-36.0, 0.0)]);
+        for n in 2..30 {
+            s.takes_hold(0.0, 0.0, tick(n));
+        }
+        let v = s.velocity(lift(30)).unwrap();
+        assert!(v.abs() < 0.01, "{v}");
+        assert_eq!(s.landing(lift(30)), Some(1.0));
+    }
+
+    #[test]
+    fn velocity_is_in_stages_per_second_the_way_the_row_moves() {
+        // 20 units per 8ms leftwards is 2500 units/s, which advances the row
+        // at 2500/180 stages per second.
+        let travel: Vec<(f64, f64)> = (0..20).map(|_| (-20.0, 0.0)).collect();
+        let s = swipe(0.0, &travel);
+        let v = s.velocity(lift(travel.len())).unwrap();
+        assert!((v - 2500.0 / 180.0).abs() < 0.2, "{v}");
+        let back = swipe(
+            2.0,
+            &travel.iter().map(|(x, y)| (-x, *y)).collect::<Vec<_>>(),
+        );
+        assert!(back.velocity(lift(travel.len())).unwrap() < 0.0);
+    }
+
+    #[test]
+    fn a_flick_lands_a_stage_over_though_the_fingers_barely_moved_it() {
+        // A quarter of a stage of travel, fast: thrown, not dropped.
+        let travel: Vec<(f64, f64)> = (0..5).map(|_| (-9.0, 0.0)).collect();
+        let s = swipe(1.0, &travel);
+        let at = s.position().unwrap();
+        assert!(at < 1.3, "the fingers moved it {at}");
+        assert_eq!(s.landing(lift(travel.len())), Some(2.0));
+    }
+
+    #[test]
+    fn a_drag_past_halfway_flicked_back_goes_back() {
+        // Velocity decides over position: the hand said "no" at the end.
+        let mut travel: Vec<(f64, f64)> = (0..7).map(|_| (-20.0, 0.0)).collect();
+        travel.extend((0..6).map(|_| (10.0, 0.0)));
+        let s = swipe(0.0, &travel);
+        assert!(s.position().unwrap() > 0.4, "{}", s.position().unwrap());
+        assert_eq!(s.landing(lift(travel.len())), Some(0.0));
+    }
+
+    #[test]
+    fn a_throw_carries_at_most_one_stage_past_the_fingers() {
+        // However hard: the row is pages, not a scroll.
+        let travel: Vec<(f64, f64)> = (0..6).map(|_| (-120.0, 0.0)).collect();
+        let s = swipe(0.0, &travel);
+        let at = s.position().unwrap();
+        let landing = s.landing(lift(travel.len())).unwrap();
+        assert!(landing <= (at + CARRY).round(), "{landing} from {at}");
+        assert!(landing > at, "a hard throw must still go forwards");
+    }
+
+    #[test]
+    fn a_pause_before_the_lift_forgets_the_speed() {
+        // Fast, then held for a moment, then lifted: the hold is the intent.
+        let travel: Vec<(f64, f64)> = (0..5).map(|_| (-9.0, 0.0)).collect();
+        let s = swipe(1.0, &travel);
+        let held = lift(travel.len()) + VELOCITY_STALE * 2;
+        assert_eq!(s.velocity(held), Some(0.0));
+        assert_eq!(s.landing(held), Some(1.0));
+    }
+
+    #[test]
+    fn the_velocity_reads_the_end_of_the_swipe_not_its_average() {
+        // Slow for a long while, then fast: the lift happens at the fast.
+        let mut travel: Vec<(f64, f64)> = (0..40).map(|_| (-1.0, 0.0)).collect();
+        travel.extend((0..6).map(|_| (-30.0, 0.0)));
+        let s = swipe(0.0, &travel);
+        let v = s.velocity(lift(travel.len())).unwrap();
+        assert!(v > 15.0, "{v} is the average, not the end");
+    }
+
+    #[test]
+    fn a_swipe_driving_nothing_has_no_velocity_and_no_landing() {
+        let s = swipe(0.0, &[(1.0, 1.0)]);
+        assert_eq!(s.velocity(lift(1)), None);
+        assert_eq!(s.landing(lift(1)), None);
+        let reveal = reveal_swipe(0.0, &[(0.0, -30.0)]);
+        assert_eq!(reveal.landing(lift(1)), None, "the reveal has no stages");
+    }
+
+    #[test]
+    fn the_reveal_reports_its_speed_upwards_as_opening() {
+        let travel: Vec<(f64, f64)> = (0..20).map(|_| (0.0, -14.0)).collect();
+        let s = reveal_swipe(0.0, &travel);
+        let v = s.velocity(lift(travel.len())).unwrap();
+        assert!((v - 14.0 / 0.008 / 140.0).abs() < 0.2, "{v}");
+    }
+
+    #[test]
+    fn an_upward_drag_that_flicks_back_down_closes() {
+        // Opened most of the way, then thrown shut at the end: the throw wins
+        // over both the position and the direction it set out in.
+        let mut travel: Vec<(f64, f64)> = (0..10).map(|_| (0.0, -14.0)).collect();
+        travel.extend((0..6).map(|_| (0.0, 8.0)));
+        let s = reveal_swipe(0.0, &travel);
+        assert!(s.reveal().unwrap() > 0.5);
+        assert_eq!(s.reveal_commits(lift(travel.len())), Some(false));
+        // Held still before the lift, the same swipe is read the old way.
+        assert_eq!(commits_at_rest(&s), Some(true));
+    }
+
+    #[test]
+    fn a_creeping_lift_is_decided_by_direction_not_by_a_tiny_velocity() {
+        // Slower than a flick: the speed is noise, and the direction rule
+        // still holds.
+        let travel: Vec<(f64, f64)> = (0..24).map(|_| (0.0, -1.0)).collect();
+        let s = reveal_swipe(0.0, &travel);
+        let v = s.velocity(lift(travel.len())).unwrap();
+        assert!(v.abs() < REVEAL_FLICK, "{v}");
+        assert_eq!(s.reveal_commits(lift(travel.len())), Some(true));
     }
 }

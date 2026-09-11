@@ -351,7 +351,7 @@ impl Volume {
             self.reveal.animate_to(
                 0.0,
                 now,
-                motion.duration(crate::anim::PANEL_CLOSE),
+                motion.duration(crate::anim::VOLUME_FADE),
                 Curve::EaseOut,
             );
         }

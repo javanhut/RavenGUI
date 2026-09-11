@@ -20,7 +20,7 @@ use huginn_core::geometry::Rect;
 use huginn_core::window::WindowId;
 use raven_desktop::{Entry, Icons, Pixmaps};
 
-use crate::anim::{Animated, Curve};
+use crate::anim::Reveal;
 use crate::canvas::{Canvas, Panel};
 use crate::text::Text;
 
@@ -35,9 +35,6 @@ const HOVER_DELAY: Duration = Duration::from_millis(220);
 /// A band rather than the last row of pixels: a pointer moved quickly can jump
 /// several pixels between motion events and never land on row `height - 1`.
 const EDGE_BAND: i32 = 4;
-
-/// How long the dock takes to spring up.
-const REVEAL: Duration = Duration::from_millis(260);
 
 /// How long the pointer must rest on a tile before its windows are pictured.
 ///
@@ -262,7 +259,7 @@ pub(crate) fn alt_tab_items(apps: &[Entry], windows: &[(WindowId, Option<String>
 #[derive(Debug)]
 pub(crate) struct Dock {
     /// 0 hidden, 1 fully up.
-    reveal: Animated,
+    reveal: Reveal,
     /// When the pointer arrived at the bottom edge, if it is still there.
     at_edge_since: Option<Duration>,
     /// Whether the pointer is over the dock itself, which keeps it up.
@@ -272,7 +269,7 @@ pub(crate) struct Dock {
 impl Default for Dock {
     fn default() -> Self {
         Self {
-            reveal: Animated::settled(0.0),
+            reveal: Reveal::hidden(),
             at_edge_since: None,
             hovered: false,
         }
@@ -324,29 +321,25 @@ impl Dock {
                 .at_edge_since
                 .is_some_and(|since| now.saturating_sub(since) >= HOVER_DELAY);
 
-        let target = if should_show { 1.0 } else { 0.0 };
-        if (self.reveal.target() - target).abs() < f32::EPSILON {
+        if self.reveal.is_showing() == should_show {
             return false;
         }
-        self.reveal.animate_to(
-            target,
-            now,
-            motion.duration(REVEAL),
-            // A spring on the way up, so it arrives like an object; plain
-            // easing on the way down, because an overshoot while leaving reads
-            // as the dock trying to follow the pointer off the screen.
-            if should_show {
-                Curve::Spring
-            } else {
-                Curve::EaseOut
-            },
-        );
+        // The same spring as every panel, critically damped both ways: a
+        // pointer resting at an edge did not throw anything, and a dock that
+        // leaves with a bounce reads as trying to follow the pointer off the
+        // screen. What the pointer gets is a dock that turns round mid-rise
+        // if it leaves, with the speed it had.
+        if should_show {
+            self.reveal.open(now, motion.is_reduced());
+        } else {
+            self.reveal.close(now, motion.is_reduced());
+        }
         true
     }
 
     /// Hide immediately, without animating. For a window going fullscreen.
     pub(crate) fn hide_now(&mut self) {
-        self.reveal.jump_to(0.0);
+        self.reveal.hide_now();
         self.at_edge_since = None;
         self.hovered = false;
     }
