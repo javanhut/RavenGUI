@@ -257,18 +257,39 @@ mod tests {
                 Report {
                     frames: 312,
                     skipped: 4,
-                    render: Some(Percentiles { count: 312, p50: 3.1, p99: 7.8, max: 12.4 }),
-                    present: Some(Percentiles { count: 312, p50: 16.6, p99: 17.2, max: 33.1 }),
+                    render: Some(Percentiles {
+                        count: 312,
+                        p50: 3.1,
+                        p99: 7.8,
+                        max: 12.4,
+                    }),
+                    present: Some(Percentiles {
+                        count: 312,
+                        p50: 16.6,
+                        p99: 17.2,
+                        max: 33.1,
+                    }),
                 },
             ),
             (
                 "HDMI-A-1".to_string(),
-                Report { frames: 0, skipped: 0, render: None, present: None },
+                Report {
+                    frames: 0,
+                    skipped: 0,
+                    render: None,
+                    present: None,
+                },
             ),
         ];
         let text = render_text(Duration::from_secs(60), &rows);
         assert!(text.contains("last 60s"));
-        assert!(text.lines().any(|l| l.starts_with("eDP-1") && l.contains("3.1") && l.contains("7.8")));
-        assert!(text.lines().any(|l| l.starts_with("HDMI-A-1") && l.contains(" - ")));
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("eDP-1") && l.contains("3.1") && l.contains("7.8"))
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("HDMI-A-1") && l.contains(" - "))
+        );
     }
 }

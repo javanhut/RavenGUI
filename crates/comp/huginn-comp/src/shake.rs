@@ -50,6 +50,12 @@ const WINDOW_MSEC: u32 = 600;
 pub(crate) struct Shake {
     /// Travel since the last reversal.
     leg: (f64, f64),
+    /// Travel against the leg since it seemed to turn round, while that is
+    /// still too short to be sure it did. A turn is only a turn once the
+    /// pointer has gone [`MIN_LEG`] back the other way: until then a pixel
+    /// or two backwards is the hand's tremor in the middle of a leg, and
+    /// counting it would make a straight, slightly wobbly move a shake.
+    turn: Option<(f64, f64)>,
     /// When each recent reversal happened, oldest first. Never longer than
     /// [`REVERSALS`]: the count that fires also empties it.
     reversals: Vec<u32>,
@@ -68,13 +74,25 @@ impl Shake {
     /// taken modulo so the wrap is not a stall.
     pub(crate) fn moved(&mut self, dx: f64, dy: f64, time_msec: u32) -> bool {
         let (lx, ly) = self.leg;
-        let travelled = (lx * lx + ly * ly).sqrt();
-        let against = lx * dx + ly * dy < 0.0;
-        if travelled >= MIN_LEG && against {
+        let against = |x: f64, y: f64| x * dx + y * dy < 0.0;
+        let long = |x: f64, y: f64| (x * x + y * y).sqrt() >= MIN_LEG;
+        match self.turn {
+            // Back the way the leg was going: the turn was a twitch, and the
+            // travel is the leg's.
+            Some((tx, ty)) if against(tx, ty) => {
+                self.turn = None;
+                self.leg = (lx + tx + dx, ly + ty + dy);
+            }
+            Some((tx, ty)) => self.turn = Some((tx + dx, ty + dy)),
+            None if long(lx, ly) && against(lx, ly) => self.turn = Some((dx, dy)),
+            None => self.leg = (lx + dx, ly + dy),
+        }
+        if let Some((tx, ty)) = self.turn
+            && long(tx, ty)
+        {
             self.reversals.push(time_msec);
-            self.leg = (dx, dy);
-        } else {
-            self.leg = (lx + dx, ly + dy);
+            self.leg = (tx, ty);
+            self.turn = None;
         }
         self.reversals
             .retain(|&at| time_msec.wrapping_sub(at) <= WINDOW_MSEC);

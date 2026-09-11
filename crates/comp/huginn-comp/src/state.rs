@@ -3762,7 +3762,7 @@ impl Huginn {
                 Self::FOUND_SIZE,
                 now,
                 self.settings.motion().duration(Self::FOUND_GROW),
-                crate::anim::Curve::Spring,
+                crate::anim::Curve::EaseOut,
             );
         }
         self.queue_redraw();
@@ -3772,13 +3772,17 @@ impl Huginn {
     /// be seen from across the room on a large screen, and still a pointer
     /// rather than a banner: the arrow's tip stays put, so it can be used at
     /// this size, and people do.
-    const FOUND_SIZE: f32 = 3.0;
+    pub(crate) const FOUND_SIZE: f32 = 3.0;
     /// How long the pointer stays large after the last shake. Long enough to
     /// find it after the eye has stopped chasing the motion, short enough
     /// that it is back to normal by the time it is being used.
     const FOUND_HOLD: std::time::Duration = std::time::Duration::from_millis(900);
-    /// The pop: fast, with the spring's one overshoot, so it draws the eye.
-    const FOUND_GROW: std::time::Duration = std::time::Duration::from_millis(180);
+    /// The pop: quick, and easing out so it reads as the pointer growing
+    /// rather than a bigger one appearing. Not the spring: that curve is
+    /// all snap and wobble — it is at full size within a sixth of its
+    /// duration, two frames here — and a pointer that is suddenly large
+    /// and then shivers is one the eye has to find all over again.
+    const FOUND_GROW: std::time::Duration = std::time::Duration::from_millis(200);
     /// The return: unhurried and without a bounce. Nothing needs the eye now.
     const FOUND_SHRINK: std::time::Duration = std::time::Duration::from_millis(240);
 
