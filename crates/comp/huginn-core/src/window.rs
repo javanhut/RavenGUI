@@ -67,6 +67,9 @@ pub struct Window {
     pub geometry: Rect,
     /// Geometry and mode to restore when leaving fullscreen.
     restore: Option<(Rect, WindowMode)>,
+    /// The mode the window was in when it was put away, so it comes back as
+    /// that. `None` while it is not minimized.
+    minimized_from: Option<WindowMode>,
     pub mode: WindowMode,
     pub hints: SizeHints,
     pub app_id: Option<String>,
@@ -89,6 +92,7 @@ impl Window {
             id,
             geometry: Rect::ZERO,
             restore: None,
+            minimized_from: None,
             mode: WindowMode::default(),
             hints: SizeHints::default(),
             app_id: None,
@@ -139,21 +143,36 @@ impl Window {
     }
 
     /// Put the window in the background without closing its client.
+    ///
+    /// What it was — a tile or a floating window — is kept for
+    /// [`Self::unminimize`]. A fullscreen window leaves fullscreen first,
+    /// which is what settles the mode and rect it goes back to: restoring
+    /// is never fullscreen (see `unminimize`), and a floating window that
+    /// went fullscreen and was then put away is still a floating window.
     pub fn minimize(&mut self) {
+        if self.mode == WindowMode::Minimized {
+            return;
+        }
+        self.unfullscreen();
+        self.minimized_from = Some(self.mode);
         self.mode = WindowMode::Minimized;
     }
 
-    /// Bring a minimized window back into the layout as an ordinary tile.
+    /// Bring a minimized window back into the layout as what it was: a tile
+    /// takes its place in the workspace at whatever size the layout gives it,
+    /// a floating window gets its own rect back.
     ///
-    /// Restoring is not fullscreen: the window takes its place in the
-    /// workspace at whatever size the layout gives it, so the panels and the
+    /// Restoring is not fullscreen either way, so the panels and the
     /// client's own chrome (a browser's tab strip, say) stay usable. Returns
     /// whether the window was minimized.
     pub fn unminimize(&mut self) -> bool {
         if self.mode != WindowMode::Minimized {
             return false;
         }
-        self.mode = WindowMode::Tiled;
+        self.mode = match self.minimized_from.take() {
+            Some(WindowMode::Floating) => WindowMode::Floating,
+            _ => WindowMode::Tiled,
+        };
         true
     }
 
@@ -197,6 +216,56 @@ mod tests {
 
     fn win() -> Window {
         Window::new(WindowId::from_raw(1))
+    }
+
+    #[test]
+    fn a_minimized_tile_comes_back_as_a_tile() {
+        let mut w = win();
+        w.minimize();
+        assert!(w.is_minimized());
+        assert!(w.unminimize());
+        assert!(w.is_tiled());
+        assert!(!w.unminimize(), "already restored");
+    }
+
+    #[test]
+    fn a_minimized_floating_window_comes_back_floating_where_it_was() {
+        let mut w = win();
+        w.mode = WindowMode::Floating;
+        w.geometry = Rect::from_xywh(10, 10, 300, 200);
+        w.minimize();
+        assert!(w.is_minimized());
+        assert!(w.unminimize());
+        assert_eq!(w.mode, WindowMode::Floating);
+        assert_eq!(w.geometry, Rect::from_xywh(10, 10, 300, 200));
+    }
+
+    #[test]
+    fn minimizing_a_fullscreen_window_restores_what_it_was_before_fullscreen() {
+        let mut w = win();
+        w.mode = WindowMode::Floating;
+        w.geometry = Rect::from_xywh(10, 10, 300, 200);
+        w.fullscreen(Rect::from_xywh(0, 0, 1920, 1080));
+        w.minimize();
+        assert!(w.unminimize());
+        assert_eq!(w.mode, WindowMode::Floating, "not fullscreen, not a tile");
+        assert_eq!(w.geometry, Rect::from_xywh(10, 10, 300, 200));
+
+        let mut w = win();
+        w.fullscreen(Rect::from_xywh(0, 0, 1920, 1080));
+        w.minimize();
+        assert!(w.unminimize());
+        assert!(w.is_tiled());
+    }
+
+    #[test]
+    fn minimizing_twice_keeps_the_first_origin() {
+        let mut w = win();
+        w.mode = WindowMode::Floating;
+        w.minimize();
+        w.minimize();
+        assert!(w.unminimize());
+        assert_eq!(w.mode, WindowMode::Floating);
     }
 
     #[test]
