@@ -4290,28 +4290,17 @@ impl Huginn {
             self.accept_app_switcher();
             return;
         }
-        let Some(entry) = item.entry.and_then(|i| self.apps.get(i)) else {
+        let Some(index) = item.entry else {
             return;
         };
         if !item.running {
-            // Not running: start it. The launcher opens applications rather
-            // than documents, so there are no targets to substitute. A
-            // `Terminal=true` entry is wrapped in the terminal here just as
-            // the launcher and the pinned panel wrap it — the dock must not
-            // be the one place a TUI app launches without its terminal.
-            let (path, argv) = (entry.path.clone(), entry.argv(&[]));
-            if let Some(argv) = argv {
-                let argv = if entry.terminal {
-                    crate::launcher::in_terminal(argv, &self.apps)
-                } else {
-                    argv
-                };
-                self.launch(Some(path), &argv);
-            } else {
-                tracing::warn!(name = %entry.name, "dock entry has nothing runnable");
-            }
+            // Not running: start it.
+            self.launch_dock_entry(index);
             return;
         }
+        let Some(entry) = self.apps.get(index) else {
+            return;
+        };
         // Focus the first visible window belonging to it on this workspace.
         // Failing that, bring back one it has put away: a running indicator
         // under an icon whose click does nothing reads as broken, and the
@@ -4346,6 +4335,50 @@ impl Huginn {
         if let Some(id) = minimized {
             self.restore_window(id);
             self.refresh_dock();
+        }
+    }
+
+    /// Open another window of a dock item's application — a middle click or
+    /// `Ctrl`+click on its icon. Running or not, this starts it: the one
+    /// thing a plain click on a running application's icon cannot do is
+    /// give you a second window of it, and this is where that lives.
+    /// Raven's own applications open one window per launch, so "start it
+    /// again" and "another window" are the same request.
+    pub(crate) fn launch_dock_item_anew(&mut self, item: &crate::dock::Item) {
+        if item.is_launcher() {
+            self.open_launcher();
+            return;
+        }
+        // A tile in the put-away strip is a window, not an application:
+        // there is nothing to start twice, and the click means the tile.
+        if self.app_switcher_open() && item.window.is_some() {
+            self.activate_dock_item(item);
+            return;
+        }
+        if let Some(index) = item.entry {
+            self.launch_dock_entry(index);
+        }
+    }
+
+    /// Start the application behind a dock entry. The launcher opens
+    /// applications rather than documents, so there are no targets to
+    /// substitute. A `Terminal=true` entry is wrapped in the terminal here
+    /// just as the launcher and the pinned panel wrap it — the dock must not
+    /// be the one place a TUI app launches without its terminal.
+    fn launch_dock_entry(&mut self, index: usize) {
+        let Some(entry) = self.apps.get(index) else {
+            return;
+        };
+        let (path, argv) = (entry.path.clone(), entry.argv(&[]));
+        if let Some(argv) = argv {
+            let argv = if entry.terminal {
+                crate::launcher::in_terminal(argv, &self.apps)
+            } else {
+                argv
+            };
+            self.launch(Some(path), &argv);
+        } else {
+            tracing::warn!(name = %entry.name, "dock entry has nothing runnable");
         }
     }
 

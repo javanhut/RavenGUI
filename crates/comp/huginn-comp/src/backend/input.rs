@@ -260,7 +260,24 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     if button_state == ButtonState::Pressed
         && let Some(item) = state.dock_click()
     {
-        state.activate_dock_item(&item);
+        // A middle click, or `Ctrl`+click, on an icon opens another window
+        // of that application; any other press is the ordinary click that
+        // starts or raises it. A touchpad's three-finger tap arrives as a
+        // middle press too and is *not* this: that tap is the strip's, and
+        // a tap on the dock that started a second copy of something would
+        // be the touchpad shortcut misfiring on the wrong device.
+        let ctrl_click = event.button_code() == crate::mouse::BTN_LEFT
+            && state.seat.get_keyboard().is_some_and(|keyboard| {
+                let mods = keyboard.modifier_state();
+                mods.ctrl && !mods.logo && !mods.alt && !mods.shift
+            });
+        let middle_click = event.button_code() == crate::mouse::BTN_MIDDLE
+            && !event.device().has_capability(DeviceCapability::Gesture);
+        if ctrl_click || middle_click {
+            state.launch_dock_item_anew(&item);
+        } else {
+            state.activate_dock_item(&item);
+        }
         return;
     }
 

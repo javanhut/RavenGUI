@@ -196,6 +196,15 @@ combination.
 | `Super`+click | tap: show the put-away windows, and take a tile; drag: the three-finger swipe, sideways, up or down |
 | `Super`+middle click | open or close the workspace overview |
 
+The dock is the compositor's too, so a press on it never reaches a client. A
+plain click on an icon starts the application, or raises a window of it if
+one is up — bringing one back from the dock if that is where it went. A
+**middle click**, or **`Ctrl`+click**, starts it again whether or not it is
+running: that is how you get a second window of something. Raven's own
+applications open one window per launch, so a second launch *is* a second
+window. (On a touchpad the three-finger tap is a middle press, but it keeps
+its own meaning over the dock; use `Ctrl`+click there.)
+
 One pointer motion is the compositor's without any chord at all. **Shake the
 pointer** — a few quick back-and-forths, in any direction — and it grows to
 three times its size, holds for most of a second after the shaking stops, and
