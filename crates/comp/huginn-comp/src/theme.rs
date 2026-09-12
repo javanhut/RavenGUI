@@ -95,8 +95,10 @@ pub(crate) const BACKGROUND: Color = Color::from_argb(0xFF16_161F);
 pub(crate) const BORDER: Color = Color::from_argb(0xFF2A_2A3A);
 /// Body text.
 pub(crate) const TEXT: Color = Color::from_argb(0xFFE8_E8F0);
-/// Secondary text: footers, hints, anything deliberately quieter.
-pub(crate) const TEXT_DIM: Color = Color::from_argb(0xFF9A_9AB0);
+/// Secondary text: footers, hints, anything deliberately quieter. This is
+/// TEXT at ~70% over BACKGROUND, the same ratio the GTK apps use; RoostBar's
+/// `muted` and Settings' `sync_roostbar` carry the same hex.
+pub(crate) const TEXT_DIM: Color = Color::from_argb(0xFFAB_ABC2);
 
 // ---------------------------------------------------------------------------
 // The material
