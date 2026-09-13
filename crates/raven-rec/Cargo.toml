@@ -1,0 +1,16 @@
+[package]
+name = "raven-rec"
+description = "The Raven screen recording format: a lossless screen codec with no dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Nothing beyond std, on purpose. This is the file format every recording is
+# written in, and a format that can be broken by somebody else's release is not
+# one a recording can be trusted to still open in five years.
+[dependencies]
+
+[lints]
+workspace = true

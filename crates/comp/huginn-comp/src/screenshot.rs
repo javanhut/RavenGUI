@@ -21,13 +21,12 @@
 //! the ordinary scene minus the pointer — a screenshot of the desktop should
 //! not have a cursor stamped into it. The read-back is the same
 //! `create_buffer` → `bind` → draw → `copy_framebuffer` → `map_texture` path the
-//! udev backend already uses to feed a GPU-less display (`present_dumb`).
+//! udev backend already uses to feed a GPU-less display (`present_dumb`), and
+//! the same one [`crate::record`] runs thirty times a second.
 //!
 //! Everything from [`Capture`] down is plain pixel work with no renderer in it,
-//! so the cropping, the path policy and the timestamp are unit-tested without a
-//! GPU.
+//! so the cropping is unit-tested without a GPU.
 
-use std::ffi::OsStr;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
@@ -35,7 +34,7 @@ use anyhow::{Context, Result};
 use smithay::{
     backend::renderer::{
         Bind, Color32F, ExportMem, Frame, Offscreen, Renderer,
-        gles::{GlesRenderer, GlesTexture},
+        gles::{GlesMapping, GlesRenderer, GlesTexture},
         utils::draw_render_elements,
     },
     utils::{Physical, Rectangle, Scale, Size, Transform},
@@ -117,12 +116,48 @@ fn grab(
     size: Size<i32, Physical>,
     scale: f64,
 ) -> Result<Capture> {
-    let damage = [Rectangle::from_size(size)];
-    let mut texture: GlesTexture = renderer
+    let mut texture = offscreen_texture(renderer, size)?;
+    let mapping = draw_offscreen(renderer, &mut texture, elements, size, scale, true)?;
+    let rgba = renderer
+        .map_texture(&mapping)
+        .map_err(|e| anyhow::anyhow!("mapping the capture: {e}"))?
+        .to_vec();
+
+    Ok(Capture {
+        width: size.w,
+        height: size.h,
+        rgba,
+    })
+}
+
+/// A texture to capture a `size` screen into.
+pub(crate) fn offscreen_texture(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Physical>,
+) -> Result<GlesTexture> {
+    renderer
         .create_buffer(FORMAT, (size.w, size.h).into())
-        .map_err(|e| anyhow::anyhow!("allocating the capture texture: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("allocating the capture texture: {e}"))
+}
+
+/// Draw `elements` into `texture` and queue the read-back of what was drawn.
+///
+/// The returned mapping is a pixel buffer GL fills behind the draw; mapping it
+/// is what hands the bytes over, and mapping blocks until the GPU has got that
+/// far. `block` waits on the frame's fence here instead, which a one-off
+/// screenshot can afford. A recording cannot: it maps the buffer on its next
+/// tick, by which time the GPU long since has.
+pub(crate) fn draw_offscreen(
+    renderer: &mut GlesRenderer,
+    texture: &mut GlesTexture,
+    elements: &[HuginnElement],
+    size: Size<i32, Physical>,
+    scale: f64,
+    block: bool,
+) -> Result<GlesMapping> {
+    let damage = [Rectangle::from_size(size)];
     let mut framebuffer = renderer
-        .bind(&mut texture)
+        .bind(texture)
         .map_err(|e| anyhow::anyhow!("binding the capture texture: {e}"))?;
     {
         let mut frame = renderer
@@ -138,31 +173,21 @@ fn grab(
             &damage,
         )
         .map_err(|e| anyhow::anyhow!("drawing the capture: {e}"))?;
-        // Block on the fence: the read-back below must see a finished frame, not
-        // one still on the GPU.
         let sync = frame
             .finish()
             .map_err(|e| anyhow::anyhow!("finishing the capture: {e}"))?;
-        let _ = sync.wait();
+        if block {
+            let _ = sync.wait();
+        }
     }
 
-    let mapping = renderer
+    renderer
         .copy_framebuffer(
             &framebuffer,
             Rectangle::from_size((size.w, size.h).into()),
             FORMAT,
         )
-        .map_err(|e| anyhow::anyhow!("reading the capture back: {e}"))?;
-    let rgba = renderer
-        .map_texture(&mapping)
-        .map_err(|e| anyhow::anyhow!("mapping the capture: {e}"))?
-        .to_vec();
-
-    Ok(Capture {
-        width: size.w,
-        height: size.h,
-        rgba,
-    })
+        .map_err(|e| anyhow::anyhow!("reading the capture back: {e}"))
 }
 
 /// A window/region rectangle in global logical pixels, turned into the
@@ -220,10 +245,12 @@ impl Capture {
 
     /// Write the image to the screenshots directory and return its path.
     fn save(&self) -> Result<PathBuf> {
-        let dir = screenshot_dir()
+        let dir = crate::userdirs::user_dir("XDG_PICTURES_DIR", "Pictures")
+            .map(|base| base.join("Screenshots"))
             .context("no directory to save a screenshot in (no HOME, no XDG_PICTURES_DIR)")?;
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = unique_path(&dir, &timestamp());
+        let stem = crate::userdirs::timestamp("Screenshot");
+        let path = crate::userdirs::unique_path(&dir, &stem, "png");
         encode_png(&path, self.width, self.height, &self.rgba)
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
@@ -240,205 +267,9 @@ fn encode_png(path: &Path, width: i32, height: i32, rgba: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// `<pictures>/Screenshots`, the directory shots are written to.
-///
-/// The pictures directory is the one the user-dirs specification names —
-/// `$XDG_PICTURES_DIR` if it is exported, otherwise the value in
-/// `user-dirs.dirs`, otherwise `~/Pictures`. `None` only when there is no `HOME`
-/// and nothing to anchor a relative path to, which is the one case there is
-/// nowhere sensible to put a file.
-fn screenshot_dir() -> Option<PathBuf> {
-    let user_dirs = read_user_dirs();
-    pictures_base(
-        std::env::var_os("HOME").as_deref(),
-        std::env::var_os("XDG_PICTURES_DIR").as_deref(),
-        user_dirs.as_deref(),
-    )
-    .map(|base| base.join("Screenshots"))
-}
-
-/// The pictures directory, from the environment and the `user-dirs.dirs`
-/// contents. Split out with the inputs passed in so the policy is testable
-/// without touching the real environment.
-fn pictures_base(
-    home: Option<&OsStr>,
-    xdg_pictures: Option<&OsStr>,
-    user_dirs: Option<&str>,
-) -> Option<PathBuf> {
-    if let Some(dir) = xdg_pictures.filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    let home = home.filter(|value| !value.is_empty())?;
-    let home = Path::new(home);
-    if let Some(relative) = user_dirs.and_then(parse_pictures_dir) {
-        return Some(expand_home(&relative, home));
-    }
-    Some(home.join("Pictures"))
-}
-
-/// The contents of `user-dirs.dirs`, from `$XDG_CONFIG_HOME` or `~/.config`.
-fn read_user_dirs() -> Option<String> {
-    let path = match std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-        Some(config) => PathBuf::from(config).join("user-dirs.dirs"),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".config/user-dirs.dirs"),
-    };
-    std::fs::read_to_string(path).ok()
-}
-
-/// The `XDG_PICTURES_DIR="..."` value from a `user-dirs.dirs` file, unquoted.
-///
-/// The format is shell assignments; the value is double-quoted and usually
-/// begins with `$HOME`. Comments and other keys are skipped.
-fn parse_pictures_dir(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("XDG_PICTURES_DIR=") else {
-            continue;
-        };
-        let value = rest.trim().trim_matches('"');
-        if value.is_empty() {
-            return None;
-        }
-        return Some(value.to_owned());
-    }
-    None
-}
-
-/// Expand a leading `$HOME` (or `~`) in a user-dirs value against `home`.
-fn expand_home(value: &str, home: &Path) -> PathBuf {
-    if let Some(rest) = value.strip_prefix("$HOME/") {
-        home.join(rest)
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        home.join(rest)
-    } else if value == "$HOME" || value == "~" {
-        home.to_path_buf()
-    } else {
-        PathBuf::from(value)
-    }
-}
-
-/// A filename for a shot taken now, unique within `dir`.
-///
-/// Timestamped to the second; a second shot in the same second gets a `-2`
-/// suffix rather than overwriting the first.
-fn unique_path(dir: &Path, base: &str) -> PathBuf {
-    let first = dir.join(format!("{base}.png"));
-    if !first.exists() {
-        return first;
-    }
-    for n in 2.. {
-        let candidate = dir.join(format!("{base}-{n}.png"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("the integers do not run out")
-}
-
-/// A `Screenshot-YYYY-MM-DD-HHMMSS` stem, in UTC.
-///
-/// UTC rather than local time because turning a Unix timestamp into local time
-/// needs the zone database and a C library call, and a compositor that forbids
-/// unsafe is not going to reach for `localtime` to name a file. The name is for
-/// telling two shots apart, which UTC does exactly as well.
-fn timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, mo, d, h, mi, s) = civil_utc(secs);
-    format!("Screenshot-{y:04}-{mo:02}-{d:02}-{h:02}{mi:02}{s:02}")
-}
-
-/// Broken-down UTC time from a Unix timestamp: `(year, month, day, hour, min,
-/// sec)`. Howard Hinnant's `civil_from_days`, which is exact and needs no zone
-/// data.
-fn civil_utc(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
-    let rem = (secs % 86_400) as u32;
-    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month, day, hour, minute, second)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn an_exported_pictures_dir_wins() {
-        let base = pictures_base(
-            Some(OsStr::new("/home/person")),
-            Some(OsStr::new("/photos")),
-            Some("XDG_PICTURES_DIR=\"$HOME/Pictures\"\n"),
-        );
-        assert_eq!(base, Some(PathBuf::from("/photos")));
-    }
-
-    #[test]
-    fn an_empty_exported_pictures_dir_is_ignored() {
-        // A shell that exported the variable blank has said nothing, not "put it
-        // at the filesystem root".
-        let base = pictures_base(Some(OsStr::new("/home/person")), Some(OsStr::new("")), None);
-        assert_eq!(base, Some(PathBuf::from("/home/person/Pictures")));
-    }
-
-    #[test]
-    fn user_dirs_is_consulted_and_home_expanded() {
-        let base = pictures_base(
-            Some(OsStr::new("/home/person")),
-            None,
-            Some(
-                "# generated\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\nXDG_PICTURES_DIR=\"$HOME/Bilder\"\n",
-            ),
-        );
-        assert_eq!(base, Some(PathBuf::from("/home/person/Bilder")));
-    }
-
-    #[test]
-    fn without_user_dirs_it_falls_back_to_pictures() {
-        let base = pictures_base(Some(OsStr::new("/home/person")), None, None);
-        assert_eq!(base, Some(PathBuf::from("/home/person/Pictures")));
-    }
-
-    #[test]
-    fn with_no_home_there_is_nowhere_to_put_it() {
-        assert_eq!(pictures_base(None, None, None), None);
-        // ...unless an absolute pictures dir was exported, which needs no home.
-        assert_eq!(
-            pictures_base(None, Some(OsStr::new("/shots")), None),
-            Some(PathBuf::from("/shots"))
-        );
-    }
-
-    #[test]
-    fn an_absolute_user_dirs_value_is_left_alone() {
-        assert_eq!(
-            expand_home("/mnt/pics", Path::new("/home/person")),
-            PathBuf::from("/mnt/pics")
-        );
-    }
-
-    #[test]
-    fn known_timestamps_break_down_correctly() {
-        // 2023-11-14T22:13:20Z
-        assert_eq!(civil_utc(1_700_000_000), (2023, 11, 14, 22, 13, 20));
-        // The epoch itself.
-        assert_eq!(civil_utc(0), (1970, 1, 1, 0, 0, 0));
-        // A leap day: 2024-02-29T12:00:00Z.
-        assert_eq!(civil_utc(1_709_208_000), (2024, 2, 29, 12, 0, 0));
-    }
 
     #[test]
     fn cropping_takes_the_right_rows() {

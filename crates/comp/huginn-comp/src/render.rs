@@ -114,7 +114,7 @@ pub(crate) fn elements_split(
     scale: f64,
 ) -> (Vec<HuginnElement>, Vec<HuginnElement>) {
     let (all, boundary) =
-        elements_with_boundary(renderer, state, fallback_cursor, view, scale, true);
+        elements_with_boundary(renderer, state, fallback_cursor, view, scale, Pass::Screen);
     // A glass window is found by its own elements rather than by counting:
     // a surface tree yields one element per subsurface, so a scene index is
     // not an element index. Everything up to and including the last element
@@ -157,17 +157,22 @@ pub(crate) fn elements_split(
 /// boundary: blurring the pointer would be blurring the one thing the user is
 /// aiming with.
 ///
-/// `include_cursor` is false only for a screenshot: the pointer is drawn by the
-/// compositor over the scene, not part of it, and a capture of the desktop
-/// should not have an arrow stamped into it. See [`capture_elements`].
+/// `pass` says who is looking; see [`Pass`] for what each leaves out.
 fn elements_with_boundary(
     renderer: &mut GlesRenderer,
     state: &Huginn,
     fallback_cursor: Option<&Cursor>,
     view: Rect,
     scale: f64,
-    include_cursor: bool,
+    pass: Pass,
 ) -> (Vec<HuginnElement>, usize) {
+    let include_cursor = pass != Pass::Screenshot;
+    // The recording dot is on the screen for the person at it, and must not be
+    // in the captures it is warning them about. See `Huginn::capture_hidden_len`.
+    let hidden = match pass {
+        Pass::Screen => 0,
+        Pass::Screenshot | Pass::Recording => state.capture_hidden_len(),
+    };
     let (ox, oy) = (view.x(), view.y());
     // Everything `scene` hands out is in desktop coordinates; this is the
     // one place they become this screen's.
@@ -270,6 +275,9 @@ fn elements_with_boundary(
     for (index, item) in state.scene().into_iter().enumerate() {
         if index == above {
             boundary = Some(out.len());
+        }
+        if index < hidden {
+            continue;
         }
         match item {
             SceneItem::Surface(_, rect)
@@ -452,5 +460,37 @@ pub(crate) fn capture_elements(
     view: Rect,
     scale: f64,
 ) -> Vec<HuginnElement> {
-    elements_with_boundary(renderer, state, None, view, scale, false).0
+    elements_with_boundary(renderer, state, None, view, scale, Pass::Screenshot).0
+}
+
+/// The scene as one flat front-to-back list for a frame of a recording: like a
+/// screenshot, but with the pointer, since in a recording where the pointer is
+/// and what it does is most of what is being shown. See [`crate::record`].
+pub(crate) fn recording_elements(
+    renderer: &mut GlesRenderer,
+    state: &Huginn,
+    fallback_cursor: Option<&Cursor>,
+    view: Rect,
+    scale: f64,
+) -> Vec<HuginnElement> {
+    elements_with_boundary(
+        renderer,
+        state,
+        fallback_cursor,
+        view,
+        scale,
+        Pass::Recording,
+    )
+    .0
+}
+
+/// Who a scene is being assembled for, which decides what it leaves out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// The screen itself: everything.
+    Screen,
+    /// A screenshot: no pointer, and no recording dot.
+    Screenshot,
+    /// A frame of a recording: the pointer, but no recording dot.
+    Recording,
 }

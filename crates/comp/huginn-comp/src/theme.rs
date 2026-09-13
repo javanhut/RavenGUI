@@ -91,6 +91,9 @@ pub(crate) const SETTINGS_APP: &str = "raven-settings";
 pub(crate) const STORE_APP: &str = "raven-store";
 /// Panel, dock and overlay background.
 pub(crate) const BACKGROUND: Color = Color::from_argb(0xFF16_161F);
+/// The recording dot. Red, not the accent: it is a warning that the screen is
+/// being captured, and it must not be mistaken for a theme colour.
+pub(crate) const RECORDING: Color = Color::from_argb(0xFFFF_453A);
 /// Hairline borders.
 pub(crate) const BORDER: Color = Color::from_argb(0xFF2A_2A3A);
 /// Body text.

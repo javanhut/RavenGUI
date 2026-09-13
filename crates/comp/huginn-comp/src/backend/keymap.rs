@@ -142,6 +142,10 @@ pub(crate) enum Action {
     /// selection the pointer finishes. On `Print`, before the `Super` layer, so
     /// it needs no modifier; Shift and Ctrl pick region and window.
     Screenshot(crate::screenshot::Shot),
+    /// Start recording the focused screen, or stop the recording under way.
+    /// `Super`+`Print`: the screenshot key, resolved at the same point and for
+    /// the same reasons, with the modifier Shift and Ctrl leave free.
+    Record,
     /// Abandon an in-progress region selection. Escape, and only reachable while
     /// the selection is up, which is why it has no row in [`BINDINGS`].
     CancelRegion,
@@ -363,6 +367,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "screenshot the screen (Shift: region, Ctrl: window)",
     },
     Binding {
+        action: Action::Record,
+        chord: "Super+Print",
+        description: "start or stop recording the screen",
+    },
+    Binding {
         action: Action::Volume(crate::audio::Key::Raise),
         chord: "Volume keys",
         description: "raise, lower or mute the volume",
@@ -432,6 +441,11 @@ pub(crate) fn resolve(
     // Screenshots resolve here, before the `Super`-layer gate below, so `Print`
     // needs no modifier. It is available over any open panel — a capture is of
     // whatever is on the screen — but not while locked, which returned above.
+    // Recording is the same key with Super, taken from the Super layer here
+    // for the same reason: `Print` is the compositor's whatever holds it.
+    if sym == keysyms::KEY_Print && modifiers.logo {
+        return FilterResult::Intercept(pressed(key_state, Action::Record));
+    }
     if let Some(shot) = screenshot_key(sym, modifiers) {
         return FilterResult::Intercept(pressed(key_state, Action::Screenshot(shot)));
     }
@@ -1671,6 +1685,34 @@ mod tests {
             intercepted(ctrl(), keysyms::KEY_Print),
             Some(Action::Screenshot(Shot::Window))
         );
+    }
+
+    #[test]
+    fn super_print_toggles_recording() {
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_Print),
+            Some(Action::Record)
+        );
+        // Super wins over the screenshot modifiers: there is one recording key.
+        assert_eq!(
+            intercepted(super_ctrl(), keysyms::KEY_Print),
+            Some(Action::Record)
+        );
+        // The release is swallowed with the press, and does not toggle again.
+        assert!(matches!(
+            resolve(
+                KeyState::Released,
+                &super_held(),
+                keysyms::KEY_Print,
+                Modes::default()
+            ),
+            FilterResult::Intercept(None)
+        ));
+        // Not while locked, like the screenshot keys.
+        assert!(matches!(
+            while_locked(super_held(), keysyms::KEY_Print, None),
+            FilterResult::Forward
+        ));
     }
 
     #[test]

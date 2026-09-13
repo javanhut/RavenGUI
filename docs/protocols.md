@@ -130,7 +130,7 @@ find them in the registry.
 | Missing | Consequence |
 |---|---|
 | `wlr-foreign-toplevel-management-v1` | No window *management* from outside: an external dock or switcher can list windows (see `ext_foreign_toplevel_list_v1` above) but cannot activate, close or minimize one. |
-| `wlr-screencopy`, `ext-image-copy-capture-v1` | No *client* screen capture: no screen sharing, and no third-party screen recorder. The compositor takes its own screenshots on `Print` (see `docs/integration.md`), so there is no protocol here to do it through. |
+| `wlr-screencopy`, `ext-image-copy-capture-v1` | No *client* screen capture: no screen sharing, and no third-party screen recorder. The compositor takes its own screenshots on `Print` and records the screen on `Super+Print` (see `docs/integration.md`), so there is no protocol here to do either through. |
 | `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. |
 | `zwp_primary_selection_v1` | No middle-click paste. The regular clipboard works. |
 | `text-input-v3`, `input-method-v2` | No input methods. CJK and other IME input will not work. |

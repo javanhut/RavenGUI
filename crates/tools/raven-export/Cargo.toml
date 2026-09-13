@@ -1,0 +1,21 @@
+[package]
+name = "raven-export"
+description = "Turn a Raven screen recording into an MP4 that anything plays."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "raven-export"
+path = "src/main.rs"
+
+# Only the tree's own crates: the recording format and the encoder. The MP4
+# container and the colour conversion are written here.
+[dependencies]
+raven-rec.workspace = true
+raven-h264.workspace = true
+
+[lints]
+workspace = true

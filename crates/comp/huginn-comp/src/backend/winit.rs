@@ -37,6 +37,7 @@ use smithay::{
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
+            RegistrationToken,
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
@@ -91,6 +92,10 @@ struct Nested {
     signal: LoopSignal,
     /// The event loop, for arming the lock claim timeout from a keystroke.
     handle: LoopHandle<'static, Nested>,
+    /// The screen recording under way, if there is one. See `crate::record`.
+    recording: Option<crate::record::Recording>,
+    /// The timer that ticks it, so stopping can take the timer out too.
+    recording_timer: Option<RegistrationToken>,
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -256,6 +261,8 @@ pub(crate) fn run() -> Result<()> {
         start: Instant::now(),
         signal,
         handle: handle.clone(),
+        recording: None,
+        recording_timer: None,
     };
 
     // NOTE: no SIGTERM handling. calloop's signal source needs its `signals`
@@ -306,6 +313,10 @@ impl Nested {
         if self.state.take_redraw() {
             // render flushes internally, before submit blocks.
             self.render()?;
+            // One window, so a frame drawn is a frame of the recorded screen.
+            if let Some(recording) = self.recording.as_mut() {
+                recording.note_damage();
+            }
         } else {
             // Flush even without a frame: a client waiting on a configure it
             // never receives will sit there forever.
@@ -527,6 +538,8 @@ impl Nested {
         let state = &mut self.state;
         match action {
             Action::Quit => {
+                // Stopped properly, so the file gets its end marker.
+                self.stop_recording();
                 self.signal.stop();
                 return;
             }
@@ -602,6 +615,10 @@ impl Nested {
                 self.screenshot(shot);
                 return;
             }
+            Action::Record => {
+                self.toggle_recording();
+                return;
+            }
             Action::CancelRegion => {
                 state.cancel_region();
                 return;
@@ -650,6 +667,95 @@ impl Nested {
                 self.state.begin_flash(output);
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "screenshot failed"),
+        }
+    }
+
+    /// Start recording the focused screen, or stop the recording under way.
+    fn toggle_recording(&mut self) {
+        if self.recording.is_some() {
+            self.stop_recording();
+            return;
+        }
+        let output = self.state.focused_output_index();
+        let recording =
+            match crate::record::Recording::start(self.backend.renderer(), &self.state, output) {
+                Ok(recording) => recording,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "recording did not start");
+                    return;
+                }
+            };
+        let timer = Timer::from_duration(crate::record::INTERVAL);
+        let token = match self.handle.insert_source(timer, |_, _, data: &mut Nested| {
+            if data.tick_recording() {
+                TimeoutAction::ToDuration(crate::record::INTERVAL)
+            } else {
+                data.recording_timer = None;
+                TimeoutAction::Drop
+            }
+        }) {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot arm the recording timer; not recording");
+                if let Err(e) = recording.stop(self.backend.renderer()) {
+                    tracing::warn!(error = %format!("{e:#}"), "recording failed");
+                }
+                return;
+            }
+        };
+        tracing::info!(path = %recording.path().display(), "recording started");
+        self.state.set_recording_dot(Some(recording.output()));
+        self.recording = Some(recording);
+        self.recording_timer = Some(token);
+    }
+
+    /// Stop the recording under way, if there is one, and its timer.
+    fn stop_recording(&mut self) {
+        if let Some(token) = self.recording_timer.take() {
+            self.handle.remove(token);
+        }
+        self.finish_recording();
+    }
+
+    /// End the recording and say how it went. Leaves the timer alone, because
+    /// this is also called from inside it, and there the timer drops itself.
+    fn finish_recording(&mut self) {
+        let Some(recording) = self.recording.take() else {
+            return;
+        };
+        self.state.set_recording_dot(None);
+        match recording.stop(self.backend.renderer()) {
+            Ok(summary) => tracing::info!(
+                path = %summary.path.display(),
+                frames = summary.frames,
+                dropped = summary.dropped,
+                seconds = summary.length.as_secs_f64(),
+                "recording saved"
+            ),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "recording failed"),
+        }
+    }
+
+    /// One tick of the recording. Returns whether it is still going.
+    fn tick_recording(&mut self) -> bool {
+        let Some(recording) = self.recording.as_mut() else {
+            return false;
+        };
+        let icon = match &self.state.cursor_status {
+            CursorImageStatus::Named(icon) => *icon,
+            _ => CursorIcon::Default,
+        };
+        let cursor = self
+            .cursors
+            .get(&icon)
+            .or_else(|| self.cursors.get(&CursorIcon::Default));
+        match recording.tick(self.backend.renderer(), &self.state, cursor) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "recording stopped");
+                self.finish_recording();
+                false
+            }
         }
     }
 }
