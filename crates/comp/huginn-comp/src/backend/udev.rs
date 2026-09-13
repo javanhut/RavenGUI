@@ -69,6 +69,7 @@ use smithay::{
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
+            RegistrationToken,
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
@@ -212,6 +213,10 @@ struct Udev {
     /// `global_remove` and leaves late binds harmless; the slot itself is
     /// reaped here once every client has had ample time to hear the news.
     retired_globals: Vec<(GlobalId, Instant)>,
+    /// The screen recording under way, if there is one. See `crate::record`.
+    recording: Option<crate::record::Recording>,
+    /// The timer that ticks it, so stopping can take the timer out too.
+    recording_timer: Option<RegistrationToken>,
 }
 
 /// How long a withdrawn `wl_output` global stays bindable before it is
@@ -535,6 +540,8 @@ pub(crate) fn run() -> Result<()> {
         start: Instant::now(),
         signal,
         retired_globals: Vec::new(),
+        recording: None,
+        recording_timer: None,
     };
 
     // Every other DRM device on the seat: the discrete GPU on a hybrid
@@ -1563,6 +1570,7 @@ impl Udev {
             allocator,
             screens,
             secondaries,
+            recording,
             ..
         } = self;
         let Some(screen) = screens.get_mut(&key) else {
@@ -1593,6 +1601,14 @@ impl Udev {
                 screen.dirty = false;
                 screen.submitted_at = Some(Instant::now());
                 screen.stats.record_render(started.elapsed());
+                // Something new reached this screen, so a recording of it has
+                // a frame to take. `Ok(false)` is nothing new, and costs the
+                // recording nothing either.
+                if let Some(recording) = recording.as_mut()
+                    && recording.output() == screen.name
+                {
+                    recording.note_damage();
+                }
             }
             // Nothing changed on screen; do not burn a page flip on it.
             Ok(false) => {
@@ -1799,6 +1815,8 @@ impl Udev {
         let state = &mut self.state;
         match action {
             Action::Quit => {
+                // Stopped properly, so the file gets its end marker.
+                self.stop_recording();
                 self.signal.stop();
                 return;
             }
@@ -1871,6 +1889,10 @@ impl Udev {
                 self.screenshot(shot);
                 return;
             }
+            Action::Record => {
+                self.toggle_recording();
+                return;
+            }
             Action::CancelRegion => {
                 state.cancel_region();
                 return;
@@ -1919,6 +1941,110 @@ impl Udev {
                 self.state.begin_flash(output);
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "screenshot failed"),
+        }
+    }
+
+    /// Start recording the focused screen, or stop the recording under way.
+    fn toggle_recording(&mut self) {
+        if self.recording.is_some() {
+            self.stop_recording();
+            return;
+        }
+        let output = self.state.focused_output_index();
+        let recording =
+            match crate::record::Recording::start(&mut self.renderer, &self.state, output) {
+                Ok(recording) => recording,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "recording did not start");
+                    return;
+                }
+            };
+        let timer = Timer::from_duration(crate::record::INTERVAL);
+        let token = match self.handle.insert_source(timer, |_, _, data: &mut Udev| {
+            if data.tick_recording() {
+                TimeoutAction::ToDuration(crate::record::INTERVAL)
+            } else {
+                data.recording_timer = None;
+                TimeoutAction::Drop
+            }
+        }) {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot arm the recording timer; not recording");
+                if let Err(e) = recording.stop(&mut self.renderer) {
+                    tracing::warn!(error = %format!("{e:#}"), "recording failed");
+                }
+                return;
+            }
+        };
+        tracing::info!(path = %recording.path().display(), "recording started");
+        self.state.set_recording_dot(Some(recording.output()));
+        self.recording = Some(recording);
+        self.recording_timer = Some(token);
+    }
+
+    /// Stop the recording under way, if there is one, and its timer.
+    fn stop_recording(&mut self) {
+        if let Some(token) = self.recording_timer.take() {
+            self.handle.remove(token);
+        }
+        self.finish_recording();
+    }
+
+    /// End the recording and say how it went. Leaves the timer alone, because
+    /// this is also called from inside it, and there the timer drops itself.
+    fn finish_recording(&mut self) {
+        let Some(recording) = self.recording.take() else {
+            return;
+        };
+        self.state.set_recording_dot(None);
+        match recording.stop(&mut self.renderer) {
+            Ok(summary) => tracing::info!(
+                path = %summary.path.display(),
+                frames = summary.frames,
+                dropped = summary.dropped,
+                seconds = summary.length.as_secs_f64(),
+                "recording saved"
+            ),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "recording failed"),
+        }
+    }
+
+    /// One tick of the recording. Returns whether it is still going.
+    ///
+    /// Switched away to another VT, the tick does nothing but stay armed: the
+    /// screen draws nothing then either, and the recording picks up when the
+    /// session comes back.
+    fn tick_recording(&mut self) -> bool {
+        if !self.session.is_active() {
+            return self.recording.is_some();
+        }
+        let Some(recording) = self.recording.as_mut() else {
+            return false;
+        };
+        // The pointer as the recorded screen draws it: at that screen's
+        // density, in the shape a client asked for.
+        let density = self
+            .state
+            .outputs()
+            .iter()
+            .find(|info| info.name == recording.output())
+            .map_or(self.state.scale().advertised, |info| info.scale.advertised);
+        let icon = match &self.state.cursor_status {
+            CursorImageStatus::Named(icon) => *icon,
+            _ => CursorIcon::Default,
+        };
+        let cursor = self
+            .cursors
+            .get(&(density, icon))
+            .or_else(|| self.cursors.get(&(density, CursorIcon::Default)));
+        match recording.tick(&mut self.renderer, &self.state, cursor) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "recording stopped");
+                self.finish_recording();
+                false
+            }
         }
     }
 }

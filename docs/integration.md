@@ -183,6 +183,7 @@ client cannot receive or override them:
 | `Super+Ctrl+H` | show or hide the keybinding list |
 | `Super+Ctrl+Esc` | quit the compositor |
 | `Print` | screenshot the screen (`Shift`: region, `Ctrl`: window) |
+| `Super+Print` | start or stop recording the screen |
 | volume keys | raise, lower or mute the output volume |
 
 And these pointer chords, which never reach the client under the pointer.
@@ -295,8 +296,47 @@ Files land in `<pictures>/Screenshots`, where `<pictures>` is
 `Screenshot-YYYY-MM-DD-HHMMSS.png`, in UTC. The pointer is not in the image, and
 a white flash confirms the capture. There is no client-facing side to this: it
 cannot be triggered over a protocol, and there is no capture protocol for other
-software to record the screen through, so screen recorders and share tools still
-do not work.
+software to record the screen through, so third-party screen recorders and share
+tools still do not work.
+
+## Screen recording
+
+`Super+Print` starts recording the focused screen, and pressing it again stops
+the recording. It is a compositor feature for the same reason screenshots are.
+While a screen is being recorded a small red dot sits in its top-right corner;
+the dot is not in the recording, and not in screenshots either. The pointer is
+in the recording.
+
+Recordings land in `<videos>/Recordings`, where `<videos>` is
+`$XDG_VIDEOS_DIR`, the value in `user-dirs.dirs`, or `~/Videos` — named
+`Recording-YYYY-MM-DD-HHMMSS.rvr`, in UTC. The `.rvr` file is Raven's own
+lossless screen format (`crates/raven-rec`), not something a video player opens.
+`raven-export` turns one into an MP4 that anything plays:
+
+```sh
+raven-export ~/Videos/Recordings/Recording-2026-09-13-101500.rvr
+raven-export recording.rvr -o talk.mp4 --quality 18 --keyframes 2
+```
+
+The video is H.264 Constrained Baseline, BT.709, written by Raven's own encoder
+(`crates/raven-h264`) into an MP4 written by the exporter itself; nothing outside
+the tree is involved. `--quality` is the quantiser, 0 to 51, lower sharper and
+larger (default 22). `--keyframes` is the most seconds between frames a player
+can seek to (default 5). The video keeps the recording's timing: a screen that
+sat still for ten seconds is one frame that lasts ten seconds.
+
+The recorder looks for a new frame 30 times a second and captures only when the
+screen has actually drawn something, so an idle desktop costs next to nothing.
+The read-back from the GPU is collected a tick later instead of waited on, and
+the compression runs on a thread of its own. If that thread falls behind, frames
+are dropped rather than stalling the desktop; the count is logged when the
+recording stops.
+
+A recording ends when the key is pressed again, when the compositor quits, or
+when the screen is unplugged or changes resolution. Locking the session does not
+stop it: the recording shows the lock screen, never the desktop behind it. A
+crash leaves a file with no end marker, which still reads back up to its last
+whole frame.
 
 ## Touchpad gestures huginn takes
 

@@ -811,6 +811,9 @@ pub(crate) struct Huginn {
     /// began. It fades over [`FLASH`](Self::FLASH) and then clears itself.
     flash: Option<(usize, Instant)>,
     flash_buffer: SolidColorBuffer,
+    /// The dot on a screen being recorded: the screen's connector name, and
+    /// the dot drawn at its density. See [`crate::record`].
+    recording_dot: Option<(String, crate::canvas::Panel)>,
     /// Windows whose drawn rectangle is still on its way to the layout's.
     ///
     /// A relayout moves the layout's rectangles at once; these are what the
@@ -1082,6 +1085,7 @@ impl Huginn {
             pending_capture: None,
             flash: None,
             flash_buffer: SolidColorBuffer::new((area.w(), area.h()), [1.0, 1.0, 1.0, 1.0]),
+            recording_dot: None,
             motions: HashMap::new(),
             opening: HashMap::new(),
             closing: Vec::new(),
@@ -1556,8 +1560,15 @@ impl Huginn {
         }
 
         let mut out = Vec::new();
-        // Above everything: the capture flash and the region-selection ring.
-        // Both are transient screenshot UI that must never be occluded or
+        // First of all, the recording dot: it says the screen is being
+        // captured, so nothing may cover it. It leads the list because captures
+        // leave it out by skipping the leading items; see
+        // [`Self::capture_hidden_len`].
+        if let Some((buffer, rect)) = self.recording_dot_at() {
+            out.push(SceneItem::Overlay(buffer, rect, 1.0));
+        }
+        // Above everything else: the capture flash and the region-selection
+        // ring. Both are transient screenshot UI that must never be occluded or
         // blurred, so they lead the front group. See [`Self::blur_boundary`],
         // which counts them.
         if let Some((rect, alpha)) = self.flash_at() {
@@ -4395,7 +4406,8 @@ impl Huginn {
         // the scene, above the panels, so they are counted here too — the
         // boundary is the number of items in front of it, and an undercount
         // would push a real panel into the blurred group.
-        usize::from(self.flash_at().is_some())
+        usize::from(self.recording_dot_at().is_some())
+            + usize::from(self.flash_at().is_some())
             + self.region_ring_len()
             + usize::from(self.help.is_some())
             + usize::from(self.volume_panel.is_some())
@@ -5052,6 +5064,44 @@ impl Huginn {
         }
         self.flash = Some((output, Instant::now()));
         self.queue_redraw();
+    }
+
+    /// Show the recording dot on the screen named `output`, or take it away.
+    pub(crate) fn set_recording_dot(&mut self, output: Option<&str>) {
+        self.recording_dot = output.and_then(|name| {
+            let density = self.outputs.get(self.output_index(name)?)?.scale.advertised;
+            Some((name.to_owned(), crate::record::indicator(density)))
+        });
+        self.queue_redraw();
+    }
+
+    /// The recording dot's buffer and where it goes, or `None` when nothing is
+    /// being recorded.
+    ///
+    /// `None` while locked as well: the lock's scene is the lock and nothing
+    /// else. The recording carries on and records the lock screen, so there
+    /// is nothing to warn about that the lock screen does not already show.
+    fn recording_dot_at(&self) -> Option<(&MemoryRenderBuffer, Rect)> {
+        if self.lock.is_some() {
+            return None;
+        }
+        let (name, panel) = self.recording_dot.as_ref()?;
+        let screen = self.outputs.get(self.output_index(name)?)?.rect;
+        Some((
+            panel.buffer(),
+            crate::record::indicator_placement(screen, panel.size()),
+        ))
+    }
+
+    /// How many of [`Self::scene`]'s leading items a capture leaves out: the
+    /// recording dot, when it is up.
+    ///
+    /// The dot is on the screen for the person at it, not for the recording it
+    /// is warning them about, nor for a screenshot taken while it runs. Worked
+    /// out by the same function that decides whether the scene pushes it, so
+    /// the count cannot skip a real item.
+    pub(crate) fn capture_hidden_len(&self) -> usize {
+        usize::from(self.recording_dot_at().is_some())
     }
 
     /// The flash's screen rectangle and current opacity, or `None` when it is

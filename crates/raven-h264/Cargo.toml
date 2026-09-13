@@ -1,0 +1,15 @@
+[package]
+name = "raven-h264"
+description = "Raven's own H.264 Constrained Baseline encoder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Nothing beyond std, for the reason raven-rec has none: the encoder every
+# exported recording goes through cannot be one somebody else can break.
+[dependencies]
+
+[lints]
+workspace = true

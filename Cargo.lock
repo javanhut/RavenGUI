@@ -964,6 +964,7 @@ dependencies = [
  "png",
  "raven-desktop",
  "raven-protocol",
+ "raven-rec",
  "serde",
  "smithay",
  "toml",
@@ -1821,6 +1822,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-export"
+version = "0.0.1"
+dependencies = [
+ "raven-h264",
+ "raven-rec",
+]
+
+[[package]]
+name = "raven-h264"
+version = "0.0.1"
+
+[[package]]
 name = "raven-output"
 version = "0.0.1"
 dependencies = [
@@ -1837,6 +1850,10 @@ dependencies = [
  "wayland-scanner",
  "wayland-server",
 ]
+
+[[package]]
+name = "raven-rec"
+version = "0.0.1"
 
 [[package]]
 name = "raw-window-handle"

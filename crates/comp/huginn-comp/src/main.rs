@@ -49,6 +49,8 @@ mod pointer;
 #[cfg(target_os = "linux")]
 mod popup;
 #[cfg(target_os = "linux")]
+mod record;
+#[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]
 mod screenshot;
@@ -68,6 +70,8 @@ mod switcher;
 mod text;
 #[cfg(target_os = "linux")]
 mod theme;
+#[cfg(target_os = "linux")]
+mod userdirs;
 #[cfg(target_os = "linux")]
 mod wallpaper;
 #[cfg(target_os = "linux")]
