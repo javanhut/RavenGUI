@@ -4442,7 +4442,11 @@ impl Huginn {
     /// patch it is cropped to, the glass window — asks here, so "off" means
     /// the offscreen render never runs, not just that one caller skips it.
     fn blur_enabled(&self) -> bool {
-        self.desktop_config.blur(self.blur_by_default)
+        // Desktop glass and panels can remain mapped behind the lock screen.
+        // Their blur rectangles must not be applied to the lock-only scene,
+        // or a tiled window leaves a matching blurry patch over the login UI.
+        // The greeter compositor has no desktop effects to apply either.
+        !self.is_locked() && !self.greeter && self.desktop_config.blur(self.blur_by_default)
     }
 
     /// The glass window on screen, if blur is on and one is mapped and not
@@ -5374,7 +5378,13 @@ impl Huginn {
                     let front = (1.0 - f64::from(distance.abs())).clamp(0.0, 1.0);
                     let overview = 0.88 + 0.12 * front;
                     let scale = 1.0 + (overview - 1.0) * reveal;
-                    let slot = f64::from(distance) * f64::from(area.w()) * 0.96 * reveal;
+                    // A whole screen apart with the overview shut, pulling in
+                    // only as it opens. Scaled to nothing by the reveal, a
+                    // neighbour still sliding away would be drawn over the
+                    // desktop once the shrink settles before the slide does —
+                    // the workspace just left flashing on the one arrived at.
+                    let pitch = 1.0 - 0.04 * reveal;
+                    let slot = f64::from(distance) * f64::from(area.w()) * pitch;
                     let offset_x = (1.0 - scale) * f64::from(area.w()) * 0.5 + slot;
                     let offset_y = (1.0 - scale) * f64::from(area.h()) * 0.5;
                     let side = (f64::from(distance.abs()) - 0.15).clamp(0.0, 1.0);
