@@ -4,12 +4,13 @@
 //! through [`crate::text`] — real shaping and antialiased rasterization — which
 //! is what lets this be a panel someone reads rather than a debugging aid.
 //!
-//! Every chord is drawn as a row of keycaps that press themselves down in
-//! order, hold, and let go, so the list shows the gesture as well as naming
-//! it. The panel is painted twice when it opens — every cap up, every cap
-//! down — and a frame only copies across the caps whose state changed, so the
-//! animation costs a few small copies rather than shaping thirty-odd rows of
-//! text sixty times a second.
+//! Every chord is drawn as real-looking keycaps — a pale face on a darker
+//! skirt — that go down one at a time, hold, and come back up. A pressed key
+//! sinks into its skirt, rings in the accent colour and throws three short
+//! rays above it. Each cap is painted at a handful of depths when the overlay
+//! opens, and a frame only copies across the caps whose depth changed, so the
+//! animation costs a few small copies rather than shaping every row of text
+//! sixty times a second.
 
 use std::time::Duration;
 
@@ -20,14 +21,16 @@ use huginn_core::geometry::Rect;
 
 use crate::backend::keymap::BINDINGS;
 use crate::canvas::{Canvas, Panel};
-use crate::text::Text;
+use crate::text::{Text, Weight};
 use crate::theme::{self, Color};
 
 /// Padding inside the panel's border, in pixels at 1x.
 const PAD: f32 = 20.0;
 /// Space between the chord column and the description column.
 const COLUMN_GAP: f32 = 24.0;
-/// Blank space between one binding and the next.
+/// Space between one column of bindings and the next.
+const COLUMNS_GAP: f32 = 40.0;
+/// Blank space around the title rule and above the footer.
 const LINE_GAP: f32 = 6.0;
 /// Text size at a 1080p output, in pixels. Scaled with the output below.
 const BASE_SIZE: f32 = 15.0;
@@ -48,27 +51,39 @@ const OVERLAY_ALPHA: u8 = 0xF2;
 /// Corner radius at 1×: the panel radius every other floating surface has.
 const RADIUS: f32 = theme::PANEL_RADIUS;
 
-/// The shadow under a raised cap: the strip that makes it read as a key
-/// standing up from the panel, and that disappears when it is pressed.
-const CAP_SHADOW: Color = Color::from_argb(0x7000_0000);
+/// The top of a key, where the legend is printed.
+const CAP_FACE: Color = Color::from_argb(0xFFE4_E7EC);
+/// The sloped sides between the face and the skirt.
+const CAP_RIM: Color = Color::from_argb(0xFFC3_C8D1);
+/// The part of the key below its sides, which the press sinks into.
+const CAP_SKIRT: Color = Color::from_argb(0xFF96_9CA8);
+const CAP_LABEL: Color = Color::from_argb(0xFF1D_2027);
+/// The light along the top edge of the face.
+const CAP_SHINE: Color = Color::from_argb(0xFFFF_FFFF);
+/// The shadow a raised key casts; it goes as the key goes down.
+const CAP_SHADOW: Color = Color::from_argb(0x5A00_0000);
 
 const TITLE: &str = "Huginn keybindings";
 const FOOTER: &str =
     "Esc or a click outside closes this. Plain Super belongs to the focused application.";
 
 /// Pause at the top of a cycle, before the first key goes down.
-const LEAD: Duration = Duration::from_millis(250);
-/// Between one key of a chord going down and the next.
-const STEP: Duration = Duration::from_millis(160);
+const LEAD: Duration = Duration::from_millis(300);
+/// Between one key going down and the next: long enough that the order reads.
+const STEP: Duration = Duration::from_millis(280);
+/// How long a key takes to go down.
+const PRESS: Duration = Duration::from_millis(90);
 /// How long the whole chord is held once its last key is down.
-const HOLD: Duration = Duration::from_millis(550);
+const HOLD: Duration = Duration::from_millis(700);
+/// How long the keys take to come back up.
+const RELEASE: Duration = Duration::from_millis(140);
 /// One press and the rest after it. The same for every row, whatever its
-/// length, so the rows stay in step with each other rather than drifting
-/// apart into noise.
-const CYCLE: Duration = Duration::from_millis(2600);
-/// How much later each row starts than the one above it: the presses run
-/// down the list as a wave instead of every row stamping at once.
-const STAGGER: Duration = Duration::from_millis(40);
+/// length, so the rows keep one calm rhythm rather than drifting into noise.
+const CYCLE: Duration = Duration::from_millis(3000);
+/// How many depths between up and down a cap is painted at. Enough that the
+/// press eases rather than jumps; each one is a copy of every cap kept while
+/// the overlay is up.
+const STAGES: usize = 4;
 
 /// The keybinding overlay.
 pub(crate) struct Overlay {
@@ -95,13 +110,12 @@ struct Row {
     first: usize,
 }
 
-/// One keycap: where it is, what it looks like either way, and which way the
-/// buffer shows it now.
+/// One keycap: where it is, its pixels at every depth, and which depth the
+/// buffer shows now.
 struct Cap {
     at: CapBox,
-    up: Vec<u8>,
-    down: Vec<u8>,
-    is_down: bool,
+    stages: Vec<Vec<u8>>,
+    shown: usize,
 }
 
 impl Overlay {
@@ -109,25 +123,34 @@ impl Overlay {
     /// pixels per logical one.
     pub(crate) fn render(output: Rect, text: &mut Text, density: u32) -> Self {
         let layout = fit(output, text, density);
-        let (up, boxes) = paint(&layout, text, false);
-        let (down, _) = paint(&layout, text, true);
+        let base = paint_base(&layout, text);
+        let stages: Vec<Canvas> = (0..=STAGES)
+            .map(|stage| {
+                let mut canvas = Canvas {
+                    pixels: base.pixels.clone(),
+                    stride: base.stride,
+                    height: base.height,
+                };
+                draw_caps(&mut canvas, &layout, text, stage as f32 / STAGES as f32);
+                canvas
+            })
+            .collect();
         let mut rows = Vec::with_capacity(layout.rows.len());
         let mut caps = Vec::new();
-        for (row, boxes) in layout.rows.into_iter().zip(boxes) {
+        for row in layout.rows {
             rows.push(Row {
                 presses: row.chord.presses,
                 first: caps.len(),
             });
-            caps.extend(boxes.into_iter().map(|at| Cap {
+            caps.extend(row.caps.into_iter().map(|at| Cap {
                 at,
-                up: cut(&up, at),
-                down: cut(&down, at),
-                is_down: false,
+                stages: stages.iter().map(|canvas| cut(canvas, at)).collect(),
+                shown: 0,
             }));
         }
         Self {
-            panel: Panel::from_canvas(&up, density),
-            stride: up.stride,
+            panel: Panel::from_canvas(&stages[0], density),
+            stride: base.stride,
             rows,
             caps,
         }
@@ -149,13 +172,18 @@ impl Overlay {
     /// rectangles are damaged, so a frame where nothing is pressed or let go
     /// uploads nothing at all.
     pub(crate) fn animate(&mut self, elapsed: Duration) -> bool {
-        let mut wanted = vec![false; self.caps.len()];
-        for (index, row) in self.rows.iter().enumerate() {
-            for cap in down(index, &row.presses, elapsed) {
-                wanted[row.first + cap] = true;
+        let cycle = (elapsed.as_millis() / CYCLE.as_millis()) as usize;
+        let within = Duration::from_millis((elapsed.as_millis() % CYCLE.as_millis()) as u64);
+        let mut wanted = vec![0; self.caps.len()];
+        for row in &self.rows {
+            let Some(press) = row.presses.get(cycle % row.presses.len().max(1)) else {
+                continue;
+            };
+            for (order, &cap) in press.iter().enumerate() {
+                wanted[row.first + cap] = stage(amount(order, press.len(), within));
             }
         }
-        if self.caps.iter().zip(&wanted).all(|(cap, &want)| cap.is_down == want) {
+        if self.caps.iter().zip(&wanted).all(|(cap, &want)| cap.shown == want) {
             return false;
         }
         let (stride, caps) = (self.stride, &mut self.caps);
@@ -163,11 +191,11 @@ impl Overlay {
         let Ok(()) = context.draw(|pixels| {
             let mut damage = Vec::new();
             for (cap, &want) in caps.iter_mut().zip(&wanted) {
-                if cap.is_down == want {
+                if cap.shown == want {
                     continue;
                 }
-                cap.is_down = want;
-                paste(pixels, stride, cap.at, if want { &cap.down } else { &cap.up });
+                cap.shown = want;
+                paste(pixels, stride, cap.at, &cap.stages[want]);
                 damage.push(Rectangle::<i32, Buffer>::new(
                     (cap.at.x as i32, cap.at.y as i32).into(),
                     (cap.at.w as i32, cap.at.h as i32).into(),
@@ -239,33 +267,40 @@ fn parse(chord: &'static str) -> Chord {
     Chord { items, presses }
 }
 
-/// The caps of the row at `row` that are down `elapsed` after the overlay
-/// opened, out of its `presses`.
+/// How far down the key `order`-th in a chord of `keys` is, 0 up to 1 down,
+/// `within` a cycle.
 ///
-/// Pure, so the choreography can be tested without a clock: each key goes
-/// down [`STEP`] after the one before it, the chord is held for [`HOLD`], and
-/// then everything lets go until the next [`CYCLE`].
-fn down(row: usize, presses: &[Vec<usize>], elapsed: Duration) -> &[usize] {
-    let Some(since) = elapsed.checked_sub(STAGGER * row as u32) else {
-        return &[];
+/// Pure, so the choreography can be tested without a clock: each key starts
+/// down [`STEP`] after the one before it and takes [`PRESS`] to get there;
+/// once the last is down the chord is held for [`HOLD`], and then every key
+/// comes up together over [`RELEASE`].
+fn amount(order: usize, keys: usize, within: Duration) -> f32 {
+    let Some(t) = within.checked_sub(LEAD) else {
+        return 0.0;
     };
-    let cycle = since.as_millis() / CYCLE.as_millis();
-    let Some(press) = presses.get(cycle as usize % presses.len().max(1)) else {
-        return &[];
-    };
-    let within = Duration::from_millis((since.as_millis() % CYCLE.as_millis()) as u64);
-    let Some(into) = within.checked_sub(LEAD) else {
-        return &[];
-    };
-    if into >= STEP * press.len().saturating_sub(1) as u32 + HOLD {
-        return &[];
+    let down = STEP * order as u32;
+    let release = STEP * keys.saturating_sub(1) as u32 + PRESS + HOLD;
+    if t < down {
+        0.0
+    } else if t < release {
+        ease_out((t - down).as_secs_f32() / PRESS.as_secs_f32())
+    } else {
+        1.0 - ease_out((t - release).as_secs_f32() / RELEASE.as_secs_f32())
     }
-    let keys = (into.as_millis() / STEP.as_millis()) as usize + 1;
-    &press[..keys.min(press.len())]
 }
 
-/// A keycap's rectangle on the canvas, in pixels, including the depth it
-/// travels when pressed.
+/// Fast to start, easing into rest. Cubic, as [`crate::anim`]'s is.
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// The painted depth nearest `amount`.
+fn stage(amount: f32) -> usize {
+    (amount.clamp(0.0, 1.0) * STAGES as f32).round() as usize
+}
+
+/// A keycap's rectangle on the canvas, in pixels: the key, the glow around
+/// it, and the rays above it — everything that changes as it is pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapBox {
     x: usize,
@@ -274,42 +309,60 @@ struct CapBox {
     h: usize,
 }
 
-/// A row of the table, measured.
+/// A row of the table, placed.
 struct RowLayout {
     chord: Chord,
-    /// The width of each of the chord's items, in order.
-    widths: Vec<f32>,
+    /// The left edge and width of each of the chord's items, in order. For a
+    /// cap that is the key itself, without its glow.
+    placed: Vec<(f32, f32)>,
+    caps: Vec<CapBox>,
+    /// The top of the row's boxes.
+    y: f32,
+    desc_x: f32,
 }
 
-/// Everything about the panel's geometry, worked out once and painted twice.
+/// Everything about the panel's geometry, worked out once and painted from.
 /// All in canvas pixels.
 struct Layout {
     px: f32,
     size: f32,
+    /// How many columns the bindings were split into. Only a test reads it,
+    /// to check that a 1080p screen gets the two that make the list fit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    columns: usize,
     line: f32,
     pad: f32,
-    column_gap: f32,
     line_gap: f32,
     rule: f32,
-    /// The face of a cap; it stands [`Self::depth`] above the panel.
+    /// A key's face and sides; the skirt below adds [`Self::lip`].
     cap_h: f32,
-    depth: f32,
-    cap_radius: f32,
+    lip: f32,
+    bevel: f32,
+    radius: f32,
+    /// How far the glow reaches outside a key.
+    glow: f32,
+    ring_w: f32,
+    /// The space above a key its rays are drawn in.
+    ray_area: f32,
+    ray_len: f32,
+    ray_gap: f32,
+    ray_w: f32,
     label_size: f32,
-    chord_w: f32,
     body_w: f32,
+    footer_y: f32,
     w: usize,
     h: usize,
     rows: Vec<RowLayout>,
 }
 
-/// Lay the panel out at a size that fits on `output`.
+/// Lay the panel out at a size and column count that fits on `output`.
 ///
 /// Text grows with the output rather than the panel being scaled after the
 /// fact: rasterizing at the final size is the whole reason for a real font
 /// stack, and scaling a bitmap afterwards would throw that away. Keycaps take
-/// more height than a line of text, so the list no longer fits a 1080p screen
-/// at the size it would like; it is shrunk to fit rather than clipped.
+/// far more height than a line of text, so the list is split into two
+/// columns where the screen is wide enough, and shrunk only as far as it has
+/// to be to fit.
 ///
 /// Everything is in the canvas's own pixels, of which a 2× output has twice
 /// as many per logical pixel as a 1× one. `px` is that factor; it goes into
@@ -317,203 +370,387 @@ struct Layout {
 /// is placed at the same logical size either way.
 fn fit(output: Rect, text: &mut Text, density: u32) -> Layout {
     let px = density.max(1) as f32;
-    let floor = MIN_SIZE * px;
-    let (room_w, room_h) = (
+    let room = (
         output.w() as f32 * px * FILL,
         output.h() as f32 * px * FILL,
     );
-    let mut size =
+    let wanted =
         (BASE_SIZE * (output.h() as f32 / 1080.0)).clamp(BASE_SIZE, BASE_SIZE * 2.5) * px;
-    let mut layout = lay_out(text, size, px);
+    // Best first: fits both ways, then fits across (a list clipped at the
+    // bottom still reads from the top; one clipped at the side loses the end
+    // of every line), then whichever overflows least — and among equals the
+    // larger text.
+    let rank = |layout: &Layout| {
+        let (over_w, over_h) = (layout.w as f32 / room.0, layout.h as f32 / room.1);
+        (
+            over_w <= 1.0 && over_h <= 1.0,
+            over_w <= 1.0,
+            -over_w.max(over_h),
+            layout.size,
+        )
+    };
+    let mut best: Option<Layout> = None;
+    for columns in [1, 2] {
+        let layout = shrink_to_fit(text, wanted, px, room, columns);
+        let better = best
+            .as_ref()
+            .is_none_or(|best| rank(&layout).partial_cmp(&rank(best)) == Some(std::cmp::Ordering::Greater));
+        if better {
+            best = Some(layout);
+        }
+    }
+    best.expect("at least one column count is tried")
+}
+
+/// [`lay_out`] at `size`, shrunk until it fits `room` or reaches the floor.
+fn shrink_to_fit(text: &mut Text, size: f32, px: f32, room: (f32, f32), columns: usize) -> Layout {
+    let floor = MIN_SIZE * px;
+    let mut size = size;
+    let mut layout = lay_out(text, size, px, columns);
     // Shaped text is not quite linear in its size and the padding does not
     // scale with it at all, so one proportional step can leave the panel a
     // little over. A few more converge.
     for _ in 0..4 {
-        let over = (layout.w as f32 / room_w).max(layout.h as f32 / room_h);
+        let over = (layout.w as f32 / room.0).max(layout.h as f32 / room.1);
         if over <= 1.0 || size <= floor {
             break;
         }
         size = (size / over).max(floor);
-        layout = lay_out(text, size, px);
+        layout = lay_out(text, size, px, columns);
     }
     layout
 }
 
-/// Measure the panel at text `size`.
-fn lay_out(text: &mut Text, size: f32, px: f32) -> Layout {
-    let label_size = size * 0.86;
-    let cap_h = (size * 1.7).round();
-    let depth = (size * 0.16).round().max(px);
-    let cap_pad = (size * 0.55).round();
-    let sep_gap = (size * 0.3).round();
-
-    let rows: Vec<RowLayout> = BINDINGS
-        .iter()
-        .map(|binding| {
-            let chord = parse(binding.chord);
-            let widths = chord
-                .items
-                .iter()
-                .map(|item| match item {
-                    // Never narrower than tall: a single letter is a square
-                    // key, not a sliver.
-                    Item::Cap(key) => {
-                        (text.measure(key, label_size).0 + cap_pad * 2.0).ceil().max(cap_h)
-                    }
-                    Item::Sep(sep) => text.measure(sep, size).0.ceil() + sep_gap * 2.0,
-                })
-                .collect();
-            RowLayout { chord, widths }
-        })
-        .collect();
-
-    let chord_w = rows
-        .iter()
-        .map(|row| row.widths.iter().sum::<f32>())
-        .fold(0.0_f32, f32::max);
-    let column_gap = COLUMN_GAP * px;
-    // Measured into a Vec first: the closure would hold `text` mutably while
-    // the chained title and footer measurements need it too.
-    let widest_row = BINDINGS
-        .iter()
-        .map(|b| chord_w + column_gap + text.measure(b.description, size).0)
-        .fold(0.0_f32, f32::max);
-    let body_w = widest_row
-        .max(text.measure(TITLE, size).0)
-        .max(text.measure(FOOTER, size).0);
+/// Measure and place the panel at text `size`, in `columns` columns.
+fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
+    // Key dimensions follow the text, rounded at 1x and then multiplied out,
+    // so a 2× panel is exactly twice a 1× one rather than rounding apart.
+    let unit = size / px;
+    let m = |k: f32| (unit * k).round().max(1.0) * px;
+    let cap_h = m(1.75);
+    let lip = m(0.2).max(2.0 * px);
+    let bevel = m(0.14);
+    let radius = m(0.36);
+    let ring_w = m(0.11);
+    let glow = m(0.3).max(ring_w + 2.0 * px);
+    let ray_len = m(0.45);
+    let ray_gap = m(0.15);
+    let ray_w = m(0.12).max(px);
+    let ray_area = (ray_len + ray_gap + ray_w).max(glow);
+    let cap_pad = m(0.6);
+    let sep_gap = m(0.3);
+    let row_gap = m(0.15);
+    let label_size = size * 0.88;
+    let box_h = ray_area + cap_h + lip + glow;
 
     let line = size * 1.35;
-    let (pad, line_gap, rule) = (PAD * px, LINE_GAP * px, px);
-    // Title, a rule under it, every binding, then the footer.
-    let count = rows.len() as f32;
-    let h = pad * 2.0
-        + line + line_gap                       // title
-        + rule + line_gap                       // rule
-        + count * (cap_h + depth + line_gap)    // bindings
-        + line_gap
-        + line; // footer
+    let (pad, column_gap, columns_gap, line_gap, rule) = (
+        PAD * px,
+        COLUMN_GAP * px,
+        COLUMNS_GAP * px,
+        LINE_GAP * px,
+        px,
+    );
+
+    let mut measured = Vec::with_capacity(BINDINGS.len());
+    for binding in BINDINGS {
+        let chord = parse(binding.chord);
+        let mut widths = Vec::with_capacity(chord.items.len());
+        for item in &chord.items {
+            widths.push(match *item {
+                // Never much narrower than tall: a single letter is a square
+                // key, not a sliver.
+                Item::Cap(key) => (text.measure_weighted(key, label_size, Weight::BOLD).0
+                    + cap_pad * 2.0)
+                    .max(cap_h * 1.05)
+                    .ceil(),
+                Item::Sep(sep) => {
+                    text.measure_weighted(sep, size, Weight::BOLD).0.ceil() + sep_gap * 2.0
+                }
+            });
+        }
+        let description = text.measure(binding.description, size).0;
+        measured.push((chord, widths, description));
+    }
+
+    let top = pad + line + line_gap + rule + line_gap;
+    let per_column = BINDINGS.len().div_ceil(columns.max(1));
+    let mut rows = Vec::with_capacity(BINDINGS.len());
+    let mut longest = 0;
+    let mut x = pad;
+    let mut remaining = measured.into_iter();
+    loop {
+        let column: Vec<_> = remaining.by_ref().take(per_column).collect();
+        if column.is_empty() {
+            break;
+        }
+        let chord_w = column
+            .iter()
+            .map(|(_, widths, _)| widths.iter().sum::<f32>())
+            .fold(0.0_f32, f32::max)
+            + glow * 2.0;
+        let description_w = column.iter().map(|(_, _, w)| *w).fold(0.0_f32, f32::max);
+        let desc_x = x + chord_w + column_gap;
+        longest = longest.max(column.len());
+        for (i, (chord, widths, _)) in column.into_iter().enumerate() {
+            let y = (top + i as f32 * (box_h + row_gap)).round();
+            let mut left = x + glow;
+            let mut placed = Vec::with_capacity(widths.len());
+            let mut caps = Vec::new();
+            for (item, width) in chord.items.iter().zip(widths) {
+                if let Item::Cap(_) = item {
+                    caps.push(CapBox {
+                        x: (left - glow) as usize,
+                        y: y as usize,
+                        w: (width + glow * 2.0) as usize,
+                        h: box_h as usize,
+                    });
+                }
+                placed.push((left, width));
+                left += width;
+            }
+            rows.push(RowLayout {
+                chord,
+                placed,
+                caps,
+                y,
+                desc_x,
+            });
+        }
+        x = (desc_x + description_w + columns_gap).ceil();
+    }
+    let columns_w = x - columns_gap - pad;
+    let body_w = columns_w
+        .max(text.measure(TITLE, size).0)
+        .max(text.measure(FOOTER, size).0);
+    let rows_h = longest as f32 * box_h + longest.saturating_sub(1) as f32 * row_gap;
+    let footer_y = top + rows_h + line_gap * 2.0;
 
     Layout {
         px,
         size,
+        columns,
         line,
         pad,
-        column_gap,
         line_gap,
         rule,
         cap_h,
-        depth,
-        cap_radius: (size * 0.35).round(),
+        lip,
+        bevel,
+        radius,
+        glow,
+        ring_w,
+        ray_area,
+        ray_len,
+        ray_gap,
+        ray_w,
         label_size,
-        chord_w,
         body_w,
+        footer_y,
         w: (body_w + pad * 2.0).ceil() as usize,
-        h: h.ceil() as usize,
+        h: (footer_y + line + pad).ceil() as usize,
         rows,
     }
 }
 
-/// Paint the panel with every cap up, or every cap `pressed`, and say where
-/// the caps went. The two paintings differ only inside those boxes.
-fn paint(layout: &Layout, text: &mut Text, pressed: bool) -> (Canvas, Vec<Vec<CapBox>>) {
-    let l = layout;
+/// Everything on the panel but the keys: the ground, the title, the `+` and
+/// `/` between keys, the descriptions and the footer.
+fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
     let mut canvas = Canvas::new(l.w, l.h);
     canvas.material(0, 0, l.w, l.h, RADIUS * l.px, OVERLAY_ALPHA);
 
-    let mut y = l.pad;
+    let y = l.pad;
     text.draw(&mut canvas, TITLE, l.size, l.pad as i32, y as i32, theme::accent());
-    y += l.line + l.line_gap;
     canvas.tint(
         l.pad as usize,
-        y as usize,
+        (y + l.line + l.line_gap) as usize,
         l.body_w as usize,
         l.rule as usize,
         theme::RULE,
         0x14,
     );
-    y += l.rule + l.line_gap;
 
-    let mut boxes = Vec::with_capacity(l.rows.len());
     for (row, binding) in l.rows.iter().zip(BINDINGS) {
-        let mut x = l.pad;
-        let mut caps = Vec::new();
-        for (item, &width) in row.chord.items.iter().zip(&row.widths) {
-            match *item {
-                Item::Cap(key) => {
-                    let at = CapBox {
-                        x: x as usize,
-                        y: y as usize,
-                        w: width as usize,
-                        h: (l.cap_h + l.depth) as usize,
-                    };
-                    draw_cap(&mut canvas, text, l, at, key, pressed);
-                    caps.push(at);
-                }
-                Item::Sep(sep) => {
-                    let (w, h) = text.measure(sep, l.size);
-                    text.draw(
-                        &mut canvas,
-                        sep,
-                        l.size,
-                        (x + (width - w) / 2.0) as i32,
-                        (y + (l.cap_h - h) / 2.0) as i32,
-                        theme::TEXT_DIM,
-                    );
-                }
+        let face = row.y + l.ray_area;
+        for (item, &(x, width)) in row.chord.items.iter().zip(&row.placed) {
+            if let Item::Sep(sep) = *item {
+                let (w, h) = text.measure_weighted(sep, l.size, Weight::BOLD);
+                text.draw_weighted(
+                    &mut canvas,
+                    sep,
+                    l.size,
+                    (x + (width - w) / 2.0).round() as i32,
+                    (face + (l.cap_h - h) / 2.0).round() as i32,
+                    theme::TEXT,
+                    Weight::BOLD,
+                );
             }
-            x += width;
         }
-        boxes.push(caps);
         let h = text.measure(binding.description, l.size).1;
         text.draw(
             &mut canvas,
             binding.description,
             l.size,
-            (l.pad + l.chord_w + l.column_gap) as i32,
-            (y + (l.cap_h - h) / 2.0) as i32,
+            row.desc_x as i32,
+            (face + (l.cap_h - h) / 2.0).round() as i32,
             theme::TEXT,
         );
-        y += l.cap_h + l.depth + l.line_gap;
     }
-    y += l.line_gap;
+
     text.draw(
         &mut canvas,
         FOOTER,
         l.size,
         l.pad as i32,
-        y as i32,
+        l.footer_y as i32,
         theme::TEXT_DIM,
     );
-
-    (canvas, boxes)
+    canvas
 }
 
-/// One keycap. Raised, it stands on a shadow `depth` deep; pressed, its face
-/// drops into the shadow's place and takes the accent.
-fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &str, pressed: bool) {
-    let (face_h, depth) = (l.cap_h as usize, l.depth as usize);
-    let top = if pressed { at.y + depth } else { at.y };
-    if !pressed {
-        canvas.fill_rounded(at.x, at.y + depth, at.w, face_h, l.cap_radius, CAP_SHADOW);
+/// Every key on the panel, `amount` of the way down.
+fn draw_caps(canvas: &mut Canvas, l: &Layout, text: &mut Text, amount: f32) {
+    for row in &l.rows {
+        let mut caps = row.caps.iter();
+        for item in &row.chord.items {
+            if let Item::Cap(key) = *item
+                && let Some(&at) = caps.next()
+            {
+                draw_cap(canvas, text, l, at, key, amount);
+            }
+        }
     }
-    // Opaque first: the faces are translucent, and the shadow showing through
-    // one would make it look pressed when it is not.
-    canvas.fill_rounded(at.x, top, at.w, face_h, l.cap_radius, theme::BACKGROUND);
-    let (face, edge) = if pressed {
-        (theme::accent().with_alpha(0x50), theme::accent().with_alpha(0xC0))
-    } else {
-        (theme::WELL_RAISED, theme::HAIRLINE)
-    };
-    canvas.fill_rounded(at.x, top, at.w, face_h, l.cap_radius, face);
-    canvas.stroke_rounded(at.x, top, at.w, face_h, l.cap_radius, l.px, edge);
-    let (w, h) = text.measure(key, l.label_size);
-    text.draw(
+}
+
+/// One keycap, `t` of the way down.
+///
+/// Raised, it is a pale face on sloped sides on a darker skirt, casting a
+/// shadow. Pressing sinks the face and sides into the skirt, fades the shadow
+/// out, and fades in an accent ring and the three rays above.
+fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &str, t: f32) {
+    let w = at.w as f32 - l.glow * 2.0;
+    let fx = at.x as f32 + l.glow;
+    let fy = at.y as f32 + l.ray_area;
+    let travel = ((l.lip - l.px) * t).round();
+    let top = fy + travel;
+    // The bottom of the skirt stays put; the top comes down to meet it.
+    let body_h = l.cap_h + l.lip - travel;
+    let (x, wu) = (fx as usize, w as usize);
+    let accent = |alpha: f32| theme::accent().with_alpha((alpha * t).round() as u8);
+
+    if t < 1.0 {
+        canvas.fill_rounded(
+            x,
+            (fy + l.px * 2.0) as usize,
+            wu,
+            (l.cap_h + l.lip) as usize,
+            l.radius,
+            CAP_SHADOW.with_alpha((f32::from(CAP_SHADOW.to_rgba_bytes()[3]) * (1.0 - t)) as u8),
+        );
+    }
+    if t > 0.0 {
+        // A soft halo out to the edge of the box, then a crisp ring just
+        // outside the key. Both before the key, which covers their inner
+        // edges.
+        canvas.stroke_rounded(
+            at.x,
+            (top - l.glow) as usize,
+            at.w,
+            (body_h + l.glow * 2.0) as usize,
+            l.radius + l.glow,
+            l.glow,
+            accent(70.0),
+        );
+        let off = l.ring_w + l.px;
+        canvas.stroke_rounded(
+            (fx - off) as usize,
+            (top - off) as usize,
+            (w + off * 2.0) as usize,
+            (body_h + off * 2.0) as usize,
+            l.radius + off,
+            l.ring_w,
+            accent(235.0),
+        );
+    }
+
+    canvas.fill_rounded(x, top as usize, wu, body_h as usize, l.radius, CAP_SKIRT);
+    canvas.fill_rounded(x, top as usize, wu, l.cap_h as usize, l.radius, CAP_RIM);
+    let face_x = fx + l.bevel;
+    let face_y = top + (l.bevel * 0.5).round();
+    let face_w = w - l.bevel * 2.0;
+    let face_h = l.cap_h - (l.bevel * 1.5).round();
+    let face_r = (l.radius - l.bevel).max(l.px);
+    canvas.fill_rounded(
+        face_x as usize,
+        face_y as usize,
+        face_w as usize,
+        face_h as usize,
+        face_r,
+        CAP_FACE,
+    );
+    if face_w > face_r * 2.0 {
+        canvas.tint(
+            (face_x + face_r) as usize,
+            face_y as usize,
+            (face_w - face_r * 2.0) as usize,
+            l.px as usize,
+            CAP_SHINE,
+            0x90,
+        );
+    }
+    let (tw, th) = text.measure_weighted(key, l.label_size, Weight::BOLD);
+    text.draw_weighted(
         canvas,
         key,
         l.label_size,
-        (at.x as f32 + (at.w as f32 - w) / 2.0) as i32,
-        (top as f32 + (face_h as f32 - h) / 2.0) as i32,
-        theme::TEXT,
+        (face_x + (face_w - tw) / 2.0).round() as i32,
+        (face_y + (face_h - th) / 2.0).round() as i32,
+        CAP_LABEL,
+        Weight::BOLD,
+    );
+
+    if t > 0.0 {
+        let color = accent(255.0);
+        let cx = fx + w / 2.0;
+        let bottom = fy - l.ray_gap - l.ray_w / 2.0;
+        let tip = bottom - l.ray_len;
+        let spread = l.ray_len * 0.9;
+        ray(canvas, (cx, bottom), (cx, tip), l.ray_w, color);
+        ray(
+            canvas,
+            (cx - spread, bottom),
+            (cx - spread - l.ray_len * 0.45, tip + l.ray_len * 0.15),
+            l.ray_w,
+            color,
+        );
+        ray(
+            canvas,
+            (cx + spread, bottom),
+            (cx + spread + l.ray_len * 0.45, tip + l.ray_len * 0.15),
+            l.ray_w,
+            color,
+        );
+    }
+}
+
+/// A straight stroke with round ends from `from` to `to`, antialiased.
+fn ray(canvas: &mut Canvas, from: (f32, f32), to: (f32, f32), width: f32, color: Color) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let length2 = (dx * dx + dy * dy).max(f32::EPSILON);
+    let reach = width;
+    let (left, top) = (from.0.min(to.0) - reach, from.1.min(to.1) - reach);
+    let (right, bottom) = (from.0.max(to.0) + reach, from.1.max(to.1) + reach);
+    canvas.paint(
+        left.floor() as i32,
+        top.floor() as i32,
+        (right - left).ceil() as i32,
+        (bottom - top).ceil() as i32,
+        |x, y| {
+            let along = (((x - from.0) * dx + (y - from.1) * dy) / length2).clamp(0.0, 1.0);
+            let distance = (x - (from.0 + along * dx)).hypot(y - (from.1 + along * dy));
+            let coverage = (width / 2.0 - distance + 0.5).clamp(0.0, 1.0);
+            (coverage > 0.0).then_some((color, coverage))
+        },
     );
 }
 
@@ -535,12 +772,19 @@ fn paste(pixels: &mut [u8], stride: usize, at: CapBox, patch: &[u8]) {
     }
 }
 
-/// Lay the panel out and paint it with every cap up. Split from
-/// [`Overlay::render`] so a test can get at the pixels without going through a
-/// renderer.
+/// The panel with every key at `amount`. Split from [`Overlay::render`] so a
+/// test can get at the pixels without going through a renderer.
+#[cfg(test)]
+fn compose_at(output: Rect, text: &mut Text, density: u32, amount: f32) -> Canvas {
+    let layout = fit(output, text, density);
+    let mut canvas = paint_base(&layout, text);
+    draw_caps(&mut canvas, &layout, text, amount);
+    canvas
+}
+
 #[cfg(test)]
 fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
-    paint(&fit(output, text, density), text, false).0
+    compose_at(output, text, density, 0.0)
 }
 
 #[cfg(test)]
@@ -590,16 +834,51 @@ mod tests {
     }
 
     #[test]
-    fn a_1080p_screen_shows_the_whole_list() {
-        // Keycaps are taller than the lines they replaced, and the table is
-        // long; unshrunk, the bottom rows would sit off the screen.
+    fn a_1080p_screen_shows_the_whole_list_in_two_columns() {
+        // Keycaps are much taller than lines of text, and the table is long;
+        // in one column the bottom rows would sit off the screen.
         let mut text = Text::new();
         if !text.is_usable() {
             return;
         }
         let output = Rect::from_xywh(0, 0, 1920, 1080);
+        let layout = fit(output, &mut text, 1);
+        assert_eq!(layout.columns, 2);
         let at = Overlay::render(output, &mut text, 1).placement(output);
         assert!(at.h() <= output.h(), "{} tall on a 1080 screen", at.h());
+        assert!(at.w() <= output.w(), "{} wide on a 1920 screen", at.w());
+    }
+
+    #[test]
+    fn caps_never_overlap_each_other_or_the_descriptions() {
+        // A frame copies a cap's whole box in; a box that overlapped another
+        // cap, or a description, would paint over it with a stale copy.
+        let mut text = Text::new();
+        for output in [
+            Rect::from_xywh(0, 0, 1920, 1080),
+            Rect::from_xywh(0, 0, 1280, 1024),
+            Rect::from_xywh(0, 0, 3840, 2160),
+        ] {
+            for density in [1, 2] {
+                let layout = fit(output, &mut text, density);
+                let boxes: Vec<(CapBox, f32)> = layout
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.caps.iter().map(|at| (*at, row.desc_x)))
+                    .collect();
+                for (i, (a, desc_x)) in boxes.iter().enumerate() {
+                    assert!(a.x + a.w <= layout.w && a.y + a.h <= layout.h, "{a:?} off the panel");
+                    assert!(((a.x + a.w) as f32) < *desc_x, "{a:?} runs into its description");
+                    for (b, _) in &boxes[i + 1..] {
+                        let overlap = a.x < b.x + b.w
+                            && b.x < a.x + a.w
+                            && a.y < b.y + b.h
+                            && b.y < a.y + a.h;
+                        assert!(!overlap, "{a:?} overlaps {b:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -764,33 +1043,42 @@ mod tests {
     }
 
     #[test]
-    fn keys_go_down_in_order_hold_and_let_go_together() {
-        let presses = [vec![0, 1, 2]];
-        let at = |ms: u64| down(0, &presses, Duration::from_millis(ms));
-        assert_eq!(at(0), &[] as &[usize], "nothing before the lead-in");
-        assert_eq!(at(LEAD.as_millis() as u64), &[0]);
-        assert_eq!(at((LEAD + STEP).as_millis() as u64), &[0, 1]);
-        assert_eq!(at((LEAD + STEP * 2).as_millis() as u64), &[0, 1, 2]);
-        let held = LEAD + STEP * 2 + HOLD;
-        assert_eq!(at(held.as_millis() as u64 - 1), &[0, 1, 2], "still held");
-        assert_eq!(at(held.as_millis() as u64), &[] as &[usize], "all let go");
+    fn keys_go_down_one_at_a_time() {
+        let at = |order: usize, t: Duration| stage(amount(order, 3, t));
+        assert_eq!(at(0, Duration::ZERO), 0, "nothing before the lead-in");
+        // The first key is all the way down before the second has started.
+        assert_eq!(at(0, LEAD + PRESS), STAGES);
+        assert_eq!(at(1, LEAD + PRESS), 0);
+        assert_eq!(at(1, LEAD + STEP + PRESS), STAGES);
+        assert_eq!(at(2, LEAD + STEP + PRESS), 0);
+        assert_eq!(at(2, LEAD + STEP * 2 + PRESS), STAGES);
+        // Partway down in between, so the press eases rather than jumps.
+        let halfway = at(0, LEAD + PRESS / 4);
+        assert!(halfway > 0 && halfway < STAGES, "{halfway}");
+    }
+
+    #[test]
+    fn the_chord_is_held_then_let_go_together() {
+        let release = LEAD + STEP * 2 + PRESS + HOLD;
+        for order in 0..3 {
+            assert_eq!(stage(amount(order, 3, release - Duration::from_millis(1))), STAGES);
+            assert_eq!(stage(amount(order, 3, release + RELEASE)), 0);
+        }
     }
 
     #[test]
     fn alternatives_take_turns_from_one_cycle_to_the_next() {
-        let presses = [vec![0, 1, 2], vec![0, 1, 3]];
-        let chord = LEAD + STEP * 2;
-        assert_eq!(down(0, &presses, chord), &[0, 1, 2]);
-        assert_eq!(down(0, &presses, CYCLE + chord), &[0, 1, 3]);
-        assert_eq!(down(0, &presses, CYCLE * 2 + chord), &[0, 1, 2]);
-    }
-
-    #[test]
-    fn lower_rows_start_later() {
-        let presses = [vec![0]];
-        assert_eq!(down(0, &presses, LEAD), &[0]);
-        assert_eq!(down(10, &presses, LEAD), &[] as &[usize]);
-        assert_eq!(down(10, &presses, LEAD + STAGGER * 10), &[0]);
+        let mut overlay = Overlay::render(Rect::from_xywh(0, 0, 1920, 1080), &mut Text::new(), 1);
+        // Row 0 is `Super+Ctrl+E / T`: E the first time round, T the next.
+        let row = &overlay.rows[0];
+        let (first, e, t) = (row.first, row.presses[0][2], row.presses[1][2]);
+        let chord_down = LEAD + STEP * 2 + PRESS;
+        overlay.animate(chord_down);
+        assert_eq!(overlay.caps[first + e].shown, STAGES);
+        assert_eq!(overlay.caps[first + t].shown, 0);
+        overlay.animate(CYCLE + chord_down);
+        assert_eq!(overlay.caps[first + e].shown, 0);
+        assert_eq!(overlay.caps[first + t].shown, STAGES);
     }
 
     #[test]
@@ -800,7 +1088,8 @@ mod tests {
         for binding in BINDINGS {
             let chord = parse(binding.chord);
             for press in &chord.presses {
-                let busy = LEAD + STEP * press.len().saturating_sub(1) as u32 + HOLD;
+                let busy =
+                    LEAD + STEP * press.len().saturating_sub(1) as u32 + PRESS + HOLD + RELEASE;
                 assert!(busy < CYCLE, "{} does not fit a cycle", binding.chord);
             }
         }
@@ -810,10 +1099,16 @@ mod tests {
     fn a_pressed_cap_looks_different_from_a_raised_one() {
         let mut overlay = Overlay::render(Rect::from_xywh(0, 0, 1920, 1080), &mut Text::new(), 1);
         assert!(!overlay.caps.is_empty());
-        assert!(overlay.caps.iter().all(|cap| cap.up != cap.down));
+        assert!(overlay
+            .caps
+            .iter()
+            .all(|cap| cap.stages[0] != cap.stages[STAGES]));
         assert!(!overlay.animate(Duration::ZERO), "nothing is down at the start");
-        assert!(overlay.animate(LEAD), "the first key goes down");
-        assert!(!overlay.animate(LEAD), "and nothing more happens at the same moment");
+        assert!(overlay.animate(LEAD + PRESS), "the first key goes down");
+        assert!(
+            !overlay.animate(LEAD + PRESS),
+            "and nothing more happens at the same moment"
+        );
     }
 
     /// Write the overlay to a binary PPM so a person can look at it.
@@ -827,7 +1122,7 @@ mod tests {
     /// HUGINN_OVERLAY_DUMP=/tmp/overlay.ppm cargo test -p huginn-comp overlay_dump
     /// ```
     ///
-    /// Set `HUGINN_OVERLAY_PRESSED=1` as well to see every cap down.
+    /// Set `HUGINN_OVERLAY_PRESSED=1` as well to see every key down.
     ///
     /// Does nothing when the variable is unset, so it costs a CI run nothing.
     #[test]
@@ -835,10 +1130,13 @@ mod tests {
         let Ok(path) = std::env::var("HUGINN_OVERLAY_DUMP") else {
             return;
         };
-        let pressed = std::env::var_os("HUGINN_OVERLAY_PRESSED").is_some();
+        let amount = if std::env::var_os("HUGINN_OVERLAY_PRESSED").is_some() {
+            1.0
+        } else {
+            0.0
+        };
         let mut text = Text::new();
-        let layout = fit(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
-        let (canvas, _) = paint(&layout, &mut text, pressed);
+        let canvas = compose_at(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, amount);
         let (w, h) = (canvas.stride, canvas.height);
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         // The canvas is RGBA and PPM is RGB, so the alpha is dropped. Every
