@@ -697,6 +697,9 @@ pub(crate) struct Huginn {
     /// set, and leaves the backends' clear colour showing.
     wallpaper: Option<crate::wallpaper::Wallpaper>,
     wallpaper_panels: Vec<Option<crate::canvas::Panel>>,
+    /// The files `wallpaper` was decoded from, as they were then, so a picture
+    /// replaced at the same path is noticed; see [`Self::refresh_wallpaper`].
+    wallpaper_sources: crate::wallpaper::Sources,
     /// What `~/.config/raven/desktop.toml` said when last read.
     desktop_config: crate::desktop_config::DesktopConfig,
     /// Whether blur is on when the file does not say. On until the backend
@@ -1101,6 +1104,9 @@ impl Huginn {
             focus_ring_shown: None,
             help: None,
             help_opened: std::time::Duration::ZERO,
+            // Stamped before decoding, and fields are evaluated in the order
+            // written; see `Sources::of`.
+            wallpaper_sources: crate::wallpaper::Sources::of(desktop_config.wallpaper().as_deref()),
             wallpaper: crate::wallpaper::Wallpaper::chosen_or_installed(desktop_config.wallpaper()),
             desktop_config,
             blur_by_default: true,
@@ -1179,19 +1185,8 @@ impl Huginn {
             self.refresh_launcher();
         }
 
-        if cfg.wallpaper() != self.desktop_config.wallpaper() {
-            self.wallpaper = crate::wallpaper::Wallpaper::chosen_or_installed(cfg.wallpaper());
-            self.wallpaper_panels = self
-                .outputs
-                .iter()
-                .map(|output| {
-                    self.wallpaper
-                        .as_ref()
-                        .map(|w| w.panel(output.scale.render, output.scale.advertised))
-                })
-                .collect();
-        }
         self.desktop_config = cfg;
+        self.refresh_wallpaper();
 
         // Everything compositor-drawn reads the accent when it renders, so
         // rebuild what is on screen.
@@ -1200,6 +1195,37 @@ impl Huginn {
         self.refresh_launcher();
         self.refresh_pinned();
         self.queue_redraw();
+    }
+
+    /// Re-read the wallpaper if the file it would come from is not the one it
+    /// was read from: another path in `desktop.toml`, the same path replaced,
+    /// or `set/` pointed elsewhere.
+    ///
+    /// A couple of stats when nothing changed, so [`crate::configwatch`] calls
+    /// it for any event near a wallpaper without deciding which ones matter.
+    pub(crate) fn refresh_wallpaper(&mut self) {
+        let chosen = self.desktop_config.wallpaper();
+        let sources = crate::wallpaper::Sources::of(chosen.as_deref());
+        if sources == self.wallpaper_sources {
+            return;
+        }
+        self.wallpaper_sources = sources;
+        self.wallpaper = crate::wallpaper::Wallpaper::chosen_or_installed(chosen);
+        self.wallpaper_panels = self
+            .outputs
+            .iter()
+            .map(|output| {
+                self.wallpaper
+                    .as_ref()
+                    .map(|w| w.panel(output.scale.render, output.scale.advertised))
+            })
+            .collect();
+        self.queue_redraw();
+    }
+
+    /// Where a change to the wallpaper could come from, for the watch.
+    pub(crate) fn wallpaper_directories(&self) -> Vec<std::path::PathBuf> {
+        crate::wallpaper::directories(self.desktop_config.wallpaper().as_deref())
     }
 
     /// A key for the quick settings panel, and whatever a row asked for.
