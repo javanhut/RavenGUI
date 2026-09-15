@@ -203,6 +203,14 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         return;
     }
 
+    // The keybinding overlay takes any press while it is up: off the panel it
+    // closes, on it nothing happens. Swallowed either way, as the launcher's
+    // are — it is drawn over everything, so a click is aimed at the list or at
+    // getting rid of it, not at a window the user can barely see behind it.
+    if button_state == ButtonState::Pressed && state.help_click() {
+        return;
+    }
+
     // `Super`+a button is the mouse's three-finger gesture — see
     // [`crate::mouse`]. After the lock and the region selection, which own
     // the pointer outright, and before everything that reads the desktop: a

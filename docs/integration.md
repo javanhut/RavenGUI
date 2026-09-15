@@ -186,7 +186,7 @@ client cannot receive or override them:
 | `Super+Ctrl+Space` | open the application launcher |
 | `Super+Ctrl+A` | open the pinned applications |
 | `Super+Ctrl+S` | open quick settings |
-| `Super+Ctrl+H` | show or hide the keybinding list |
+| `Super+Ctrl+H` | show the keybinding list (`Esc` or a click outside closes it) |
 | `Super+Ctrl+Esc` | quit the compositor |
 | `Print` | screenshot the screen (`Shift`: region, `Ctrl`: window) |
 | `Super+Print` | start or stop recording the screen |
