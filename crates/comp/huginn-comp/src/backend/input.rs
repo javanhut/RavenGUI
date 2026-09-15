@@ -89,6 +89,7 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     // of everything but the lock, so the motion itself is harmless; this is
     // about the compositor's own drawing, which does not go through the scene.
     if !state.is_locked() {
+        state.notifications_pointer_moved();
         state.dock_pointer_moved();
         state.launcher_pointer_moved();
         state.pinned_pointer_moved();
@@ -103,7 +104,12 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     // and the client must not see a pointer that is on the bar. The cursor
     // goes back to the arrow too, since whatever shape the client last asked
     // for was for its own content.
-    let under = if state.launcher_covers_pointer() || state.pinned_covers_pointer() {
+    // A notification card is compositor-drawn in the same way, in front of
+    // everything the pointer can reach.
+    let under = if state.notifications_cover_pointer()
+        || state.launcher_covers_pointer()
+        || state.pinned_covers_pointer()
+    {
         None
     } else if !state.is_locked() && state.decor_covers_pointer() {
         state.cursor_status = smithay::input::pointer::CursorImageStatus::default_named();
@@ -200,6 +206,14 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
                 ButtonState::Released => state.region_release(),
             }
         }
+        return;
+    }
+
+    // A notification card is drawn in front of everything but the recording
+    // dot, so it is asked first. A press on a card acts on the card — a left
+    // click takes it or the control it landed on, a right click dismisses it —
+    // and never reaches what is behind. See `Huginn::notifications_click`.
+    if button_state == ButtonState::Pressed && state.notifications_click(event.button_code()) {
         return;
     }
 

@@ -290,7 +290,10 @@ mod tests {
         // still opaque.
         let last = (canvas.height - 1) * canvas.stride * 4;
         let rule = &canvas.pixels[last..last + 4];
-        assert!(rule[0] > BG[0] && rule[3] == 0xFF, "rule pixel was {rule:?}");
+        assert!(
+            rule[0] > BG[0] && rule[3] == 0xFF,
+            "rule pixel was {rule:?}"
+        );
         // The top-left corner is background: no text starts flush with the edge.
         assert_eq!(&canvas.pixels[0..4], &BG);
         let panel = render(&mut text, key(Some("hello"), true, 2)).panel;

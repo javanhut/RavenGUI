@@ -65,6 +65,10 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # talks to it from a thread of its own too, so no async runtime enters the
 # frame loop.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# zbus's name-request flags are enumflags2 bit sets, and the notifications
+# server has to spell "no flags at all": the type's `Default` is not empty. See
+# huginn-comp/src/notifications/bus.rs. Already in the tree through zbus.
+enumflags2 = "0.7"
 # Text shaping, layout and rasterization for the compositor-drawn shell.
 # `default-features = false` drops fontconfig, which would put a C library on
 # the critical path of a distro that ships almost no GUI dependencies; fontdb

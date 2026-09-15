@@ -282,6 +282,53 @@ There is no way for a client to register a global chord of its own. If your
 software needs one, it currently has to be reached from a dock icon or by being
 spawned.
 
+## Notifications
+
+Huginn is the notification server. Send notifications the ordinary way —
+`org.freedesktop.Notifications` on the session bus, through libnotify,
+`notify-send`, GLib's `GNotification` or anything else that speaks the
+specification — and they appear as cards in the top-right corner of the
+focused screen. There is no Raven-specific API, and none is needed.
+
+`GetCapabilities` reports `actions`, `body`, `body-markup`, `icon-static` and
+`persistence`. In detail:
+
+- **Urgency and timeouts.** Low and normal cards stay four and six seconds, or
+  as long as `expire_timeout` asks; critical ones stay until dismissed. The
+  six is `[notifications] timeout_seconds` in `desktop.toml`, which Raven
+  Settings' Notifications page writes.
+- **Actions.** Up to three are drawn as buttons; `default` is the card itself.
+  A click sends `ActionInvoked`, then `NotificationClosed` with reason 2 unless
+  the notification is `resident`.
+- **Icons.** `app_icon` as an icon name, an absolute path or a `file://` URI;
+  otherwise the icon of the application the `desktop-entry` hint names.
+  `image-data` is not drawn yet.
+- **Body markup.** `<b>`, `<i>`, `<br>`, `<img alt>` and entities. `<u>` and
+  links show as plain text.
+- **Replacing.** `replaces_id` updates the card in place.
+- **Hints read.** `urgency`, `category`, `desktop-entry`, `transient` and
+  `resident`.
+
+Clicking a card also brings forward the window your application has open,
+matched by `desktop-entry` — or failing that the application name — against
+the window's `app_id`. Set `desktop-entry` to your desktop file's name and it
+works.
+
+Not every notification interrupts. With do not disturb on (quick settings,
+Raven Settings, or `[notifications] do_not_disturb`), while a window is
+fullscreen, and while an idle inhibitor is on screen, only critical
+notifications appear. The rest stay open, without a card, until the person
+brings them back from the "Notifications" row in quick settings or your
+application closes them; a `transient` notification that would wait is closed
+with reason 1 instead. While the session is locked nothing appears and nothing
+times out, and what arrived is placed when it unlocks. A card does not count
+down while the pointer is on it, or while nobody has touched the keyboard or
+mouse for a minute.
+
+`Super+Ctrl+N` dismisses the newest card and `Super+Ctrl+Shift+N` all of them;
+a right click dismisses one. Cards are left out of screenshots and screen
+recordings.
+
 ## Screenshots
 
 `Print` takes a screenshot; the compositor does it, not a client. A Wayland

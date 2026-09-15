@@ -136,6 +136,20 @@ pub(crate) const WELL_RAISED: Color = Color::from_argb(0x22FF_FFFF);
 /// A hairline inside a panel: between rows, under a heading.
 pub(crate) const RULE: Color = Color::from_argb(0x14FF_FFFF);
 
+/// Corner radius of a card at a 1080p output, in logical pixels.
+///
+/// Raven Glass has one radius scale — 6 controls, 8 rows, 12 groups, 14
+/// cards, 20 heroes — and a notification is a card in exactly the sense the
+/// GTK applications draw one. [`PANEL_RADIUS`] is for the large panels.
+pub(crate) const CARD_RADIUS: f32 = 14.0;
+
+/// Something critical: a notification marked urgent.
+///
+/// The error colour of the GTK applications (`raven-glass.css`'s
+/// `error_color`), so "critical" is one red across the desktop. Not
+/// [`RECORDING`], whose red only ever means the screen is being captured.
+pub(crate) const CRITICAL: Color = Color::from_argb(0xFFFB_7185);
+
 /// The selection wash: the accent at the strength a selected row or tile is
 /// tinted with. The accent's one job inside a panel, apart from the caret.
 pub(crate) fn selection() -> Color {

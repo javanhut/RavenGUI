@@ -2750,7 +2750,6 @@ mod tests {
         assert_eq!(launcher.selection(), None);
     }
 
-
     // -- The two layouts ---------------------------------------------------
 
     #[test]
@@ -2760,7 +2759,13 @@ mod tests {
         let mut launcher = Launcher::default();
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
         assert!(launcher.is_collapsed());
-        for key in [Key::Up, Key::Left, Key::Right, Key::PageDown, Key::NextGroup] {
+        for key in [
+            Key::Up,
+            Key::Left,
+            Key::Right,
+            Key::PageDown,
+            Key::NextGroup,
+        ] {
             assert_eq!(
                 launcher.press(key, &apps, &frecency, NOW, CLOCK, STILL),
                 Outcome::Unchanged,
@@ -2875,7 +2880,10 @@ mod tests {
         let (mut launcher, apps) = typed("f");
         launcher.press(Key::Right, &apps, &Frecency::new(), NOW, CLOCK, STILL);
         assert!(launcher.set_style(Style::Arc));
-        assert!(!launcher.set_style(Style::Arc), "the same style is not a change");
+        assert!(
+            !launcher.set_style(Style::Arc),
+            "the same style is not a change"
+        );
         launcher.reindex(&apps, &Frecency::new(), NOW);
         assert_eq!(launcher.selected(), 0);
     }
@@ -2929,7 +2937,11 @@ mod tests {
             "back onto the first page, at its right end"
         );
         launcher.press(Key::PageDown, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(launcher.selected(), ARC_SLOTS, "a page lands on its top slot");
+        assert_eq!(
+            launcher.selected(),
+            ARC_SLOTS,
+            "a page lands on its top slot"
+        );
         assert_eq!(
             launcher.press(Key::PageDown, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Unchanged
@@ -3044,11 +3056,23 @@ mod tests {
 
     #[test]
     fn ctrl_arrows_and_page_keys_are_recognised() {
-        assert_eq!(Key::from_keysym(keysyms::KEY_Left, true, None), Key::PrevGroup);
-        assert_eq!(Key::from_keysym(keysyms::KEY_Right, true, None), Key::NextGroup);
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Left, true, None),
+            Key::PrevGroup
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Right, true, None),
+            Key::NextGroup
+        );
         assert_eq!(Key::from_keysym(keysyms::KEY_Left, false, None), Key::Left);
-        assert_eq!(Key::from_keysym(keysyms::KEY_Page_Down, false, None), Key::PageDown);
-        assert_eq!(Key::from_keysym(keysyms::KEY_Page_Up, false, None), Key::PageUp);
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Page_Down, false, None),
+            Key::PageDown
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Page_Up, false, None),
+            Key::PageUp
+        );
     }
 
     // -- The pointer -------------------------------------------------------
@@ -3221,7 +3245,10 @@ mod tests {
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.set_layout(with_menu(1, 3));
         let beside = huginn_core::geometry::Point::new(25, 10);
-        assert_eq!(launcher.click(beside, &apps, &Frecency::new(), NOW, CLOCK, STILL), Outcome::Redraw);
+        assert_eq!(
+            launcher.click(beside, &apps, &Frecency::new(), NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
         assert_eq!(launcher.menu(), None);
         assert!(
             launcher.is_open(),
@@ -3667,10 +3694,14 @@ pub(crate) fn draw_heading(canvas: &mut Canvas, text: &mut Text, m: &Metrics, y:
 
 /// A hairline across the panel's inner width at `y`.
 pub(crate) fn draw_rule(canvas: &mut Canvas, m: &Metrics, y: f32) {
-    canvas.tint(m.pad as usize,
+    canvas.tint(
+        m.pad as usize,
         y as usize,
         m.inner as usize,
-        1, crate::theme::RULE, 0x14);
+        1,
+        crate::theme::RULE,
+        0x14,
+    );
 }
 
 /// A suggestion tile: icon over label, in a well, ringed when selected.
@@ -4389,7 +4420,10 @@ mod render_tests {
     fn the_panel_grows_and_shrinks_with_what_it_shows() {
         let (bar, _) = drawn("", 0);
         let (grid, _) = drawn("", 1);
-        assert!(bar.height < grid.height, "the bar did not open into the grid");
+        assert!(
+            bar.height < grid.height,
+            "the bar did not open into the grid"
+        );
         let two_rows = composed(&tools(12), "tool");
         let one_row = composed(&apps(), "raven");
         assert!(
@@ -4403,11 +4437,17 @@ mod render_tests {
         // Centred, it would jump up by half of whatever it grew.
         let (bar, _) = drawn("", 0);
         let (grid, _) = drawn("", 1);
-        let top = |height: usize| {
-            placement(OUTPUT, (760, height as i32), None, 1.0, Style::List).y()
-        };
-        assert_eq!(top(bar.height), top(grid.height), "the list moved as it opened");
-        assert!(top(grid.height) < OUTPUT.h() / 4, "the list is not near the top");
+        let top =
+            |height: usize| placement(OUTPUT, (760, height as i32), None, 1.0, Style::List).y();
+        assert_eq!(
+            top(bar.height),
+            top(grid.height),
+            "the list moved as it opened"
+        );
+        assert!(
+            top(grid.height) < OUTPUT.h() / 4,
+            "the list is not near the top"
+        );
     }
 
     /// `count` applications answering to "tool".
@@ -4699,10 +4739,7 @@ mod render_tests {
             first.0.y() >= tile_bottom,
             "a recent row overlapped the tiles"
         );
-        assert!(
-            second.0.x() > first.0.x(),
-            "the foot is out of order"
-        );
+        assert!(second.0.x() > first.0.x(), "the foot is out of order");
         assert_eq!((first.1, second.1), (SUGGESTED, SUGGESTED + 1));
     }
 
@@ -4810,7 +4847,6 @@ mod render_tests {
         );
     }
 
-
     // -- The arc ------------------------------------------------------------
 
     fn arc_laid_out(apps: &[Entry], query: &str) -> (Launcher, Canvas, Layout) {
@@ -4855,7 +4891,10 @@ mod render_tests {
         let panel = Rect::from_xywh(0, 0, layout.size.0, layout.size.1);
         assert_eq!(layout.canvas_point(panel, Point::new(2, 2)), None);
         let hub = layout.blur.expect("the arc names its blur").center();
-        assert!(layout.canvas_point(panel, hub).is_some(), "the hub is not the launcher");
+        assert!(
+            layout.canvas_point(panel, hub).is_some(),
+            "the hub is not the launcher"
+        );
     }
 
     #[test]
@@ -4869,7 +4908,10 @@ mod render_tests {
             (blur.right() - 1, blur.bottom() - 1),
         ] {
             let alpha = canvas.pixels[(y as usize * canvas.stride + x as usize) * 4 + 3];
-            assert!(alpha > 0x80, "the blur's corner ({x}, {y}) is off the glass: {alpha}");
+            assert!(
+                alpha > 0x80,
+                "the blur's corner ({x}, {y}) is off the glass: {alpha}"
+            );
         }
     }
 
@@ -4891,7 +4933,12 @@ mod render_tests {
     #[test]
     fn the_arcs_sidebar_is_categories_until_something_is_typed() {
         let (_, _, layout) = arc_laid_out(&apps(), "");
-        assert!(layout.buttons.iter().any(|(_, b)| *b == Button::Category(0)));
+        assert!(
+            layout
+                .buttons
+                .iter()
+                .any(|(_, b)| *b == Button::Category(0))
+        );
         let (_, _, searching) = arc_laid_out(&apps(), "f");
         assert!(
             searching

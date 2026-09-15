@@ -40,6 +40,8 @@ mod motion;
 #[cfg(target_os = "linux")]
 mod mouse;
 #[cfg(target_os = "linux")]
+mod notifications;
+#[cfg(target_os = "linux")]
 mod overlay;
 mod overview;
 mod pinned;

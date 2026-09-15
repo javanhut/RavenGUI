@@ -195,7 +195,8 @@ written by the Settings application (`raven-settings`, `Super+Ctrl+P`, or the
 "All settings" row in quick settings) and read by the compositor at start and
 whenever it changes (`huginn-comp/src/desktop_config.rs`, `configwatch.rs`).
 Of that file the compositor honours the accent, animations, the idle lock
-timeout, the terminal the spawn chord opens, a wallpaper of its own for
+timeout, do not disturb and how long a notification card stays
+(`[notifications]`), the terminal the spawn chord opens, a wallpaper of its own for
 when `ravencanvasd` is not running, and `blur` — which blurs the desktop
 behind the launcher, the pinned panel and *glass* windows (translucent
 clients that ask for it by `app_id`; Raven Settings today); off, the panels
@@ -227,7 +228,7 @@ texture, one quad per window.
 
 This is still a deliberate constraint rather than an unfinished feature. A
 format a user can write is a format that must not change between releases,
-which is why the compositor's share of it is six keys with defaults, and why
+which is why the compositor's share of it is a handful of keys with defaults, and why
 the file is written by a program that knows the schema rather than by hand.
 
 What this constrains is configuration, not extension. Software written outside
