@@ -27,7 +27,7 @@ use std::time::Duration;
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, LoopHandle, Mode, PostAction};
-use inotify::{Inotify, WatchDescriptor, WatchMask};
+use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
 use crate::xwayland::AsHuginn;
 
@@ -35,6 +35,26 @@ use crate::xwayland::AsHuginn;
 const SETTLE: Duration = Duration::from_millis(200);
 
 const BUFFER: usize = 4096;
+
+/// Whether an event says the file it names is ready to read.
+///
+/// A `CREATE` of a plain file is the start of a copy, not the end: `cp` and
+/// `install` create the file and then write it, and a large picture can take
+/// longer than [`SETTLE`] to arrive, so reading on the create decodes half of
+/// one. Its `CLOSE_WRITE` follows and is the event that counts. A symlink or a
+/// hard link is complete the moment it exists and never gets a `CLOSE_WRITE`,
+/// so those count on the create, as does a directory.
+fn settled(mask: EventMask, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if !mask.contains(EventMask::CREATE) || mask.contains(EventMask::ISDIR) {
+        return true;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_symlink() || meta.nlink() > 1,
+        // Gone already; whatever moved or removed it sends its own event.
+        Err(_) => false,
+    }
+}
 
 /// One mask for every watch. inotify keeps one watch per directory, and adding
 /// a directory that is already watched *replaces* its mask — so a wallpaper
@@ -52,7 +72,7 @@ struct Watches {
     inotify: Inotify,
     config_dir: PathBuf,
     /// The config directory's watch, or its parent's while it does not exist.
-    config: Vec<WatchDescriptor>,
+    config: HashMap<WatchDescriptor, PathBuf>,
     wallpaper: HashMap<WatchDescriptor, PathBuf>,
 }
 
@@ -62,18 +82,16 @@ impl Watches {
     /// directory is missing, watch its parent for it to appear; the settings
     /// app creates it on first save.
     fn arm_config(&mut self) {
-        let watches = self.inotify.watches();
-        let armed = match watches.clone().add(&self.config_dir, mask()) {
-            Ok(wd) => Some(wd),
+        let mut watches = self.inotify.watches();
+        let armed = match watches.add(&self.config_dir, mask()) {
+            Ok(wd) => Some((wd, self.config_dir.clone())),
             Err(_) => self
                 .config_dir
                 .parent()
-                .and_then(|p| watches.clone().add(p, mask()).ok()),
+                .and_then(|p| watches.add(p, mask()).ok().map(|wd| (wd, p.to_owned()))),
         };
-        if let Some(wd) = armed
-            && !self.config.contains(&wd)
-        {
-            self.config.push(wd);
+        if let Some((wd, dir)) = armed {
+            self.config.insert(wd, dir);
         }
     }
 
@@ -91,7 +109,7 @@ impl Watches {
             }
         }
         for (wd, _) in self.wallpaper.drain() {
-            if !next.contains_key(&wd) && !self.config.contains(&wd) {
+            if !next.contains_key(&wd) && !self.config.contains_key(&wd) {
                 // Fails for a directory that has since gone, which removed
                 // the watch already.
                 let _ = watches.remove(wd);
@@ -129,7 +147,7 @@ where
     let mut watches = Watches {
         inotify,
         config_dir,
-        config: Vec::new(),
+        config: HashMap::new(),
         wallpaper: HashMap::new(),
     };
     watches.arm_config();
@@ -164,7 +182,19 @@ where
                         let mut rearm_config = false;
                         for event in events {
                             any = true;
-                            if w.config.contains(&event.wd) {
+                            let Some(dir) = w
+                                .config
+                                .get(&event.wd)
+                                .or_else(|| w.wallpaper.get(&event.wd))
+                            else {
+                                continue;
+                            };
+                            if let Some(name) = event.name
+                                && !settled(event.mask, &dir.join(name))
+                            {
+                                continue;
+                            }
+                            if w.config.contains_key(&event.wd) {
                                 // Either the file itself, or the `raven`
                                 // directory appearing under ~/.config (then
                                 // re-arm on it).
@@ -236,4 +266,64 @@ where
         return;
     }
     tracing::info!(path = %path.display(), "watching the desktop settings file and the wallpaper");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway directory, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("huginn-configwatch-{name}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("scratch dir");
+            Self(root)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The gap this closes: `cp` onto a watched directory creates the file
+    /// empty and fills it afterwards.
+    #[test]
+    fn a_plain_file_being_created_waits_for_its_close() {
+        let scratch = Scratch::new("create");
+        let file = scratch.0.join("wallpaper.jpg");
+        let _open = std::fs::File::create(&file).expect("create");
+        assert!(!settled(EventMask::CREATE, &file));
+        assert!(settled(EventMask::CLOSE_WRITE, &file));
+        assert!(settled(EventMask::MOVED_TO, &file));
+    }
+
+    #[test]
+    fn links_and_directories_are_complete_when_created() {
+        let scratch = Scratch::new("links");
+        let target = scratch.0.join("cliff.jpg");
+        std::fs::write(&target, b"x").expect("write");
+
+        let symlink = scratch.0.join("wallpaper.jpg");
+        std::os::unix::fs::symlink(&target, &symlink).expect("symlink");
+        assert!(settled(EventMask::CREATE, &symlink));
+
+        let hard = scratch.0.join("wallpaper.png");
+        std::fs::hard_link(&target, &hard).expect("hard link");
+        assert!(settled(EventMask::CREATE, &hard));
+
+        let dir = scratch.0.join("raven");
+        std::fs::create_dir(&dir).expect("mkdir");
+        assert!(settled(EventMask::CREATE | EventMask::ISDIR, &dir));
+    }
+
+    #[test]
+    fn a_file_gone_before_its_create_is_read_is_not_ready() {
+        let scratch = Scratch::new("gone");
+        assert!(!settled(EventMask::CREATE, &scratch.0.join("nothing")));
+    }
 }
