@@ -859,6 +859,24 @@ impl Queue {
         self.history.clear();
     }
 
+    /// Take one closed notification out of the history. Returns whether it
+    /// was there.
+    pub fn forget(&mut self, id: Id) -> bool {
+        let before = self.history.len();
+        self.history.retain(|record| record.notification.id != id);
+        before != self.history.len()
+    }
+
+    /// Every open notification the person may see: all the cards, those out
+    /// of view below the stack included, then the tray. Not what is waiting
+    /// for the session to unlock, which nobody is to see before it does.
+    pub fn open(&self) -> impl Iterator<Item = &Notification> {
+        self.cards
+            .iter()
+            .map(|c| &c.notification)
+            .chain(self.tray.iter())
+    }
+
     /// The cards to draw, top to bottom.
     pub fn visible(&self) -> impl Iterator<Item = &Notification> {
         self.cards.iter().take(MAX_CARDS).map(|c| &c.notification)
@@ -1625,5 +1643,39 @@ mod tests {
         assert_eq!(queue.history().next().map(|r| r.notification.id), Some(60));
         queue.clear_history();
         assert_eq!(queue.history().count(), 0);
+    }
+
+    #[test]
+    fn one_closed_notification_can_be_forgotten() {
+        let mut queue = Queue::default();
+        for id in 1..=3 {
+            queue.notify(note(id, Urgency::Normal), Duration::ZERO);
+            queue.dismiss(id, Duration::ZERO);
+        }
+        assert!(queue.forget(2));
+        assert!(!queue.forget(2), "already forgotten");
+        let history: Vec<_> = queue.history().map(|r| r.notification.id).collect();
+        assert_eq!(history, [3, 1]);
+    }
+
+    #[test]
+    fn open_lists_every_card_and_the_tray_but_not_what_waits_for_unlock() {
+        let mut queue = Queue::default();
+        for id in 1..=5 {
+            queue.notify(note(id, Urgency::Normal), Duration::ZERO);
+        }
+        queue.set_context(quiet(), Duration::ZERO);
+        queue.notify(note(6, Urgency::Normal), Duration::ZERO);
+        queue.set_context(
+            Context {
+                locked: true,
+                ..Context::default()
+            },
+            Duration::ZERO,
+        );
+        queue.notify(note(7, Urgency::Normal), Duration::ZERO);
+
+        let open: Vec<_> = queue.open().map(|n| n.id).collect();
+        assert_eq!(open, [5, 4, 3, 2, 1, 6], "cards out of view are still open");
     }
 }

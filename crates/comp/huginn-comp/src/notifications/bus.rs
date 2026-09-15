@@ -21,6 +21,16 @@
 //! into a failure to start, so the name is requested after the connection is
 //! built instead.
 //!
+//! # The notification centre
+//!
+//! Beside the standard interface, the same object serves
+//! `org.raven.Notifications`, for the desktop's own software — a bar's clock
+//! panel — to show what is open and what recently closed, and to remove it.
+//! The specification has no way to list notifications, and no application
+//! needs one; this is not an API for applications. `List` answers from a
+//! [`Listing`] the loop keeps current, so it never waits on the loop either,
+//! and `Changed` is emitted whenever that listing does.
+//!
 //! # Failing soft
 //!
 //! No session bus, or a bus that goes away, is logged once and retried every
@@ -29,7 +39,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use enumflags2::BitFlags;
 use huginn_core::notify::{Closed, Id, Ids, Invoked, Request};
@@ -40,6 +50,9 @@ use zbus::zvariant::{OwnedValue, Value};
 
 pub(crate) const NAME: &str = "org.freedesktop.Notifications";
 pub(crate) const PATH: &str = "/org/freedesktop/Notifications";
+
+/// The notification centre's interface, on the same object as [`NAME`].
+pub(crate) const CENTRE: &str = "org.raven.Notifications";
 
 /// How long to wait before trying the bus again, and how often a live
 /// connection is checked for having gone.
@@ -62,6 +75,75 @@ const SPEC_VERSION: &str = "1.2";
 /// loop.
 pub(crate) type Open = Arc<Mutex<HashSet<Id>>>;
 
+/// What the notification centre lists, shared by the bus thread and the loop.
+pub(crate) type Listing = Arc<Mutex<Snapshot>>;
+
+/// The notification centre's list as the loop last published it.
+#[derive(Debug, Clone)]
+pub(crate) struct Snapshot {
+    /// Newest first.
+    pub(crate) entries: Vec<Entry>,
+    /// The compositor's uptime when it was taken, and the moment that was:
+    /// together they turn an uptime into a time of day.
+    pub(crate) now: Duration,
+    pub(crate) taken: Instant,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            now: Duration::ZERO,
+            taken: Instant::now(),
+        }
+    }
+}
+
+/// One notification in the centre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub(crate) id: Id,
+    pub(crate) app_name: String,
+    pub(crate) app_icon: String,
+    pub(crate) summary: String,
+    /// Without its markup.
+    pub(crate) body: String,
+    /// In the compositor's uptime.
+    pub(crate) arrived: Duration,
+    /// Still open, rather than closed and kept in the history.
+    pub(crate) open: bool,
+}
+
+/// An entry as `List` sends it: id, application, icon, summary, body, when it
+/// arrived in Unix seconds, and whether it is still open.
+type Listed = (u32, String, String, String, String, i64, bool);
+
+impl Snapshot {
+    fn listed(&self) -> Vec<Listed> {
+        let wall = SystemTime::now();
+        let since_taken = self.taken.elapsed();
+        self.entries
+            .iter()
+            .map(|entry| {
+                let age = self.now.saturating_sub(entry.arrived) + since_taken;
+                let arrived = wall
+                    .checked_sub(age)
+                    .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |at| i64::try_from(at.as_secs()).unwrap_or(i64::MAX));
+                (
+                    entry.id,
+                    entry.app_name.clone(),
+                    entry.app_icon.clone(),
+                    entry.summary.clone(),
+                    entry.body.clone(),
+                    arrived,
+                    entry.open,
+                )
+            })
+            .collect()
+    }
+}
+
 /// A call for the loop.
 #[derive(Debug)]
 pub(crate) enum Incoming {
@@ -74,6 +156,10 @@ pub(crate) enum Incoming {
         sender: Option<String>,
     },
     Close(Id),
+    /// The centre removed one: dismissed if open, and not kept in the history.
+    Remove(Id),
+    /// The centre removed everything.
+    Clear,
 }
 
 /// Where calls go. Returns `false` once the loop is gone.
@@ -165,6 +251,36 @@ impl Server {
     }
 }
 
+/// `org.raven.Notifications`. See the module documentation.
+struct Centre {
+    listing: Listing,
+    sink: Sink,
+}
+
+// `Changed` is emitted by name in `announce_until_closed`, like the standard
+// interface's signals.
+#[zbus::interface(name = "org.raven.Notifications")]
+impl Centre {
+    /// Open notifications and the history, newest first.
+    fn list(&self) -> Vec<Listed> {
+        self.listing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .listed()
+    }
+
+    /// Remove one notification, open or closed. An id that names nothing is
+    /// not an error: it may have closed a moment ago.
+    fn remove(&self, id: u32) {
+        (self.sink)(Incoming::Remove(id));
+    }
+
+    /// Remove every notification, open or closed.
+    fn clear(&self) {
+        (self.sink)(Incoming::Clear);
+    }
+}
+
 /// A signal for the loop's side to have sent.
 #[derive(Debug)]
 pub(crate) enum Outgoing {
@@ -172,11 +288,17 @@ pub(crate) enum Outgoing {
     Closed(Closed),
     /// `ActionInvoked`.
     Invoked(Invoked),
+    /// The centre's `Changed`: the [`Listing`] is different.
+    Changed,
 }
 
 /// Serve until the loop goes away. Runs on the notifications thread.
-pub(crate) fn serve<F>(sink: F, outgoing: &mpsc::Receiver<Outgoing>, open: &Open)
-where
+pub(crate) fn serve<F>(
+    sink: F,
+    outgoing: &mpsc::Receiver<Outgoing>,
+    open: &Open,
+    listing: &Listing,
+) where
     F: Fn(Incoming) -> bool + Send + Sync + 'static,
 {
     let sink: Sink = Arc::new(sink);
@@ -189,7 +311,11 @@ where
             open: Arc::clone(open),
             sink: Arc::clone(&sink),
         };
-        match connect(server) {
+        let centre = Centre {
+            listing: Arc::clone(listing),
+            sink: Arc::clone(&sink),
+        };
+        match connect(server, centre) {
             Ok(connection) => {
                 warned = false;
                 if announce_until_closed(&connection, outgoing) == Ended::CompositorGone {
@@ -224,9 +350,10 @@ fn name_flags() -> BitFlags<RequestNameFlags> {
     BitFlags::empty()
 }
 
-fn connect(server: Server) -> zbus::Result<Connection> {
+fn connect(server: Server, centre: Centre) -> zbus::Result<Connection> {
     let connection = zbus::blocking::connection::Builder::session()?
         .serve_at(PATH, server)?
+        .serve_at(PATH, centre)?
         .build()?;
     // Neither `DoNotQueue` nor `ReplaceExisting`. See the module documentation
     // and `name_flags`.
@@ -272,6 +399,12 @@ fn announce_until_closed(connection: &Connection, outgoing: &mpsc::Receiver<Outg
                 );
                 if let Err(e) = sent {
                     tracing::debug!(error = %e, id, "could not announce an action");
+                }
+            }
+            Ok(Outgoing::Changed) => {
+                let sent = connection.emit_signal(None::<&str>, PATH, CENTRE, "Changed", &());
+                if let Err(e) = sent {
+                    tracing::debug!(error = %e, "could not announce a changed list");
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -479,6 +612,7 @@ mod tests {
                 move |call| to_loop.send(call).is_ok(),
                 &reports,
                 &serving_open,
+                &Listing::default(),
             );
         });
 
@@ -554,10 +688,16 @@ mod tests {
         let (server_end, client_end) = UnixStream::pair().unwrap();
         let (to_loop, from_bus) = mpsc::channel::<Incoming>();
         let open: Open = Arc::default();
+        let sink: Sink = Arc::new(move |incoming| to_loop.send(incoming).is_ok());
         let server = Server {
             ids: Arc::default(),
             open: Arc::clone(&open),
-            sink: Arc::new(move |incoming| to_loop.send(incoming).is_ok()),
+            sink: Arc::clone(&sink),
+        };
+        let listing: Listing = Arc::default();
+        let centre = Centre {
+            listing: Arc::clone(&listing),
+            sink,
         };
         let guid = zbus::Guid::generate();
         let serving = std::thread::spawn(move || {
@@ -566,6 +706,8 @@ mod tests {
                 .unwrap()
                 .p2p()
                 .serve_at(PATH, server)
+                .unwrap()
+                .serve_at(PATH, centre)
                 .unwrap()
                 .build()
                 .unwrap()
@@ -602,7 +744,7 @@ mod tests {
                 assert_eq!(request.body, "<b>done</b>");
                 assert_eq!(request.actions, ["default", "Open"]);
             }
-            Incoming::Close(_) => panic!("expected a notification"),
+            other => panic!("expected a notification, got {other:?}"),
         }
 
         // A replacement gets the id it named back.
@@ -643,6 +785,32 @@ mod tests {
         let refused: zbus::Result<()> = proxy.call("CloseNotification", &(99u32,));
         assert!(refused.is_err(), "an id that names nothing is an error");
 
+        // The centre: List answers from the listing, Remove and Clear go to
+        // the loop.
+        let centre = zbus::blocking::Proxy::new(&client, NAME, PATH, CENTRE).unwrap();
+        listing.lock().unwrap().entries = vec![Entry {
+            id: 1,
+            app_name: "Oracle".into(),
+            app_icon: String::new(),
+            summary: "Answer ready".into(),
+            body: "done".into(),
+            arrived: Duration::ZERO,
+            open: false,
+        }];
+        let listed: Vec<Listed> = centre.call("List", &()).unwrap();
+        assert_eq!(listed.len(), 1);
+        let (id, app, _, summary, body, arrived, open) = &listed[0];
+        assert_eq!(
+            (*id, app.as_str(), summary.as_str(), body.as_str(), *open),
+            (1, "Oracle", "Answer ready", "done", false)
+        );
+        assert!(*arrived > 1_600_000_000, "a time of day, in Unix seconds");
+        let () = centre.call("Remove", &(1u32,)).unwrap();
+        assert!(matches!(from_bus.recv().unwrap(), Incoming::Remove(1)));
+        let () = centre.call("Clear", &()).unwrap();
+        assert!(matches!(from_bus.recv().unwrap(), Incoming::Clear));
+        let mut changed = centre.receive_signal("Changed").unwrap();
+
         // ActionInvoked and NotificationClosed: what the loop reports is what
         // the client hears.
         let mut invoked = proxy.receive_signal("ActionInvoked").unwrap();
@@ -668,6 +836,8 @@ mod tests {
         let message = closed.next().expect("a NotificationClosed signal");
         let (closed_id, reason): (u32, u32) = message.body().deserialize().unwrap();
         assert_eq!((closed_id, reason), (1, 2));
+        report.send(Outgoing::Changed).unwrap();
+        changed.next().expect("a Changed signal");
 
         drop(report);
         assert_eq!(announcing.join().unwrap(), Ended::CompositorGone);

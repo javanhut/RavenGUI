@@ -329,6 +329,12 @@ mouse for a minute.
 a right click dismisses one. Cards are left out of screenshots and screen
 recordings.
 
+What is open, and what closed recently, can be read and removed through
+`org.raven.Notifications` on the same object (`docs/protocols.md`). That
+interface is for the desktop's own panels — RoostBar's clock panel lists and
+removes notifications with it — not for applications. A notification removed
+there closes with reason 2, the same as a dismissed card.
+
 ## Screenshots
 
 `Print` takes a screenshot; the compositor does it, not a client. A Wayland

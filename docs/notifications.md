@@ -10,8 +10,9 @@ time away decide what interrupts; do not disturb is a quick settings row and
 `[notifications]` in desktop.toml, written by Raven Settings' Notifications
 page; and quick settings brings back what arrived quietly. Phase 6 is done:
 mako is uninstalled and nothing starts it, so Huginn owns the name from login.
-Still to come: a list of closed notifications (the core keeps it; nothing shows
-it yet).
+The list of open and closed notifications is served as
+`org.raven.Notifications` (`docs/protocols.md`), which RoostBar's clock panel
+shows; quick settings does not show the history yet.
 
 The README says the compositor draws the shell, notifications included, because
 "anything that must feel instant and must never fail does not get to be a
