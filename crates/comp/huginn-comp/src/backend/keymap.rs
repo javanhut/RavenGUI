@@ -69,8 +69,12 @@ pub(crate) enum Action {
     /// just locked. So `Super`+`L` is reserved, and RavenTerminal may not use
     /// it.
     Lock,
-    /// Show or hide the keybinding overlay.
-    ToggleHelp,
+    /// Show the keybinding overlay.
+    OpenHelp,
+    /// Close the keybinding overlay. Escape, and only reachable while the
+    /// overlay is up, which is why it has no row in [`BINDINGS`]; a click
+    /// outside it does the same from the pointer side.
+    CloseHelp,
     /// Open the application launcher.
     OpenLauncher,
     /// Open the settings application — the full one, not the panel.
@@ -184,6 +188,8 @@ pub(crate) struct Modes {
     /// A region screenshot is being dragged out. Every key but Escape is
     /// swallowed so a keystroke cannot act on a window under the selection.
     pub selecting_region: bool,
+    /// The keybinding overlay is up, and Escape closes it.
+    pub help_open: bool,
 }
 
 /// One row of the keybinding overlay, and one clause of the startup log line.
@@ -352,9 +358,9 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "open the software store",
     },
     Binding {
-        action: Action::ToggleHelp,
+        action: Action::OpenHelp,
         chord: "Super+Ctrl+H",
-        description: "show or hide this list",
+        description: "show this list",
     },
     Binding {
         action: Action::Quit,
@@ -436,6 +442,14 @@ pub(crate) fn resolve(
     if mode.selecting_region {
         let action = (sym == keysyms::KEY_Escape).then_some(Action::CancelRegion);
         return FilterResult::Intercept(action.and_then(|action| pressed(key_state, action)));
+    }
+
+    // The keybinding overlay closes on Escape, ahead of every panel it is
+    // drawn over. Only Escape: the list is there to be read while the chords
+    // on it are tried, so every other key goes where it would have gone. And
+    // only Escape without Super, so `Super`+`Ctrl`+`Esc` still quits.
+    if mode.help_open && sym == keysyms::KEY_Escape && !modifiers.logo {
+        return FilterResult::Intercept(pressed(key_state, Action::CloseHelp));
     }
 
     // Screenshots resolve here, before the `Super`-layer gate below, so `Print`
@@ -621,7 +635,7 @@ pub(crate) fn resolve(
         // Tab: put a window away, or show the put-away ones to bring one back.
         keysyms::KEY_m | keysyms::KEY_M if modifiers.shift => Action::OpenMinimized,
         keysyms::KEY_m | keysyms::KEY_M => Action::MinimizeFocused,
-        keysyms::KEY_h | keysyms::KEY_H => Action::ToggleHelp,
+        keysyms::KEY_h | keysyms::KEY_H => Action::OpenHelp,
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
         keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
         keysyms::KEY_Return => Action::PromoteFocused,
@@ -767,6 +781,49 @@ mod tests {
             shift: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn escape_closes_the_help_overlay_and_nothing_else_is_taken() {
+        let help = Modes {
+            help_open: true,
+            ..Modes::default()
+        };
+        let plain = ModifiersState::default();
+        assert!(matches!(
+            resolve(KeyState::Pressed, &plain, keysyms::KEY_Escape, help),
+            FilterResult::Intercept(Some(Action::CloseHelp))
+        ));
+        // Its release is swallowed with it, and acts on nothing.
+        assert!(matches!(
+            resolve(KeyState::Released, &plain, keysyms::KEY_Escape, help),
+            FilterResult::Intercept(None)
+        ));
+        // Other keys go where they would have gone: the list is read while
+        // the chords on it are tried.
+        assert!(matches!(
+            resolve(KeyState::Pressed, &plain, keysyms::KEY_a, help),
+            FilterResult::Forward
+        ));
+        assert!(matches!(
+            resolve(KeyState::Pressed, &super_ctrl(), keysyms::KEY_j, help),
+            FilterResult::Intercept(Some(Action::FocusNext))
+        ));
+        // Quitting is still Super+Ctrl+Esc, overlay or not.
+        assert!(matches!(
+            resolve(KeyState::Pressed, &super_ctrl(), keysyms::KEY_Escape, help),
+            FilterResult::Intercept(Some(Action::Quit))
+        ));
+        // With the overlay down, Escape is the client's.
+        assert!(matches!(
+            resolve(KeyState::Pressed, &plain, keysyms::KEY_Escape, Modes::default()),
+            FilterResult::Forward
+        ));
+        // And the chord opens it rather than toggling it shut.
+        assert_eq!(
+            intercepted(super_ctrl(), keysyms::KEY_h),
+            Some(Action::OpenHelp)
+        );
     }
 
     /// The action a press produces with the launcher open.

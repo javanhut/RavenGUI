@@ -168,10 +168,9 @@ pub(crate) enum SceneItem<'a> {
     /// itself, so unlike a surface there is no client to click on or to send a
     /// frame callback to.
     Ring(&'a SolidColorBuffer, Rect, f32),
-    /// The keybinding overlay. Compositor-drawn like the ring, so it too is
-    /// invisible to hit testing — clicks fall through it to whatever is
-    /// underneath, which is right for something that is a label rather than a
-    /// window.
+    /// A compositor-drawn panel: the keybinding overlay, and the others. Like
+    /// the ring it is invisible to hit testing, so a click on one is taken by
+    /// the input path asking the panel first — see `backend::input`.
     Overlay(&'a MemoryRenderBuffer, Rect, f32),
     /// A window that is gone, still fading out: its last buffer as a texture
     /// the compositor kept, drawn where the surface was — the second
@@ -679,9 +678,13 @@ pub(crate) struct Huginn {
     /// `apply` happened; the backend owes a re-arrange.
     layout_changed: bool,
 
-    /// The keybinding overlay, drawn once when it is summoned rather than on
-    /// every frame. `None` when it is not on screen, which is almost always.
+    /// The keybinding overlay, painted once when it is summoned; a frame only
+    /// swaps the keycaps that were pressed or let go since the last. `None`
+    /// when it is not on screen, which is almost always.
     help: Option<crate::overlay::Overlay>,
+    /// When the overlay opened, on [`Self::uptime`]'s clock, which is where
+    /// its keycaps' presses count from.
+    help_opened: std::time::Duration,
 
     /// The wallpaper at its own size, read from disk once at startup, and the
     /// copies composed for each output, parallel to `outputs`.
@@ -1093,6 +1096,7 @@ impl Huginn {
             render_context: None,
             focus_ring_shown: None,
             help: None,
+            help_opened: std::time::Duration::ZERO,
             wallpaper: crate::wallpaper::Wallpaper::chosen_or_installed(desktop_config.wallpaper()),
             desktop_config,
             blur_by_default: true,
@@ -1208,26 +1212,72 @@ impl Huginn {
         self.launch(None, &[crate::theme::STORE_APP.to_owned()]);
     }
 
-    /// Show or hide the keybinding overlay.
+    /// Show the keybinding overlay. Already up, it stays as it is.
     ///
     /// Rendered on the way in rather than kept around: it is a few hundred
     /// kilobytes that spend the whole session unlooked at, and the table it is
     /// drawn from cannot change while the compositor runs, so there is nothing
     /// to gain by holding it.
-    pub(crate) fn toggle_help(&mut self) {
-        self.help = match self.help {
-            Some(_) => None,
-            None => {
-                let area = self.output_area();
-                let advertised = self.scale().advertised;
-                Some(crate::overlay::Overlay::render(
-                    area,
-                    &mut self.text,
-                    advertised,
-                ))
-            }
+    pub(crate) fn open_help(&mut self) {
+        if self.help.is_some() {
+            return;
+        }
+        let area = self.output_area();
+        let advertised = self.scale().advertised;
+        self.help = Some(crate::overlay::Overlay::render(
+            area,
+            &mut self.text,
+            advertised,
+        ));
+        self.help_opened = self.uptime();
+        tracing::debug!(visible = true, "keybinding overlay");
+        self.queue_redraw();
+    }
+
+    /// Put the keybinding overlay away.
+    pub(crate) fn close_help(&mut self) {
+        if self.help.take().is_some() {
+            tracing::debug!(visible = false, "keybinding overlay");
+            self.queue_redraw();
+        }
+    }
+
+    /// Whether the keybinding overlay is on screen.
+    pub(crate) fn help_open(&self) -> bool {
+        self.help.is_some()
+    }
+
+    /// A press while the keybinding overlay is up. Returns whether it was
+    /// taken, which it always is when the overlay is there: off the panel it
+    /// closes it, and on the panel it does nothing.
+    pub(crate) fn help_click(&mut self) -> bool {
+        let Some(help) = &self.help else {
+            return false;
         };
-        tracing::debug!(visible = self.help.is_some(), "keybinding overlay");
+        let at = help.placement(self.output_area());
+        let (x, y) = (self.pointer_location.x, self.pointer_location.y);
+        let on_panel = x >= f64::from(at.x())
+            && x < f64::from(at.right())
+            && y >= f64::from(at.y())
+            && y < f64::from(at.y() + at.h());
+        if !on_panel {
+            self.close_help();
+        }
+        true
+    }
+
+    /// Press and release the overlay's keycaps. Frames keep coming for as
+    /// long as it is up, since the presses go by the clock; under reduced
+    /// motion the caps stay still and the overlay costs no frames at all.
+    fn tick_help(&mut self, now: std::time::Duration) {
+        if self.settings.motion().is_reduced() {
+            return;
+        }
+        let opened = self.help_opened;
+        let Some(help) = self.help.as_mut() else {
+            return;
+        };
+        help.animate(now.saturating_sub(opened));
         self.queue_redraw();
     }
 
@@ -4649,6 +4699,7 @@ impl Huginn {
         }
         self.tick_found_pointer(now);
         self.tick_volume(now);
+        self.tick_help(now);
         if let Some(since) = self.dock_hover_since {
             if now.saturating_sub(since) >= crate::dock::PREVIEW_DELAY {
                 self.dock_hover_since = None;
