@@ -144,7 +144,13 @@ You get one `state` event immediately on creation, so there is never a moment
 where you have to render a placeholder while you wait, and another whenever any
 field changes. Fields are the workspace count, the zero-based active index, and
 an occupancy bitmask where bit N is set if workspace N holds at least one
-window. The mask caps at 32 workspaces; there are nine.
+window. The mask caps at 32 workspaces; there are at most 16.
+
+The row is dynamic, so `count` changes. It starts at one. Every workspace
+holding a window is kept, along with the active one and any a screen is
+showing. There is always one empty spare at the end to slide into. An empty
+workspace you leave is removed, and the indices after it shift down. A shell
+should redraw its indicators from each `state` event, not assume a fixed row.
 
 `activate(index)` switches workspace. An out-of-range index is **ignored rather
 than clamped** — clamping would turn a bug in your client into a silent jump to

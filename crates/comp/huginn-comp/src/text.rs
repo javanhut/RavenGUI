@@ -17,7 +17,8 @@
 //! [`Text::new`] scans the system's font directories, which takes on the order
 //! of a hundred milliseconds. It is built once and kept, never per draw.
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+pub(crate) use cosmic_text::Weight;
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
 
 use crate::theme::Color;
 
@@ -71,16 +72,23 @@ impl Text {
     }
 
     /// Lay `text` out at `size` pixels, wrapping at `width` if given.
-    pub(crate) fn layout(&mut self, text: &str, size: f32, width: Option<f32>) -> Buffer {
+    ///
+    /// At `weight`: a heading or a name that has to lead the eye is set
+    /// heavier than the text around it.
+    pub(crate) fn layout_weighted(
+        &mut self,
+        text: &str,
+        size: f32,
+        width: Option<f32>,
+        weight: Weight,
+    ) -> Buffer {
         // Line height at 1.35× the font size. Tighter reads as cramped at the
         // sizes a launcher uses; looser stops a list looking like a list.
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, size * 1.35));
         buffer.set_size(width, None);
         buffer.set_text(
             text,
-            &Attrs::new()
-                .family(Family::SansSerif)
-                .weight(Weight::NORMAL),
+            &Attrs::new().family(Family::SansSerif).weight(weight),
             // Advanced shaping: ligatures, kerning, and the reordering that
             // scripts like Devanagari need. The cheaper mode is only correct
             // for text that happens to be Latin, which the name of an
@@ -94,7 +102,13 @@ impl Text {
 
     /// The width and height `text` occupies at `size`, in pixels.
     pub(crate) fn measure(&mut self, text: &str, size: f32) -> (f32, f32) {
-        let buffer = self.layout(text, size, None);
+        self.measure_weighted(text, size, Weight::NORMAL)
+    }
+
+    /// [`Self::measure`] at `weight`. A heavier face is wider, so text drawn
+    /// with [`Self::draw_weighted`] has to be measured the same way to centre.
+    pub(crate) fn measure_weighted(&mut self, text: &str, size: f32, weight: Weight) -> (f32, f32) {
+        let buffer = self.layout_weighted(text, size, None, weight);
         let width = buffer
             .layout_runs()
             .map(|run| run.line_w)
@@ -124,10 +138,25 @@ impl Text {
         y: i32,
         color: Color,
     ) {
+        self.draw_weighted(surface, text, size, x, y, color, Weight::NORMAL);
+    }
+
+    /// [`Self::draw`] at `weight`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_weighted(
+        &mut self,
+        surface: &mut impl Surface,
+        text: &str,
+        size: f32,
+        x: i32,
+        y: i32,
+        color: Color,
+        weight: Weight,
+    ) {
         if !self.usable {
             return;
         }
-        let buffer = self.layout(text, size, None);
+        let buffer = self.layout_weighted(text, size, None, weight);
         // Split the borrow: `draw_glyph` needs the cache mutably while the
         // buffer is being walked, and both live on `self`.
         let Self { fonts, cache, .. } = self;

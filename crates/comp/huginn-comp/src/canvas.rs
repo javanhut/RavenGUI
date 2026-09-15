@@ -241,6 +241,40 @@ impl Canvas {
         }
     }
 
+    /// Paint an arbitrary shape into the `w`×`h` box at `x`, `y`: `shade` is
+    /// asked, for the centre of every pixel in the box, what colour covers
+    /// it and how much (0..=1), and the answer is blended over what is there.
+    ///
+    /// The discs, arcs, glows and gradients the launcher's arc is made of are
+    /// each "a colour and a coverage per pixel". One visitor for all of them
+    /// keeps the blending in one place — [`Self::blend_over`], which is what
+    /// lets translucent glass accumulate alpha over nothing — rather than a
+    /// copy of it per shape. The box is clipped to the canvas, so a shape
+    /// may be described past its edge.
+    pub(crate) fn paint(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        mut shade: impl FnMut(f32, f32) -> Option<(Color, f32)>,
+    ) {
+        let (left, top) = (x.max(0) as usize, y.max(0) as usize);
+        let right = (x + w).clamp(0, self.stride as i32) as usize;
+        let bottom = (y + h).clamp(0, self.height as i32) as usize;
+        for row in top..bottom {
+            for col in left..right {
+                let Some((color, coverage)) = shade(col as f32 + 0.5, row as f32 + 0.5) else {
+                    continue;
+                };
+                let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+                if alpha > 0 {
+                    self.blend_over(col, row, color, alpha);
+                }
+            }
+        }
+    }
+
     /// [`Self::blend_over`] across the columns `from..to` of one row.
     fn blend_span(&mut self, from: usize, to: usize, row: usize, color: Color, alpha: u8) {
         for col in from..to {
@@ -423,6 +457,24 @@ mod tests {
         assert_eq!(alpha(20, 3), 0, "one pixel in from the edge must stay clear");
         // The corner pixel is outside the arc and gets nothing.
         assert_eq!(alpha(0, 0), 0);
+    }
+
+    #[test]
+    fn paint_blends_what_the_shader_says_and_clips_to_the_canvas() {
+        let mut canvas = Canvas::new(20, 20);
+        let white = Color::from_argb(0xFFFF_FFFF);
+        // A disc of radius 6 centred at (10, 10), described from off the
+        // top-left corner so the clipping is exercised too.
+        canvas.paint(-5, -5, 40, 40, |x, y| {
+            let d = (x - 10.0).hypot(y - 10.0);
+            Some((white, 6.5 - d))
+        });
+        let alpha = |x: usize, y: usize| canvas.pixels[(y * 20 + x) * 4 + 3];
+        assert_eq!(alpha(10, 10), 255, "the centre is covered");
+        assert_eq!(alpha(0, 0), 0, "outside the disc nothing is painted");
+        // (14.5, 14.5) is 6.36 from the centre: part-way across the rim.
+        let edge = alpha(14, 14);
+        assert!(edge > 0 && edge < 255, "the rim is antialiased, was {edge}");
     }
 
     #[test]

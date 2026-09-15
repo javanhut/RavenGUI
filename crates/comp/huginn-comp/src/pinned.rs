@@ -690,8 +690,7 @@ fn compose(
     let mut canvas = Canvas::new(width, height.max(1));
     let mut layout = Layout {
         size: (width as i32, height.max(1) as i32),
-        hits: Vec::new(),
-        menu_hits: Vec::new(),
+        ..Layout::default()
     };
     let rect =
         |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
