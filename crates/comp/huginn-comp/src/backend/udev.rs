@@ -319,6 +319,8 @@ pub(crate) fn run() -> Result<()> {
     crate::fileindex::start::<Udev>(&handle, &mut state);
     // BlueZ, for the quick settings row. Same shape: a thread and a wake-up.
     crate::bluetooth::start::<Udev>(&handle, &mut state);
+    // org.freedesktop.Notifications, opt-in until cards are drawn. Same shape.
+    crate::notifications::start::<Udev>(&handle, &mut state);
 
     match EGLDevice::device_for_display(renderer.egl_context().display())
         .and_then(|device| device.try_get_render_node())
@@ -1877,6 +1879,8 @@ impl Udev {
             Action::Settings(key) => state.settings_key(key),
             Action::OpenFullSettings => state.open_full_settings(),
             Action::OpenStore => state.open_store(),
+            Action::DismissNotification => state.dismiss_newest_notification(),
+            Action::DismissNotifications => state.dismiss_notifications(),
             Action::OpenLauncher => state.open_launcher(),
             Action::OpenPinned => state.open_pinned(),
             Action::Pinned(key) => state.pinned_key(key),

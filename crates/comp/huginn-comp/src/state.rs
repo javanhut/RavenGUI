@@ -745,6 +745,10 @@ pub(crate) struct Huginn {
     /// When the compositor started, so animations have a monotonic origin.
     started: std::time::Instant,
 
+    /// Every notification the compositor holds. Empty, and never filled,
+    /// unless [`crate::notifications::start`] is serving the bus.
+    pub(crate) notifications: crate::notifications::Notifications,
+
     /// The application launcher, and the index it searches.
     pub(crate) launcher: crate::launcher::Launcher,
     /// A way to ask [`crate::fileindex`] for a walk ahead of schedule, and
@@ -1114,6 +1118,7 @@ impl Huginn {
             volume,
             volume_panel: None,
             started: std::time::Instant::now(),
+            notifications: crate::notifications::Notifications::default(),
             launcher: crate::launcher::Launcher::default(),
             file_index_requests: None,
             file_index_built: None,
@@ -1137,7 +1142,11 @@ impl Huginn {
             huginn.desktop_config.motion(),
             huginn.desktop_config.idle_after(),
             huginn.desktop_config.launcher_style(),
+            huginn.desktop_config.do_not_disturb(),
         );
+        huginn
+            .notifications
+            .set_timeouts(huginn.desktop_config.notification_timeouts());
         huginn
     }
 
@@ -1156,8 +1165,13 @@ impl Huginn {
         self.overview_chrome = None;
         self.refresh_overview_chrome();
 
-        self.settings
-            .apply_desktop_config(cfg.motion(), cfg.idle_after(), cfg.launcher_style());
+        self.settings.apply_desktop_config(
+            cfg.motion(),
+            cfg.idle_after(),
+            cfg.launcher_style(),
+            cfg.do_not_disturb(),
+        );
+        self.notifications.set_timeouts(cfg.notification_timeouts());
         // The launcher row may just have changed under an open launcher.
         if self.launcher.set_style(self.settings.launcher_style()) && self.launcher.is_open() {
             let now = self.now();
@@ -1199,6 +1213,12 @@ impl Huginn {
         }
         if let Some(program) = self.settings.take_launch() {
             self.launch(None, &[program.to_owned()]);
+        }
+        if self.settings.take_show_missed() {
+            let (now, motion) = (self.uptime(), self.settings.motion());
+            if self.notifications.present_tray(now, motion) {
+                self.refresh_notifications();
+            }
         }
     }
 
@@ -1329,6 +1349,10 @@ impl Huginn {
         }
         if self.volume_panel.is_some() {
             self.refresh_volume();
+        }
+        if self.notifications.drawn_count() > 0 {
+            self.notifications.invalidate();
+            self.refresh_notifications();
         }
         if self.dock_panel.is_some() {
             self.refresh_dock();
@@ -1623,6 +1647,14 @@ impl Huginn {
         // [`Self::capture_hidden_len`].
         if let Some((buffer, rect)) = self.recording_dot_at() {
             out.push(SceneItem::Overlay(buffer, rect, 1.0));
+        }
+        // Then the notification cards, for the same reason from the other
+        // side: they are for the person at the screen, and what a notification
+        // says has no business in a screenshot or a recording taken while it
+        // was up. Leading the list is how a capture leaves them out; see
+        // [`Self::capture_hidden_len`].
+        for (panel, rect, shown) in self.notification_cards() {
+            out.push(SceneItem::Overlay(panel.buffer(), rect, shown));
         }
         // Above everything else: the capture flash and the region-selection
         // ring. Both are transient screenshot UI that must never be occluded or
@@ -4495,6 +4527,7 @@ impl Huginn {
         // boundary is the number of items in front of it, and an undercount
         // would push a real panel into the blurred group.
         usize::from(self.recording_dot_at().is_some())
+            + self.notifications.drawn_count()
             + usize::from(self.flash_at().is_some())
             + self.region_ring_len()
             + usize::from(self.help.is_some())
@@ -4661,6 +4694,7 @@ impl Huginn {
     /// nothing, so an idle desktop still renders no frames.
     pub(crate) fn tick_animations(&mut self) {
         let now = self.uptime();
+        self.sync_notifications();
         // The gesture's strip times out; Alt-Tab's lives as long as Alt is
         // held and needs no frames of its own while nothing about it changes.
         match self.app_switcher.and_then(|switcher| switcher.dismiss_at) {
@@ -4699,6 +4733,7 @@ impl Huginn {
         }
         self.tick_found_pointer(now);
         self.tick_volume(now);
+        self.tick_notifications(now);
         self.tick_help(now);
         if let Some(since) = self.dock_hover_since {
             if now.saturating_sub(since) >= crate::dock::PREVIEW_DELAY {
@@ -4801,6 +4836,17 @@ impl Huginn {
         }
     }
 
+    /// Move the notification cards on, and drop the ones that have finished
+    /// leaving.
+    ///
+    /// Frames only while a card slides or fades. A card sitting still needs
+    /// none: its expiry is a timer, not something counted per frame.
+    fn tick_notifications(&mut self, now: std::time::Duration) {
+        if self.notifications.tick(now) {
+            self.queue_redraw();
+        }
+    }
+
     /// Advance the slider's hold and fade, and drop it once it has gone.
     ///
     /// The alpha is read at draw time from the reveal, so the panel is not
@@ -4853,6 +4899,9 @@ impl Huginn {
     /// moment it is dismissed would make it vanish rather than leave.
     pub(crate) fn refresh_settings(&mut self) {
         let now = self.uptime();
+        // The notifications row says how many are waiting, so it is told
+        // before the panel is drawn.
+        self.settings.set_missed(self.notifications.tray_len());
         let (area, advertised) = (self.output_area(), self.scale().advertised);
         self.settings_panel = self.settings.is_visible(now).then(|| {
             crate::settings::render(&self.settings, &mut self.text, area, now, advertised)
@@ -4871,8 +4920,7 @@ impl Huginn {
         }
         // The launcher row, likewise: the row owns the value and the
         // launcher takes a copy, redrawing if it is on screen.
-        if self.launcher.set_style(self.settings.launcher_style())
-            && self.launcher.is_visible(now)
+        if self.launcher.set_style(self.settings.launcher_style()) && self.launcher.is_visible(now)
         {
             // Re-ranked, not only redrawn: the two layouts walk different
             // navigation orders over the same query.
@@ -4937,6 +4985,236 @@ impl Huginn {
     pub(crate) fn bluetooth_changed(&mut self) {
         if self.settings_panel.is_some() {
             self.refresh_settings();
+        }
+    }
+
+    /// A call from the notifications thread. From [`crate::notifications::start`].
+    pub(crate) fn notification_arrived(&mut self, incoming: crate::notifications::bus::Incoming) {
+        // Placed under what the desktop is doing now, not as of the last
+        // frame, which on an idle desktop may have been minutes ago.
+        self.sync_notifications();
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        self.notifications.receive(incoming, now, motion);
+        self.refresh_notifications();
+    }
+
+    /// The notification expiry timer fired. From [`crate::notifications::start`].
+    pub(crate) fn notifications_due(&mut self) {
+        // The person may have gone away since the timer was armed, in which
+        // case what is due is held rather than closed.
+        self.sync_notifications();
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        self.notifications.due(now, motion);
+        self.refresh_notifications();
+    }
+
+    /// How long without a key press or pointer movement before the person
+    /// counts as away, and notification cards stop counting down.
+    const NOTIFICATIONS_AWAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Tell the notifications what the desktop is doing: locked, do not
+    /// disturb, a fullscreen window, an idle inhibitor on screen, or nobody at
+    /// the keyboard. Cheap when nothing changed, which is most frames.
+    fn sync_notifications(&mut self) {
+        let context = huginn_core::notify::Context {
+            locked: self.is_locked(),
+            do_not_disturb: self.settings.do_not_disturb(),
+            fullscreen: self.has_fullscreen(),
+            idle_inhibited: self.idle_inhibited(),
+        };
+        let away =
+            Instant::now().saturating_duration_since(self.last_input) >= Self::NOTIFICATIONS_AWAY;
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        if self.notifications.set_context(context, away, now, motion) {
+            self.refresh_notifications();
+        }
+    }
+
+    /// Compose the cards that need it, and draw.
+    ///
+    /// A redraw is asked for whether or not anything was composed: a card that
+    /// only started leaving needs frames to fade, not new pixels.
+    fn refresh_notifications(&mut self) {
+        let (output, density) = (self.output_area(), self.scale().advertised);
+        let Huginn {
+            notifications,
+            text,
+            icons,
+            pixmaps,
+            apps,
+            ..
+        } = self;
+        notifications.compose(|notification, hover| {
+            crate::notifications::card::render(
+                notification,
+                text,
+                icons,
+                pixmaps,
+                apps,
+                output,
+                density,
+                hover,
+            )
+        });
+        self.queue_redraw();
+    }
+
+    /// The notification cards as they are on screen now, in drawing order:
+    /// each card and the rectangle it occupies. Stacked in the area windows
+    /// may use on the focused output, so a bar's exclusive zone is never
+    /// covered.
+    ///
+    /// One function for the scene and for the pointer, so what a click lands
+    /// on is what is drawn, sliding cards included.
+    fn placed_notifications(&self) -> Vec<(crate::notifications::Drawn<'_>, Rect)> {
+        let now = self.uptime();
+        let drawn: Vec<_> = self.notifications.drawn(now).collect();
+        let sizes: Vec<_> = drawn
+            .iter()
+            .map(|card| (card.panel.size(), card.shown))
+            .collect();
+        let rects = crate::notifications::card::stack(self.space.area(), &sizes);
+        drawn.into_iter().zip(rects).collect()
+    }
+
+    /// The notification cards to draw: each card's pixels, where it goes now,
+    /// and how far it is shown. The scene pushes exactly
+    /// [`crate::notifications::Notifications::drawn_count`] of these.
+    fn notification_cards(&self) -> Vec<(&crate::canvas::Panel, Rect, f32)> {
+        self.placed_notifications()
+            .into_iter()
+            .map(|(card, rect)| (card.panel, rect, card.shown))
+            .collect()
+    }
+
+    /// The card under the pointer, and what on it. Never a card on its way
+    /// out, and never while locked, when no card is on screen.
+    fn notification_under_pointer(
+        &self,
+    ) -> Option<(huginn_core::notify::Id, crate::notifications::card::Target)> {
+        if self.is_locked() {
+            return None;
+        }
+        let point = self.pointer_point();
+        self.placed_notifications()
+            .into_iter()
+            .filter(|(card, _)| !card.leaving)
+            .find(|(_, rect)| {
+                point.x >= rect.x()
+                    && point.y >= rect.y()
+                    && point.x < rect.x() + rect.w()
+                    && point.y < rect.y() + rect.h()
+            })
+            .map(|(card, rect)| {
+                let target = card.hits.target(point.x - rect.x(), point.y - rect.y());
+                (card.id, target)
+            })
+    }
+
+    /// Whether a notification card is under the pointer. The input backend
+    /// asks this before forwarding motion, as it does for the launcher, so a
+    /// window behind a card is not told about a pointer that is on the card.
+    pub(crate) fn notifications_cover_pointer(&self) -> bool {
+        self.notification_under_pointer().is_some()
+    }
+
+    /// Tell the cards where the pointer went: the one under it holds still and
+    /// shows its close control, and the control under it is raised.
+    pub(crate) fn notifications_pointer_moved(&mut self) {
+        let hover = self.notification_under_pointer();
+        if self.notifications.set_hover(hover, self.uptime()) {
+            self.refresh_notifications();
+        }
+    }
+
+    /// A press on a notification card. Returns whether one was under the
+    /// pointer, in which case the press is the card's and goes no further.
+    ///
+    /// A left click on a control does what the control says. A left click on
+    /// the rest of the card takes it: its default action if it has one, and
+    /// the window of the application it came from is brought forward. A right
+    /// click, or the close control, dismisses it. Any other button does
+    /// nothing, and is still swallowed: it was aimed at the card.
+    pub(crate) fn notifications_click(&mut self, button: u32) -> bool {
+        use crate::notifications::card::Target;
+        let Some((id, target)) = self.notification_under_pointer() else {
+            return false;
+        };
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        match (button, target) {
+            (crate::mouse::BTN_LEFT, Target::Button(index)) => {
+                if let Some(key) = self.notifications.button_key(id, index) {
+                    self.notifications.invoke(id, &key, now, motion);
+                }
+            }
+            (crate::mouse::BTN_LEFT, Target::Body) => {
+                let source = self
+                    .notifications
+                    .get(id)
+                    .map(|n| (n.desktop_entry.clone(), n.app_name.clone()));
+                if !self
+                    .notifications
+                    .invoke(id, huginn_core::notify::DEFAULT_ACTION, now, motion)
+                {
+                    self.notifications.dismiss(id, now, motion);
+                }
+                if let Some((entry, app)) = source {
+                    self.go_to_notification_source(entry.as_deref(), &app);
+                }
+            }
+            (crate::mouse::BTN_LEFT, Target::Close) | (crate::mouse::BTN_RIGHT, _) => {
+                self.notifications.dismiss(id, now, motion);
+            }
+            _ => {}
+        }
+        // The card under the pointer may now be a different one, or none.
+        self.notifications_pointer_moved();
+        self.refresh_notifications();
+        true
+    }
+
+    /// Bring forward the window of the application a notification came from.
+    ///
+    /// Matched the way the dock matches a window to an application: through
+    /// the installed entry its `desktop-entry` hint names, then that name
+    /// against the window's `app_id` directly, then the application name the
+    /// notification gave. A window put away comes back; one on another
+    /// workspace is gone to. Nothing matching is not an error: plenty of
+    /// notifications come from something with no window at all.
+    fn go_to_notification_source(&mut self, desktop_entry: Option<&str>, app_name: &str) {
+        let desktop_entry = desktop_entry.map(|id| id.strip_suffix(".desktop").unwrap_or(id));
+        let entry =
+            desktop_entry.and_then(|id| crate::notifications::card::entry_for(&self.apps, id));
+        let belongs = |app_id: &str| {
+            entry.is_some_and(|entry| crate::dock::matches(entry, app_id))
+                || desktop_entry.is_some_and(|id| id.eq_ignore_ascii_case(app_id))
+                || (!app_name.is_empty() && app_name.eq_ignore_ascii_case(app_id))
+        };
+        let window = self
+            .windows
+            .iter()
+            .find(|(_, surface)| surface.app_id().is_some_and(|app_id| belongs(&app_id)))
+            .map(|(id, _)| *id);
+        if let Some(id) = window {
+            self.go_to_window(id);
+        }
+    }
+
+    /// Dismiss the notification card on top. `Super`+`Ctrl`+`N`.
+    pub(crate) fn dismiss_newest_notification(&mut self) {
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        if self.notifications.dismiss_newest(now, motion) {
+            self.notifications_pointer_moved();
+            self.refresh_notifications();
+        }
+    }
+
+    /// Dismiss every notification card. `Super`+`Ctrl`+`Shift`+`N`.
+    pub(crate) fn dismiss_notifications(&mut self) {
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        if self.notifications.dismiss_all(now, motion) {
+            self.notifications_pointer_moved();
+            self.refresh_notifications();
         }
     }
 
@@ -5207,8 +5485,11 @@ impl Huginn {
     /// is warning them about, nor for a screenshot taken while it runs. Worked
     /// out by the same function that decides whether the scene pushes it, so
     /// the count cannot skip a real item.
+    ///
+    /// The notification cards follow the dot and are left out with it: what a
+    /// notification said is for the person who was there when it arrived.
     pub(crate) fn capture_hidden_len(&self) -> usize {
-        usize::from(self.recording_dot_at().is_some())
+        usize::from(self.recording_dot_at().is_some()) + self.notifications.drawn_count()
     }
 
     /// The flash's screen rectangle and current opacity, or `None` when it is

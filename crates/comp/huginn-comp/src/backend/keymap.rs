@@ -153,6 +153,12 @@ pub(crate) enum Action {
     /// Abandon an in-progress region selection. Escape, and only reachable while
     /// the selection is up, which is why it has no row in [`BINDINGS`].
     CancelRegion,
+    /// Dismiss the notification card on top.
+    DismissNotification,
+    /// Dismiss every notification card, including the ones waiting out of
+    /// view. The tray is left alone: what arrived quietly is still there to
+    /// read.
+    DismissNotifications,
 }
 
 /// What the compositor is already doing, which decides what a key means.
@@ -376,6 +382,16 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::Record,
         chord: "Super+Print",
         description: "start or stop recording the screen",
+    },
+    Binding {
+        action: Action::DismissNotification,
+        chord: "Super+Ctrl+N",
+        description: "dismiss the newest notification",
+    },
+    Binding {
+        action: Action::DismissNotifications,
+        chord: "Super+Ctrl+Shift+N",
+        description: "dismiss every notification",
     },
     Binding {
         action: Action::Volume(crate::audio::Key::Raise),
@@ -627,6 +643,10 @@ pub(crate) fn resolve(
         // I for install: the store is the other application the desktop
         // opens by name rather than through the launcher.
         keysyms::KEY_i | keysyms::KEY_I => Action::OpenStore,
+        // N for notifications. Shift takes every card rather than the top one,
+        // the way Shift widens a chord's reach elsewhere in this table.
+        keysyms::KEY_n | keysyms::KEY_N if modifiers.shift => Action::DismissNotifications,
+        keysyms::KEY_n | keysyms::KEY_N => Action::DismissNotification,
         keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
         // Ctrl is what separates this from `Super`+`C`, which is copy: the
         // branch above returns before this one whenever Ctrl is not held.
@@ -816,7 +836,12 @@ mod tests {
         ));
         // With the overlay down, Escape is the client's.
         assert!(matches!(
-            resolve(KeyState::Pressed, &plain, keysyms::KEY_Escape, Modes::default()),
+            resolve(
+                KeyState::Pressed,
+                &plain,
+                keysyms::KEY_Escape,
+                Modes::default()
+            ),
             FilterResult::Forward
         ));
         // And the chord opens it rather than toggling it shut.
@@ -1546,6 +1571,26 @@ mod tests {
             documented.len(),
             "an action is reachable by a key but missing from BINDINGS, so the \
              overlay and the log line will not mention it"
+        );
+    }
+
+    #[test]
+    fn super_ctrl_n_dismisses_the_newest_notification_and_shift_every_one() {
+        assert_eq!(
+            intercepted(super_ctrl(), keysyms::KEY_n),
+            Some(Action::DismissNotification)
+        );
+        // Shift capitalises the letter on most layouts and leaves it alone on
+        // the rest; both spellings are the same chord.
+        for sym in [keysyms::KEY_n, keysyms::KEY_N] {
+            assert_eq!(
+                intercepted(super_ctrl_shift(), sym),
+                Some(Action::DismissNotifications)
+            );
+        }
+        assert!(
+            forwarded(KeyState::Pressed, super_held(), keysyms::KEY_n),
+            "plain Super+N is the application's"
         );
     }
 

@@ -29,6 +29,7 @@
 pub mod geometry;
 pub mod layer;
 pub mod layout;
+pub mod notify;
 pub mod scale;
 pub mod strip;
 pub mod tiles;
@@ -599,9 +600,7 @@ impl Space {
         self.next_window += 1;
         self.windows.insert(id, Window::new(id));
         if self.workspaces[self.active].is_full()
-            && let Some(target) = self
-                .workspace_with_room()
-                .or_else(|| self.add_workspace())
+            && let Some(target) = self.workspace_with_room().or_else(|| self.add_workspace())
         {
             self.activate_workspace(target);
         }
@@ -1689,7 +1688,11 @@ mod tests {
         for _ in 0..MAX_WORKSPACES {
             s.open_window();
         }
-        assert_eq!(s.workspaces().len(), MAX_WORKSPACES, "the row grew to its cap");
+        assert_eq!(
+            s.workspaces().len(),
+            MAX_WORKSPACES,
+            "the row grew to its cap"
+        );
         assert!(s.workspaces().iter().all(Workspace::is_full));
         let extra = s.open_window();
         assert!(
@@ -2205,7 +2208,10 @@ mod tests {
     fn the_row_starts_with_one_workspace_and_no_spare_while_it_is_empty() {
         let mut s = Space::new(SCREEN);
         assert_eq!(s.workspaces().len(), 1);
-        assert!(!s.tidy_workspaces(), "an empty desktop is already its own spare");
+        assert!(
+            !s.tidy_workspaces(),
+            "an empty desktop is already its own spare"
+        );
         assert_eq!(s.workspaces().len(), 1);
     }
 
@@ -2283,7 +2289,11 @@ mod tests {
         assert_eq!(s.workspaces().len(), 3);
         s.close_window(b);
         assert!(s.tidy_workspaces());
-        assert_eq!(s.workspaces().len(), 2, "the empty one you are on is the spare");
+        assert_eq!(
+            s.workspaces().len(),
+            2,
+            "the empty one you are on is the spare"
+        );
         assert_eq!(s.active_index(), 1);
     }
 
@@ -2296,7 +2306,10 @@ mod tests {
             s.tidy_workspaces();
         }
         assert_eq!(s.workspaces().len(), MAX_WORKSPACES);
-        assert!(s.workspaces().iter().all(|w| !w.is_empty()), "no room for a spare");
+        assert!(
+            s.workspaces().iter().all(|w| !w.is_empty()),
+            "no room for a spare"
+        );
     }
 
     #[test]
@@ -2306,7 +2319,10 @@ mod tests {
         let b = s.open_window();
         assert!(s.send_focused_to_workspace(1));
         assert_eq!(s.workspace_of(b), Some(1));
-        assert!(!s.send_focused_to_workspace(5), "further than that is refused");
+        assert!(
+            !s.send_focused_to_workspace(5),
+            "further than that is refused"
+        );
     }
 
     #[test]

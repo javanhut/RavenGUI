@@ -454,7 +454,11 @@ mod tests {
         assert!(alpha(20, 0) > 200, "top edge was {}", alpha(20, 0));
         assert!(alpha(0, 15) > 200, "left edge was {}", alpha(0, 15));
         assert_eq!(alpha(20, 15), 0, "the middle must stay clear");
-        assert_eq!(alpha(20, 3), 0, "one pixel in from the edge must stay clear");
+        assert_eq!(
+            alpha(20, 3),
+            0,
+            "one pixel in from the edge must stay clear"
+        );
         // The corner pixel is outside the arc and gets nothing.
         assert_eq!(alpha(0, 0), 0);
     }

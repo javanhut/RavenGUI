@@ -18,7 +18,7 @@
 //! of a hundred milliseconds. It is built once and kept, never per draw.
 
 pub(crate) use cosmic_text::Weight;
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache};
 
 use crate::theme::Color;
 
@@ -171,18 +171,173 @@ impl Text {
                 // `run.line_y` is the baseline; the glyph's `top` is measured
                 // up from it, hence the subtraction.
                 let top = y + physical.y + run.line_y as i32 - image.placement.top;
+                blit_coverage(surface, image, left, top, color);
+            }
+        }
+    }
+}
 
-                for (row, chunk) in image
-                    .data
-                    .chunks_exact(image.placement.width.max(1) as usize)
-                    .enumerate()
-                {
-                    for (column, coverage) in chunk.iter().enumerate() {
-                        if *coverage > 0 {
-                            surface.blend(left + column as i32, top + row as i32, color, *coverage);
-                        }
+/// A run of text in its own weight and slant, for [`Text::draw_wrapped`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Styled<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) weight: Weight,
+    pub(crate) italic: bool,
+}
+
+impl<'a> Styled<'a> {
+    pub(crate) fn plain(text: &'a str) -> Self {
+        Self::weighted(text, Weight::NORMAL)
+    }
+
+    pub(crate) fn weighted(text: &'a str, weight: Weight) -> Self {
+        Self {
+            text,
+            weight,
+            italic: false,
+        }
+    }
+}
+
+impl Text {
+    /// The height of one line of text at `size`: what [`Self::layout_weighted`]
+    /// and [`Self::draw_wrapped`] lay lines out at.
+    pub(crate) fn line_height(size: f32) -> f32 {
+        size * 1.35
+    }
+
+    /// Lay out runs of differently styled text as one paragraph, wrapping at
+    /// `width`.
+    fn layout_styled(&mut self, spans: &[Styled<'_>], size: f32, width: f32) -> Buffer {
+        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, Self::line_height(size)));
+        buffer.set_size(Some(width), None);
+        let runs = spans.iter().map(|span| {
+            let style = if span.italic {
+                Style::Italic
+            } else {
+                Style::Normal
+            };
+            (
+                span.text,
+                Attrs::new()
+                    .family(Family::SansSerif)
+                    .weight(span.weight)
+                    .style(style),
+            )
+        });
+        buffer.set_rich_text(
+            runs,
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut self.fonts, false);
+        buffer
+    }
+
+    /// How many lines `spans` take when wrapped at `width`.
+    pub(crate) fn wrapped_lines(&mut self, spans: &[Styled<'_>], size: f32, width: f32) -> usize {
+        if !self.usable {
+            return 0;
+        }
+        self.layout_styled(spans, size, width).layout_runs().count()
+    }
+
+    /// Draw `spans` wrapped at `width` with the top-left of the block at `x`,
+    /// `y`, keeping at most `max_lines` lines. Text that does not fit ends in
+    /// an ellipsis on the last line kept, cut at the glyph that would cross the
+    /// edge, rather than simply stopping at a word with nothing to say more
+    /// was there.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_wrapped(
+        &mut self,
+        surface: &mut impl Surface,
+        spans: &[Styled<'_>],
+        size: f32,
+        x: f32,
+        y: f32,
+        width: f32,
+        max_lines: usize,
+        color: Color,
+    ) {
+        if !self.usable || max_lines == 0 {
+            return;
+        }
+        let buffer = self.layout_styled(spans, size, width);
+        let truncated = buffer.layout_runs().count() > max_lines;
+        let ellipsis_w = if truncated {
+            self.measure("…", size).0
+        } else {
+            0.0
+        };
+        let (left, top) = (x.round() as i32, y.round() as i32);
+        let mut ellipsis_at = None;
+        {
+            // Split the borrow, as `draw_weighted` does.
+            let Self { fonts, cache, .. } = self;
+            for (index, run) in buffer.layout_runs().take(max_lines).enumerate() {
+                let last = truncated && index + 1 == max_lines;
+                let mut end = 0.0_f32;
+                for glyph in run.glyphs {
+                    if last && glyph.x + glyph.w > width - ellipsis_w {
+                        break;
                     }
+                    let physical = glyph.physical((0.0, 0.0), 1.0);
+                    if let Some(image) = cache.get_image(fonts, physical.cache_key).as_ref() {
+                        blit_coverage(
+                            surface,
+                            image,
+                            left + physical.x + image.placement.left,
+                            top + physical.y + run.line_y as i32 - image.placement.top,
+                            color,
+                        );
+                    }
+                    end = glyph.x + glyph.w;
                 }
+                if last {
+                    ellipsis_at = Some((end, run.line_top));
+                }
+            }
+        }
+        if let Some((end, line_top)) = ellipsis_at {
+            self.draw(
+                surface,
+                "…",
+                size,
+                left + end.round() as i32,
+                top + line_top.round() as i32,
+                color,
+            );
+        }
+    }
+}
+
+/// Blend a rasterized glyph's coverage onto `surface` with its top-left at
+/// `left`, `top`.
+///
+/// Only a plain coverage mask is drawn. A colour glyph — an emoji, or a digit
+/// that fell back to the emoji font because the face asked for had no glyph
+/// for it — is four bytes of RGBA per pixel, and blended as if each byte were
+/// coverage it comes out as a block of stripes the width of several letters.
+/// Leaving it out loses one symbol; drawing it wrong spoils the whole line.
+fn blit_coverage(
+    surface: &mut impl Surface,
+    image: &cosmic_text::SwashImage,
+    left: i32,
+    top: i32,
+    color: Color,
+) {
+    if !matches!(image.content, cosmic_text::SwashContent::Mask) {
+        return;
+    }
+    for (row, chunk) in image
+        .data
+        .chunks_exact(image.placement.width.max(1) as usize)
+        .enumerate()
+    {
+        for (column, coverage) in chunk.iter().enumerate() {
+            if *coverage > 0 {
+                surface.blend(left + column as i32, top + row as i32, color, *coverage);
             }
         }
     }

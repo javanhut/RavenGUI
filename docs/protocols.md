@@ -122,6 +122,15 @@ restrict the global to a privileged client, and on a single-user session there
 is nothing to distinguish one client from another: every client here already
 runs as the person whose session it is.
 
+## D-Bus: `org.freedesktop.Notifications`
+
+Not a Wayland global, but part of the same contract. Huginn owns
+`org.freedesktop.Notifications` on the session bus and serves version 1.2 of
+the Desktop Notifications specification; `docs/integration.md` says what it
+supports. It asks for the name without replacing an owner that already has it:
+a notification daemon started before Huginn keeps the name, and Huginn becomes
+the owner when that daemon exits.
+
 ## Absent
 
 Not stubs — these globals do not exist, and a client asking for them will not

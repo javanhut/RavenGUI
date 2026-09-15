@@ -207,6 +207,14 @@ pub(crate) trait Control: std::fmt::Debug {
     fn take_launch(&mut self) -> Option<&'static str> {
         None
     }
+    /// How many notifications are waiting unseen, for the one row that says.
+    /// Every other row ignores it.
+    fn set_waiting(&mut self, _waiting: usize) {}
+    /// Whether the row asked, on its last activation, for the waiting
+    /// notifications to be shown. Taken once, like [`Self::take_launch`].
+    fn take_show(&mut self) -> bool {
+        false
+    }
 }
 
 /// The row that leaves the panel for the settings application, which is
@@ -574,6 +582,71 @@ impl Control for Animations {
     fn activate(&mut self) -> bool {
         self.motion = self.motion.toggled();
         true
+    }
+}
+
+const DO_NOT_DISTURB: &str = "Do not disturb";
+const NOTIFICATIONS: &str = "Notifications";
+
+/// Do not disturb: only critical notifications appear, and the rest wait.
+/// Wired up, like [`Animations`]: the compositor reads it back through
+/// [`Settings::do_not_disturb`].
+#[derive(Debug)]
+struct DoNotDisturb {
+    on: bool,
+}
+
+impl Control for DoNotDisturb {
+    fn label(&self) -> &str {
+        DO_NOT_DISTURB
+    }
+    fn read(&self) -> Reading {
+        Reading {
+            value: if self.on { "On" } else { "Off" }.to_owned(),
+            real: true,
+        }
+    }
+    fn activate(&mut self) -> bool {
+        self.on = !self.on;
+        true
+    }
+}
+
+/// The notifications that arrived without a card — under do not disturb, or
+/// over a fullscreen window — and the way to see them. Return brings them
+/// back as cards and closes the panel, so they are what is on screen.
+#[derive(Debug, Default)]
+struct MissedNotifications {
+    waiting: usize,
+    show: bool,
+}
+
+impl Control for MissedNotifications {
+    fn label(&self) -> &str {
+        NOTIFICATIONS
+    }
+    fn read(&self) -> Reading {
+        let value = match self.waiting {
+            0 => "None missed".to_owned(),
+            n => format!("{n} missed"),
+        };
+        Reading { value, real: true }
+    }
+    fn activate(&mut self) -> bool {
+        if self.waiting == 0 {
+            return false;
+        }
+        self.show = true;
+        true
+    }
+    fn concluded(&self) -> bool {
+        self.show
+    }
+    fn set_waiting(&mut self, waiting: usize) {
+        self.waiting = waiting;
+    }
+    fn take_show(&mut self) -> bool {
+        std::mem::take(&mut self.show)
     }
 }
 
@@ -987,6 +1060,8 @@ impl Settings {
                 Box::new(Brightness { percent: 75 }),
                 Box::new(WiFi { on: true }),
                 Box::new(BluetoothRow::new(Box::new(crate::bluetooth::Unavailable))),
+                Box::new(DoNotDisturb { on: false }),
+                Box::new(MissedNotifications::default()),
                 Box::new(AllSettings::default()),
                 // Last, so that stepping down through the panel arrives at it
                 // deliberately and a stray Return on the first row is a mute,
@@ -1081,14 +1156,16 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Give the Animations, Lock and Launcher rows what `desktop.toml` said.
-    /// Called at startup and whenever the file changes; between those the
-    /// rows are the source, as with [`Self::set_pins_layout`].
+    /// Give the Animations, Lock, Launcher and Do not disturb rows what
+    /// `desktop.toml` said. Called at startup and whenever the file changes;
+    /// between those the rows are the source, as with
+    /// [`Self::set_pins_layout`].
     pub(crate) fn apply_desktop_config(
         &mut self,
         motion: Motion,
         after: IdleAfter,
         style: crate::launcher::Style,
+        do_not_disturb: bool,
     ) {
         for control in &mut self.controls {
             if control.label() == "Animations" {
@@ -1097,6 +1174,8 @@ impl Settings {
                 *control = Box::new(IdleLock { after });
             } else if control.label() == LAUNCHER_LAYOUT {
                 *control = Box::new(LauncherLayout { style });
+            } else if control.label() == DO_NOT_DISTURB {
+                *control = Box::new(DoNotDisturb { on: do_not_disturb });
             }
         }
     }
@@ -1104,6 +1183,29 @@ impl Settings {
     /// A program a row asked for on its last activation, if any. Taken once.
     pub(crate) fn take_launch(&mut self) -> Option<&'static str> {
         self.controls.iter_mut().find_map(|c| c.take_launch())
+    }
+
+    /// Whether do not disturb is on, read from the control that owns it.
+    pub(crate) fn do_not_disturb(&self) -> bool {
+        self.controls
+            .iter()
+            .find(|c| c.label() == DO_NOT_DISTURB)
+            .is_some_and(|c| c.read().value == "On")
+    }
+
+    /// Tell the notifications row how many are waiting unseen. Changed in
+    /// place rather than by replacing the row, so a request the row has just
+    /// made survives the redraw that follows it.
+    pub(crate) fn set_missed(&mut self, waiting: usize) {
+        for control in &mut self.controls {
+            control.set_waiting(waiting);
+        }
+    }
+
+    /// Whether the notifications row asked for what was missed to be shown.
+    /// Taken once.
+    pub(crate) fn take_show_missed(&mut self) -> bool {
+        self.controls.iter_mut().any(|c| c.take_show())
     }
 
     /// Give the pinned rows what the file said. Called once at startup,
@@ -1459,8 +1561,50 @@ mod tests {
         settings.press(Key::Activate, T0);
         assert_eq!(settings.launcher_style(), Style::List);
         // What the file says replaces what the row showed.
-        settings.apply_desktop_config(Motion::Full, IdleAfter::default(), Style::Arc);
+        settings.apply_desktop_config(Motion::Full, IdleAfter::default(), Style::Arc, false);
         assert_eq!(settings.launcher_style(), Style::Arc);
+    }
+
+    #[test]
+    fn do_not_disturb_toggles_and_the_file_sets_it() {
+        let mut settings = opened();
+        assert!(!settings.do_not_disturb());
+        select(&mut settings, DO_NOT_DISTURB);
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Redraw);
+        assert!(settings.do_not_disturb());
+        settings.apply_desktop_config(
+            Motion::Full,
+            IdleAfter::default(),
+            crate::launcher::Style::List,
+            false,
+        );
+        assert!(
+            !settings.do_not_disturb(),
+            "what the file says replaces the row"
+        );
+    }
+
+    #[test]
+    fn the_notifications_row_brings_back_what_was_missed_and_closes_the_panel() {
+        let mut settings = opened();
+        select(&mut settings, NOTIFICATIONS);
+        let row = index_of(&settings, NOTIFICATIONS);
+        assert_eq!(settings.controls[row].read().value, "None missed");
+        assert_eq!(
+            settings.press(Key::Activate, T0),
+            Outcome::Unchanged,
+            "nothing to bring back"
+        );
+        assert!(!settings.take_show_missed());
+
+        settings.set_missed(3);
+        assert_eq!(settings.controls[row].read().value, "3 missed");
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Dismissed);
+        // The compositor redraws the panel before it takes the request, and
+        // tells the row the count again when it does.
+        settings.set_missed(3);
+        assert!(settings.take_show_missed());
+        assert!(!settings.take_show_missed(), "taken once");
     }
 
     #[test]

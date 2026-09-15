@@ -183,7 +183,12 @@ impl Overlay {
                 wanted[row.first + cap] = stage(amount(order, press.len(), within));
             }
         }
-        if self.caps.iter().zip(&wanted).all(|(cap, &want)| cap.shown == want) {
+        if self
+            .caps
+            .iter()
+            .zip(&wanted)
+            .all(|(cap, &want)| cap.shown == want)
+        {
             return false;
         }
         let (stride, caps) = (self.stride, &mut self.caps);
@@ -370,12 +375,8 @@ struct Layout {
 /// is placed at the same logical size either way.
 fn fit(output: Rect, text: &mut Text, density: u32) -> Layout {
     let px = density.max(1) as f32;
-    let room = (
-        output.w() as f32 * px * FILL,
-        output.h() as f32 * px * FILL,
-    );
-    let wanted =
-        (BASE_SIZE * (output.h() as f32 / 1080.0)).clamp(BASE_SIZE, BASE_SIZE * 2.5) * px;
+    let room = (output.w() as f32 * px * FILL, output.h() as f32 * px * FILL);
+    let wanted = (BASE_SIZE * (output.h() as f32 / 1080.0)).clamp(BASE_SIZE, BASE_SIZE * 2.5) * px;
     // Best first: fits both ways, then fits across (a list clipped at the
     // bottom still reads from the top; one clipped at the side loses the end
     // of every line), then whichever overflows least — and among equals the
@@ -392,9 +393,9 @@ fn fit(output: Rect, text: &mut Text, density: u32) -> Layout {
     let mut best: Option<Layout> = None;
     for columns in [1, 2] {
         let layout = shrink_to_fit(text, wanted, px, room, columns);
-        let better = best
-            .as_ref()
-            .is_none_or(|best| rank(&layout).partial_cmp(&rank(best)) == Some(std::cmp::Ordering::Greater));
+        let better = best.as_ref().is_none_or(|best| {
+            rank(&layout).partial_cmp(&rank(best)) == Some(std::cmp::Ordering::Greater)
+        });
         if better {
             best = Some(layout);
         }
@@ -560,7 +561,14 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
     canvas.material(0, 0, l.w, l.h, RADIUS * l.px, OVERLAY_ALPHA);
 
     let y = l.pad;
-    text.draw(&mut canvas, TITLE, l.size, l.pad as i32, y as i32, theme::accent());
+    text.draw(
+        &mut canvas,
+        TITLE,
+        l.size,
+        l.pad as i32,
+        y as i32,
+        theme::accent(),
+    );
     canvas.tint(
         l.pad as usize,
         (y + l.line + l.line_gap) as usize,
@@ -867,8 +875,14 @@ mod tests {
                     .flat_map(|row| row.caps.iter().map(|at| (*at, row.desc_x)))
                     .collect();
                 for (i, (a, desc_x)) in boxes.iter().enumerate() {
-                    assert!(a.x + a.w <= layout.w && a.y + a.h <= layout.h, "{a:?} off the panel");
-                    assert!(((a.x + a.w) as f32) < *desc_x, "{a:?} runs into its description");
+                    assert!(
+                        a.x + a.w <= layout.w && a.y + a.h <= layout.h,
+                        "{a:?} off the panel"
+                    );
+                    assert!(
+                        ((a.x + a.w) as f32) < *desc_x,
+                        "{a:?} runs into its description"
+                    );
                     for (b, _) in &boxes[i + 1..] {
                         let overlap = a.x < b.x + b.w
                             && b.x < a.x + a.w
@@ -913,9 +927,8 @@ mod tests {
         // design; everything else inside the panel must be painted.
         let reach = RADIUS.ceil() as usize;
         let (w, h) = (canvas.stride, canvas.height);
-        let in_corner = |x: usize, y: usize| {
-            (x < reach || x + reach >= w) && (y < reach || y + reach >= h)
-        };
+        let in_corner =
+            |x: usize, y: usize| (x < reach || x + reach >= w) && (y < reach || y + reach >= h);
         let clear = canvas
             .pixels
             .as_chunks::<4>()
@@ -1061,7 +1074,10 @@ mod tests {
     fn the_chord_is_held_then_let_go_together() {
         let release = LEAD + STEP * 2 + PRESS + HOLD;
         for order in 0..3 {
-            assert_eq!(stage(amount(order, 3, release - Duration::from_millis(1))), STAGES);
+            assert_eq!(
+                stage(amount(order, 3, release - Duration::from_millis(1))),
+                STAGES
+            );
             assert_eq!(stage(amount(order, 3, release + RELEASE)), 0);
         }
     }
@@ -1099,11 +1115,16 @@ mod tests {
     fn a_pressed_cap_looks_different_from_a_raised_one() {
         let mut overlay = Overlay::render(Rect::from_xywh(0, 0, 1920, 1080), &mut Text::new(), 1);
         assert!(!overlay.caps.is_empty());
-        assert!(overlay
-            .caps
-            .iter()
-            .all(|cap| cap.stages[0] != cap.stages[STAGES]));
-        assert!(!overlay.animate(Duration::ZERO), "nothing is down at the start");
+        assert!(
+            overlay
+                .caps
+                .iter()
+                .all(|cap| cap.stages[0] != cap.stages[STAGES])
+        );
+        assert!(
+            !overlay.animate(Duration::ZERO),
+            "nothing is down at the start"
+        );
         assert!(overlay.animate(LEAD + PRESS), "the first key goes down");
         assert!(
             !overlay.animate(LEAD + PRESS),

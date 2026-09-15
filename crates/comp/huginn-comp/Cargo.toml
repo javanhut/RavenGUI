@@ -48,8 +48,15 @@ smithay = { workspace = true, features = [
 calloop.workspace = true
 inotify.workspace = true
 zbus.workspace = true
+enumflags2.workspace = true
 # Already in the tree via winit; used to load the system cursor theme.
 xcursor = "0.3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Peer-to-peer connections, so the notifications server is tested over a real
+# socket without a session bus. Tests only: the resolver keeps this feature out
+# of the compositor itself.
+zbus = { workspace = true, features = ["p2p"] }
 
 [lints]
 workspace = true

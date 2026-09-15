@@ -24,6 +24,11 @@
 //!   [`crate::launcher::Style`]; also stepped from quick settings.
 //! - `general.terminal` — what the spawn binding launches.
 //! - `general.lock_after_minutes` — [`crate::settings::IdleAfter`].
+//! - `notifications.do_not_disturb` — only critical notifications are shown;
+//!   also switched from quick settings. See [`crate::notifications`].
+//! - `notifications.timeout_seconds` — how long a card stays when its
+//!   application leaves that to the desktop; see
+//!   [`huginn_core::notify::Timeouts`].
 //!
 //! The rest of the file (theme mode, shadows, scale, …) is for the
 //! applications and the bar, which read it themselves.
@@ -83,11 +88,30 @@ impl Default for General {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct Notifications {
+    pub do_not_disturb: bool,
+    /// Seconds a normal card stays when its application leaves that to the
+    /// desktop. 0 is the compiled-in six.
+    pub timeout_seconds: u32,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            do_not_disturb: false,
+            timeout_seconds: 6,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopConfig {
     pub appearance: Appearance,
     pub general: General,
+    pub notifications: Notifications,
 }
 
 /// Where the file lives: `$XDG_CONFIG_HOME/raven/desktop.toml`.
@@ -164,6 +188,27 @@ impl DesktopConfig {
         let w = self.appearance.wallpaper.trim();
         (!w.is_empty()).then(|| PathBuf::from(w))
     }
+
+    pub(crate) fn do_not_disturb(&self) -> bool {
+        self.notifications.do_not_disturb
+    }
+
+    /// How long cards stay by default. The file sets a normal card's time; a
+    /// low-urgency card keeps its shorter one unless that would be longer. An
+    /// hour is the most the file may ask for: a card that stays longer is one
+    /// that should have been critical.
+    pub(crate) fn notification_timeouts(&self) -> huginn_core::notify::Timeouts {
+        let defaults = huginn_core::notify::Timeouts::default();
+        let seconds = self.notifications.timeout_seconds;
+        if seconds == 0 {
+            return defaults;
+        }
+        let normal = std::time::Duration::from_secs(u64::from(seconds.min(3600)));
+        huginn_core::notify::Timeouts {
+            low: defaults.low.min(normal),
+            normal,
+        }
+    }
 }
 
 /// `#RRGGBB` to an opaque colour.
@@ -194,7 +239,10 @@ mod tests {
     #[test]
     fn the_launcher_layout_is_the_list_unless_the_file_names_the_arc() {
         use crate::launcher::Style;
-        assert_eq!(DesktopConfig::parse("").unwrap().launcher_style(), Style::List);
+        assert_eq!(
+            DesktopConfig::parse("").unwrap().launcher_style(),
+            Style::List
+        );
         let arc = DesktopConfig::parse("[appearance]\nlauncher_layout = \"arc\"\n").unwrap();
         assert_eq!(arc.launcher_style(), Style::Arc);
         // A layout a later build added falls back rather than failing the file.
@@ -227,6 +275,34 @@ mod tests {
         assert_eq!(cfg.idle_after(), IdleAfter::Off);
         assert_eq!(cfg.terminal(), "kitty");
         assert!(cfg.wallpaper().is_some());
+    }
+
+    #[test]
+    fn notifications_interrupt_and_stay_six_seconds_unless_the_file_says() {
+        use std::time::Duration;
+        let silent = DesktopConfig::parse("").unwrap();
+        assert!(!silent.do_not_disturb());
+        assert_eq!(
+            silent.notification_timeouts(),
+            huginn_core::notify::Timeouts::default()
+        );
+
+        let set =
+            DesktopConfig::parse("[notifications]\ndo_not_disturb = true\ntimeout_seconds = 10\n")
+                .unwrap();
+        assert!(set.do_not_disturb());
+        let t = set.notification_timeouts();
+        assert_eq!(t.normal, Duration::from_secs(10));
+        assert_eq!(t.low, Duration::from_secs(4), "low keeps its shorter time");
+
+        let short = DesktopConfig::parse("[notifications]\ntimeout_seconds = 2\n").unwrap();
+        assert_eq!(short.notification_timeouts().low, Duration::from_secs(2));
+
+        let zero = DesktopConfig::parse("[notifications]\ntimeout_seconds = 0\n").unwrap();
+        assert_eq!(
+            zero.notification_timeouts(),
+            huginn_core::notify::Timeouts::default()
+        );
     }
 
     #[test]
