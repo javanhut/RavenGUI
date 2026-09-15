@@ -334,6 +334,7 @@ impl Nested {
         let size = self.backend.window_size();
         let damage = Rectangle::from_size(size);
         let radius = self.state.blur_radius();
+        let alpha = self.state.blur_alpha();
         // Always 1 here — see the output setup — but the elements were built
         // against it, so it is the only correct value to draw them with.
         let scale = self.state.scale().fractional();
@@ -372,7 +373,7 @@ impl Nested {
                 let renderer = self.backend.renderer();
                 self.blur
                     .as_mut()
-                    .and_then(|blur| blur.pass(renderer, &behind, size, scale, radius))
+                    .and_then(|blur| blur.pass(renderer, &behind, size, scale, radius, alpha))
                     .and_then(|element| render::blur_element(element, rect, scale))
             }
             _ => None,
