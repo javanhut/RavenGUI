@@ -4662,6 +4662,22 @@ impl Huginn {
         }
     }
 
+    /// How opaque the blurred patch is: the panel's own reveal, so the patch
+    /// fades out with the panel rather than outliving it.
+    ///
+    /// The patch is a hard-edged rectangle. Drawn at full strength while the
+    /// panel over it fades, it is left on screen as a box for the tail of
+    /// every close — visible long after the panel that explained it is gone.
+    /// A glass window has no fade of its own and gets it at full strength.
+    pub(crate) fn blur_alpha(&self) -> f32 {
+        if self.panel_blur_open() {
+            let clock = self.uptime();
+            self.launcher.reveal(clock).max(self.pinned.reveal(clock)).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
     /// Where on the output the blurred desktop shows through: the launcher
     /// panel's placement, inset by its corner radius. See
     /// [`crate::launcher::blur_rect`] for why the inset.

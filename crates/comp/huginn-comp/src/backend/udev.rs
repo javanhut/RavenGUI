@@ -1547,6 +1547,7 @@ impl Udev {
         let (front, behind) =
             render::elements_split(&mut self.renderer, &self.state, cursor, view, scale);
         let radius = self.state.blur_radius();
+        let alpha = self.state.blur_alpha();
         let blurred = match self.state.blur_rect() {
             // The panel is on the focused screen; a blur for it on any other
             // would be a smear over nothing.
@@ -1555,7 +1556,7 @@ impl Udev {
                     Rect::from_xywh(rect.x() - view.x(), rect.y() - view.y(), rect.w(), rect.h());
                 self.blur
                     .as_mut()
-                    .and_then(|blur| blur.pass(&mut self.renderer, &behind, size, scale, radius))
+                    .and_then(|blur| blur.pass(&mut self.renderer, &behind, size, scale, radius, alpha))
                     .and_then(|element| render::blur_element(element, rect, scale))
             }
             _ => None,

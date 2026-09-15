@@ -308,6 +308,7 @@ impl Blur {
     ///
     /// `size` is the output in physical pixels and `scale` is what the caller
     /// will draw the returned element — and would have drawn `elements` — with.
+    /// `alpha` is how opaque the returned element is over the sharp desktop.
     ///
     /// `None` if anything fails, in which case the caller draws `elements`
     /// itself exactly as it would have without a blur.
@@ -318,8 +319,9 @@ impl Blur {
         size: Size<i32, Physical>,
         scale: f64,
         radius: f32,
+        alpha: f32,
     ) -> Option<TextureShaderElement> {
-        if radius <= 0.05 || size.w <= 0 || size.h <= 0 || scale <= 0.0 {
+        if radius <= 0.05 || alpha <= 0.01 || size.w <= 0 || size.h <= 0 || scale <= 0.0 {
             return None;
         }
         self.ensure_textures(renderer, size)?;
@@ -365,6 +367,9 @@ impl Blur {
                 Size::from((size.w, size.h)),
                 [1.0 / size.w as f32, 0.0],
                 sigma,
+                // Opaque: this pass is texture-to-texture, and the fade is
+                // applied once, on the element the caller draws.
+                1.0,
             );
             let _ = smithay::backend::renderer::utils::draw_render_elements::<GlesRenderer, _, _>(
                 &mut frame,
@@ -387,6 +392,7 @@ impl Blur {
             logical,
             [0.0, 1.0 / size.h as f32],
             sigma,
+            alpha,
         ))
     }
 
@@ -420,6 +426,7 @@ fn shader_element(
     size: Size<i32, Logical>,
     direction: [f32; 2],
     sigma: f32,
+    alpha: f32,
 ) -> TextureShaderElement {
     let inner = TextureRenderElement::from_static_texture(
         Id::new(),
@@ -428,7 +435,7 @@ fn shader_element(
         texture.clone(),
         1,
         Transform::Normal,
-        Some(1.0),
+        Some(alpha),
         None,
         Some((size.w, size.h).into()),
         None,
