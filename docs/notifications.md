@@ -8,9 +8,10 @@ dismissed, with `Super+Ctrl+N` and `Super+Ctrl+Shift+N` from the keyboard.
 Phase 5 is done too: the lock screen, fullscreen windows, idle inhibitors and
 time away decide what interrupts; do not disturb is a quick settings row and
 `[notifications]` in desktop.toml, written by Raven Settings' Notifications
-page; and quick settings brings back what arrived quietly. Still to come: a
-list of closed notifications (the core keeps it; nothing shows it yet), and
-retiring mako.
+page; and quick settings brings back what arrived quietly. Phase 6 is done:
+mako is uninstalled and nothing starts it, so Huginn owns the name from login.
+Still to come: a list of closed notifications (the core keeps it; nothing shows
+it yet).
 
 The README says the compositor draws the shell, notifications included, because
 "anything that must feel instant and must never fail does not get to be a
@@ -254,8 +255,8 @@ the common case; the token is follow-up work once xdg-activation exists.
    DND row; history in quick settings; `[notifications]` in desktop.toml and
    Raven Settings; docs (`README.md`, `docs/integration.md`,
    `docs/protocols.md` gains a D-Bus section).
-6. **Retire mako** — `rvn uninstall mako`, remove `~/.config/mako`. Oracle
-   needs no change: it already speaks the standard interface.
+6. **Retire mako** (done) — `rvn uninstall mako`, remove `~/.config/mako`.
+   Oracle needs no change: it already speaks the standard interface.
 
 Each phase ends with `cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings` and `./scripts/check-unsafe.sh` clean.

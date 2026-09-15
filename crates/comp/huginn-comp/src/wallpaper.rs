@@ -93,6 +93,20 @@ impl Wallpaper {
             .or_else(Self::installed)
     }
 
+    /// What a refresh while the session runs should put on screen.
+    ///
+    /// Unlike [`Self::chosen_or_installed`], a file that is there and will not
+    /// decode does not fall through to the next one: it is most often a copy
+    /// still being written, and the picture already up is a better thing to
+    /// show for that moment than the machine's or none. Only a wallpaper that
+    /// is no longer there at all clears the screen.
+    pub(crate) fn replacement(chosen: Option<PathBuf>) -> Replacement {
+        match chosen.filter(|p| p.is_file()).or_else(installed_path) {
+            None => Replacement::Show(None),
+            Some(path) => Self::at(path).map_or(Replacement::Keep, |w| Replacement::Show(Some(w))),
+        }
+    }
+
     fn at(path: PathBuf) -> Option<Self> {
         match load(&path) {
             Ok(wallpaper) => {
@@ -197,6 +211,14 @@ impl Wallpaper {
         }
         out
     }
+}
+
+/// See [`Wallpaper::replacement`].
+pub(crate) enum Replacement {
+    /// This, or nothing when there is no wallpaper file left.
+    Show(Option<Wallpaper>),
+    /// The file is there and will not decode; leave what is on screen.
+    Keep,
 }
 
 /// Which file a wallpaper was read from, as it was when read.

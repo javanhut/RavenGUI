@@ -1209,8 +1209,14 @@ impl Huginn {
         if sources == self.wallpaper_sources {
             return;
         }
+        // Recorded even when the file will not decode, so the same broken file
+        // is not decoded again on every event, while the finished copy of a
+        // half-written one -- which stamps differently -- is.
         self.wallpaper_sources = sources;
-        self.wallpaper = crate::wallpaper::Wallpaper::chosen_or_installed(chosen);
+        match crate::wallpaper::Wallpaper::replacement(chosen) {
+            crate::wallpaper::Replacement::Show(wallpaper) => self.wallpaper = wallpaper,
+            crate::wallpaper::Replacement::Keep => return,
+        }
         self.wallpaper_panels = self
             .outputs
             .iter()
