@@ -49,7 +49,7 @@ use crate::anim::Reveal;
 use crate::canvas::Panel;
 use crate::settings::Motion;
 use crate::xwayland::AsHuginn;
-use bus::{Incoming, Open, Outgoing};
+use bus::{Entry, Incoming, Listing, Open, Outgoing};
 use card::{Hits, Target};
 
 /// Start serving notifications.
@@ -64,6 +64,7 @@ where
     let (incoming, arrivals) = channel::channel::<Incoming>();
     let (outgoing, to_announce) = mpsc::channel::<Outgoing>();
     let open: Open = Arc::default();
+    let listing: Listing = Arc::default();
 
     // The source goes in before the thread starts, so a bus call can never
     // arrive with nowhere to go.
@@ -78,6 +79,7 @@ where
     }
 
     let thread_open = Arc::clone(&open);
+    let thread_listing = Arc::clone(&listing);
     // zbus calls the sink from its executor, so the sender sits behind a
     // mutex to be shareable between threads.
     let incoming = Mutex::new(incoming);
@@ -91,7 +93,7 @@ where
                     .send(call)
                     .is_ok()
             };
-            bus::serve(sink, &to_announce, &thread_open);
+            bus::serve(sink, &to_announce, &thread_open, &thread_listing);
         });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "could not start the notifications thread");
@@ -108,7 +110,9 @@ where
             .map_err(|e| tracing::warn!(error = %e, "could not schedule a notification's expiry"))
             .is_ok()
     };
-    state.notifications.attach(outgoing, open, Box::new(arm));
+    state
+        .notifications
+        .attach(outgoing, open, listing, Box::new(arm));
 }
 
 /// Every notification the compositor holds, the cards that show them, and the
@@ -160,6 +164,9 @@ pub(crate) struct Drawn<'a> {
 struct Link {
     outgoing: mpsc::Sender<Outgoing>,
     open: Open,
+    /// What the notification centre lists, kept current by
+    /// [`Notifications::publish`].
+    listing: Listing,
 }
 
 /// The expiry timer.
@@ -183,9 +190,14 @@ impl Notifications {
         &mut self,
         outgoing: mpsc::Sender<Outgoing>,
         open: Open,
+        listing: Listing,
         arm: Box<dyn Fn(Duration) -> bool>,
     ) {
-        self.link = Some(Link { outgoing, open });
+        self.link = Some(Link {
+            outgoing,
+            open,
+            listing,
+        });
         self.expiry = Some(Expiry { arm, armed: None });
     }
 
@@ -221,6 +233,22 @@ impl Notifications {
             Incoming::Close(id) => {
                 let closed = self.queue.retract(id, now);
                 self.announce(closed);
+            }
+            Incoming::Remove(id) => {
+                // Dismissing puts it in the history, which is exactly where
+                // the person just asked it not to be.
+                let closed = self.queue.dismiss(id, now);
+                self.announce(closed);
+                self.queue.forget(id);
+            }
+            Incoming::Clear => {
+                let ids: Vec<Id> = self.queue.open().map(|n| n.id).collect();
+                let closed: Vec<Closed> = ids
+                    .into_iter()
+                    .filter_map(|id| self.queue.dismiss(id, now))
+                    .collect();
+                self.announce(closed);
+                self.queue.clear_history();
             }
         }
         self.settle(now, motion);
@@ -443,10 +471,49 @@ impl Notifications {
     }
 
     /// After the queue changed: bring the cards into line with it, and the
-    /// expiry timer too.
+    /// expiry timer and the notification centre's list too.
     fn settle(&mut self, now: Duration, motion: Motion) {
         self.sync(now, motion);
         self.rearm(now);
+        self.publish(now);
+    }
+
+    /// Give the notification centre the list as it is now: open notifications
+    /// and the history, newest first. `Changed` goes out only when the list is
+    /// different, so a card merely coming into view says nothing.
+    fn publish(&self, now: Duration) {
+        let Some(link) = &self.link else {
+            return;
+        };
+        let open = self.queue.open().map(|n| (n, true));
+        let closed = self.queue.history().map(|r| (&r.notification, false));
+        let mut entries: Vec<Entry> = open
+            .chain(closed)
+            .map(|(n, open)| Entry {
+                id: n.id,
+                app_name: n.app_name.clone(),
+                app_icon: n.app_icon.clone(),
+                summary: n.summary.clone(),
+                body: huginn_core::notify::plain(&n.body),
+                arrived: n.arrived,
+                open,
+            })
+            .collect();
+        // Stable, so notifications that arrived together keep the queue's
+        // order.
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.arrived));
+
+        let mut snapshot = link
+            .listing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        snapshot.now = now;
+        snapshot.taken = std::time::Instant::now();
+        if snapshot.entries != entries {
+            snapshot.entries = entries;
+            drop(snapshot);
+            let _ = link.outgoing.send(Outgoing::Changed);
+        }
     }
 
     /// Make the cards match what the queue has in view: a new card for each
@@ -569,29 +636,128 @@ mod tests {
         Open,
         Rc<RefCell<Vec<Duration>>>,
     ) {
+        let (notifications, announced, open, armed, _) = attached_with_listing();
+        (notifications, announced, open, armed)
+    }
+
+    /// What [`attached`] gives, and the notification centre's listing too.
+    type AttachedWithListing = (
+        Notifications,
+        mpsc::Receiver<Outgoing>,
+        Open,
+        Rc<RefCell<Vec<Duration>>>,
+        Listing,
+    );
+
+    fn attached_with_listing() -> AttachedWithListing {
         let (outgoing, announced) = mpsc::channel();
         let open: Open = Arc::default();
+        let listing: Listing = Arc::default();
         let armed = Rc::new(RefCell::new(Vec::new()));
         let record = Rc::clone(&armed);
         let mut notifications = Notifications::default();
         notifications.attach(
             outgoing,
             Arc::clone(&open),
+            Arc::clone(&listing),
             Box::new(move |after| {
                 record.borrow_mut().push(after);
                 true
             }),
         );
-        (notifications, announced, open, armed)
+        (notifications, announced, open, armed, listing)
     }
 
     fn closed(id: Id, reason: CloseReason) -> Outgoing {
         Outgoing::Closed(Closed { id, reason })
     }
 
-    /// Everything sent so far, as text, for comparing whole sequences.
+    /// Everything sent so far, as text, for comparing whole sequences. The
+    /// centre's `Changed` is left out, except where a test asks for it with
+    /// [`sent_all`].
     fn sent(announced: &mpsc::Receiver<Outgoing>) -> Vec<String> {
+        announced
+            .try_iter()
+            .filter(|o| !matches!(o, Outgoing::Changed))
+            .map(|o| format!("{o:?}"))
+            .collect()
+    }
+
+    fn sent_all(announced: &mpsc::Receiver<Outgoing>) -> Vec<String> {
         announced.try_iter().map(|o| format!("{o:?}")).collect()
+    }
+
+    /// The centre's list: each id and whether it is still open.
+    fn listed(listing: &Listing) -> Vec<(Id, bool)> {
+        listing
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| (e.id, e.open))
+            .collect()
+    }
+
+    #[test]
+    fn the_centre_lists_open_and_closed_newest_first_and_says_when_it_changes() {
+        let (mut notifications, announced, _, _, listing) = attached_with_listing();
+        notifications.receive(notify(1, "one"), secs(1), Motion::Reduced);
+        notifications.receive(notify(2, "two"), secs(2), Motion::Reduced);
+        notifications.dismiss(1, secs(3), Motion::Reduced);
+        assert_eq!(listed(&listing), [(2, true), (1, false)]);
+        assert_eq!(
+            sent_all(&announced)
+                .iter()
+                .filter(|s| *s == "Changed")
+                .count(),
+            3,
+            "one Changed for each change"
+        );
+
+        notifications.set_hover(Some((2, Target::Body)), secs(4));
+        notifications.due(secs(5), Motion::Reduced);
+        assert!(
+            sent_all(&announced).is_empty(),
+            "nothing listed changed, so nothing is said"
+        );
+    }
+
+    #[test]
+    fn removing_from_the_centre_dismisses_and_keeps_no_history() {
+        let (mut notifications, announced, _, _, listing) = attached_with_listing();
+        notifications.receive(notify(1, "one"), secs(1), Motion::Reduced);
+        notifications.receive(notify(2, "two"), secs(2), Motion::Reduced);
+        notifications.dismiss(1, secs(3), Motion::Reduced);
+        let _ = sent_all(&announced);
+
+        notifications.receive(Incoming::Remove(2), secs(4), Motion::Reduced);
+        assert_eq!(
+            sent(&announced),
+            [format!("{:?}", closed(2, CloseReason::Dismissed))],
+            "its client is told it was dismissed"
+        );
+        assert_eq!(listed(&listing), [(1, false)]);
+
+        notifications.receive(Incoming::Remove(1), secs(5), Motion::Reduced);
+        assert!(listed(&listing).is_empty(), "a closed one is forgotten");
+        assert!(sent(&announced).is_empty(), "and nobody is owed a signal");
+    }
+
+    #[test]
+    fn clearing_the_centre_dismisses_everything_and_forgets_the_history() {
+        let (mut notifications, announced, _, _, listing) = attached_with_listing();
+        for id in 1..=5 {
+            notifications.receive(notify(id, "hello"), secs(1), Motion::Reduced);
+        }
+        notifications.dismiss(1, secs(2), Motion::Reduced);
+        let _ = sent_all(&announced);
+
+        notifications.receive(Incoming::Clear, secs(3), Motion::Reduced);
+        assert_eq!(sent(&announced).len(), 4, "the four still open");
+        assert!(listed(&listing).is_empty());
+        notifications.compose(blank);
+        notifications.tick(secs(3));
+        assert_eq!(notifications.drawn_count(), 0);
     }
 
     #[test]
@@ -600,7 +766,7 @@ mod tests {
         open.lock().unwrap().insert(1);
 
         notifications.receive(notify(1, "hello"), Duration::ZERO, Motion::Full);
-        assert!(announced.try_recv().is_err(), "nothing closes on arrival");
+        assert!(sent(&announced).is_empty(), "nothing closes on arrival");
 
         notifications.receive(Incoming::Close(1), secs(1), Motion::Full);
         assert_eq!(
@@ -614,7 +780,7 @@ mod tests {
     fn closing_something_already_gone_says_nothing() {
         let (mut notifications, announced, _, _) = attached();
         notifications.receive(Incoming::Close(7), Duration::ZERO, Motion::Full);
-        assert!(announced.try_recv().is_err());
+        assert!(sent(&announced).is_empty());
     }
 
     #[test]
@@ -749,7 +915,7 @@ mod tests {
         let (mut notifications, announced, _, armed) = attached();
         notifications.receive(notify(1, "hello"), Duration::ZERO, Motion::Full);
         notifications.due(secs(2), Motion::Full);
-        assert!(announced.try_recv().is_err());
+        assert!(sent(&announced).is_empty());
         assert_eq!(*armed.borrow(), [secs(6), secs(4)]);
     }
 
@@ -765,7 +931,7 @@ mod tests {
             "nothing new"
         );
         notifications.due(secs(6), Motion::Full);
-        assert!(announced.try_recv().is_err(), "held while pointed at");
+        assert!(sent(&announced).is_empty(), "held while pointed at");
 
         assert!(notifications.set_hover(None, secs(60)));
         assert_eq!(
@@ -884,7 +1050,7 @@ mod tests {
         assert!(notifications.set_context(Context::default(), true, secs(2), Motion::Full));
         notifications.due(secs(6), Motion::Full);
         assert!(
-            announced.try_recv().is_err(),
+            sent(&announced).is_empty(),
             "nobody was there to see it go"
         );
 

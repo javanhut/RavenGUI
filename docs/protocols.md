@@ -131,6 +131,19 @@ supports. It asks for the name without replacing an owner that already has it:
 a notification daemon started before Huginn keeps the name, and Huginn becomes
 the owner when that daemon exits.
 
+### `org.raven.Notifications`
+
+The same object also serves a notification centre, for the desktop's own
+software (RoostBar's clock panel) rather than for applications, which should
+keep to the standard interface:
+
+| Member | Signature | Meaning |
+|---|---|---|
+| `List` | `() → a(usssxb)` | Open notifications and the session's history, newest first: id, application name, icon, summary, body without markup, arrival in Unix seconds, still open. Nothing waiting behind the lock screen is listed. |
+| `Remove` | `(u) → ()` | Dismiss the notification if it is open (its client gets `NotificationClosed` with reason 2) and forget it from the history. An id that names nothing is not an error. |
+| `Clear` | `() → ()` | `Remove` for everything listed. |
+| `Changed` | signal, `()` | What `List` returns is different. Not sent when only a card's position changes. |
+
 ## Absent
 
 Not stubs — these globals do not exist, and a client asking for them will not
