@@ -10,7 +10,7 @@ it, laid out left to right with the built-in panel (`eDP-*`, `LVDS-*`,
 has one position in that space and is drawn by whichever screens it overlaps;
 the pointer is one point in it and crosses between screens where they touch.
 
-Workspaces belong to screens. Each screen shows one of the nine, no workspace
+Workspaces belong to screens. Each screen shows one of them, no workspace
 shows on two screens, and the *focused* screen is the one whose workspace is
 active — where new windows open, where `Super+Ctrl` bindings act, where the
 shell's own panels (dock, launcher, quick settings, volume) sit. Focus follows

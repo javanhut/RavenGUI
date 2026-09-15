@@ -41,11 +41,13 @@ use geometry::{Dir, Rect};
 use window::{Window, WindowId, WindowMode};
 use workspace::{Direction, Layout, Workspace, WorkspaceId};
 
-/// How many workspaces exist at startup.
+/// The most workspaces the row grows to.
 ///
-/// Fixed rather than dynamic for now: static workspaces let a panel render a
-/// stable row of indicators, which is the behaviour `muninn` is built around.
-const DEFAULT_WORKSPACES: u64 = 9;
+/// The row is dynamic: it starts with one workspace, keeps every workspace
+/// that holds a window, and keeps one empty spare at the end to slide into.
+/// See [`Space::tidy_workspaces`]. Sixteen keeps it well inside the 32-bit
+/// occupancy mask the shell protocol reports.
+pub const MAX_WORKSPACES: usize = 16;
 
 /// Gutter used until the compositor supplies its own. See [`Space::set_gap`].
 const DEFAULT_GAP: i32 = 8;
@@ -141,17 +143,21 @@ pub struct Space {
     /// the drag for the one you left instead of freezing the one you arrive on.
     carousel_drag: Option<WorkspaceId>,
     next_window: u64,
+    /// The id the next workspace created is given. Ids are never reused, so a
+    /// workspace removed and another created in its place are told apart.
+    next_workspace: u64,
+    /// The window cap every workspace is created with. See
+    /// [`Self::set_tile_cap`].
+    tile_cap: usize,
 }
 
 impl Space {
-    /// Create a space with [`DEFAULT_WORKSPACES`] empty workspaces on one
-    /// output covering `area`.
+    /// Create a space with one empty workspace on one output covering `area`.
+    /// More are created as they are needed; see [`Self::tidy_workspaces`].
     pub fn new(area: Rect) -> Self {
         Self {
             windows: BTreeMap::new(),
-            workspaces: (1..=DEFAULT_WORKSPACES)
-                .map(|n| Workspace::new(WorkspaceId::from_raw(n)))
-                .collect(),
+            workspaces: vec![Workspace::new(WorkspaceId::from_raw(1))],
             active: 0,
             outputs: vec![OutputArea::new(area)],
             visible: vec![0],
@@ -160,6 +166,83 @@ impl Space {
             carousel_offset: None,
             carousel_drag: None,
             next_window: 1,
+            next_workspace: 2,
+            tile_cap: workspace::DEFAULT_TILE_CAP,
+        }
+    }
+
+    /// Append an empty workspace to the end of the row and return its index,
+    /// or `None` at [`MAX_WORKSPACES`].
+    fn add_workspace(&mut self) -> Option<usize> {
+        if self.workspaces.len() >= MAX_WORKSPACES {
+            return None;
+        }
+        let mut workspace = Workspace::new(WorkspaceId::from_raw(self.next_workspace));
+        self.next_workspace += 1;
+        workspace.set_tile_cap(self.tile_cap);
+        self.workspaces.push(workspace);
+        Some(self.workspaces.len() - 1)
+    }
+
+    /// Grow and shrink the row to fit what is in use, and report whether it
+    /// changed.
+    ///
+    /// Kept: every workspace holding a window, the active one, and any a
+    /// screen is showing. An empty workspace nobody is on is removed, so
+    /// leaving a new workspace without opening anything there puts it back
+    /// away. At the end of the row there is always exactly one empty spare to
+    /// slide into (until [`MAX_WORKSPACES`]); an empty active workspace at the
+    /// end is that spare, so sliding past an empty workspace does not make
+    /// another.
+    ///
+    /// Removing a workspace shifts the indices after it, so this is explicit
+    /// rather than run by every mutator: the compositor calls it when nothing
+    /// is holding an index — not while the overview's row is on screen.
+    pub fn tidy_workspaces(&mut self) -> bool {
+        let before: Vec<WorkspaceId> = self.workspaces.iter().map(Workspace::id).collect();
+        // Everything but the last, back to front, so a removal only shifts
+        // indices that have already been looked at. The last is the spare
+        // candidate and is judged below.
+        for index in (0..self.workspaces.len() - 1).rev() {
+            if self.workspaces[index].is_empty()
+                && index != self.active
+                && !self.visible.contains(&index)
+            {
+                self.remove_workspace(index);
+            }
+        }
+        // An empty active workspace just before an empty hidden one at the end:
+        // the one you are on is already the spare.
+        let len = self.workspaces.len();
+        if len >= 2
+            && self.active == len - 2
+            && self.workspaces[len - 2].is_empty()
+            && self.workspaces[len - 1].is_empty()
+            && !self.visible.contains(&(len - 1))
+        {
+            self.remove_workspace(len - 1);
+        }
+        let last = self.workspaces.len() - 1;
+        let spare = self.workspaces[last].is_empty()
+            && (last == self.active || !self.visible.contains(&last));
+        if !spare {
+            self.add_workspace();
+        }
+        !self.workspaces.iter().map(Workspace::id).eq(before)
+    }
+
+    /// Drop workspace `index`, which must be empty, and shift the indices
+    /// that pointed past it.
+    fn remove_workspace(&mut self, index: usize) {
+        debug_assert!(self.workspaces[index].is_empty());
+        self.workspaces.remove(index);
+        if self.active > index {
+            self.active -= 1;
+        }
+        for shown in &mut self.visible {
+            if *shown > index {
+                *shown -= 1;
+            }
         }
     }
 
@@ -445,7 +528,8 @@ impl Space {
                     (0..self.workspaces.len())
                         .find(|candidate| !seen.contains(candidate) && *candidate != self.active)
                 })
-                // Nine workspaces and more than nine screens: share the last.
+                // Nothing free: make one. Past the cap, share the active one.
+                .or_else(|| self.add_workspace())
                 .unwrap_or(self.active);
             self.workspaces[pick].set_output(index);
             seen.push(pick);
@@ -506,15 +590,18 @@ impl Space {
     /// [`Workspace::tile_cap`] — then the window opens on the nearest
     /// workspace with room and that workspace becomes active, so the window
     /// appears in front of you rather than filing itself somewhere hidden.
-    /// With every workspace full, the cap yields: a window has to exist
-    /// somewhere, and an over-full workspace is a better failure than a
-    /// client whose surface was never given a home.
+    /// With every workspace full a new one is made at the end of the row, and
+    /// at [`MAX_WORKSPACES`] the cap yields: a window has to exist somewhere,
+    /// and an over-full workspace is a better failure than a client whose
+    /// surface was never given a home.
     pub fn open_window(&mut self) -> WindowId {
         let id = WindowId::from_raw(self.next_window);
         self.next_window += 1;
         self.windows.insert(id, Window::new(id));
         if self.workspaces[self.active].is_full()
-            && let Some(target) = self.workspace_with_room()
+            && let Some(target) = self
+                .workspace_with_room()
+                .or_else(|| self.add_workspace())
         {
             self.activate_workspace(target);
         }
@@ -544,6 +631,7 @@ impl Space {
     /// The compositor's way of applying a configured default; a single
     /// workspace's cap is set on the workspace itself.
     pub fn set_tile_cap(&mut self, cap: usize) {
+        self.tile_cap = cap.max(1);
         for workspace in &mut self.workspaces {
             workspace.set_tile_cap(cap);
         }
@@ -630,7 +718,8 @@ impl Space {
     }
 
     /// Switch to workspace `index`. Out-of-range indices are ignored rather
-    /// than clamped, so a stray keybinding cannot silently jump to workspace 9.
+    /// than clamped, so a stray keybinding cannot silently jump to the last
+    /// workspace.
     ///
     /// A workspace already showing on another screen is not pulled across:
     /// focus goes to it where it is. Anything else is shown on the focused
@@ -671,14 +760,18 @@ impl Space {
     }
 
     /// Send the focused window to workspace `index`, keeping the current
-    /// workspace active.
+    /// workspace active. One past the end of the row makes a new workspace
+    /// for it.
     pub fn send_focused_to_workspace(&mut self, index: usize) -> bool {
-        if index >= self.workspaces.len() || index == self.active {
+        if index > self.workspaces.len() || index == self.active {
             return false;
         }
         let Some(id) = self.focused() else {
             return false;
         };
+        if index == self.workspaces.len() && self.add_workspace().is_none() {
+            return false;
+        }
         self.workspaces[self.active].remove(id);
         self.workspaces[index].insert(id);
         true
@@ -1044,8 +1137,18 @@ mod tests {
     /// gutter it leaves between two windows. See [`edge_gap`].
     const EDGE: i32 = edge_gap(DEFAULT_GAP);
 
+    /// A space with a few empty workspaces to move between. The row is
+    /// dynamic, and these tests are about what happens on it, not how big it
+    /// is; nothing here tidies, so they stay.
+    fn padded(mut s: Space) -> Space {
+        while s.workspaces().len() < 5 {
+            s.add_workspace();
+        }
+        s
+    }
+
     fn space() -> Space {
-        Space::new(SCREEN)
+        padded(Space::new(SCREEN))
     }
 
     #[test]
@@ -1583,9 +1686,10 @@ mod tests {
         // client with no home.
         let mut s = space();
         s.set_tile_cap(1);
-        for _ in 0..9 {
+        for _ in 0..MAX_WORKSPACES {
             s.open_window();
         }
+        assert_eq!(s.workspaces().len(), MAX_WORKSPACES, "the row grew to its cap");
         assert!(s.workspaces().iter().all(Workspace::is_full));
         let extra = s.open_window();
         assert!(
@@ -1661,7 +1765,7 @@ mod tests {
         // Scroll is per workspace, like the layout it belongs to. Held globally,
         // arriving on a carousel would inherit wherever the last one happened to
         // be sitting.
-        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let mut s = padded(Space::new(Rect::from_xywh(0, 0, 1000, 600)));
         let mut first = Vec::new();
         for _ in 0..6 {
             first.push(s.open_window());
@@ -1787,7 +1891,7 @@ mod tests {
     /// recomputed, so a test that swipes "two panes across" cannot disagree
     /// with the layout about how far that is.
     fn strip_of(n: usize) -> (Space, Vec<WindowId>, i32) {
-        let mut s = Space::new(Rect::from_xywh(0, 0, 1000, 600));
+        let mut s = padded(Space::new(Rect::from_xywh(0, 0, 1000, 600)));
         let windows: Vec<WindowId> = (0..n).map(|_| s.open_window()).collect();
         if let Some(first) = windows.first() {
             s.active_workspace_mut().focus(*first);
@@ -2080,9 +2184,129 @@ mod tests {
     const RIGHT: Rect = Rect::from_xywh(1920, 0, 2560, 1440);
 
     fn two_screens() -> Space {
-        let mut s = Space::new(LEFT);
+        let mut s = padded(Space::new(LEFT));
         s.set_outputs(vec![OutputArea::new(LEFT), OutputArea::new(RIGHT)]);
         s
+    }
+
+    #[test]
+    fn a_second_screen_on_a_single_workspace_row_gets_a_new_one() {
+        let mut s = Space::new(LEFT);
+        s.set_outputs(vec![OutputArea::new(LEFT), OutputArea::new(RIGHT)]);
+        let visible: Vec<_> = s.visible_workspaces().collect();
+        assert_eq!(visible, vec![(0, 0), (1, 1)], "not the active one, shared");
+        s.tidy_workspaces();
+        assert_eq!(s.workspaces().len(), 3, "both shown, plus a spare");
+    }
+
+    // ---- dynamic workspaces ------------------------------------------------
+
+    #[test]
+    fn the_row_starts_with_one_workspace_and_no_spare_while_it_is_empty() {
+        let mut s = Space::new(SCREEN);
+        assert_eq!(s.workspaces().len(), 1);
+        assert!(!s.tidy_workspaces(), "an empty desktop is already its own spare");
+        assert_eq!(s.workspaces().len(), 1);
+    }
+
+    #[test]
+    fn a_window_makes_a_spare_to_slide_into() {
+        let mut s = Space::new(SCREEN);
+        s.open_window();
+        assert!(s.tidy_workspaces());
+        assert_eq!(s.workspaces().len(), 2);
+        assert!(s.workspaces()[1].is_empty());
+    }
+
+    #[test]
+    fn standing_on_the_spare_keeps_it_and_makes_no_other() {
+        let mut s = Space::new(SCREEN);
+        s.open_window();
+        s.tidy_workspaces();
+        assert!(s.activate_workspace(1));
+        assert!(!s.tidy_workspaces());
+        assert_eq!(s.workspaces().len(), 2);
+        assert_eq!(s.active_index(), 1);
+    }
+
+    #[test]
+    fn leaving_an_empty_workspace_puts_it_away() {
+        let mut s = Space::new(SCREEN);
+        let a = s.open_window();
+        s.tidy_workspaces();
+        s.activate_workspace(1);
+        let b = s.open_window();
+        s.tidy_workspaces();
+        assert_eq!(s.workspaces().len(), 3, "1 and 2 in use, 3 spare");
+
+        // Onto the spare, then all the way back: the spare stays the spare.
+        s.activate_workspace(2);
+        s.tidy_workspaces();
+        s.activate_workspace(0);
+        s.tidy_workspaces();
+        assert_eq!(s.workspaces().len(), 3);
+
+        // Closing everything on 2 while on 1 takes 2 out of the row.
+        s.close_window(b);
+        assert!(s.tidy_workspaces());
+        assert_eq!(s.workspaces().len(), 2);
+        assert_eq!(s.workspace_of(a), Some(0));
+        assert!(s.workspaces()[1].is_empty());
+    }
+
+    #[test]
+    fn removing_a_workspace_before_the_active_one_keeps_you_where_you_are() {
+        let mut s = Space::new(SCREEN);
+        s.open_window();
+        s.tidy_workspaces();
+        s.activate_workspace(1);
+        let b = s.open_window();
+        s.tidy_workspaces();
+        s.activate_workspace(0);
+        let a = s.focused().unwrap();
+        s.close_window(a);
+        s.activate_workspace(1);
+        assert!(s.tidy_workspaces());
+        assert_eq!(s.active_index(), 0, "the emptied first one went");
+        assert_eq!(s.focused(), Some(b));
+        assert_eq!(s.visible_on(0), Some(0));
+    }
+
+    #[test]
+    fn emptying_the_workspace_you_are_on_drops_the_extra_spare() {
+        let mut s = Space::new(SCREEN);
+        s.open_window();
+        s.tidy_workspaces();
+        s.activate_workspace(1);
+        let b = s.open_window();
+        s.tidy_workspaces();
+        assert_eq!(s.workspaces().len(), 3);
+        s.close_window(b);
+        assert!(s.tidy_workspaces());
+        assert_eq!(s.workspaces().len(), 2, "the empty one you are on is the spare");
+        assert_eq!(s.active_index(), 1);
+    }
+
+    #[test]
+    fn the_row_stops_growing_at_the_cap() {
+        let mut s = Space::new(SCREEN);
+        for index in 0..MAX_WORKSPACES {
+            s.activate_workspace(index);
+            s.open_window();
+            s.tidy_workspaces();
+        }
+        assert_eq!(s.workspaces().len(), MAX_WORKSPACES);
+        assert!(s.workspaces().iter().all(|w| !w.is_empty()), "no room for a spare");
+    }
+
+    #[test]
+    fn sending_one_past_the_end_makes_a_workspace() {
+        let mut s = Space::new(SCREEN);
+        s.open_window();
+        let b = s.open_window();
+        assert!(s.send_focused_to_workspace(1));
+        assert_eq!(s.workspace_of(b), Some(1));
+        assert!(!s.send_focused_to_workspace(5), "further than that is refused");
     }
 
     #[test]

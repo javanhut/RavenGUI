@@ -1132,6 +1132,7 @@ impl Huginn {
         huginn.settings.apply_desktop_config(
             huginn.desktop_config.motion(),
             huginn.desktop_config.idle_after(),
+            huginn.desktop_config.launcher_style(),
         );
         huginn
     }
@@ -1152,7 +1153,13 @@ impl Huginn {
         self.refresh_overview_chrome();
 
         self.settings
-            .apply_desktop_config(cfg.motion(), cfg.idle_after());
+            .apply_desktop_config(cfg.motion(), cfg.idle_after(), cfg.launcher_style());
+        // The launcher row may just have changed under an open launcher.
+        if self.launcher.set_style(self.settings.launcher_style()) && self.launcher.is_open() {
+            let now = self.now();
+            self.launcher.reindex(&self.apps, &self.frecency, now);
+            self.refresh_launcher();
+        }
 
         if cfg.wallpaper() != self.desktop_config.wallpaper() {
             self.wallpaper = crate::wallpaper::Wallpaper::chosen_or_installed(cfg.wallpaper());
@@ -1616,6 +1623,7 @@ impl Huginn {
                     panel.size(),
                     self.launcher.origin(),
                     reveal,
+                    self.launcher.style(),
                 ),
                 reveal.clamp(0.0, 1.0),
             ));
@@ -2876,6 +2884,8 @@ impl Huginn {
                     // from the active workspace, and a swipe that snapped it
                     // back to the active index before following the fingers
                     // would lurch. With no overview the two are the same.
+                    // Tidied first, since that can move the active index.
+                    self.tidy_workspaces();
                     let origin = self
                         .workspace_carousel
                         .as_ref()
@@ -2902,6 +2912,7 @@ impl Huginn {
                         } else {
                             // Born pinned shut: the fingers drive the reveal
                             // from here, not the open animation.
+                            self.tidy_workspaces();
                             self.workspace_carousel =
                                 Some(WorkspaceCarousel::at(self.space.active_index() as f32, 0.0));
                             0.0
@@ -3382,6 +3393,19 @@ impl Huginn {
         }
     }
 
+    /// Grow or shrink the workspace row to what is in use; see
+    /// [`huginn_core::Space::tidy_workspaces`].
+    ///
+    /// Never while the overview's row exists, open or still closing: it
+    /// positions cards by workspace index, and a workspace taken out from
+    /// under it would slide every card after it one place over. The row is
+    /// tidied on the arrange that follows the overview finishing.
+    pub(crate) fn tidy_workspaces(&mut self) {
+        if self.workspace_carousel.is_none() {
+            self.space.tidy_workspaces();
+        }
+    }
+
     /// Open the workspace Cover Flow at the active workspace.
     pub(crate) fn open_workspace_carousel(&mut self) {
         let now = self.uptime();
@@ -3396,6 +3420,9 @@ impl Huginn {
             self.queue_redraw();
             return;
         }
+        // Last chance before the row holds indices: make sure the spare to
+        // slide into is there.
+        self.tidy_workspaces();
         let mut carousel = WorkspaceCarousel::at(self.space.active_index() as f32, 0.0);
         carousel.reveal.go_to(1.0, now, instant);
         self.workspace_carousel = Some(carousel);
@@ -4040,6 +4067,7 @@ impl Huginn {
         let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
         let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
         self.launcher.set_pinned(self.pins.paths().to_vec());
+        self.launcher.set_style(self.settings.launcher_style());
         self.launcher
             .open(&self.apps, &self.frecency, now, origin, clock, motion);
         self.refresh_launcher();
@@ -4072,6 +4100,7 @@ impl Huginn {
             panel.size(),
             self.launcher.origin(),
             self.launcher.reveal(self.uptime()),
+            self.launcher.style(),
         );
         self.launcher
             .layout()
@@ -4113,7 +4142,10 @@ impl Huginn {
         match self.launcher_canvas_point() {
             Some(point) => {
                 let (clock, motion) = (self.uptime(), self.settings.motion());
-                let outcome = self.launcher.click(point, &self.apps, clock, motion);
+                let now = self.now();
+                let outcome =
+                    self.launcher
+                        .click(point, &self.apps, &self.frecency, now, clock, motion);
                 self.act_on_launcher(outcome);
             }
             None => self.launcher_key(crate::launcher::Key::Dismiss),
@@ -4136,6 +4168,12 @@ impl Huginn {
             crate::launcher::Outcome::TogglePin { entry } => {
                 self.toggle_pin(&entry);
                 self.refresh_launcher();
+            }
+            crate::launcher::Outcome::OpenPinned => {
+                let (clock, motion) = (self.uptime(), self.settings.motion());
+                self.launcher.close(clock, motion);
+                self.refresh_launcher();
+                self.open_pinned();
             }
             crate::launcher::Outcome::Unchanged => {}
         }
@@ -4527,11 +4565,14 @@ impl Huginn {
         }
         let clock = self.uptime();
         if let Some(panel) = self.launcher_panel.as_ref() {
-            return crate::launcher::blur_rect(crate::launcher::placement(
+            // The arc is not a rectangle, so it names its own region; see
+            // `Launcher::blur_region`.
+            return self.launcher.blur_region(crate::launcher::placement(
                 self.output_area(),
                 panel.size(),
                 self.launcher.origin(),
                 self.launcher.reveal(clock),
+                self.launcher.style(),
             ));
         }
         // The pinned panel is drawn with the launcher's corners, so its
@@ -4776,6 +4817,17 @@ impl Huginn {
         let orientation = self.settings.pins_orientation();
         if self.pins.set_position(position) | self.pins.set_orientation(orientation) {
             self.pins_changed();
+        }
+        // The launcher row, likewise: the row owns the value and the
+        // launcher takes a copy, redrawing if it is on screen.
+        if self.launcher.set_style(self.settings.launcher_style())
+            && self.launcher.is_visible(now)
+        {
+            // Re-ranked, not only redrawn: the two layouts walk different
+            // navigation orders over the same query.
+            let epoch = self.now();
+            self.launcher.reindex(&self.apps, &self.frecency, epoch);
+            self.refresh_launcher();
         }
         self.queue_redraw();
     }
@@ -5953,6 +6005,7 @@ impl Huginn {
     /// sends the minimum number of configures. Sending one per window on every
     /// call would make clients re-render continuously.
     pub(crate) fn arrange(&mut self) {
+        self.tidy_workspaces();
         self.settle_carousel();
         // Where each visible window is drawn *before* the layout moves it,
         // which is where its motion has to start from. Taken now rather than

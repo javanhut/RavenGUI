@@ -657,6 +657,37 @@ impl Control for PinsLayout {
 const PINS_POSITION: &str = "Pinned apps";
 const PINS_LAYOUT: &str = "Pinned layout";
 
+/// How the launcher is laid out: the list or the arc. Wired up: the
+/// compositor reads it back through [`Settings::launcher_style`] and hands it
+/// to the launcher, which redraws in the new layout if it is open.
+#[derive(Debug)]
+struct LauncherLayout {
+    style: crate::launcher::Style,
+}
+
+impl Control for LauncherLayout {
+    fn label(&self) -> &str {
+        LAUNCHER_LAYOUT
+    }
+    fn read(&self) -> Reading {
+        Reading {
+            value: self.style.value().to_owned(),
+            real: true,
+        }
+    }
+    fn activate(&mut self) -> bool {
+        self.style = self.style.stepped(1);
+        true
+    }
+    fn adjust(&mut self, delta: i32) -> bool {
+        self.style = self.style.stepped(delta);
+        true
+    }
+}
+
+/// The launcher layout row's label, which is also how the row is found.
+const LAUNCHER_LAYOUT: &str = "Launcher";
+
 /// What the Power row can ask the machine to do.
 ///
 /// A closed set stepped with one key, like [`IdleAfter`]. Suspend comes
@@ -944,6 +975,9 @@ impl Settings {
                 Box::new(IdleLock {
                     after: IdleAfter::default(),
                 }),
+                Box::new(LauncherLayout {
+                    style: crate::launcher::Style::default(),
+                }),
                 Box::new(PinsPosition {
                     position: crate::pins::Position::default(),
                 }),
@@ -1038,15 +1072,31 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Give the Animations and Lock rows what `desktop.toml` said. Called at
-    /// startup and whenever the file changes; between those the rows are the
-    /// source, as with [`Self::set_pins_layout`].
-    pub(crate) fn apply_desktop_config(&mut self, motion: Motion, after: IdleAfter) {
+    /// How the launcher is laid out, read from the control that owns it.
+    pub(crate) fn launcher_style(&self) -> crate::launcher::Style {
+        self.controls
+            .iter()
+            .find(|c| c.label() == LAUNCHER_LAYOUT)
+            .and_then(|c| crate::launcher::Style::from_value(&c.read().value))
+            .unwrap_or_default()
+    }
+
+    /// Give the Animations, Lock and Launcher rows what `desktop.toml` said.
+    /// Called at startup and whenever the file changes; between those the
+    /// rows are the source, as with [`Self::set_pins_layout`].
+    pub(crate) fn apply_desktop_config(
+        &mut self,
+        motion: Motion,
+        after: IdleAfter,
+        style: crate::launcher::Style,
+    ) {
         for control in &mut self.controls {
             if control.label() == "Animations" {
                 *control = Box::new(Animations { motion });
             } else if control.label() == "Lock when idle" {
                 *control = Box::new(IdleLock { after });
+            } else if control.label() == LAUNCHER_LAYOUT {
+                *control = Box::new(LauncherLayout { style });
             }
         }
     }
@@ -1396,6 +1446,21 @@ mod tests {
             settings.press(Key::Down, T0);
         }
         panic!("could not reach {label:?}");
+    }
+
+    #[test]
+    fn the_launcher_row_steps_between_the_list_and_the_arc() {
+        use crate::launcher::Style;
+        let mut settings = opened();
+        assert_eq!(settings.launcher_style(), Style::List);
+        select(&mut settings, LAUNCHER_LAYOUT);
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Redraw);
+        assert_eq!(settings.launcher_style(), Style::Arc);
+        settings.press(Key::Activate, T0);
+        assert_eq!(settings.launcher_style(), Style::List);
+        // What the file says replaces what the row showed.
+        settings.apply_desktop_config(Motion::Full, IdleAfter::default(), Style::Arc);
+        assert_eq!(settings.launcher_style(), Style::Arc);
     }
 
     #[test]

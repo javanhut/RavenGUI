@@ -20,6 +20,8 @@
 //!   `Option` here rather than resolved at parse time.
 //! - `appearance.wallpaper` — the compositor's own background, behind whatever
 //!   `ravencanvasd` draws when it is running.
+//! - `appearance.launcher_layout` — `"list"` or `"arc"`,
+//!   [`crate::launcher::Style`]; also stepped from quick settings.
 //! - `general.terminal` — what the spawn binding launches.
 //! - `general.lock_after_minutes` — [`crate::settings::IdleAfter`].
 //!
@@ -47,6 +49,9 @@ pub(crate) struct Appearance {
     pub blur: Option<bool>,
     /// Absolute path of an image, or empty for the machine's wallpaper.
     pub wallpaper: String,
+    /// `"list"` or `"arc"`; see [`crate::launcher::Style`]. Empty, or a
+    /// value this build does not know, is the list.
+    pub launcher_layout: String,
 }
 
 impl Default for Appearance {
@@ -56,6 +61,7 @@ impl Default for Appearance {
             smooth_animations: true,
             blur: None,
             wallpaper: String::new(),
+            launcher_layout: String::new(),
         }
     }
 }
@@ -149,6 +155,11 @@ impl DesktopConfig {
         }
     }
 
+    /// How the launcher is laid out: the list unless the file names another.
+    pub(crate) fn launcher_style(&self) -> crate::launcher::Style {
+        crate::launcher::Style::from_value(&self.appearance.launcher_layout).unwrap_or_default()
+    }
+
     pub(crate) fn wallpaper(&self) -> Option<PathBuf> {
         let w = self.appearance.wallpaper.trim();
         (!w.is_empty()).then(|| PathBuf::from(w))
@@ -178,6 +189,17 @@ mod tests {
         assert_eq!(cfg.terminal(), crate::theme::TERMINAL);
         assert_eq!(cfg.wallpaper(), None);
         assert_eq!(cfg.appearance.blur, None);
+    }
+
+    #[test]
+    fn the_launcher_layout_is_the_list_unless_the_file_names_the_arc() {
+        use crate::launcher::Style;
+        assert_eq!(DesktopConfig::parse("").unwrap().launcher_style(), Style::List);
+        let arc = DesktopConfig::parse("[appearance]\nlauncher_layout = \"arc\"\n").unwrap();
+        assert_eq!(arc.launcher_style(), Style::Arc);
+        // A layout a later build added falls back rather than failing the file.
+        let unknown = DesktopConfig::parse("[appearance]\nlauncher_layout = \"orbit\"\n").unwrap();
+        assert_eq!(unknown.launcher_style(), Style::List);
     }
 
     #[test]

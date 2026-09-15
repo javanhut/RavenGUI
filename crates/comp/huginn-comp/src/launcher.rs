@@ -17,6 +17,10 @@
 
 use raven_desktop::{Entry, FileIndex, Frecency, Icons, Pixmaps, calculate, entry, search};
 
+mod arc;
+mod list;
+mod paint;
+
 /// Read every installed application.
 ///
 /// Called at startup and again whenever [`crate::appwatch`] sees one of these
@@ -92,6 +96,14 @@ pub(crate) enum Key {
     Down,
     Left,
     Right,
+    /// A page of the arc at a time, or three rows of the list's grid.
+    PageUp,
+    PageDown,
+    /// `Ctrl`+`Left`/`Right`: the previous or next filter while searching —
+    /// All, Apps, Files — or, on the arc before anything is typed, the
+    /// previous or next category.
+    PrevGroup,
+    NextGroup,
     /// Launch the selected application.
     Launch,
     /// Show, or hide, the selected application's other ways to start.
@@ -119,6 +131,10 @@ impl Key {
             keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => Self::Actions,
             keysyms::KEY_BackSpace if ctrl => Self::DeleteWord,
             keysyms::KEY_BackSpace => Self::Backspace,
+            keysyms::KEY_Left if ctrl => Self::PrevGroup,
+            keysyms::KEY_Right if ctrl => Self::NextGroup,
+            keysyms::KEY_Page_Up => Self::PageUp,
+            keysyms::KEY_Page_Down => Self::PageDown,
             keysyms::KEY_Up => Self::Up,
             keysyms::KEY_Down => Self::Down,
             keysyms::KEY_Left => Self::Left,
@@ -163,6 +179,9 @@ pub(crate) enum Outcome {
     /// the pin list (see [`crate::pins`]) and tells the launcher what it
     /// now holds through [`Launcher::set_pinned`].
     TogglePin { entry: std::path::PathBuf },
+    /// Close the launcher and open the pinned panel in its place: the
+    /// list's "Pinned panel" link, for the pins that did not fit the foot.
+    OpenPinned,
 }
 
 /// What a re-rank does with the highlight. Typing asks a new question and
@@ -189,6 +208,177 @@ pub(crate) enum Target {
     /// The typed query, evaluated as arithmetic. Not something to launch —
     /// see [`Launcher::launch`] for what Enter does on it.
     Result,
+}
+
+/// How the launcher is laid out. Chosen in quick settings, and by
+/// `appearance.launcher_layout` in `desktop.toml`.
+///
+/// Two layouts over one launcher rather than two launchers: the query, the
+/// ranking, the actions menu and pinning are the same whichever is showing,
+/// and only how they are arranged — and so what the arrow keys walk — differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Style {
+    /// A search bar that opens into a grid: suggestions with the pinned and
+    /// recent applications along the foot before anything is typed, results
+    /// once something is. The default, because a list of names is what
+    /// everyone already knows how to read.
+    #[default]
+    List,
+    /// Seven applications on an arc around the search, the categories beside
+    /// it, and the highlighted application's details and actions on the other
+    /// side.
+    Arc,
+}
+
+impl Style {
+    pub(crate) const ALL: [Self; 2] = [Self::List, Self::Arc];
+
+    /// What the quick settings row shows, and what `desktop.toml` says.
+    pub(crate) fn value(self) -> &'static str {
+        match self {
+            Self::List => "List",
+            Self::Arc => "Arc",
+        }
+    }
+
+    pub(crate) fn from_value(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.value().eq_ignore_ascii_case(value.trim()))
+    }
+
+    /// The next layout, `delta` steps along [`Self::ALL`], wrapping.
+    pub(crate) fn stepped(self, delta: i32) -> Self {
+        let n = Self::ALL.len() as i32;
+        let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0) as i32;
+        Self::ALL[(at + delta).rem_euclid(n) as usize]
+    }
+}
+
+/// Which kinds of result a search shows.
+///
+/// Tabs in the list, the sidebar on the arc. Counted before filtering, so
+/// the tab says how many files a search found while the apps are showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Filter {
+    #[default]
+    All,
+    Apps,
+    Files,
+}
+
+impl Filter {
+    pub(crate) const ALL: [Self; 3] = [Self::All, Self::Apps, Self::Files];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Apps => "Apps",
+            Self::Files => "Files",
+        }
+    }
+
+    fn stepped(self, delta: i32) -> Self {
+        let n = Self::ALL.len() as i32;
+        let at = Self::ALL.iter().position(|f| *f == self).unwrap_or(0) as i32;
+        Self::ALL[(at + delta).rem_euclid(n) as usize]
+    }
+}
+
+/// How a search's results are ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Sort {
+    /// Match quality, then frecency: what [`search`] returns.
+    #[default]
+    Relevance,
+    /// Alphabetical, for someone scanning for a name they half remember.
+    Name,
+}
+
+impl Sort {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Relevance => "Best match",
+            Self::Name => "Name",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Relevance => Self::Name,
+            Self::Name => Self::Relevance,
+        }
+    }
+}
+
+/// What the arc's sidebar groups applications by, before anything is typed.
+///
+/// A handful of groups over the freedesktop `Categories` rather than the
+/// spec's dozens: a sidebar of "AudioVideo", "Audio" and "Video" as three
+/// rows is three chances to look in the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Category {
+    All,
+    Development,
+    Media,
+    Internet,
+    Utilities,
+    System,
+}
+
+impl Category {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::All,
+        Self::Development,
+        Self::Media,
+        Self::Internet,
+        Self::Utilities,
+        Self::System,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::All => "All Apps",
+            Self::Development => "Development",
+            Self::Media => "Media",
+            Self::Internet => "Internet",
+            Self::Utilities => "Utilities",
+            Self::System => "System",
+        }
+    }
+
+    /// Whether `entry` belongs here, by the categories its desktop file lists.
+    pub(crate) fn contains(self, entry: &Entry) -> bool {
+        let has = |names: &[&str]| {
+            entry
+                .categories
+                .iter()
+                .any(|c| names.iter().any(|n| c.eq_ignore_ascii_case(n)))
+        };
+        match self {
+            Self::All => true,
+            Self::Development => has(&["Development"]),
+            Self::Media => has(&["AudioVideo", "Audio", "Video", "Graphics"]),
+            Self::Internet => has(&["Network"]),
+            Self::Utilities => has(&["Utility"]),
+            Self::System => has(&["System", "Settings"]),
+        }
+    }
+}
+
+/// Something on the panel that answers a click but is not in the navigation
+/// order: a tab, the sort, the list's chevron, a category, a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Button {
+    /// The list's chevron: open the bar into the grid, or close it again.
+    Expand,
+    Filter(Filter),
+    Sort,
+    /// A category on the arc's sidebar, as an index into
+    /// [`Launcher::categories`].
+    Category(usize),
+    /// The list's link to the pinned panel.
+    PinnedPanel,
 }
 
 /// The launcher.
@@ -242,6 +432,31 @@ pub(crate) struct Launcher {
     /// "Pin" or "Unpin" without being handed the pin list on every key. Set
     /// by the compositor when the launcher opens and after each toggle.
     pinned: Vec<std::path::PathBuf>,
+    /// Which layout draws it; see [`Style`].
+    style: Style,
+    /// Whether the list's grid is showing. The list opens as a bar — only
+    /// the search field — and grows into the grid on Down, Tab or Return,
+    /// or as soon as anything is typed. Meaningless on the arc.
+    expanded: bool,
+    /// Which kinds of result a search shows.
+    filter: Filter,
+    /// How a search's results are ordered.
+    sort: Sort,
+    /// The categories the arc offers — [`Category::All`] and every group at
+    /// least one installed application is in — and which is chosen.
+    categories: Vec<Category>,
+    category: usize,
+    /// The list's suggestion tiles before anything is typed: the most-used
+    /// applications that are not already pinned, as indices.
+    suggested: Vec<usize>,
+    /// The pinned applications the list's foot shows, as indices, in pin
+    /// order. Those whose desktop file is not installed are left out.
+    pins_shown: Vec<usize>,
+    /// When each application was last launched, for "Opened 2h ago".
+    last_used: Vec<(usize, u64)>,
+    /// How many applications and files the search found before [`Filter`]
+    /// took any away, so the tabs can say.
+    found: (usize, usize),
 }
 
 impl Default for Launcher {
@@ -263,6 +478,16 @@ impl Default for Launcher {
             origin: None,
             layout: Layout::default(),
             pinned: Vec::new(),
+            style: Style::default(),
+            expanded: false,
+            filter: Filter::default(),
+            sort: Sort::default(),
+            categories: vec![Category::All],
+            category: 0,
+            suggested: Vec::new(),
+            pins_shown: Vec::new(),
+            last_used: Vec::new(),
+            found: (0, 0),
         }
     }
 }
@@ -338,40 +563,149 @@ impl Launcher {
         self.visible.get(self.selected).copied()
     }
 
-    /// The application rows the list draws: at most [`VISIBLE`] of
-    /// [`Self::results`], starting at `first`.
+    /// The first row of the list's result grid that is drawn; at most
+    /// [`GRID_ROWS`] rows are.
     ///
-    /// `first` is scroll state, kept rather than derived from the selection,
-    /// because the keyboard and the mouse want different things of it. The
-    /// highlight walking down past the last drawn row pulls the window down
-    /// one row at a time, and walking back up past the first pulls it back
-    /// (see [`Self::scroll_to_selection`]). The pointer, on the other hand,
-    /// only ever lands on a row that is already drawn — and a window that
-    /// re-derived itself around the hovered row would slide the rows out
-    /// from under the pointer, so the next motion event highlighted a
-    /// different application than the one the hand is over. With the
-    /// highlight below the applications — on the files or the run row — the
-    /// window stays where it was when the highlight left.
-    pub(crate) fn window(&self) -> &[usize] {
-        let len = self.results.len();
-        let first = self.first.min(len.saturating_sub(VISIBLE));
-        &self.results[first..(first + VISIBLE).min(len)]
+    /// Scroll state, kept rather than derived from the selection, because the
+    /// keyboard and the mouse want different things of it. The highlight
+    /// walking down past the last drawn row pulls the grid down a row, and
+    /// walking back up past the first pulls it back (see
+    /// [`Self::scroll_to_selection`]). The pointer only ever lands on a tile
+    /// already drawn — and a grid that re-derived itself around the hovered
+    /// tile would slide the tiles out from under the pointer, so the next
+    /// motion event highlighted something other than what the hand is over.
+    pub(crate) fn first_row(&self) -> usize {
+        self.first
     }
 
-    /// Slide the window the least that puts the highlight among the drawn
-    /// rows. Called after the keyboard moves the highlight and after the
-    /// results change; deliberately not after a hover, see [`Self::window`].
+    /// Slide the grid the least that puts the highlight among the drawn rows.
+    /// Called after the keyboard moves the highlight and after the results
+    /// change; deliberately not after a hover, see [`Self::first_row`].
     fn scroll_to_selection(&mut self) {
-        let last_window = self.results.len().saturating_sub(VISIBLE);
-        if let (Some(Target::App(_)), false) = (self.target(), self.is_grid()) {
-            // The application section of `visible` mirrors `results`,
-            // offset by the result row when there is one.
-            let position = self.selected - usize::from(self.result.is_some());
-            self.first = self
-                .first
-                .clamp(position.saturating_sub(VISIBLE - 1), position);
+        let tiles = self.tile_range();
+        let last_first = tiles.len().div_ceil(COLUMNS).saturating_sub(GRID_ROWS);
+        if self.style == Style::List && !self.is_grid() && tiles.contains(&self.selected) {
+            let row = (self.selected - tiles.start) / COLUMNS;
+            self.first = self.first.clamp(row.saturating_sub(GRID_ROWS - 1), row);
         }
-        self.first = self.first.min(last_window);
+        self.first = self.first.min(last_first);
+    }
+
+    /// The tiles of the list's grid, as positions in the navigation order:
+    /// the suggestions before anything is typed, and once something is, the
+    /// applications and then the files — between the result row, when
+    /// there is one, and the run row.
+    fn tile_range(&self) -> std::ops::Range<usize> {
+        if self.is_grid() {
+            0..self.suggested.len()
+        } else {
+            let start = usize::from(self.visible.first() == Some(&Target::Result));
+            start..start + self.results.len() + self.file_hits.len()
+        }
+    }
+
+    /// The list's foot before anything is typed — the pinned applications,
+    /// then the recent ones — as positions in the navigation order.
+    fn strip_range(&self) -> std::ops::Range<usize> {
+        if self.is_grid() && self.style == Style::List {
+            self.suggested.len()..self.visible.len()
+        } else {
+            0..0
+        }
+    }
+
+    /// Which layout draws the launcher.
+    pub(crate) fn style(&self) -> Style {
+        self.style
+    }
+
+    /// Lay out in `style` from now on. Returns whether that was a change.
+    ///
+    /// The navigation order differs between the layouts, so the caller
+    /// re-ranks an open launcher afterwards ([`Self::reindex`]); the
+    /// highlight goes back to the top rather than to whatever sits at the
+    /// same position in a different arrangement.
+    pub(crate) fn set_style(&mut self, style: Style) -> bool {
+        if self.style == style {
+            return false;
+        }
+        self.style = style;
+        self.selected = 0;
+        self.first = 0;
+        self.menu = None;
+        true
+    }
+
+    /// Whether the list is only its search bar: nothing typed, and not
+    /// opened into the grid.
+    pub(crate) fn is_collapsed(&self) -> bool {
+        self.style == Style::List && !self.expanded && self.query.is_empty()
+    }
+
+    pub(crate) fn filter(&self) -> Filter {
+        self.filter
+    }
+
+    pub(crate) fn sort(&self) -> Sort {
+        self.sort
+    }
+
+    /// How many applications and files the search found, before the filter.
+    pub(crate) fn found(&self) -> (usize, usize) {
+        self.found
+    }
+
+    /// The categories on the arc's sidebar, and which is chosen.
+    pub(crate) fn categories(&self) -> &[Category] {
+        &self.categories
+    }
+
+    pub(crate) fn category(&self) -> usize {
+        self.category
+    }
+
+    /// The list's suggestion tiles, as indices into the application list.
+    pub(crate) fn suggested(&self) -> &[usize] {
+        &self.suggested
+    }
+
+    /// The pinned applications along the list's foot, as indices.
+    pub(crate) fn pins_shown(&self) -> &[usize] {
+        &self.pins_shown
+    }
+
+    /// When the application at `index` was last launched, in unix seconds.
+    pub(crate) fn last_used(&self, index: usize) -> Option<u64> {
+        self.last_used
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, at)| *at)
+    }
+
+    /// Everything the highlight can be on, in navigation order.
+    pub(crate) fn visible(&self) -> &[Target] {
+        &self.visible
+    }
+
+    /// The highlight's position in [`Self::visible`].
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Where the blurred desktop shows through the launcher at `placement`.
+    ///
+    /// The list is a rounded rectangle and blurs as every panel does
+    /// ([`blur_rect`]). The arc is not a rectangle, and the blur path can only
+    /// crop to one: the arc's composition names a rectangle that lies wholly
+    /// inside its glass ([`Layout::blur`]), mapped here onto the output.
+    pub(crate) fn blur_region(&self, placement: Rect) -> Option<Rect> {
+        match self.layout.blur {
+            Some(inner) => {
+                let region = self.layout.to_output(placement, inner);
+                (!region.is_empty()).then_some(region)
+            }
+            None => blur_rect(placement),
+        }
     }
 
     /// Files matching the query, best first. Empty in the grid.
@@ -397,7 +731,9 @@ impl Launcher {
     /// name through the shell would be a trap one keystroke below it. Files
     /// do not suppress it — a file called "make" is not what "make" meant.
     pub(crate) fn offers_command(&self) -> bool {
-        !self.query.is_empty() && self.results.is_empty()
+        // Counted before the filter: "Files" hiding the applications that
+        // matched does not make the query a command.
+        !self.query.is_empty() && self.found.0 == 0
     }
 
     /// Use a newly built index. The next re-rank searches it.
@@ -456,20 +792,6 @@ impl Launcher {
         self.query.is_empty()
     }
 
-    /// How many suggestion tiles are showing.
-    fn tiles(&self) -> usize {
-        if self.is_grid() {
-            self.results.len().min(SUGGESTED)
-        } else {
-            0
-        }
-    }
-
-    /// Whether the highlight is on a suggestion tile rather than a row.
-    fn on_tile(&self) -> bool {
-        self.selected < self.tiles()
-    }
-
     /// Open with an empty query, showing the most-used applications.
     ///
     /// `origin` is the dock's launcher icon, or `None` to grow in place from
@@ -488,7 +810,14 @@ impl Launcher {
         self.open = true;
         self.query.clear();
         self.selected = 0;
+        self.first = 0;
         self.menu = None;
+        // Every opening starts from the same place: the bar, every result
+        // kind, best match first, and all the applications on the arc.
+        self.expanded = false;
+        self.filter = Filter::All;
+        self.sort = Sort::Relevance;
+        self.category = 0;
         self.origin = origin;
         self.refresh(entries, frecency, now, Keep::Top);
         self.reveal.open(clock, motion.is_reduced());
@@ -574,14 +903,49 @@ impl Launcher {
                     self.menu = Some(next);
                     return Outcome::Redraw;
                 }
-                Key::Left | Key::Right | Key::Ignored => return Outcome::Unchanged,
+                Key::Left
+                | Key::Right
+                | Key::PageUp
+                | Key::PageDown
+                | Key::PrevGroup
+                | Key::NextGroup
+                | Key::Ignored => return Outcome::Unchanged,
                 Key::Launch => return self.launch(entries, clock, motion),
                 Key::Insert(_) | Key::Backspace | Key::DeleteWord | Key::Clear => {
                     self.menu = None;
                 }
             }
         }
+        // The list's bar is only a field: the keys that would walk a grid
+        // open it instead, and the rest have nothing to walk.
+        if self.is_collapsed() {
+            match key {
+                Key::Down | Key::Actions | Key::Launch => {
+                    self.expanded = true;
+                    self.selected = 0;
+                    self.first = 0;
+                    return Outcome::Redraw;
+                }
+                Key::Up
+                | Key::Left
+                | Key::Right
+                | Key::PageUp
+                | Key::PageDown
+                | Key::PrevGroup
+                | Key::NextGroup => return Outcome::Unchanged,
+                _ => {}
+            }
+        }
         match key {
+            // Escape folds an opened list back into its bar before it closes
+            // anything: the grid was asked for with a key, and one key puts
+            // it away again. Anything typed, or the arc, closes at once.
+            Key::Dismiss if self.style == Style::List && self.expanded && self.query.is_empty() => {
+                self.expanded = false;
+                self.selected = 0;
+                self.first = 0;
+                Outcome::Redraw
+            }
             Key::Dismiss => {
                 self.close(clock, motion);
                 Outcome::Dismissed
@@ -596,16 +960,17 @@ impl Launcher {
                 self.menu = Some(0);
                 Outcome::Redraw
             }
-            Key::Up => self.move_vertically(-1),
-            Key::Down => self.move_vertically(1),
-            // A row has no sideways; the keys are swallowed rather than
-            // forwarded, like every other key while the launcher is open.
-            Key::Left if !self.on_tile() => Outcome::Unchanged,
-            Key::Right if !self.on_tile() => Outcome::Unchanged,
-            Key::Left => self.move_selection(-1),
-            Key::Right => self.move_selection(1),
+            Key::Up => self.step(huginn_core::geometry::Dir::Up),
+            Key::Down => self.step(huginn_core::geometry::Dir::Down),
+            Key::Left => self.step(huginn_core::geometry::Dir::Left),
+            Key::Right => self.step(huginn_core::geometry::Dir::Right),
+            Key::PageUp => self.page(-1),
+            Key::PageDown => self.page(1),
+            Key::PrevGroup => self.change_group(-1, entries, frecency, now),
+            Key::NextGroup => self.change_group(1, entries, frecency, now),
             Key::Insert(c) => {
                 self.query.push(c);
+                self.expanded = true;
                 self.after_edit(entries, frecency, now)
             }
             Key::Backspace => {
@@ -766,23 +1131,31 @@ impl Launcher {
         &mut self,
         point: huginn_core::geometry::Point,
         entries: &[Entry],
+        frecency: &Frecency,
+        now: u64,
         clock: std::time::Duration,
         motion: crate::settings::Motion,
     ) -> Outcome {
         if !self.open {
             return Outcome::Unchanged;
         }
-        if self.menu.is_some() {
-            return match self.layout.menu_hit(point) {
+        if let Some(button) = self.layout.button(point) {
+            return self.press_button(button, entries, frecency, now);
+        }
+        // The arc lists the highlighted application's actions all the
+        // time, in its card, so one of them is a click away without Tab.
+        if self.menu.is_some() || self.style == Style::Arc {
+            match self.layout.menu_hit(point) {
                 Some(item) => {
                     self.menu = Some(item);
-                    self.launch(entries, clock, motion)
+                    return self.launch(entries, clock, motion);
                 }
-                None => {
+                None if self.menu.is_some() => {
                     self.menu = None;
-                    Outcome::Redraw
+                    return Outcome::Redraw;
                 }
-            };
+                None => {}
+            }
         }
         let moved = self.hover(point);
         if self.layout.hit(point).is_none() {
@@ -804,6 +1177,72 @@ impl Launcher {
     /// match, not whatever happened to be highlighted for the previous query.
     fn after_edit(&mut self, entries: &[Entry], frecency: &Frecency, now: u64) -> Outcome {
         self.selected = 0;
+        self.first = 0;
+        // A filter is a way of looking at a search; with the search gone,
+        // the next one starts from everything again.
+        if self.query.is_empty() {
+            self.filter = Filter::All;
+        }
+        self.refresh(entries, frecency, now, Keep::Top);
+        Outcome::Redraw
+    }
+
+    /// A click on something that is not a result: a tab, the sort, the
+    /// chevron, a category, the link to the pinned panel.
+    fn press_button(
+        &mut self,
+        button: Button,
+        entries: &[Entry],
+        frecency: &Frecency,
+        now: u64,
+    ) -> Outcome {
+        match button {
+            Button::Expand if self.is_collapsed() => {
+                self.expanded = true;
+            }
+            // The chevron on an open list folds it back to the bar, taking
+            // any query with it: a bar with a query in it is not a bar.
+            Button::Expand => {
+                self.query.clear();
+                self.expanded = false;
+                self.filter = Filter::All;
+            }
+            Button::Filter(filter) if filter == self.filter => return Outcome::Unchanged,
+            Button::Filter(filter) => self.filter = filter,
+            Button::Sort => self.sort = self.sort.toggled(),
+            Button::Category(index) if index == self.category || index >= self.categories.len() => {
+                return Outcome::Unchanged;
+            }
+            Button::Category(index) => self.category = index,
+            Button::PinnedPanel => return Outcome::OpenPinned,
+        }
+        self.selected = 0;
+        self.first = 0;
+        self.menu = None;
+        self.refresh(entries, frecency, now, Keep::Top);
+        Outcome::Redraw
+    }
+
+    /// `Ctrl`+`Left`/`Right`: the next filter while searching, or the next
+    /// category on the arc before anything is typed.
+    fn change_group(
+        &mut self,
+        delta: i32,
+        entries: &[Entry],
+        frecency: &Frecency,
+        now: u64,
+    ) -> Outcome {
+        if !self.query.is_empty() {
+            self.filter = self.filter.stepped(delta);
+        } else if self.style == Style::Arc && self.categories.len() > 1 {
+            let n = self.categories.len() as i32;
+            self.category = (self.category as i32 + delta).rem_euclid(n) as usize;
+        } else {
+            return Outcome::Unchanged;
+        }
+        self.selected = 0;
+        self.first = 0;
+        self.menu = None;
         self.refresh(entries, frecency, now, Keep::Top);
         Outcome::Redraw
     }
@@ -831,47 +1270,102 @@ impl Launcher {
             .map(|hit| hit.index)
             .collect();
         self.recent.clear();
+        self.suggested.clear();
+        self.pins_shown.clear();
+        self.last_used = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| frecency.last_used(&e.path).map(|t| (i, t)))
+            .collect();
+        // A category with nothing in it is a row that leads nowhere.
+        self.categories = Category::ALL
+            .into_iter()
+            .filter(|c| *c == Category::All || entries.iter().any(|e| c.contains(e)))
+            .collect();
+        self.category = self.category.min(self.categories.len() - 1);
         if self.is_grid() {
-            let tiles = self.results.len().min(SUGGESTED);
-            // Not already a tile: a row that repeats a tile a few pixels up
-            // tells the user nothing they were not just looking at.
-            let shown = &self.results[..tiles];
-            self.recent = entries
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !shown.contains(i))
-                .filter_map(|(i, e)| frecency.last_used(&e.path).map(|t| (i, t)))
-                .collect();
-            self.recent
-                .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            self.recent.truncate(RECENT);
             self.file_hits.clear();
             self.result = None;
-            self.visible = shown
-                .iter()
-                .chain(self.recent.iter().map(|(i, _)| i))
-                .map(|i| Target::App(*i))
-                .collect();
+            self.found = (self.results.len(), 0);
+            match self.style {
+                Style::List => {
+                    // Pinned first, and not suggested again: a tile that
+                    // repeats something on the foot a few pixels down tells
+                    // the user nothing they were not just looking at.
+                    self.pins_shown = self
+                        .pinned
+                        .iter()
+                        .filter_map(|p| entries.iter().position(|e| e.path == *p))
+                        .take(PINS_SHOWN)
+                        .collect();
+                    let pins = &self.pins_shown;
+                    self.suggested = self
+                        .results
+                        .iter()
+                        .copied()
+                        .filter(|i| !pins.contains(i))
+                        .take(SUGGESTED)
+                        .collect();
+                    let suggested = &self.suggested;
+                    self.recent = self
+                        .last_used
+                        .iter()
+                        .copied()
+                        .filter(|(i, _)| !suggested.contains(i) && !pins.contains(i))
+                        .collect();
+                    self.recent
+                        .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    self.recent.truncate(RECENT);
+                    self.visible = self
+                        .suggested
+                        .iter()
+                        .chain(&self.pins_shown)
+                        .chain(self.recent.iter().map(|(i, _)| i))
+                        .map(|i| Target::App(*i))
+                        .collect();
+                }
+                Style::Arc => {
+                    // Already by frecency, then name: the first page of the
+                    // arc is what gets used, and the rest reads A to Z.
+                    let category = self.categories[self.category];
+                    self.results
+                        .retain(|i| entries.get(*i).is_some_and(|e| category.contains(e)));
+                    self.visible = self.results.iter().map(|i| Target::App(*i)).collect();
+                }
+            }
         } else {
-            // Every application is navigable, not only the rows that fit:
-            // the list scrolls under the highlight (see [`Self::window`]),
-            // so the ninth match is one more Down away rather than
-            // unreachable. The files come after the last application,
-            // however many there were. Not before the last term is two
-            // characters long, though: one letter matches most of a large
-            // index, and this runs here, on the compositor thread, on every
-            // keystroke — so `f` lists Firefox and Files, and no files.
-            self.file_hits = self.files.search(&self.query, FILES);
-            // The arithmetic result first: a query that evaluates was asked
-            // for its value, and a value is read, not chosen. The command
-            // last: it is the fallback, offered after everything the desktop
-            // could find, and the highlight should land on it only when
-            // there was nothing else to land on.
+            // Every match is navigable, not only the tiles that fit: the
+            // grid scrolls under the highlight (see [`Self::first_row`]).
+            // The files come after the last application, however many there
+            // were. Not before the last term is two characters long, though:
+            // one letter matches most of a large index, and this runs here,
+            // on the compositor thread, on every keystroke — so `f` lists
+            // Firefox and Files, and no files.
+            let mut files = self.files.search(&self.query, FILES);
+            self.found = (self.results.len(), files.len());
             self.result = calculate(&self.query);
-            self.visible = self
-                .result
-                .iter()
-                .map(|_| Target::Result)
+            match self.filter {
+                Filter::All => {}
+                Filter::Apps => files.clear(),
+                Filter::Files => self.results.clear(),
+            }
+            if self.sort == Sort::Name {
+                self.results
+                    .sort_by_cached_key(|i| entries.get(*i).map(|e| e.name.to_lowercase()));
+                let index = &self.files;
+                files.sort_by_cached_key(|i| index.get(*i).map(|f| f.name.to_lowercase()));
+            }
+            self.file_hits = files;
+            // The arithmetic result first on the list: a query that
+            // evaluates was asked for its value, and a value is read, not
+            // chosen. The arc shows it in the hub instead, where there is no
+            // row to put it on. The command last: it is the fallback,
+            // offered after everything the desktop could find, and the
+            // highlight should land on it only when there was nothing else.
+            let result = self.result.is_some() && self.style == Style::List;
+            self.visible = result
+                .then_some(Target::Result)
+                .into_iter()
                 .chain(self.results.iter().map(|i| Target::App(*i)))
                 .chain(self.file_hits.iter().map(|i| Target::File(*i)))
                 .chain(self.offers_command().then_some(Target::Command))
@@ -903,30 +1397,153 @@ impl Launcher {
         self.scroll_to_selection();
     }
 
-    /// `Up`/`Down`: a row of tiles at a time on the grid, a row at a time in
-    /// a list, and from the bottom of the grid down into the recent rows.
+    /// An arrow key, in whichever layout is showing.
+    ///
+    /// The arc is one line bent round: every arrow walks along it, `Left` and
+    /// `Up` towards its left end and `Right` and `Down` towards its right,
+    /// because on a curve "up" is a different direction at every slot. The
+    /// list is a grid with rows above and below it.
+    fn step(&mut self, dir: huginn_core::geometry::Dir) -> Outcome {
+        use huginn_core::geometry::Dir;
+        match (self.style, dir) {
+            (Style::Arc, Dir::Left | Dir::Up) => self.arc_move(-1),
+            (Style::Arc, Dir::Right | Dir::Down) => self.arc_move(1),
+            (Style::List, Dir::Up) => self.move_vertically(-1),
+            (Style::List, Dir::Down) => self.move_vertically(1),
+            // Sideways only along a row of tiles or the foot, and never off
+            // the end of one onto the other; a row has no sideways, and the
+            // keys are swallowed rather than forwarded.
+            (Style::List, Dir::Left | Dir::Right) => {
+                let delta: isize = if dir == Dir::Left { -1 } else { 1 };
+                let next = self.selected as isize + delta;
+                let within = |range: std::ops::Range<usize>| {
+                    range.contains(&self.selected) && next >= 0 && range.contains(&(next as usize))
+                };
+                if within(self.tile_range()) || within(self.strip_range()) {
+                    self.move_selection(delta)
+                } else {
+                    Outcome::Unchanged
+                }
+            }
+        }
+    }
+
+    /// `Up`/`Down` on the list: a row of tiles at a time, from the bottom row
+    /// onto the foot or the run row, and from the top row onto the result.
     fn move_vertically(&mut self, direction: isize) -> Outcome {
-        let tiles = self.tiles();
-        if !self.on_tile() {
-            // In a list, or in the recent rows. Up off the top of the recent
-            // rows lands on the last tile.
-            return self.move_selection(direction);
+        let (tiles, strip, selected) = (self.tile_range(), self.strip_range(), self.selected);
+        if tiles.contains(&selected) {
+            let next = selected as isize + direction * COLUMNS as isize;
+            if next < tiles.start as isize {
+                // Off the top row: onto the result row, if there is one.
+                return if tiles.start > 0 {
+                    self.select(tiles.start - 1)
+                } else {
+                    Outcome::Unchanged
+                };
+            }
+            if next as usize >= tiles.end {
+                let row = |at: usize| (at - tiles.start) / COLUMNS;
+                if row(selected) != row(tiles.end - 1) {
+                    // A short last row: onto its last tile.
+                    return self.select(tiles.end - 1);
+                }
+                // Off the bottom row: onto the foot or the run row.
+                return if tiles.end < self.visible.len() {
+                    self.select(tiles.end)
+                } else {
+                    Outcome::Unchanged
+                };
+            }
+            return self.select(next as usize);
         }
-        let next = self.selected as isize + direction * COLUMNS as isize;
-        if next < 0 {
-            return self.move_selection(-(self.selected as isize));
+        if strip.contains(&selected) {
+            if direction > 0 || tiles.is_empty() {
+                return Outcome::Unchanged;
+            }
+            // Up off the foot: into the last row of tiles, at the same column
+            // as far as the row reaches.
+            let last_row = tiles.start + (tiles.len() - 1) / COLUMNS * COLUMNS;
+            let column = (selected - strip.start).min(COLUMNS - 1);
+            return self.select((last_row + column).min(tiles.end - 1));
         }
-        if next as usize >= tiles {
-            // Past the last row of tiles: onto the first recent row if there
-            // is one, otherwise stay on the last tile.
-            let target = if self.visible.len() > tiles {
-                tiles
-            } else {
-                tiles - 1
-            };
-            return self.move_selection(target as isize - self.selected as isize);
+        // The result row or the run row: one step onto whatever is beside it.
+        self.move_selection(direction)
+    }
+
+    /// Put the highlight on position `index`.
+    fn select(&mut self, index: usize) -> Outcome {
+        self.move_selection(index as isize - self.selected as isize)
+    }
+
+    /// A step along the arc, by where the slots sit rather than by rank:
+    /// ranks go out from the top alternately left and right (see
+    /// [`RANK_POS`]), so rank order would zigzag across it. Past either end
+    /// is the neighbouring page.
+    fn arc_move(&mut self, direction: isize) -> Outcome {
+        let n = self.visible.len();
+        if n == 0 {
+            return Outcome::Unchanged;
         }
-        self.move_selection(next - self.selected as isize)
+        let page = self.selected / ARC_SLOTS;
+        let on_page = (n - page * ARC_SLOTS).min(ARC_SLOTS);
+        let mut position = RANK_POS[self.selected - page * ARC_SLOTS] as isize + direction;
+        // Skip the empty slots of a short last page.
+        while (0..ARC_SLOTS as isize).contains(&position)
+            && rank_at(position as usize).is_none_or(|rank| rank >= on_page)
+        {
+            position += direction;
+        }
+        let next = if position >= ARC_SLOTS as isize {
+            if (page + 1) * ARC_SLOTS >= n {
+                return Outcome::Unchanged;
+            }
+            // Onto the next page at its left end.
+            let next_page = (page + 1) * ARC_SLOTS;
+            let on_next = (n - next_page).min(ARC_SLOTS);
+            next_page
+                + (0..ARC_SLOTS)
+                    .filter_map(rank_at)
+                    .find(|rank| *rank < on_next)
+                    .unwrap_or(0)
+        } else if position < 0 {
+            if page == 0 {
+                return Outcome::Unchanged;
+            }
+            // Onto the previous page, which is full, at its right end.
+            (page - 1) * ARC_SLOTS + rank_at(ARC_SLOTS - 1).unwrap_or(0)
+        } else {
+            page * ARC_SLOTS + rank_at(position as usize).unwrap_or(0)
+        };
+        self.select(next)
+    }
+
+    /// `PageUp`/`PageDown`: a page of the arc, landing on its top slot, or
+    /// [`GRID_ROWS`] rows of the list's tiles.
+    fn page(&mut self, direction: isize) -> Outcome {
+        match self.style {
+            Style::Arc => {
+                let n = self.visible.len();
+                if n == 0 {
+                    return Outcome::Unchanged;
+                }
+                let (page, pages) = (self.selected / ARC_SLOTS, n.div_ceil(ARC_SLOTS));
+                let next = (page as isize + direction).clamp(0, pages as isize - 1) as usize;
+                if next == page {
+                    return Outcome::Unchanged;
+                }
+                self.select(next * ARC_SLOTS)
+            }
+            Style::List => {
+                let tiles = self.tile_range();
+                if !tiles.contains(&self.selected) {
+                    return Outcome::Unchanged;
+                }
+                let next = (self.selected as isize + direction * (COLUMNS * GRID_ROWS) as isize)
+                    .clamp(tiles.start as isize, tiles.end as isize - 1);
+                self.select(next as usize)
+            }
+        }
     }
 
     /// Move the highlight, stopping at the ends rather than wrapping.
@@ -1001,6 +1618,36 @@ mod tests {
         launcher.selection().map(|i| apps[i].name.clone())
     }
 
+    /// Open over `apps` and open the list's bar into its grid, as Down does.
+    fn expanded(apps: &[Entry], frecency: &Frecency) -> Launcher {
+        let mut launcher = Launcher::default();
+        launcher.open(apps, frecency, NOW, None, CLOCK, STILL);
+        assert_eq!(
+            launcher.press(Key::Down, apps, frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
+        launcher
+    }
+
+    /// Open over `apps` on the arc and type `query`.
+    fn on_arc(apps: &[Entry], query: &str) -> Launcher {
+        let frecency = Frecency::new();
+        let mut launcher = Launcher::default();
+        launcher.set_style(Style::Arc);
+        launcher.open(apps, &frecency, NOW, None, CLOCK, STILL);
+        for c in query.chars() {
+            launcher.press(Key::Insert(c), apps, &frecency, NOW, CLOCK, STILL);
+        }
+        launcher
+    }
+
+    /// `count` applications answering to "tool".
+    fn tools(count: usize) -> Vec<Entry> {
+        (1..=count)
+            .map(|n| entry(&format!("Tool {n:02}"), &format!("/bin/tool{n}")))
+            .collect()
+    }
+
     #[test]
     fn opening_shows_everything_and_selects_the_first() {
         let apps = apps();
@@ -1063,76 +1710,78 @@ mod tests {
     fn the_selection_stops_at_the_ends_rather_than_wrapping() {
         let apps = apps();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
 
         assert_eq!(
-            launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL),
+            launcher.press(Key::Left, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Unchanged
         );
-        assert_eq!(launcher.selection(), launcher.results().first().copied());
+        assert_eq!(launcher.selection(), launcher.suggested().first().copied());
 
         for _ in 0..20 {
-            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
+            launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         }
-        assert_eq!(launcher.selection(), launcher.results().last().copied());
+        assert_eq!(launcher.selection(), launcher.suggested().last().copied());
         assert_eq!(
-            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Unchanged
         );
     }
 
     #[test]
     fn before_typing_the_arrows_walk_a_grid() {
-        // Four suggestions in three columns: Right steps one, Down steps a
-        // row, and neither leaves the grid.
+        // Four suggestions on one row of six: Right steps one, and with no
+        // row and no foot below, Down and Up have nowhere to go.
         let apps = apps();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         assert!(launcher.is_grid());
-        let order: Vec<usize> = launcher.results().to_vec();
+        let order: Vec<usize> = launcher.suggested().to_vec();
 
         launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.selection(), Some(order[1]));
         launcher.press(Key::Left, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.selection(), Some(order[0]));
-        launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(launcher.selection(), Some(order[COLUMNS]));
-        launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(launcher.selection(), Some(order[0]));
+        assert_eq!(
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged
+        );
+        assert_eq!(
+            launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged
+        );
     }
 
     #[test]
-    fn typing_turns_the_grid_into_a_list() {
+    fn typing_turns_the_suggestions_into_a_grid_of_results() {
         let (mut launcher, apps) = typed("f");
-        assert!(!launcher.is_grid());
+        assert!(!launcher.is_grid() && !launcher.is_collapsed());
         let frecency = Frecency::new();
-        // Left and Right have nowhere to go in a list.
+        let first = launcher.selection();
         assert_eq!(
             launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL),
-            Outcome::Unchanged
+            Outcome::Redraw
         );
-        let first = launcher.selection();
-        launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_ne!(launcher.selection(), first, "Down did not step one row");
+        assert_ne!(launcher.selection(), first, "Right did not step one tile");
+        assert_eq!(
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged,
+            "one row, and nothing under it"
+        );
     }
 
     #[test]
     fn the_grid_never_selects_past_what_it_shows() {
         // More applications than tiles: the highlight stops at the last
         // tile rather than wandering onto a suggestion that is not drawn.
-        let apps: Vec<Entry> = (0..10)
-            .map(|i| entry(&format!("App {i}"), "/bin/app"))
-            .collect();
+        let apps = tools(10);
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         for _ in 0..20 {
             launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         }
-        let last = launcher.results()[SUGGESTED - 1];
-        assert_eq!(launcher.selection(), Some(last));
+        assert_eq!(launcher.suggested().len(), SUGGESTED);
+        assert_eq!(launcher.selection(), launcher.suggested().last().copied());
     }
 
     #[test]
@@ -1153,7 +1802,7 @@ mod tests {
         let mut launcher = Launcher::default();
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
 
-        let mut tiles: Vec<usize> = launcher.results()[..SUGGESTED].to_vec();
+        let mut tiles: Vec<usize> = launcher.suggested().to_vec();
         tiles.sort_unstable();
         assert_eq!(tiles, (0..SUGGESTED).collect::<Vec<_>>());
         let recent: Vec<usize> = launcher.recent().iter().map(|(i, _)| *i).collect();
@@ -1166,36 +1815,27 @@ mod tests {
     }
 
     #[test]
-    fn down_from_the_last_tile_row_lands_on_the_recent_rows() {
-        let apps: Vec<Entry> = (0..10)
-            .map(|i| entry(&format!("App {i}"), "/bin/app"))
-            .collect();
-        // Seven launched, six tiles: one overflows into the recent rows.
+    fn down_from_the_tiles_lands_on_the_foot_and_up_goes_back() {
+        let apps = tools(10);
+        // Seven launched, six tiles: one overflows onto the foot.
         let mut frecency = Frecency::new();
         for (i, app) in apps.iter().take(7).enumerate() {
             frecency.record(&app.path, NOW - 1_000 + i as u64);
         }
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         assert!(!launcher.recent().is_empty(), "nothing overflowed the grid");
         let first_recent = launcher.recent()[0].0;
 
-        // Down twice from the top-left tile: row two, then the recent rows.
-        launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(launcher.selection(), Some(launcher.results()[COLUMNS]));
         launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.selection(), Some(first_recent));
-        // Sideways does nothing on a row.
+        // One card on the foot: sideways has nowhere to go.
         assert_eq!(
             launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Unchanged
         );
-        // And Up goes back onto the grid.
+        // Up goes back into the tiles, in the same column.
         launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(
-            launcher.selection(),
-            Some(launcher.results()[SUGGESTED - 1])
-        );
+        assert_eq!(launcher.selection(), Some(launcher.suggested()[0]));
     }
 
     #[test]
@@ -1251,6 +1891,11 @@ mod tests {
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
         assert_eq!(launcher.menu(), None);
         assert_eq!(
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw,
+            "on the bar, Tab would open the grid rather than a menu"
+        );
+        assert_eq!(
             launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Redraw
         );
@@ -1268,8 +1913,7 @@ mod tests {
     fn the_last_menu_item_pins_and_then_unpins_without_closing() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         for _ in 0..3 {
             launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
@@ -1299,8 +1943,7 @@ mod tests {
     fn enter_on_an_action_runs_that_action_for_the_same_entry() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
@@ -1326,8 +1969,7 @@ mod tests {
     fn open_at_the_top_of_the_menu_is_the_plain_launch() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(
             launcher.press(Key::Launch, &apps, &frecency, NOW, CLOCK, STILL),
@@ -1342,8 +1984,7 @@ mod tests {
     fn escape_with_the_menu_up_closes_the_menu_not_the_launcher() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(
             launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
@@ -1351,7 +1992,13 @@ mod tests {
         );
         assert!(launcher.is_open());
         assert_eq!(launcher.menu(), None);
-        // A second Escape is the usual one.
+        // A second Escape folds the grid back into the bar, and a third is
+        // the usual one.
+        assert_eq!(
+            launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
+        assert!(launcher.is_collapsed());
         assert_eq!(
             launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Dismissed
@@ -1362,8 +2009,7 @@ mod tests {
     fn typing_puts_the_menu_away_and_edits_the_query() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.press(Key::Insert('b'), &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.menu(), None);
@@ -1449,12 +2095,12 @@ mod tests {
     }
 
     #[test]
-    fn down_walks_from_the_last_application_onto_the_files() {
+    fn right_walks_from_the_last_application_onto_the_files() {
         let (mut launcher, apps) = with_files("fi");
         let frecency = Frecency::new();
-        let rows = launcher.results().len();
-        for _ in 0..rows {
-            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
+        let tiles = launcher.results().len();
+        for _ in 0..tiles {
+            launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         }
         assert!(matches!(launcher.target(), Some(Target::File(_))));
         // A file has no actions menu.
@@ -1466,10 +2112,9 @@ mod tests {
     }
 
     /// Twelve applications answering to "tool": more than a screenful.
+    /// Twelve applications answering to "tool": two full rows of tiles.
     fn many_tools() -> Vec<Entry> {
-        (1..=12)
-            .map(|n| entry(&format!("Tool {n:02}"), &format!("/bin/tool{n}")))
-            .collect()
+        tools(12)
     }
 
     /// Open over `many_tools()` with the file index from `with_files`, and
@@ -1492,47 +2137,48 @@ mod tests {
     }
 
     #[test]
-    fn down_walks_every_application_before_the_files() {
+    fn every_application_comes_before_the_files() {
         let (mut launcher, apps) = with_many_tools();
         let frecency = Frecency::new();
         for _ in 0..11 {
-            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
+            launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         }
         let last = *launcher.results().last().unwrap();
         assert_eq!(launcher.target(), Some(Target::App(last)));
-        assert!(
-            launcher.window().contains(&last),
-            "the highlighted application is not drawn"
-        );
-        assert_eq!(launcher.window().len(), VISIBLE);
-        launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
+        launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         assert!(matches!(launcher.target(), Some(Target::File(_))));
-        // The applications keep their last window under the files.
-        assert_eq!(launcher.window(), &launcher.results()[12 - VISIBLE..]);
+        // Two rows of applications and the file on a third: all drawn.
+        assert_eq!(launcher.first_row(), 0);
     }
 
     #[test]
-    fn the_window_follows_the_highlight_both_ways() {
-        let (mut launcher, apps) = with_many_tools();
+    fn the_grid_scrolls_with_the_highlight_both_ways() {
+        let apps = tools(30);
         let frecency = Frecency::new();
-        assert_eq!(launcher.window(), &launcher.results()[..VISIBLE]);
-        for _ in 0..VISIBLE {
+        let mut launcher = Launcher::default();
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        for c in "tool".chars() {
+            launcher.press(Key::Insert(c), &apps, &frecency, NOW, CLOCK, STILL);
+        }
+        assert_eq!(launcher.first_row(), 0);
+        for _ in 0..GRID_ROWS {
             launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         }
-        // One past the first screenful: the window has slid one row.
-        assert_eq!(launcher.window(), &launcher.results()[1..=VISIBLE]);
-        for _ in 0..VISIBLE {
+        // One row past the first screenful: the grid has slid one row.
+        assert_eq!(launcher.first_row(), 1);
+        for _ in 0..GRID_ROWS {
             launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL);
         }
-        assert_eq!(launcher.window(), &launcher.results()[..VISIBLE]);
-        assert_eq!(launcher.selection(), launcher.results().first().copied());
+        assert_eq!(launcher.first_row(), 0);
+        assert_eq!(launcher.selected(), 0);
     }
 
     #[test]
-    fn a_short_list_is_its_own_window() {
-        let (launcher, _) = typed("fi");
-        assert!(launcher.results().len() <= VISIBLE);
-        assert_eq!(launcher.window(), launcher.results());
+    fn a_short_grid_never_scrolls() {
+        let (mut launcher, apps) = typed("fi");
+        launcher.press(Key::Right, &apps, &Frecency::new(), NOW, CLOCK, STILL);
+        assert!(launcher.results().len() <= COLUMNS * GRID_ROWS);
+        assert_eq!(launcher.first_row(), 0);
     }
 
     #[test]
@@ -2056,8 +2702,7 @@ mod tests {
     fn a_menu_survives_a_reindex_that_leaves_its_entry_in_place() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.menu(), Some(0));
 
@@ -2070,8 +2715,7 @@ mod tests {
     fn a_menu_closes_when_a_reindex_takes_its_entry_away() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
 
         let empty: Vec<Entry> = Vec::new();
@@ -2086,6 +2730,7 @@ mod tests {
         let (mut launcher, apps) = typed("");
         let frecency = Frecency::new();
         launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
+        launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.reindex(&apps, &frecency, NOW);
         assert_ne!(launcher.selected, 0);
 
@@ -2105,6 +2750,307 @@ mod tests {
         assert_eq!(launcher.selection(), None);
     }
 
+
+    // -- The two layouts ---------------------------------------------------
+
+    #[test]
+    fn the_list_opens_as_a_bar_and_asks_for_more_before_showing_it() {
+        let apps = apps();
+        let frecency = Frecency::new();
+        let mut launcher = Launcher::default();
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        assert!(launcher.is_collapsed());
+        for key in [Key::Up, Key::Left, Key::Right, Key::PageDown, Key::NextGroup] {
+            assert_eq!(
+                launcher.press(key, &apps, &frecency, NOW, CLOCK, STILL),
+                Outcome::Unchanged,
+                "{key:?} did something to a bar"
+            );
+        }
+        assert_eq!(
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
+        assert!(!launcher.is_collapsed());
+        // Escape folds it back before it closes anything.
+        assert_eq!(
+            launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
+        assert!(launcher.is_open() && launcher.is_collapsed());
+        assert_eq!(
+            launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Dismissed
+        );
+    }
+
+    #[test]
+    fn typing_opens_the_bar_and_emptying_the_query_leaves_it_open() {
+        let (mut launcher, apps) = typed("fi");
+        assert!(!launcher.is_collapsed());
+        launcher.press(Key::Clear, &apps, &Frecency::new(), NOW, CLOCK, STILL);
+        assert!(
+            !launcher.is_collapsed(),
+            "the grid folded away under the user's hands"
+        );
+    }
+
+    #[test]
+    fn pinned_applications_are_on_the_foot_and_not_suggested_again() {
+        let apps = apps();
+        let frecency = Frecency::new();
+        let mut launcher = Launcher::default();
+        launcher.set_pinned(vec![
+            apps[2].path.clone(),
+            PathBuf::from("/apps/uninstalled.desktop"),
+        ]);
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        assert_eq!(launcher.pins_shown(), &[2], "an uninstalled pin was shown");
+        assert!(!launcher.suggested().contains(&2));
+        assert_eq!(
+            launcher.visible()[launcher.suggested().len()],
+            Target::App(2),
+            "the pins come straight after the tiles"
+        );
+    }
+
+    #[test]
+    fn the_filter_narrows_a_search_by_kind_and_counts_before_narrowing() {
+        let (mut launcher, apps) = with_files("fi");
+        let frecency = Frecency::new();
+        let (found_apps, found_files) = launcher.found();
+        assert!(found_apps >= 2 && found_files == 1);
+
+        launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.filter(), Filter::Apps);
+        assert!(launcher.file_hits().is_empty());
+
+        launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.filter(), Filter::Files);
+        assert!(launcher.results().is_empty());
+        assert!(matches!(launcher.target(), Some(Target::File(_))));
+        assert!(
+            !launcher.offers_command(),
+            "hiding the applications made the query a command"
+        );
+        assert_eq!(launcher.found(), (found_apps, found_files));
+
+        // With the query gone, the next search starts from everything.
+        launcher.press(Key::Clear, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.filter(), Filter::All);
+    }
+
+    #[test]
+    fn sorting_by_name_orders_the_results_alphabetically() {
+        let (mut launcher, apps) = typed("f");
+        let frecency = Frecency::new();
+        assert_eq!(
+            launcher.press_button(Button::Sort, &apps, &frecency, NOW),
+            Outcome::Redraw
+        );
+        assert_eq!(launcher.sort(), Sort::Name);
+        let names: Vec<String> = launcher
+            .results()
+            .iter()
+            .map(|i| apps[*i].name.to_lowercase())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn the_style_round_trips_through_its_name() {
+        for style in Style::ALL {
+            assert_eq!(Style::from_value(style.value()), Some(style));
+        }
+        assert_eq!(Style::from_value(" arc "), Some(Style::Arc));
+        assert_eq!(Style::from_value("orbit"), None);
+        assert_eq!(Style::List.stepped(1), Style::Arc);
+        assert_eq!(Style::Arc.stepped(1), Style::List);
+    }
+
+    #[test]
+    fn changing_the_style_puts_the_highlight_back_on_top() {
+        let (mut launcher, apps) = typed("f");
+        launcher.press(Key::Right, &apps, &Frecency::new(), NOW, CLOCK, STILL);
+        assert!(launcher.set_style(Style::Arc));
+        assert!(!launcher.set_style(Style::Arc), "the same style is not a change");
+        launcher.reindex(&apps, &Frecency::new(), NOW);
+        assert_eq!(launcher.selected(), 0);
+    }
+
+    #[test]
+    fn on_the_arc_the_arrows_walk_the_slots_by_where_they_sit() {
+        let apps = tools(7);
+        let frecency = Frecency::new();
+        let mut launcher = on_arc(&apps, "");
+        assert!(!launcher.is_collapsed(), "the arc has no bar");
+        assert_eq!(launcher.selected(), 0, "the best match is highlighted");
+        // From the top, Left is the slot to its left — the second rank —
+        // and so on to the left end; Up goes the same way along the curve.
+        launcher.press(Key::Left, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(Some(launcher.selected()), rank_at(2));
+        launcher.press(Key::Left, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(Some(launcher.selected()), rank_at(1));
+        launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(Some(launcher.selected()), rank_at(0));
+        assert_eq!(
+            launcher.press(Key::Left, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged,
+            "past the left end with no page before it"
+        );
+        for _ in 0..6 {
+            launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
+        }
+        assert_eq!(Some(launcher.selected()), rank_at(ARC_SLOTS - 1));
+        assert_eq!(
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn past_the_end_of_the_arc_is_the_next_page_and_back() {
+        let apps = tools(10);
+        let frecency = Frecency::new();
+        let mut launcher = on_arc(&apps, "");
+        for _ in 0..3 {
+            launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
+        }
+        assert_eq!(Some(launcher.selected()), rank_at(ARC_SLOTS - 1));
+        launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
+        // The next page holds three; its left-most slot has the second rank.
+        assert_eq!(launcher.selected(), ARC_SLOTS + 1);
+        launcher.press(Key::Left, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(
+            Some(launcher.selected()),
+            rank_at(ARC_SLOTS - 1),
+            "back onto the first page, at its right end"
+        );
+        launcher.press(Key::PageDown, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.selected(), ARC_SLOTS, "a page lands on its top slot");
+        assert_eq!(
+            launcher.press(Key::PageDown, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Unchanged
+        );
+        launcher.press(Key::PageUp, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.selected(), 0);
+    }
+
+    #[test]
+    fn a_category_narrows_the_arc_and_ctrl_arrows_step_through_them() {
+        let mut apps = tools(3);
+        apps[0].categories = vec!["Development".into()];
+        apps[1].categories = vec!["Network".into(), "WebBrowser".into()];
+        let frecency = Frecency::new();
+        let mut launcher = on_arc(&apps, "");
+        assert_eq!(
+            launcher.categories(),
+            &[Category::All, Category::Development, Category::Internet],
+            "an empty category was offered"
+        );
+        assert_eq!(launcher.visible().len(), 3);
+        launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.visible(), &[Target::App(0)]);
+        launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.visible(), &[Target::App(1)]);
+        launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.visible().len(), 3, "round again to all of them");
+        launcher.press(Key::PrevGroup, &apps, &frecency, NOW, CLOCK, STILL);
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        assert_eq!(launcher.category(), 0, "reopening kept the category");
+    }
+
+    #[test]
+    fn escape_on_the_arc_closes_at_once() {
+        let apps = apps();
+        let mut launcher = on_arc(&apps, "");
+        assert_eq!(
+            launcher.press(Key::Dismiss, &apps, &Frecency::new(), NOW, CLOCK, STILL),
+            Outcome::Dismissed
+        );
+    }
+
+    #[test]
+    fn the_arc_shows_its_result_in_the_hub_rather_than_as_a_slot() {
+        let launcher = on_arc(&apps(), "2+2");
+        assert_eq!(launcher.result(), Some("4"));
+        assert!(!launcher.visible().contains(&Target::Result));
+        assert_eq!(launcher.visible(), &[Target::Command]);
+    }
+
+    #[test]
+    fn the_arcs_card_runs_an_action_on_a_click_without_tab() {
+        let apps = browser();
+        let mut launcher = on_arc(&apps, "");
+        launcher.set_layout(Layout {
+            size: (100, 100),
+            menu_hits: vec![
+                (Rect::from_xywh(0, 0, 100, 20), 0),
+                (Rect::from_xywh(0, 20, 100, 20), 1),
+            ],
+            ..Layout::default()
+        });
+        let point = huginn_core::geometry::Point::new(50, 30);
+        match launcher.click(point, &apps, &Frecency::new(), NOW, CLOCK, STILL) {
+            Outcome::Launch { argv, .. } => {
+                assert_eq!(argv, vec!["/bin/browser", "--new-window"]);
+            }
+            other => panic!("the card's action did not run: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_button_answers_a_click_without_launching_anything() {
+        let (mut launcher, apps) = with_files("fi");
+        launcher.set_layout(Layout {
+            size: (100, 100),
+            buttons: vec![
+                (Rect::from_xywh(0, 0, 50, 20), Button::Filter(Filter::Apps)),
+                (Rect::from_xywh(50, 0, 50, 20), Button::PinnedPanel),
+            ],
+            ..Layout::default()
+        });
+        let frecency = Frecency::new();
+        let point = |x| huginn_core::geometry::Point::new(x, 10);
+        assert_eq!(
+            launcher.click(point(10), &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
+        assert_eq!(launcher.filter(), Filter::Apps);
+        assert!(launcher.is_open());
+        assert_eq!(
+            launcher.click(point(60), &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::OpenPinned
+        );
+    }
+
+    #[test]
+    fn a_pointer_on_the_canvas_but_off_everything_drawn_is_not_on_the_launcher() {
+        use huginn_core::geometry::Point;
+        let layout = Layout {
+            size: (200, 200),
+            surfaces: vec![Rect::from_xywh(50, 50, 100, 100)],
+            ..Layout::default()
+        };
+        let panel = Rect::from_xywh(0, 0, 200, 200);
+        assert_eq!(layout.canvas_point(panel, Point::new(10, 10)), None);
+        assert_eq!(
+            layout.canvas_point(panel, Point::new(60, 60)),
+            Some(Point::new(60, 60))
+        );
+    }
+
+    #[test]
+    fn ctrl_arrows_and_page_keys_are_recognised() {
+        assert_eq!(Key::from_keysym(keysyms::KEY_Left, true, None), Key::PrevGroup);
+        assert_eq!(Key::from_keysym(keysyms::KEY_Right, true, None), Key::NextGroup);
+        assert_eq!(Key::from_keysym(keysyms::KEY_Left, false, None), Key::Left);
+        assert_eq!(Key::from_keysym(keysyms::KEY_Page_Down, false, None), Key::PageDown);
+        assert_eq!(Key::from_keysym(keysyms::KEY_Page_Up, false, None), Key::PageUp);
+    }
+
     // -- The pointer -------------------------------------------------------
 
     /// A layout with one row per navigable target, stacked, each 100 wide
@@ -2116,7 +3062,7 @@ mod tests {
             hits: (0..count)
                 .map(|i| (Rect::from_xywh(0, 20 * i as i32, 100, 20), i))
                 .collect(),
-            menu_hits: Vec::new(),
+            ..Layout::default()
         }
     }
 
@@ -2135,32 +3081,30 @@ mod tests {
     }
 
     #[test]
-    fn hovering_a_scrolled_list_does_not_scroll_it() {
-        // Down to the last application: the window is at the bottom. The
-        // pointer landing on the top drawn row must highlight that row and
-        // leave the window alone, or the rows slide out from under it.
-        let (mut launcher, apps) = with_many_tools();
+    fn hovering_a_scrolled_grid_does_not_scroll_it() {
+        // Down to the last row: the grid is scrolled to the bottom. The
+        // pointer landing on the top drawn tile must highlight that tile and
+        // leave the grid alone, or the tiles slide out from under it.
+        let apps = tools(30);
         let frecency = Frecency::new();
-        for _ in 0..11 {
+        let mut launcher = Launcher::default();
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        for c in "tool".chars() {
+            launcher.press(Key::Insert(c), &apps, &frecency, NOW, CLOCK, STILL);
+        }
+        for _ in 0..4 {
             launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         }
-        let before = launcher.window().to_vec();
-        assert_eq!(before.len(), VISIBLE);
-        let top = before[0];
-        // Rows numbered as `visible` is: the top drawn row is the selection
-        // index of that application.
-        let row = launcher
-            .visible
-            .iter()
-            .position(|t| *t == Target::App(top))
-            .unwrap();
+        let first = launcher.first_row();
+        assert_eq!(first, 2);
+        let top = first * COLUMNS;
         launcher.set_layout(stacked(launcher.visible.len()));
-        assert_eq!(launcher.hover(on_row(row)), Outcome::Redraw);
-        assert_eq!(launcher.target(), Some(Target::App(top)));
-        assert_eq!(launcher.window(), &before[..], "hovering scrolled the list");
-        // The keyboard still pulls the window: Up off the top slides it.
+        assert_eq!(launcher.hover(on_row(top)), Outcome::Redraw);
+        assert_eq!(launcher.selected(), top);
+        assert_eq!(launcher.first_row(), first, "hovering scrolled the grid");
+        // The keyboard still pulls the grid: Up off the top row slides it.
         launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(launcher.window()[1..], before[..VISIBLE - 1]);
+        assert_eq!(launcher.first_row(), first - 1);
     }
 
     #[test]
@@ -2182,7 +3126,7 @@ mod tests {
         let (mut launcher, apps) = typed("");
         launcher.set_layout(stacked(apps.len()));
         let third = apps[launcher.results()[2]].path.clone();
-        match launcher.click(on_row(2), &apps, CLOCK, STILL) {
+        match launcher.click(on_row(2), &apps, &Frecency::new(), NOW, CLOCK, STILL) {
             Outcome::Launch { entry, .. } => assert_eq!(entry, Some(third)),
             other => panic!("a click launched nothing: {other:?}"),
         }
@@ -2195,7 +3139,7 @@ mod tests {
         launcher.set_layout(stacked(apps.len()));
         let below = huginn_core::geometry::Point::new(50, 20 * apps.len() as i32 + 30);
         assert_eq!(
-            launcher.click(below, &apps, CLOCK, STILL),
+            launcher.click(below, &apps, &Frecency::new(), NOW, CLOCK, STILL),
             Outcome::Unchanged
         );
         assert!(launcher.is_open(), "a click on nothing closed it");
@@ -2208,7 +3152,7 @@ mod tests {
         launcher.close(CLOCK, STILL);
         assert_eq!(launcher.hover(on_row(1)), Outcome::Unchanged);
         assert_eq!(
-            launcher.click(on_row(1), &apps, CLOCK, STILL),
+            launcher.click(on_row(1), &apps, &Frecency::new(), NOW, CLOCK, STILL),
             Outcome::Unchanged
         );
     }
@@ -2241,8 +3185,7 @@ mod tests {
     fn with_the_menu_up_hover_moves_the_menus_highlight_and_not_the_selection() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.set_layout(with_menu(1, 3));
         assert_eq!(launcher.hover(on_menu(2)), Outcome::Redraw);
@@ -2258,11 +3201,10 @@ mod tests {
     fn clicking_a_menu_item_runs_that_action() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.set_layout(with_menu(1, 3));
-        match launcher.click(on_menu(1), &apps, CLOCK, STILL) {
+        match launcher.click(on_menu(1), &apps, &Frecency::new(), NOW, CLOCK, STILL) {
             Outcome::Launch { argv, .. } => {
                 assert_eq!(argv, vec!["/bin/browser", "--new-window"]);
             }
@@ -2275,12 +3217,11 @@ mod tests {
         // As Escape does — not launching whatever was under the menu's edge.
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.set_layout(with_menu(1, 3));
         let beside = huginn_core::geometry::Point::new(25, 10);
-        assert_eq!(launcher.click(beside, &apps, CLOCK, STILL), Outcome::Redraw);
+        assert_eq!(launcher.click(beside, &apps, &Frecency::new(), NOW, CLOCK, STILL), Outcome::Redraw);
         assert_eq!(launcher.menu(), None);
         assert!(
             launcher.is_open(),
@@ -2318,6 +3259,18 @@ pub(crate) struct Layout {
     /// as [`Launcher::menu`] counts them. Checked first: the menu is drawn
     /// over the rows, so it is what a click there lands on.
     pub(crate) menu_hits: Vec<(Rect, usize)>,
+    /// Things that answer a click but are not in the navigation order: the
+    /// list's tabs, sort and chevron, the arc's categories.
+    pub(crate) buttons: Vec<(Rect, Button)>,
+    /// Where anything is drawn. The arc's canvas is mostly transparent —
+    /// the space around the arc, between it and its sidebar and card — and
+    /// a pointer there is over the desktop, not the launcher. Empty means
+    /// the whole canvas is panel.
+    pub(crate) surfaces: Vec<Rect>,
+    /// A rectangle, in canvas pixels, that lies wholly inside the panel's
+    /// glass, for a panel that is not a rounded rectangle. `None` blurs the
+    /// panel inset by its corners. See [`Launcher::blur_region`].
+    pub(crate) blur: Option<Rect>,
 }
 
 impl Layout {
@@ -2354,7 +3307,43 @@ impl Layout {
         }
         let x = (point.x - panel.x()) as f32 * self.size.0 as f32 / panel.w() as f32;
         let y = (point.y - panel.y()) as f32 * self.size.1 as f32 / panel.h() as f32;
-        Some(Point::new(x as i32, y as i32))
+        // Over the canvas but not over anything drawn on it is the desktop.
+        let point = Point::new(x as i32, y as i32);
+        self.on_surface(point).then_some(point)
+    }
+
+    /// The button under `point`, if any. The menu covers what it is over.
+    pub(crate) fn button(&self, point: Point) -> Option<Button> {
+        if self.menu_hit(point).is_some() {
+            return None;
+        }
+        self.buttons
+            .iter()
+            .find(|(rect, _)| rect.contains(point))
+            .map(|(_, button)| *button)
+    }
+
+    /// Whether `point`, in canvas pixels, is on something drawn.
+    fn on_surface(&self, point: Point) -> bool {
+        self.surfaces.is_empty() || self.surfaces.iter().any(|rect| rect.contains(point))
+    }
+
+    /// `rect`, in canvas pixels, on the output where the panel was placed at
+    /// `panel`: the inverse of [`Self::canvas_point`].
+    pub(crate) fn to_output(&self, panel: Rect, rect: Rect) -> Rect {
+        if self.size.0 <= 0 || self.size.1 <= 0 {
+            return Rect::ZERO;
+        }
+        let (sx, sy) = (
+            panel.w() as f32 / self.size.0 as f32,
+            panel.h() as f32 / self.size.1 as f32,
+        );
+        Rect::from_xywh(
+            panel.x() + (rect.x() as f32 * sx).ceil() as i32,
+            panel.y() + (rect.y() as f32 * sy).ceil() as i32,
+            (rect.w() as f32 * sx).floor() as i32,
+            (rect.h() as f32 * sy).floor() as i32,
+        )
     }
 }
 
@@ -2364,19 +3353,34 @@ pub(crate) const WIDTH: f32 = 560.0;
 pub(crate) const PAD: f32 = 18.0;
 /// Text size at a 1080p output.
 pub(crate) const BASE_SIZE: f32 = 16.0;
-/// How many results are shown. Beyond this the answer was not in the list and
-/// another keystroke is faster than another screenful.
-const VISIBLE: usize = 8;
-/// How many suggestions the grid shows before anything is typed.
+/// Rows of the list's result grid drawn at once. Beyond this the answer was
+/// not near the top, and another keystroke is faster than another screenful.
+pub(crate) const GRID_ROWS: usize = 3;
+/// How many suggestions the list shows before anything is typed: one row.
 const SUGGESTED: usize = 6;
-/// Tiles per row of the suggestion grid.
-const COLUMNS: usize = 3;
-/// How many recently launched applications are listed under the grid.
+/// Tiles per row of the list's grid.
+pub(crate) const COLUMNS: usize = 6;
+/// How many recently launched applications the list's foot shows.
 const RECENT: usize = 3;
-/// How many matching files are listed under the results. None are listed
-/// until the last query term is [`raven_desktop::files::MIN_TERM`]
+/// How many pinned applications the list's foot shows; the rest are a click
+/// away on the pinned panel.
+const PINS_SHOWN: usize = 6;
+/// How many matching files a search lists after the applications. None are
+/// listed until the last query term is [`raven_desktop::files::MIN_TERM`]
 /// characters long; see [`Launcher::refresh`].
-const FILES: usize = 4;
+const FILES: usize = 12;
+/// Slots on the arc; a category or a search with more than this is paged.
+pub(crate) const ARC_SLOTS: usize = 7;
+/// Which slot of the arc, counted from its left end, each rank sits in: the
+/// best match at the top, then outward — left, right, left, right — so the
+/// eye starts where the answer most likely is and moves out from there.
+pub(crate) const RANK_POS: [usize; ARC_SLOTS] = [3, 2, 4, 1, 5, 0, 6];
+
+/// The rank that sits in the arc's slot `position`, counted from its left
+/// end, if any.
+pub(crate) fn rank_at(position: usize) -> Option<usize> {
+    RANK_POS.iter().position(|p| *p == position)
+}
 /// How much of a result row's inner width the application's kind ("Web
 /// Browser") may take, at most, before it is cut. The name is what was
 /// asked for; the kind is why the row answered, and stays the smaller half.
@@ -2403,15 +3407,16 @@ const _: () = assert!(ALPHA >= 0xC0 && ALPHA <= 0xE0);
 /// The footer's key hints, in the order they are read. The grid also
 /// answers to sideways arrows, and says so; the menu says what it does.
 const GRID_HINTS: &[(&str, &str)] = &[
-    ("←↑↓→", "Navigate"),
+    ("←↑↓→", "Move"),
     ("Enter", "Open"),
     ("Tab", "Actions"),
-    ("Esc", "Close"),
+    ("Esc", "Collapse"),
 ];
 const LIST_HINTS: &[(&str, &str)] = &[
-    ("↑↓", "Navigate"),
+    ("←↑↓→", "Move"),
     ("Enter", "Open"),
     ("Tab", "Actions"),
+    ("Ctrl ←→", "Filter"),
     ("Esc", "Close"),
 ];
 const MENU_HINTS: &[(&str, &str)] = &[("↑↓", "Choose"), ("Enter", "Run"), ("Esc", "Back")];
@@ -2482,17 +3487,24 @@ pub(crate) fn placement(
     panel: (i32, i32),
     origin: Option<Rect>,
     reveal: f32,
+    style: Style,
 ) -> Rect {
     /// How small the panel gets at the start of the motion.
     const MIN_SCALE: f32 = 0.86;
+    /// Where the list's top edge hangs, as a fraction of the output's height.
+    const LIST_TOP: f32 = 0.15;
 
     let (w, h) = panel;
-    let full = Rect::from_xywh(
-        output.x() + (output.w() - w).max(0) / 2,
-        output.y() + (output.h() - h).max(0) / 2,
-        w,
-        h,
-    );
+    // The list hangs from a fixed height rather than being centred: it
+    // opens from a bar into a grid, and a centred panel would jump upwards
+    // by half of whatever it grew. The arc is a fixed size and sits centred.
+    let y = match style {
+        Style::List => (output.y() + (output.h() as f32 * LIST_TOP) as i32)
+            .min(output.bottom() - h)
+            .max(output.y()),
+        Style::Arc => output.y() + (output.h() - h).max(0) / 2,
+    };
+    let full = Rect::from_xywh(output.x() + (output.w() - w).max(0) / 2, y, w, h);
     let t = reveal.clamp(0.0, 1.0);
     if t >= 1.0 {
         return full;
@@ -2558,505 +3570,10 @@ fn compose(
     output: Rect,
     density: u32,
 ) -> (Canvas, Layout) {
-    // Everything here is in the canvas's own pixels, which `density` makes
-    // more numerous than the logical ones the panel is placed in. See
-    // `Panel::from_canvas`.
-    let m = Metrics::for_output(output, density);
-    let Metrics {
-        density,
-        scale,
-        size,
-        pad,
-        width,
-        row,
-        field,
-        inner,
-        gap,
-        heading,
-        footer,
-        ..
-    } = m;
-    // A menu of `items` actions: its heading, the rows, a little air below.
-    let entry_menu_h = |items: usize| m.menu_height(items);
-
-    // The grid before anything is typed, the list once something is: the
-    // panel is as tall as whichever it is showing.
-    let grid = launcher.is_grid();
-    let tiles = launcher.results().len().min(SUGGESTED);
-    let tile_rows = tiles.div_ceil(COLUMNS);
-    let tile_w = (inner - gap * (COLUMNS - 1) as f32) / COLUMNS as f32;
-    let tile_h = TILE * scale;
-    let shown = launcher.window().len();
-    let recent = launcher.recent().len();
-    let body = if grid {
-        let tiles = if tiles > 0 {
-            heading + tile_rows as f32 * tile_h + (tile_rows - 1) as f32 * gap + gap
-        } else {
-            0.0
-        };
-        let rows = if recent > 0 {
-            gap + heading + row * recent as f32 + gap
-        } else {
-            0.0
-        };
-        tiles + rows
-    } else {
-        let files = launcher.file_hits().len();
-        let result = if launcher.result().is_some() {
-            row + gap
-        } else {
-            0.0
-        };
-        let command = if launcher.offers_command() {
-            gap + row + gap
-        } else {
-            0.0
-        };
-        result
-            + row * shown as f32
-            + if files > 0 {
-                gap + heading + row * files as f32 + gap
-            } else {
-                0.0
-            }
-            + command
-    };
-    // The actions menu sits over the body, and a short list leaves it
-    // nowhere to go but the footer: the body is at least as tall as the menu.
-    let menu = launcher
-        .menu()
-        .and(launcher.selection())
-        .and_then(|i| apps.get(i))
-        .map(|entry| entry_menu_h(launcher.menu_items(entry).len()));
-    let body = body.max(menu.unwrap_or(0.0));
-    let height = (pad * 2.0 + field + gap + body + footer) as usize;
-
-    let mut canvas = Canvas::new(width, height.max(1));
-    let mut layout = Layout {
-        size: (width as i32, height.max(1) as i32),
-        hits: Vec::new(),
-        menu_hits: Vec::new(),
-    };
-    // A row's place in the navigation order, for the pointer. The list's
-    // rows are drawn from `window`, which is a slice of `results`, and the
-    // order the keys walk is `visible`; this is what joins the two.
-    let slot_of = |target: Target| launcher.visible.iter().position(|t| *t == target);
-    let rect =
-        |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
-    draw_ground(&mut canvas, &m, width, height);
-
-    // The field, as a pill set into the panel: a well, a shade lighter
-    // than the ground, with the same hairline the panel has.
-    canvas.fill_rounded(
-        pad as usize,
-        pad as usize,
-        inner as usize,
-        field as usize,
-        field / 2.0,
-        crate::theme::WELL,
-    );
-    canvas.stroke_rounded(
-        pad as usize,
-        pad as usize,
-        inner as usize,
-        field as usize,
-        field / 2.0,
-        1.0,
-        crate::theme::HAIRLINE,
-    );
-
-    // The query, or a hint in the dim colour. A field that looks empty and a
-    // field that looks like it contains the word "Search" are different
-    // things, and the colour is what tells them apart.
-    let (query_text, query_color) = if launcher.query().is_empty() {
-        (PLACEHOLDER, crate::theme::TEXT_DIM)
-    } else {
-        (launcher.query(), crate::theme::TEXT)
-    };
-    let caret_w = 2.0 * scale;
-    let text_y = (pad + (field - size * 1.6) / 2.0) as i32;
-    let field_x = pad + field / 2.0;
-    // The placeholder starts clear of the caret. Both at the same x puts a
-    // bar through the first letter of the hint, which reads as a rendering
-    // fault rather than as a cursor.
-    let text_x = if launcher.query().is_empty() {
-        field_x + caret_w + 4.0 * scale
-    } else {
-        field_x
-    };
-    text.draw(
-        &mut canvas,
-        query_text,
-        size * 1.25,
-        text_x as i32,
-        text_y,
-        query_color,
-    );
-
-    // A caret, so the field reads as focused even when it is empty.
-    // Measured from the query, not the placeholder, so an empty field puts the
-    // caret at the start rather than after the hint text.
-    let caret_x = field_x + text.measure(launcher.query(), size * 1.25).0 + 2.0;
-    canvas.fill(
-        caret_x as usize,
-        text_y as usize,
-        caret_w as usize,
-        (size * 1.4) as usize,
-        crate::theme::accent().to_rgba_bytes(),
-    );
-
-    // Position in navigation order — a tile, a row, or a file row.
-    let selected = launcher.selected;
-    // And what it is on, for the list, whose rows are of four kinds and
-    // whose order depends on which of them are showing.
-    let target = launcher.target();
-    let style = RowStyle {
-        pad,
-        inner,
-        row,
-        size,
-        scale,
-    };
-
-    let mut y = pad + field + gap;
-    if grid {
-        if tiles > 0 {
-            text.draw(
-                &mut canvas,
-                "Suggested",
-                size * 0.95,
-                pad as i32,
-                (y + (heading - size * 1.3) / 2.0) as i32,
-                crate::theme::TEXT_DIM,
-            );
-            y += heading;
-        }
-        for (slot, index) in launcher.results().iter().take(SUGGESTED).enumerate() {
-            let Some(entry) = apps.get(*index) else {
-                continue;
-            };
-            let (col, row_n) = (slot % COLUMNS, slot / COLUMNS);
-            let x = pad + (tile_w + gap) * col as f32;
-            let ty = y + (tile_h + gap) * row_n as f32;
-            layout.hits.push((rect(x, ty, tile_w, tile_h), slot));
-            draw_tile(
-                &mut canvas,
-                text,
-                icons,
-                pixmaps,
-                &m,
-                entry,
-                x,
-                ty,
-                tile_w,
-                tile_h,
-                slot == selected,
-            );
-        }
-        if tiles > 0 {
-            y += tile_rows as f32 * tile_h + (tile_rows - 1) as f32 * gap + gap;
-        }
-
-        if recent > 0 {
-            canvas.tint(pad as usize,
-                y as usize,
-                inner as usize,
-                1, crate::theme::RULE, 0x14);
-            y += gap;
-            text.draw(
-                &mut canvas,
-                "Recent",
-                size * 0.95,
-                pad as i32,
-                (y + (heading - size * 1.3) / 2.0) as i32,
-                crate::theme::TEXT_DIM,
-            );
-            y += heading;
-            let icon_size = (size * 1.5) as u32;
-            let icon_x = pad + 8.0 * scale;
-            let stamp_size = size * 0.85;
-            let chevron_w = text.measure("›", size).0;
-            for (slot, (index, at)) in launcher.recent().iter().enumerate() {
-                let Some(entry) = apps.get(*index) else {
-                    continue;
-                };
-                let highlighted = tiles + slot == selected;
-                layout.hits.push((rect(pad, y, inner, row), tiles + slot));
-                if highlighted {
-                    canvas.fill_rounded(
-                        pad as usize,
-                        y as usize,
-                        inner as usize,
-                        row as usize,
-                        row * 0.25,
-                        crate::theme::selection(),
-                    );
-                }
-                if let Some(pixmap) = entry
-                    .icon
-                    .as_deref()
-                    .and_then(|name| launcher_icon(icons, name, icon_size / density, density))
-                    .and_then(|path| pixmaps.get(&path, icon_size))
-                {
-                    canvas.blit(
-                        icon_x as usize,
-                        (y + (row - icon_size as f32) / 2.0) as usize,
-                        &tinted(pixmap),
-                    );
-                }
-                let color = if highlighted {
-                    crate::theme::TEXT
-                } else {
-                    crate::theme::TEXT_DIM
-                };
-                // When, then a chevron, against the right edge: the row is
-                // something to open, and the mark says so.
-                let stamp = ago(launcher.now().saturating_sub(*at));
-                let right = pad + inner - 10.0 * scale;
-                text.draw(
-                    &mut canvas,
-                    "›",
-                    size,
-                    (right - chevron_w) as i32,
-                    (y + (row - size * 1.35) / 2.0) as i32,
-                    crate::theme::TEXT_DIM,
-                );
-                let (sw, _) = text.measure(&stamp, stamp_size);
-                let stamp_x = right - chevron_w - 12.0 * scale - sw;
-                text.draw(
-                    &mut canvas,
-                    &stamp,
-                    stamp_size,
-                    stamp_x as i32,
-                    (y + (row - stamp_size * 1.35) / 2.0) as i32,
-                    crate::theme::TEXT_DIM,
-                );
-                // What it is, before the stamp, when the name leaves room
-                // for it. Nothing here was searched for, so the kind is a
-                // courtesy rather than an explanation: a name that fills the
-                // row wins, and a kind that would not fit whole is dropped
-                // rather than cut, because "Web Br…" explains nothing.
-                let name_x = icon_x + icon_size as f32 + 10.0 * scale;
-                let (nw, _) = text.measure(&entry.name, size);
-                let mut name_room = stamp_x - gap - name_x;
-                if let Some(kind) = kind_of(entry) {
-                    let (kw, _) = text.measure(kind, stamp_size);
-                    let kind_x = stamp_x - gap - kw;
-                    if kw <= inner * KIND_SHARE && kind_x - gap >= name_x + nw {
-                        text.draw(
-                            &mut canvas,
-                            kind,
-                            stamp_size,
-                            kind_x as i32,
-                            (y + (row - stamp_size * 1.35) / 2.0) as i32,
-                            crate::theme::TEXT_DIM,
-                        );
-                        name_room = kind_x - gap - name_x;
-                    }
-                }
-                let name = fit(text, &entry.name, size, name_room);
-                text.draw(
-                    &mut canvas,
-                    &name,
-                    size,
-                    name_x as i32,
-                    (y + (row - size * 1.35) / 2.0) as i32,
-                    color,
-                );
-                y += row;
-            }
-            y += gap;
-        }
-    } else {
-        // The answer, before anything that merely matched. A hairline under
-        // it separates a value from the rows that are things to open.
-        if let Some(value) = launcher.result() {
-            if let Some(slot) = slot_of(Target::Result) {
-                layout.hits.push((rect(pad, y, inner, row), slot));
-            }
-            glyph_row(
-                &mut canvas,
-                text,
-                &style,
-                y,
-                RESULT_GLYPH,
-                value,
-                target == Some(Target::Result),
-            );
-            y += row;
-            canvas.tint(pad as usize,
-                y as usize,
-                inner as usize,
-                1, crate::theme::RULE, 0x14);
-            y += gap;
-        }
-
-        for index in launcher.window() {
-            let Some(entry) = apps.get(*index) else {
-                continue;
-            };
-            let highlighted = target == Some(Target::App(*index));
-            if let Some(slot) = slot_of(Target::App(*index)) {
-                layout.hits.push((rect(pad, y, inner, row), slot));
-            }
-            draw_app_row(&mut canvas, text, icons, pixmaps, &m, entry, y, highlighted);
-            y += row;
-        }
-
-        if !launcher.file_hits().is_empty() {
-            canvas.tint(pad as usize,
-                y as usize,
-                inner as usize,
-                1, crate::theme::RULE, 0x14);
-            y += gap;
-            text.draw(
-                &mut canvas,
-                "Files",
-                size * 0.95,
-                pad as i32,
-                (y + (heading - size * 1.3) / 2.0) as i32,
-                crate::theme::TEXT_DIM,
-            );
-            y += heading;
-            let icon_size = (size * 1.5) as u32;
-            let icon_x = pad + 8.0 * scale;
-            let where_size = size * 0.85;
-            let chevron_w = text.measure("›", size).0;
-            let file_icon = launcher_icon(icons, FILE_ICON, icon_size / density, density)
-                .and_then(|path| pixmaps.get(&path, icon_size))
-                .map(tinted);
-            for index in launcher.file_hits() {
-                let Some(file) = launcher.files().get(*index) else {
-                    continue;
-                };
-                let highlighted = target == Some(Target::File(*index));
-                if let Some(slot) = slot_of(Target::File(*index)) {
-                    layout.hits.push((rect(pad, y, inner, row), slot));
-                }
-                if highlighted {
-                    canvas.fill_rounded(
-                        pad as usize,
-                        y as usize,
-                        inner as usize,
-                        row as usize,
-                        row * 0.25,
-                        crate::theme::selection(),
-                    );
-                }
-                if let Some(icon) = &file_icon {
-                    canvas.blit(
-                        icon_x as usize,
-                        (y + (row - icon_size as f32) / 2.0) as usize,
-                        icon,
-                    );
-                }
-                let color = if highlighted {
-                    crate::theme::TEXT
-                } else {
-                    crate::theme::TEXT_DIM
-                };
-                // Where it is, then a chevron, against the right edge; the
-                // name is cut before it can run into either.
-                let right = pad + inner - 10.0 * scale;
-                text.draw(
-                    &mut canvas,
-                    "›",
-                    size,
-                    (right - chevron_w) as i32,
-                    (y + (row - size * 1.35) / 2.0) as i32,
-                    crate::theme::TEXT_DIM,
-                );
-                let location = fit(
-                    text,
-                    &launcher.files().location(*index),
-                    where_size,
-                    inner * 0.4,
-                );
-                let (lw, _) = text.measure(&location, where_size);
-                let location_x = right - chevron_w - 12.0 * scale - lw;
-                text.draw(
-                    &mut canvas,
-                    &location,
-                    where_size,
-                    location_x as i32,
-                    (y + (row - where_size * 1.35) / 2.0) as i32,
-                    crate::theme::TEXT_DIM,
-                );
-                let name_x = icon_x + icon_size as f32 + 10.0 * scale;
-                let name = fit(text, &file.name, size, location_x - gap - name_x);
-                text.draw(
-                    &mut canvas,
-                    &name,
-                    size,
-                    name_x as i32,
-                    (y + (row - size * 1.35) / 2.0) as i32,
-                    color,
-                );
-                y += row;
-            }
-            y += gap;
-        }
-
-        // The fallback, last: run what was typed. Under a hairline of its
-        // own so it reads as a different kind of offer from the files.
-        if launcher.offers_command() {
-            canvas.tint(pad as usize,
-                y as usize,
-                inner as usize,
-                1, crate::theme::RULE, 0x14);
-            y += gap;
-            let label = fit(
-                text,
-                &format!("Run \"{}\"", launcher.query()),
-                size,
-                inner - (pad + 8.0 * scale + size * 1.5 + 10.0 * scale) - 10.0 * scale,
-            );
-            if let Some(slot) = slot_of(Target::Command) {
-                layout.hits.push((rect(pad, y, inner, row), slot));
-            }
-            glyph_row(
-                &mut canvas,
-                text,
-                &style,
-                y,
-                COMMAND_GLYPH,
-                &label,
-                target == Some(Target::Command),
-            );
-            y += row + gap;
-        }
+    match launcher.style() {
+        Style::List => list::compose(launcher, apps, text, icons, pixmaps, output, density),
+        Style::Arc => arc::compose(launcher, apps, text, icons, pixmaps, output, density),
     }
-
-    // The actions menu, over the bottom of the body and against the right
-    // edge — near the footer hint that summoned it, and clear of the field.
-    // Drawn last so it sits on top of whatever it covers.
-    if let (Some(item), Some(entry)) = (
-        launcher.menu(),
-        launcher.selection().and_then(|i| apps.get(i)),
-    ) {
-        let items = launcher.menu_items(entry);
-        draw_menu(
-            &mut canvas,
-            text,
-            &mut layout,
-            &m,
-            &entry.name,
-            &items,
-            item,
-            y,
-            pad + field + gap,
-        );
-    }
-
-    draw_footer(
-        &mut canvas,
-        text,
-        &m,
-        y,
-        hints_for(target, launcher.menu().is_some(), grid),
-    );
-
-    (canvas, layout)
 }
 
 /// The measurements every panel that looks like the launcher is laid out
@@ -3080,8 +3597,6 @@ pub(crate) struct Metrics {
     pub(crate) width: usize,
     /// Height of a list row.
     pub(crate) row: f32,
-    /// Height of the search field.
-    pub(crate) field: f32,
     /// Corner radius of the panel.
     pub(crate) radius: f32,
     /// The width inside the padding.
@@ -3109,7 +3624,6 @@ impl Metrics {
             pad,
             width,
             row: size * 2.2,
-            field: size * 2.6,
             radius: RADIUS * scale,
             inner: width as f32 - pad * 2.0,
             gap: TILE_GAP * scale,
@@ -3727,7 +4241,7 @@ mod render_tests {
 
     #[test]
     fn fully_open_it_is_centred_at_full_size() {
-        let rect = placement(OUTPUT, PANEL, Some(ICON), 1.0);
+        let rect = placement(OUTPUT, PANEL, Some(ICON), 1.0, Style::Arc);
         assert_eq!((rect.w(), rect.h()), PANEL, "it did not reach full size");
         let left = rect.x();
         let right = OUTPUT.w() - (rect.x() + rect.w());
@@ -3737,7 +4251,7 @@ mod render_tests {
     #[test]
     fn it_starts_at_the_dock_icon_and_travels_to_the_centre() {
         // §4: "fade + scale up from the dock icon's position".
-        let start = placement(OUTPUT, PANEL, Some(ICON), 0.0);
+        let start = placement(OUTPUT, PANEL, Some(ICON), 0.0, Style::Arc);
         let icon_centre = (ICON.x() + ICON.w() / 2, ICON.y() + ICON.h() / 2);
         let start_centre = (start.x() + start.w() / 2, start.y() + start.h() / 2);
         assert_eq!(start_centre, icon_centre, "it did not start at the icon");
@@ -3745,7 +4259,7 @@ mod render_tests {
         // And moves monotonically toward the middle of the screen.
         let mut previous = start_centre.1;
         for step in 1..=10 {
-            let rect = placement(OUTPUT, PANEL, Some(ICON), step as f32 / 10.0);
+            let rect = placement(OUTPUT, PANEL, Some(ICON), step as f32 / 10.0, Style::Arc);
             let y = rect.y() + rect.h() / 2;
             assert!(y <= previous, "it moved back down at {step}");
             previous = y;
@@ -3754,8 +4268,8 @@ mod render_tests {
 
     #[test]
     fn it_scales_up_rather_than_appearing_at_full_size() {
-        let small = placement(OUTPUT, PANEL, Some(ICON), 0.0);
-        let big = placement(OUTPUT, PANEL, Some(ICON), 1.0);
+        let small = placement(OUTPUT, PANEL, Some(ICON), 0.0, Style::Arc);
+        let big = placement(OUTPUT, PANEL, Some(ICON), 1.0, Style::Arc);
         assert!(
             small.w() < big.w() && small.h() < big.h(),
             "it did not grow"
@@ -3767,7 +4281,7 @@ mod render_tests {
         // Growing from the icon's literal 44 pixels means the first frames
         // are a blur of nothing. The motion carries the meaning; the content
         // still has to be legible while it happens.
-        let start = placement(OUTPUT, PANEL, Some(ICON), 0.0);
+        let start = placement(OUTPUT, PANEL, Some(ICON), 0.0, Style::Arc);
         assert!(
             start.w() as f32 > PANEL.0 as f32 * 0.8,
             "it collapsed to {}x{}",
@@ -3780,8 +4294,8 @@ mod render_tests {
     fn with_no_dock_it_grows_in_place_from_the_centre() {
         // A keyboard shortcut with the dock hidden: scaling up from off the
         // bottom of the screen is motion the eye cannot follow.
-        let start = placement(OUTPUT, PANEL, None, 0.0);
-        let full = placement(OUTPUT, PANEL, None, 1.0);
+        let start = placement(OUTPUT, PANEL, None, 0.0, Style::Arc);
+        let full = placement(OUTPUT, PANEL, None, 1.0, Style::Arc);
         let centre = |r: Rect| (r.x() + r.w() / 2, r.y() + r.h() / 2);
         assert_eq!(centre(start), centre(full), "it travelled with no origin");
         assert!(start.w() < full.w(), "it did not scale");
@@ -3793,8 +4307,8 @@ mod render_tests {
         // which is the property that makes it reversible rather than a second
         // animation that happens to look similar.
         for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let opening = placement(OUTPUT, PANEL, Some(ICON), t);
-            let closing = placement(OUTPUT, PANEL, Some(ICON), t);
+            let opening = placement(OUTPUT, PANEL, Some(ICON), t, Style::Arc);
+            let closing = placement(OUTPUT, PANEL, Some(ICON), t, Style::Arc);
             assert_eq!(opening, closing);
         }
     }
@@ -3853,8 +4367,8 @@ mod render_tests {
 
     #[test]
     fn the_highlighted_row_is_tinted_rather_than_flooded() {
-        // A solid accent row is unreadable and was what the bug produced.
-        let (canvas, _) = drawn("", 0);
+        // A solid accent tile is unreadable and was what the bug produced.
+        let (canvas, _) = drawn("", 1);
         let accent = crate::theme::accent().to_rgba_bytes();
         let flooded = canvas
             .pixels
@@ -3863,22 +4377,44 @@ mod render_tests {
             .iter()
             .filter(|p| p[0] == accent[0] && p[1] == accent[1] && p[2] == accent[2])
             .count();
-        // The caret and the selection ring are solid accent; a flooded tile
-        // would be tens of thousands of pixels.
+        // The caret and the field's edge are near-solid accent; a flooded
+        // tile would be thousands of pixels.
         assert!(
             flooded < 4_000,
-            "{flooded} solid-accent pixels; the row is flooded"
+            "{flooded} solid-accent pixels; the tile is flooded"
         );
     }
 
     #[test]
-    fn the_panel_grows_and_shrinks_with_the_result_count() {
-        let (many, _) = drawn("", 0);
-        let (few, _) = drawn("raven", 0);
+    fn the_panel_grows_and_shrinks_with_what_it_shows() {
+        let (bar, _) = drawn("", 0);
+        let (grid, _) = drawn("", 1);
+        assert!(bar.height < grid.height, "the bar did not open into the grid");
+        let two_rows = composed(&tools(12), "tool");
+        let one_row = composed(&apps(), "raven");
         assert!(
-            few.height < many.height,
-            "the panel did not shrink to its results"
+            one_row.height < two_rows.height,
+            "the grid did not grow with its results"
         );
+    }
+
+    #[test]
+    fn the_list_hangs_from_the_same_place_as_it_opens() {
+        // Centred, it would jump up by half of whatever it grew.
+        let (bar, _) = drawn("", 0);
+        let (grid, _) = drawn("", 1);
+        let top = |height: usize| {
+            placement(OUTPUT, (760, height as i32), None, 1.0, Style::List).y()
+        };
+        assert_eq!(top(bar.height), top(grid.height), "the list moved as it opened");
+        assert!(top(grid.height) < OUTPUT.h() / 4, "the list is not near the top");
+    }
+
+    /// `count` applications answering to "tool".
+    fn tools(count: usize) -> Vec<Entry> {
+        (1..=count)
+            .map(|n| entry(&format!("Tool {n:02}"), &format!("/bin/tool{n}")))
+            .collect()
     }
 
     /// `compose()` over `apps`, with `query` typed.
@@ -3937,34 +4473,33 @@ mod render_tests {
 
     #[test]
     fn the_panel_never_grows_past_a_screenful_of_applications() {
-        // Twelve matches, eight rows: the panel is as tall as with eight
-        // matches, and stays that tall however far the highlight scrolls.
-        let twelve: Vec<Entry> = (1..=12)
-            .map(|n| entry(&format!("Tool {n:02}"), &format!("/bin/tool{n}")))
-            .collect();
-        let eight = twelve[..VISIBLE].to_vec();
-        let capped = composed(&twelve, "tool");
-        let full = composed(&eight, "tool");
+        // Thirty matches, three rows of six drawn: the panel is as tall as
+        // with eighteen, and stays that tall however far the grid scrolls.
+        let many = tools(30);
+        let screenful = many[..COLUMNS * GRID_ROWS].to_vec();
+        let capped = composed(&many, "tool");
+        let full = composed(&screenful, "tool");
         assert_eq!(
             capped.height, full.height,
-            "the panel grew past VISIBLE rows"
+            "the panel grew past GRID_ROWS rows"
         );
 
         let mut text = Text::new();
         let frecency = Frecency::default();
         let mut launcher = Launcher::default();
-        launcher.open(&twelve, &frecency, NOW, None, CLOCK, STILL);
+        launcher.open(&many, &frecency, NOW, None, CLOCK, STILL);
         for c in "tool".chars() {
-            launcher.press(Key::Insert(c), &twelve, &frecency, NOW, CLOCK, STILL);
+            launcher.press(Key::Insert(c), &many, &frecency, NOW, CLOCK, STILL);
         }
-        for _ in 0..11 {
-            launcher.press(Key::Down, &twelve, &frecency, NOW, CLOCK, STILL);
+        for _ in 0..4 {
+            launcher.press(Key::Down, &many, &frecency, NOW, CLOCK, STILL);
         }
+        assert!(launcher.first_row() > 0, "the grid did not scroll");
         let icons = Icons::discover(crate::theme::ICON_THEME);
         let mut pixmaps = Pixmaps::new();
         let scrolled = compose(
             &launcher,
-            &twelve,
+            &many,
             &mut text,
             &icons,
             &mut pixmaps,
@@ -4015,7 +4550,6 @@ mod render_tests {
     fn the_run_row_and_the_result_row_are_drawn() {
         // Each adds a row to the panel, and each puts ink on it: a row
         // that changed the height but drew nothing would be a blank strip.
-        let (empty, _) = drawn("qqzzxx", 0);
         // "1/0" has no value, so it draws exactly what "2+2" does minus the
         // result row — same run row, and with the highlight moved down onto
         // it, the same footer.
@@ -4026,15 +4560,6 @@ mod render_tests {
             "the result row did not add to the panel"
         );
         assert!(ink(&summed) > ink(&undefined), "the result was not drawn");
-        let (word, _) = drawn("fire", 0);
-        // "fire" is one application row; "qqzzxx" is one run row. Same
-        // number of rows, so a run row that took no space would show here.
-        assert!(
-            (word.height as i64 - empty.height as i64).abs() < (BASE_SIZE * 3.0) as i64,
-            "the run row is not the height of a row: {} vs {}",
-            empty.height,
-            word.height
-        );
     }
 
     #[test]
@@ -4102,6 +4627,8 @@ mod render_tests {
         }
         let mut launcher = Launcher::default();
         launcher.open(apps, &frecency, NOW, None, CLOCK, STILL);
+        // Open the bar into the grid, which typing would do anyway.
+        launcher.press(Key::Down, apps, &frecency, NOW, CLOCK, STILL);
         for c in query.chars() {
             launcher.press(Key::Insert(c), apps, &frecency, NOW, CLOCK, STILL);
         }
@@ -4173,8 +4700,8 @@ mod render_tests {
             "a recent row overlapped the tiles"
         );
         assert!(
-            second.0.y() > first.0.y(),
-            "the recent rows are out of order"
+            second.0.x() > first.0.x(),
+            "the foot is out of order"
         );
         assert_eq!((first.1, second.1), (SUGGESTED, SUGGESTED + 1));
     }
@@ -4193,7 +4720,10 @@ mod render_tests {
 
         // And a list of applications, top to bottom in result order.
         let (launcher, layout) = laid_out(&apps, "f", &[], false);
-        assert_eq!(layout.hits.len(), launcher.window().len());
+        assert_eq!(
+            layout.hits.len(),
+            launcher.results().len() + launcher.file_hits().len()
+        );
         for (n, (rect, slot)) in layout.hits.iter().enumerate() {
             assert_eq!(*slot, n, "row {n} is numbered {slot}");
             assert_eq!(layout.hit(centre(*rect)), Some(n));
@@ -4231,23 +4761,22 @@ mod render_tests {
         let query: String = apps[0].name.chars().take(4).collect();
         let (launcher, layout) = laid_out(&apps, &query, &[], true);
         assert_eq!(
-            launcher.window().len(),
+            launcher.results().len(),
             1,
-            "the fixture did not narrow to one row"
+            "the fixture did not narrow to one tile"
         );
         assert_eq!(layout.menu_hits.len(), 3, "Open, the action, and Pin");
         let (_, bare) = laid_out(&apps, &query, &[], false);
         assert!(
-            bare.size.1 < layout.size.1,
-            "the panel did not grow for the menu"
+            bare.size.1 <= layout.size.1,
+            "the panel shrank for the menu"
         );
-        let scale = 1.0;
-        let size = BASE_SIZE * scale;
-        let footer_top = layout.size.1 as f32 - PAD * scale - size * 2.4;
+        // Below the field, and inside the canvas.
+        let field_bottom = (9.0 + 50.0) as i32;
         for (rect, item) in &layout.menu_hits {
             assert!(
-                rect.bottom() <= footer_top as i32,
-                "menu item {item} at {rect:?} reaches the footer starting at {footer_top}"
+                rect.y() >= field_bottom && rect.bottom() <= layout.size.1,
+                "menu item {item} at {rect:?} is off the body"
             );
             assert_eq!(layout.menu_hit(centre(*rect)), Some(*item));
         }
@@ -4278,6 +4807,97 @@ mod render_tests {
         assert_eq!(
             layout.canvas_point(full, Point::new(700, 400)),
             Some(Point::new(20, 40))
+        );
+    }
+
+
+    // -- The arc ------------------------------------------------------------
+
+    fn arc_laid_out(apps: &[Entry], query: &str) -> (Launcher, Canvas, Layout) {
+        let mut text = Text::new();
+        let frecency = Frecency::default();
+        let mut launcher = Launcher::default();
+        launcher.set_style(Style::Arc);
+        launcher.open(apps, &frecency, NOW, None, CLOCK, STILL);
+        for c in query.chars() {
+            launcher.press(Key::Insert(c), apps, &frecency, NOW, CLOCK, STILL);
+        }
+        let icons = Icons::discover(crate::theme::ICON_THEME);
+        let mut pixmaps = Pixmaps::new();
+        let (canvas, layout) = compose(
+            &launcher,
+            apps,
+            &mut text,
+            &icons,
+            &mut pixmaps,
+            Rect::from_xywh(0, 0, 1920, 1080),
+            1,
+        );
+        (launcher, canvas, layout)
+    }
+
+    #[test]
+    fn every_slot_on_the_arc_is_a_hit_and_the_best_match_is_on_top() {
+        let apps = apps();
+        let (_, _, layout) = arc_laid_out(&apps, "");
+        assert_eq!(layout.hits.len(), apps.len());
+        let top = layout.hits.iter().min_by_key(|(rect, _)| rect.y()).unwrap();
+        assert_eq!(top.1, 0, "the top slot is not the first rank");
+        for (rect, index) in &layout.hits {
+            assert_eq!(layout.hit(centre(*rect)), Some(*index));
+        }
+    }
+
+    #[test]
+    fn off_the_glass_the_arc_is_transparent_and_not_the_launcher() {
+        let (_, canvas, layout) = arc_laid_out(&apps(), "");
+        assert_eq!(canvas.pixels[3], 0, "the canvas's corner is painted");
+        let panel = Rect::from_xywh(0, 0, layout.size.0, layout.size.1);
+        assert_eq!(layout.canvas_point(panel, Point::new(2, 2)), None);
+        let hub = layout.blur.expect("the arc names its blur").center();
+        assert!(layout.canvas_point(panel, hub).is_some(), "the hub is not the launcher");
+    }
+
+    #[test]
+    fn the_arcs_blur_lies_on_its_glass() {
+        let (_, canvas, layout) = arc_laid_out(&apps(), "");
+        let blur = layout.blur.expect("the arc names its blur");
+        for (x, y) in [
+            (blur.x(), blur.y()),
+            (blur.right() - 1, blur.y()),
+            (blur.x(), blur.bottom() - 1),
+            (blur.right() - 1, blur.bottom() - 1),
+        ] {
+            let alpha = canvas.pixels[(y as usize * canvas.stride + x as usize) * 4 + 3];
+            assert!(alpha > 0x80, "the blur's corner ({x}, {y}) is off the glass: {alpha}");
+        }
+    }
+
+    #[test]
+    fn the_arcs_card_offers_open_then_the_rest_of_the_menu() {
+        let mut apps = apps();
+        apps[0].actions.push(raven_desktop::entry::Action {
+            id: "private".into(),
+            name: "Private Window".into(),
+            exec: "firefox --private-window".into(),
+            icon: None,
+        });
+        let (launcher, _, layout) = arc_laid_out(&apps, "fire");
+        let entry = &apps[launcher.selection().expect("Firefox is highlighted")];
+        assert_eq!(layout.menu_hits.len(), launcher.menu_items(entry).len());
+        assert_eq!(layout.menu_hits[0].1, 0, "Open is not the button");
+    }
+
+    #[test]
+    fn the_arcs_sidebar_is_categories_until_something_is_typed() {
+        let (_, _, layout) = arc_laid_out(&apps(), "");
+        assert!(layout.buttons.iter().any(|(_, b)| *b == Button::Category(0)));
+        let (_, _, searching) = arc_laid_out(&apps(), "f");
+        assert!(
+            searching
+                .buttons
+                .iter()
+                .any(|(_, b)| *b == Button::Filter(Filter::Files))
         );
     }
 
@@ -4315,6 +4935,19 @@ mod render_tests {
             }
         }
         let mut launcher = Launcher::default();
+        // `LAUNCHER_STYLE=arc`: the arc rather than the list.
+        if std::env::var("LAUNCHER_STYLE").is_ok_and(|s| s.eq_ignore_ascii_case("arc")) {
+            launcher.set_style(Style::Arc);
+        }
+        // `LAUNCHER_PINS=Firefox,Files`: pin those, for the list's foot.
+        launcher.set_pinned(
+            std::env::var("LAUNCHER_PINS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|name| apps.iter().find(|a| a.name.eq_ignore_ascii_case(name)))
+                .map(|app| app.path.clone())
+                .collect(),
+        );
         // `LAUNCHER_FILES=1`: index the real home, so file rows have
         // something to show.
         if std::env::var_os("LAUNCHER_FILES").is_some()
@@ -4364,7 +4997,11 @@ mod render_tests {
 
         let mut ppm = format!("P6\n{} {}\n255\n", canvas.stride, canvas.height).into_bytes();
         for pixel in canvas.pixels.as_chunks::<4>().0.iter() {
-            ppm.extend_from_slice(&pixel[..3]);
+            let inverse = 255 - u32::from(pixel[3]);
+            for (channel, backdrop) in [48_u32, 44, 86].into_iter().enumerate() {
+                let value = u32::from(pixel[channel]) + backdrop * inverse / 255;
+                ppm.push(value.min(255) as u8);
+            }
         }
         std::fs::write(&path, ppm).expect("writing the dump");
         println!("wrote {}x{} to {path}", canvas.stride, canvas.height);
@@ -4551,8 +5188,8 @@ mod blur_tests {
         // still arriving would blur a patch of desktop with nothing over it.
         let output = Rect::from_xywh(0, 0, 1920, 1080);
         let origin = Some(Rect::from_xywh(20, 1030, 44, 44));
-        let half = placement(output, (700, 500), origin, 0.5);
-        let full = placement(output, (700, 500), origin, 1.0);
+        let half = placement(output, (700, 500), origin, 0.5, Style::Arc);
+        let full = placement(output, (700, 500), origin, 1.0, Style::Arc);
         let (half_blur, full_blur) = (blur_rect(half).unwrap(), blur_rect(full).unwrap());
         assert!(half_blur.w() < full_blur.w());
         assert_ne!(half_blur.center(), full_blur.center());
