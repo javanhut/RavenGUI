@@ -1,4 +1,5 @@
-//! Notice `desktop.toml` changing while the session runs.
+//! Notice `desktop.toml`, and the wallpaper it points at, changing while the
+//! session runs.
 //!
 //! The settings application writes the file atomically — a sibling temp file
 //! renamed into place — so the event that matters is `MOVED_TO` on the
@@ -6,17 +7,27 @@
 //! [`crate::appwatch`], and fail-soft for the same reason: losing live reload
 //! costs a logout, and a compositor that will not start over an inotify
 //! failure costs the machine.
+//!
+//! The wallpaper is watched here too, rather than only re-read when the path
+//! in `desktop.toml` changes, because the path usually does not: the settings
+//! application writes every pick to the same `wallpaper.<ext>`, and
+//! `set-wallpaper.sh` repoints `set/` without touching any config at all. The
+//! directories come from [`crate::wallpaper::directories`] and are re-armed
+//! after every reload, since a new path in the file means new ones.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::fd::AsFd;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, LoopHandle, Mode, PostAction};
-use inotify::{Inotify, WatchMask};
+use inotify::{Inotify, WatchDescriptor, WatchMask};
 
 use crate::xwayland::AsHuginn;
 
@@ -25,6 +36,71 @@ const SETTLE: Duration = Duration::from_millis(200);
 
 const BUFFER: usize = 4096;
 
+/// One mask for every watch. inotify keeps one watch per directory, and adding
+/// a directory that is already watched *replaces* its mask — so a wallpaper
+/// kept in `~/.config/raven` must not narrow the config file's watch, or the
+/// other way round.
+fn mask() -> WatchMask {
+    WatchMask::CLOSE_WRITE
+        | WatchMask::MOVED_TO
+        | WatchMask::MOVED_FROM
+        | WatchMask::CREATE
+        | WatchMask::DELETE
+}
+
+struct Watches {
+    inotify: Inotify,
+    config_dir: PathBuf,
+    /// The config directory's watch, or its parent's while it does not exist.
+    config: Vec<WatchDescriptor>,
+    wallpaper: HashMap<WatchDescriptor, PathBuf>,
+}
+
+impl Watches {
+    /// The directory, not the file: a rename replaces the inode, and a watch
+    /// on the old one would go quiet after the first save. When even the
+    /// directory is missing, watch its parent for it to appear; the settings
+    /// app creates it on first save.
+    fn arm_config(&mut self) {
+        let watches = self.inotify.watches();
+        let armed = match watches.clone().add(&self.config_dir, mask()) {
+            Ok(wd) => Some(wd),
+            Err(_) => self
+                .config_dir
+                .parent()
+                .and_then(|p| watches.clone().add(p, mask()).ok()),
+        };
+        if let Some(wd) = armed
+            && !self.config.contains(&wd)
+        {
+            self.config.push(wd);
+        }
+    }
+
+    /// Watch exactly `directories` for the wallpaper, dropping the ones no
+    /// longer wanted — but never one the config file shares.
+    fn arm_wallpaper(&mut self, directories: &[PathBuf]) {
+        let mut watches = self.inotify.watches();
+        let mut next = HashMap::new();
+        for dir in directories {
+            match watches.add(dir, mask()) {
+                Ok(wd) => {
+                    next.insert(wd, dir.clone());
+                }
+                Err(e) => tracing::debug!(path = %dir.display(), "not watching for the wallpaper: {e}"),
+            }
+        }
+        for (wd, _) in self.wallpaper.drain() {
+            if !next.contains_key(&wd) && !self.config.contains(&wd) {
+                // Fails for a directory that has since gone, which removed
+                // the watch already.
+                let _ = watches.remove(wd);
+            }
+        }
+        self.wallpaper = next;
+    }
+}
+
 pub(crate) fn start<D>(handle: &LoopHandle<'static, D>)
 where
     D: AsHuginn + 'static,
@@ -32,35 +108,16 @@ where
     let Some(path) = crate::desktop_config::path() else {
         return;
     };
-    let Some(dir) = path.parent().map(std::path::Path::to_owned) else {
+    let Some(config_dir) = path.parent().map(Path::to_owned) else {
         return;
     };
-    let mut inotify = match Inotify::init() {
+    let inotify = match Inotify::init() {
         Ok(i) => i,
         Err(e) => {
-            tracing::warn!(error = %e, "no inotify: settings changes need a relogin");
+            tracing::warn!(error = %e, "no inotify: settings and wallpaper changes need a relogin");
             return;
         }
     };
-    // The directory, not the file: a rename replaces the inode, and a watch on
-    // the old one would go quiet after the first save. When even the
-    // directory is missing, watch its parent for it to appear; the settings
-    // app creates it on first save.
-    let mask = WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE;
-    let armed = inotify.watches().add(&dir, mask).is_ok()
-        || dir
-            .parent()
-            .map(|p| {
-                inotify
-                    .watches()
-                    .add(p, WatchMask::CREATE | WatchMask::MOVED_TO)
-                    .is_ok()
-            })
-            .unwrap_or(false);
-    if !armed {
-        tracing::debug!(path = %dir.display(), "no config directory to watch");
-        return;
-    }
     let poll_fd = match inotify.as_fd().try_clone_to_owned() {
         Ok(fd) => fd,
         Err(e) => {
@@ -69,31 +126,70 @@ where
         }
     };
 
+    let mut watches = Watches {
+        inotify,
+        config_dir,
+        config: Vec::new(),
+        wallpaper: HashMap::new(),
+    };
+    watches.arm_config();
+    // Read here rather than taken from the compositor's state, which this has
+    // no handle on yet; the first reload re-arms from the state itself.
+    let chosen = crate::desktop_config::DesktopConfig::load().wallpaper();
+    watches.arm_wallpaper(&crate::wallpaper::directories(chosen.as_deref()));
+    if watches.config.is_empty() && watches.wallpaper.is_empty() {
+        tracing::debug!("no config or wallpaper directory to watch");
+        return;
+    }
+    let watches = Rc::new(RefCell::new(watches));
+
     let scheduled = Rc::new(Cell::new(false));
+    // Whether any event since the last reload was the config file itself, as
+    // opposed to only something near a wallpaper.
+    let config_changed = Rc::new(Cell::new(false));
     let lh = handle.clone();
     let mut buffer = [0u8; BUFFER];
-    let file_name = path.file_name().map(|n| n.to_owned());
+    let file_name: Option<OsString> = path.file_name().map(|n| n.to_owned());
 
+    let reader_watches = Rc::clone(&watches);
     let inserted = handle.insert_source(
         Generic::new(poll_fd, Interest::READ, Mode::Level),
         move |_, _, _data: &mut D| {
             let mut relevant = false;
+            let mut w = reader_watches.borrow_mut();
             loop {
-                match inotify.read_events(&mut buffer) {
+                match w.inotify.read_events(&mut buffer) {
                     Ok(events) => {
                         let mut any = false;
+                        let mut rearm_config = false;
                         for event in events {
                             any = true;
-                            // Either the file itself, or the `raven` directory
-                            // appearing under ~/.config (then re-arm on it).
-                            match event.name {
-                                Some(name) if Some(name.to_owned()) == file_name => relevant = true,
-                                Some(name) if name == "raven" => {
-                                    let _ = inotify.watches().add(&dir, mask);
-                                    relevant = true;
+                            if w.config.contains(&event.wd) {
+                                // Either the file itself, or the `raven`
+                                // directory appearing under ~/.config (then
+                                // re-arm on it).
+                                match event.name {
+                                    Some(name) if Some(name) == file_name.as_deref() => {
+                                        config_changed.set(true);
+                                        relevant = true;
+                                    }
+                                    Some(name) if name == "raven" => {
+                                        rearm_config = true;
+                                        config_changed.set(true);
+                                        relevant = true;
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
+                            // Any change at all: which file it was does not
+                            // narrow the work, since the refresh compares the
+                            // wallpaper's stamps and is a stat when unchanged.
+                            if w.wallpaper.contains_key(&event.wd) {
+                                relevant = true;
+                            }
+                        }
+                        if rearm_config {
+                            w.arm_config();
                         }
                         if !any {
                             break;
@@ -106,15 +202,26 @@ where
                     }
                 }
             }
+            drop(w);
             if !relevant || scheduled.get() {
                 return Ok(PostAction::Continue);
             }
             scheduled.set(true);
             let done = Rc::clone(&scheduled);
+            let config_changed = Rc::clone(&config_changed);
+            let timer_watches = Rc::clone(&reader_watches);
             if let Err(e) =
                 lh.insert_source(Timer::from_duration(SETTLE), move |_, _, data: &mut D| {
                     done.set(false);
-                    data.as_huginn().reload_desktop_config();
+                    let huginn = data.as_huginn();
+                    if config_changed.replace(false) {
+                        // Refreshes the wallpaper too.
+                        huginn.reload_desktop_config();
+                    } else {
+                        huginn.refresh_wallpaper();
+                    }
+                    let directories = huginn.wallpaper_directories();
+                    timer_watches.borrow_mut().arm_wallpaper(&directories);
                     TimeoutAction::Drop
                 })
             {
@@ -125,8 +232,8 @@ where
         },
     );
     if let Err(e) = inserted {
-        tracing::warn!(error = %e, "inotify source: settings changes need a relogin");
+        tracing::warn!(error = %e, "inotify source: settings and wallpaper changes need a relogin");
         return;
     }
-    tracing::info!(path = %path.display(), "watching the desktop settings file");
+    tracing::info!(path = %path.display(), "watching the desktop settings file and the wallpaper");
 }

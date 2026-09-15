@@ -30,7 +30,7 @@
 //! rectangle instead would resample it on every frame, forever, to draw a
 //! picture that never changes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use huginn_core::geometry::Size;
 
@@ -197,6 +197,80 @@ impl Wallpaper {
         }
         out
     }
+}
+
+/// Which file a wallpaper was read from, as it was when read.
+///
+/// The path alone is not enough: the settings application writes every pick to
+/// the same `wallpaper.<ext>`, so two different pictures share one name. The
+/// inode catches a rename over the old file, and length and mtime catch a copy
+/// in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    /// Follows symlinks, so `set/wallpaper.jpg` pointed at a different picture
+    /// is a different stamp even though the link's own name did not change.
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_owned(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// Both files [`Wallpaper::chosen_or_installed`] may read, stamped.
+///
+/// Both and not just the one that won, so a chosen file that failed to decode
+/// still lets a change to the machine's wallpaper through.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Sources {
+    chosen: Option<Stamp>,
+    installed: Option<Stamp>,
+}
+
+impl Sources {
+    /// Taken *before* decoding: a file replaced mid-decode then stamps as the
+    /// old one, and the watch event for the replacement still differs.
+    pub(crate) fn of(chosen: Option<&Path>) -> Self {
+        Self {
+            chosen: chosen.and_then(Stamp::of),
+            installed: installed_path().as_deref().and_then(Stamp::of),
+        }
+    }
+}
+
+/// The directories to watch to notice any change to what
+/// [`Wallpaper::chosen_or_installed`] would read.
+///
+/// `set/` and its parent (so `set/` being created is seen), the chosen file's
+/// directory, and wherever either file really lives when it is a symlink.
+/// Directories, not files, because a rename over a file leaves a watch on it
+/// following the unlinked inode.
+pub(crate) fn directories(chosen: Option<&Path>) -> Vec<PathBuf> {
+    let set = Path::new(SET_DIR);
+    let mut dirs = vec![set.to_owned()];
+    dirs.extend(set.parent().map(Path::to_owned));
+    for file in chosen.map(Path::to_owned).into_iter().chain(installed_path()) {
+        dirs.extend(file.parent().map(Path::to_owned));
+        if let Ok(real) = std::fs::canonicalize(&file) {
+            dirs.extend(real.parent().map(Path::to_owned));
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// The path of the wallpaper this machine has set.
@@ -542,6 +616,72 @@ mod tests {
         assert!(check_dimensions(MAX_DIMENSION as u32 + 1, 4).is_err());
         assert!(check_dimensions(60_000, 60_000).is_err());
         assert!(check_dimensions(1920, 1080).is_ok());
+    }
+
+    /// A throwaway directory, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("huginn-wallpaper-{name}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("scratch dir");
+            Self(root)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The bug: the settings application writes every pick to the same
+    /// `wallpaper.jpg`, so a new picture has the old one's path.
+    #[test]
+    fn a_file_replaced_at_the_same_path_is_a_different_source() {
+        let scratch = Scratch::new("same-path");
+        let file = scratch.0.join("wallpaper.jpg");
+        std::fs::write(&file, b"first").expect("write");
+        let before = Sources::of(Some(&file));
+        assert_eq!(before, Sources::of(Some(&file)), "nothing changed");
+
+        let staged = scratch.0.join(".new");
+        std::fs::write(&staged, b"second picture").expect("write");
+        std::fs::rename(&staged, &file).expect("rename");
+        assert_ne!(before, Sources::of(Some(&file)));
+    }
+
+    #[test]
+    fn a_symlink_repointed_is_a_different_source() {
+        let scratch = Scratch::new("symlink");
+        let (a, b) = (scratch.0.join("a.png"), scratch.0.join("b.png"));
+        std::fs::write(&a, b"a").expect("write");
+        std::fs::write(&b, b"b").expect("write");
+        let link = scratch.0.join("wallpaper.png");
+        std::os::unix::fs::symlink(&a, &link).expect("symlink");
+        let before = Sources::of(Some(&link));
+
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(&b, &link).expect("symlink");
+        assert_ne!(before, Sources::of(Some(&link)));
+    }
+
+    #[test]
+    fn the_chosen_files_directory_and_its_link_target_are_watched() {
+        let scratch = Scratch::new("dirs");
+        let library = scratch.0.join("library");
+        let picked = scratch.0.join("picked");
+        std::fs::create_dir_all(&library).expect("mkdir");
+        std::fs::create_dir_all(&picked).expect("mkdir");
+        std::fs::write(library.join("cliff.jpg"), b"x").expect("write");
+        let link = picked.join("wallpaper.jpg");
+        std::os::unix::fs::symlink(library.join("cliff.jpg"), &link).expect("symlink");
+
+        let dirs = directories(Some(&link));
+        assert!(dirs.contains(&picked), "{dirs:?}");
+        assert!(dirs.contains(&library.canonicalize().unwrap()), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from(SET_DIR)), "{dirs:?}");
     }
 
     #[test]
