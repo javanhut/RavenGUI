@@ -27,12 +27,30 @@ impl Backend {
     /// an inherited `WAYLAND_DISPLAY` selects the nested backend.
     pub(crate) fn detect(args: &[String]) -> Self {
         match args.iter().position(|a| a == "--backend") {
-            Some(i) => match args.get(i + 1).map(String::as_str) {
-                Some("udev") => Self::Udev,
-                _ => Self::Winit,
-            },
+            Some(i) => Self::named(args.get(i + 1).map(String::as_str)),
             None if std::env::var_os("WAYLAND_DISPLAY").is_some() => Self::Winit,
             None => Self::Udev,
+        }
+    }
+
+    /// The backend `--backend` named, saying so when it named nothing known.
+    ///
+    /// A value that is not understood still falls back to `winit`, because a
+    /// compositor in a window is the recoverable end of getting this wrong --
+    /// but silently is how `--backend udevv` on a TTY becomes a session that
+    /// looks like it never started.
+    fn named(value: Option<&str>) -> Self {
+        match value {
+            Some("udev") => Self::Udev,
+            Some("winit") => Self::Winit,
+            Some(other) => {
+                tracing::warn!(value = other, "unrecognised --backend; using winit");
+                Self::Winit
+            }
+            None => {
+                tracing::warn!("--backend was given no value; using winit");
+                Self::Winit
+            }
         }
     }
 }
@@ -175,6 +193,40 @@ mod tests {
     /// the property under test. An unreaped one stays as a zombie and keeps it.
     fn present(pid: u32) -> bool {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn an_explicit_backend_is_taken_whatever_the_environment_says() {
+        assert_eq!(
+            Backend::detect(&argv(&["huginn", "--backend", "udev"])),
+            Backend::Udev
+        );
+        assert_eq!(
+            Backend::detect(&argv(&["huginn", "--backend", "winit"])),
+            Backend::Winit
+        );
+    }
+
+    /// The regression behind this: `--help` was not a flag huginn knew, so it
+    /// fell through to autodetection, found an inherited `WAYLAND_DISPLAY` and
+    /// started a nested compositor in a window instead of printing anything.
+    /// `main` answers `--help` before it ever gets here, and this pins the
+    /// other half -- that an unknown value is not quietly read as a backend.
+    #[test]
+    fn an_unrecognised_backend_value_falls_back_to_winit() {
+        assert_eq!(Backend::named(Some("udevv")), Backend::Winit);
+        assert_eq!(Backend::named(Some("--help")), Backend::Winit);
+        assert_eq!(Backend::named(None), Backend::Winit);
+    }
+
+    #[test]
+    fn the_backend_names_are_exactly_the_two_that_exist() {
+        assert_eq!(Backend::named(Some("udev")), Backend::Udev);
+        assert_eq!(Backend::named(Some("winit")), Backend::Winit);
     }
 
     #[test]
