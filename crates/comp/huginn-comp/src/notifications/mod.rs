@@ -503,10 +503,7 @@ impl Notifications {
         // order.
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.arrived));
 
-        let mut snapshot = link
-            .listing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut snapshot = link.listing.lock().unwrap_or_else(PoisonError::into_inner);
         snapshot.now = now;
         snapshot.taken = std::time::Instant::now();
         if snapshot.entries != entries {
@@ -1049,10 +1046,7 @@ mod tests {
 
         assert!(notifications.set_context(Context::default(), true, secs(2), Motion::Full));
         notifications.due(secs(6), Motion::Full);
-        assert!(
-            sent(&announced).is_empty(),
-            "nobody was there to see it go"
-        );
+        assert!(sent(&announced).is_empty(), "nobody was there to see it go");
 
         assert!(notifications.set_context(Context::default(), false, secs(600), Motion::Full));
         assert_eq!(

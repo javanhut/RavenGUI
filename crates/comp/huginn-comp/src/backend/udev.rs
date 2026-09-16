@@ -1556,7 +1556,9 @@ impl Udev {
                     Rect::from_xywh(rect.x() - view.x(), rect.y() - view.y(), rect.w(), rect.h());
                 self.blur
                     .as_mut()
-                    .and_then(|blur| blur.pass(&mut self.renderer, &behind, size, scale, radius, alpha))
+                    .and_then(|blur| {
+                        blur.pass(&mut self.renderer, &behind, size, scale, radius, alpha)
+                    })
                     .and_then(|element| render::blur_element(element, rect, scale))
             }
             _ => None,
