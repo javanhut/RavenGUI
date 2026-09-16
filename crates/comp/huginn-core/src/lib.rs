@@ -585,6 +585,22 @@ impl Space {
         window.mode != was
     }
 
+    /// The window holding the whole of `workspace`'s screen, if one is.
+    ///
+    /// A fullscreen window covers the output and is drawn in workspace order,
+    /// so nothing else on that workspace can be seen beside it: a window
+    /// arriving there is either painted over by the film or paints a hole in
+    /// it. Everything that can put a window on a workspace asks this first —
+    /// see `Huginn::share_screen_with`, which answers by giving the screen up.
+    pub fn fullscreen_on(&self, workspace: usize) -> Option<WindowId> {
+        self.workspaces
+            .get(workspace)?
+            .windows()
+            .iter()
+            .copied()
+            .find(|id| self.windows.get(id).is_some_and(Window::is_fullscreen))
+    }
+
     /// Register a new window and focus it.
     ///
     /// On the active workspace, unless that workspace is already at its
@@ -653,6 +669,9 @@ impl Space {
                 if self.workspaces[index].solo() == Some(id) {
                     self.end_solo_on(index);
                 }
+                // The workspace hands focus to a neighbour by position, which
+                // is as likely to be a window in the dock as one on screen.
+                self.settle_focus(index);
                 break;
             }
         }
@@ -687,6 +706,30 @@ impl Space {
     /// The focused window on the active workspace, if any.
     pub fn focused(&self) -> Option<WindowId> {
         self.active_workspace().focused()
+    }
+
+    /// Focus `id` where it is, making the workspace showing it the active
+    /// one — and with it, the screen that workspace is on.
+    ///
+    /// Click-to-focus's way in. A click lands on whatever is drawn under the
+    /// pointer, and with two screens that is routinely a window on the
+    /// workspace the *other* one is showing. Focusing it only when it happens
+    /// to live on the active workspace is how a click that visibly lands on a
+    /// window leaves the keyboard somewhere else entirely: the ring moves, the
+    /// window looks focused, and what is typed goes to the screen behind you.
+    ///
+    /// Returns whether `id` is on a workspace some screen is showing. A window
+    /// on a workspace in the wings is not clickable and is not brought
+    /// forward: going to one of those is [`Self::activate_workspace`]'s.
+    pub fn focus_window(&mut self, id: WindowId) -> bool {
+        let Some(index) = self.workspace_of(id) else {
+            return false;
+        };
+        if !self.visible.contains(&index) {
+            return false;
+        }
+        self.active = index;
+        self.workspaces[index].focus(id)
     }
 
     /// Move focus through panes that are actually present on screen.
@@ -731,12 +774,14 @@ impl Space {
         }
         if self.visible.contains(&index) {
             self.active = index;
+            self.settle_focus(index);
             return true;
         }
         let output = self.focused_output();
         self.workspaces[index].set_output(output);
         self.visible[output] = index;
         self.active = index;
+        self.settle_focus(index);
         true
     }
 
@@ -773,6 +818,7 @@ impl Space {
         }
         self.workspaces[self.active].remove(id);
         self.workspaces[index].insert(id);
+        self.settle_focus(self.active);
         true
     }
 
@@ -886,6 +932,9 @@ impl Space {
             self.unminimize(id);
         }
         *self.workspaces[index].tiles_mut() = solo.tiles;
+        // The windows are back on screen; focus may have been left on none of
+        // them while they were all away.
+        self.settle_focus(index);
         true
     }
 
@@ -906,23 +955,42 @@ impl Space {
             return false;
         }
         window.minimize();
-        if self.focused() != Some(id) {
-            return true;
+        if let Some(workspace) = self.workspace_of(id) {
+            self.settle_focus(workspace);
         }
-
-        let next = self.workspaces[self.active]
-            .windows()
-            .iter()
-            .copied()
-            .find(|candidate| {
-                *candidate != id
-                    && self
-                        .windows
-                        .get(candidate)
-                        .is_some_and(|window| !window.is_minimized())
-            });
-        self.workspaces[self.active].set_focus(next);
         true
+    }
+
+    /// Move `workspace`'s focus off a window nobody can see.
+    ///
+    /// Focus is held by id and moved by the workspace itself whenever its
+    /// membership changes — a window closed, or sent to another workspace —
+    /// and [`Workspace`] holds ids alone, so the neighbour it hands focus to
+    /// is chosen by position with no way to tell one still on screen from one
+    /// put away in the dock. Focus resting on a minimized window is a desktop
+    /// that looks dead: the keystrokes are delivered, faithfully, to a window
+    /// in the dock, and the only way out anybody finds is putting the window
+    /// they meant away and bringing it back.
+    ///
+    /// Run wherever focus may have been settled for the workspace rather than
+    /// by the user. It is a no-op when focus is already on something visible,
+    /// which is nearly always, and clears focus when everything here is away —
+    /// there is nothing to give the keyboard to, and saying so is what stops
+    /// the next keystroke going to the dock.
+    fn settle_focus(&mut self, index: usize) {
+        let Some(workspace) = self.workspaces.get(index) else {
+            return;
+        };
+        let visible = |id: &WindowId| {
+            self.windows
+                .get(id)
+                .is_some_and(|window| !window.is_minimized())
+        };
+        if workspace.focused().as_ref().is_some_and(visible) {
+            return;
+        }
+        let next = workspace.windows().iter().find(|id| visible(id)).copied();
+        self.workspaces[index].set_focus(next);
     }
 
     /// Bring a minimized window back into the layout, and report whether it
@@ -1291,6 +1359,139 @@ mod tests {
         assert!(s.set_fullscreen(a, false));
         s.arrange();
         assert_eq!(s.window(a).expect("open").geometry, tiled_geom);
+    }
+
+    /// Two rectangles that do not touch. A fullscreen window is the whole
+    /// screen, so anything else laid out on that screen is underneath it.
+    fn disjoint(a: Rect, b: Rect) -> bool {
+        a.right() <= b.x() || b.right() <= a.x() || a.bottom() <= b.y() || b.bottom() <= a.y()
+    }
+
+    /// A window that opens while another holds the screen is not visible: the
+    /// film covers the output and is painted in workspace order. The screen
+    /// has to be given up for the two to share it, and `fullscreen_on` is how
+    /// the compositor finds out there is a screen to give up.
+    #[test]
+    fn a_window_opening_onto_a_fullscreen_screen_shares_it_rather_than_hiding_under_it() {
+        let mut s = space();
+        let a = s.open_window();
+        assert!(s.set_fullscreen(a, true));
+        s.arrange();
+
+        let here = s.active_index();
+        assert_eq!(s.fullscreen_on(here), Some(a), "a holds the screen");
+
+        let b = s.open_window();
+        s.arrange();
+        assert!(
+            !disjoint(
+                s.window(a).expect("open").geometry,
+                s.window(b).expect("open").geometry
+            ),
+            "b was laid out underneath the film, which is the bug"
+        );
+
+        // What the compositor does about it: the holder gives the screen up,
+        // and the two tile.
+        assert!(s.set_fullscreen(a, false));
+        s.arrange();
+        assert_eq!(s.fullscreen_on(here), None);
+        assert!(
+            disjoint(
+                s.window(a).expect("open").geometry,
+                s.window(b).expect("open").geometry
+            ),
+            "a split, not an overlap"
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_nothing_fullscreen_holds_no_screen() {
+        let mut s = space();
+        let a = s.open_window();
+        s.open_window();
+        s.arrange();
+        assert_eq!(s.fullscreen_on(s.active_index()), None);
+        s.set_fullscreen(a, true);
+        assert_eq!(s.fullscreen_on(s.active_index()), Some(a));
+        // Out of range rather than empty: no workspace, no holder, no panic.
+        assert_eq!(s.fullscreen_on(99), None);
+    }
+
+    // ---- focus never rests on a window nobody can see ----------------------
+
+    /// The workspace hands focus to a neighbour by position when the focused
+    /// window leaves, and it holds ids alone: the neighbour it picks may be
+    /// one that was put away. Focus landing there is keystrokes delivered to
+    /// the dock.
+    #[test]
+    fn closing_a_window_does_not_hand_focus_to_one_in_the_dock() {
+        let mut s = space();
+        let a = s.open_window();
+        let b = s.open_window();
+        let c = s.open_window();
+        s.arrange();
+
+        assert!(s.minimize(b), "b goes to the dock");
+        assert_eq!(s.focused(), Some(c), "minimizing an unfocused window is quiet");
+
+        s.close_window(c);
+        assert_eq!(
+            s.focused(),
+            Some(a),
+            "b is in the dock; focus belongs on the window still on screen"
+        );
+    }
+
+    #[test]
+    fn sending_the_focused_window_away_does_not_leave_focus_in_the_dock() {
+        let mut s = space();
+        let a = s.open_window();
+        let b = s.open_window();
+        s.arrange();
+        assert!(s.minimize(a));
+        assert_eq!(s.focused(), Some(b));
+
+        assert!(s.send_focused_to_workspace(1));
+        assert_eq!(
+            s.focused(),
+            None,
+            "only a is left here and it is put away: nothing to type into"
+        );
+    }
+
+    #[test]
+    fn arriving_on_a_workspace_focuses_something_that_is_on_screen() {
+        let mut s = space();
+        let a = s.open_window();
+        let b = s.open_window();
+        s.arrange();
+        // Put the focused window away from another workspace, which is what
+        // a client's own minimize button does to a workspace in the wings.
+        assert!(s.activate_workspace(1));
+        assert!(s.minimize(b));
+        assert_eq!(
+            s.workspaces()[0].focused(),
+            Some(a),
+            "settled where it was put away, not left on the window in the dock"
+        );
+
+        assert!(s.activate_workspace(0));
+        assert_eq!(s.focused(), Some(a), "the one window still on screen");
+    }
+
+    #[test]
+    fn a_workspace_with_everything_put_away_focuses_nothing() {
+        let mut s = space();
+        let a = s.open_window();
+        s.arrange();
+        assert!(s.minimize(a));
+        assert_eq!(s.focused(), None);
+        // And it comes back when the window does.
+        assert!(s.unminimize(a));
+        assert!(s.activate_workspace(1));
+        assert!(s.activate_workspace(0));
+        assert_eq!(s.focused(), Some(a));
     }
 
     #[test]
@@ -2190,6 +2391,42 @@ mod tests {
         let mut s = padded(Space::new(LEFT));
         s.set_outputs(vec![OutputArea::new(LEFT), OutputArea::new(RIGHT)]);
         s
+    }
+
+    /// A click lands on whatever is drawn under it, which with two screens is
+    /// routinely a window the other one is showing. Focusing it only when it
+    /// happens to be on the active workspace is a click that moves the ring
+    /// and leaves the keyboard behind.
+    #[test]
+    fn focusing_a_window_on_the_other_screen_goes_to_it_there() {
+        let mut s = two_screens();
+        let here = s.open_window();
+        assert!(s.focus_output(1));
+        let there = s.open_window();
+        assert_eq!(s.focused(), Some(there));
+
+        assert!(s.focus_window(here), "the window on the left screen");
+        assert_eq!(s.focused(), Some(here));
+        assert_eq!(s.focused_output(), 0, "and the screen it is on is focused");
+
+        assert!(s.focus_window(there));
+        assert_eq!(s.focused(), Some(there));
+        assert_eq!(s.focused_output(), 1);
+    }
+
+    #[test]
+    fn a_window_no_screen_is_showing_is_not_focused_where_it_stands() {
+        let mut s = space();
+        let shown = s.open_window();
+        assert!(s.activate_workspace(1));
+        let hidden = s.open_window();
+        assert!(s.activate_workspace(0));
+
+        assert!(
+            !s.focus_window(hidden),
+            "a workspace in the wings is activate_workspace's to bring forward"
+        );
+        assert_eq!(s.focused(), Some(shown));
     }
 
     #[test]

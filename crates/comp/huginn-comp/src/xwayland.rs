@@ -309,6 +309,10 @@ impl Huginn {
             },
         );
 
+        // As for an XDG toplevel: a workspace whose screen is held by a
+        // fullscreen window shares it rather than hiding the newcomer under
+        // it. See [`Huginn::share_screen_with`].
+        self.share_screen_with(id);
         self.arrange();
         self.refresh_focus();
         self.queue_redraw();

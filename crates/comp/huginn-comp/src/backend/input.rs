@@ -332,7 +332,7 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         && !state.pointer().is_grabbed()
         && let Some((window, hit)) = state.decor_hit()
     {
-        state.space.active_workspace_mut().focus(window);
+        state.space.focus_window(window);
         state.refresh_focus();
         if hit == crate::decor::Hit::Close
             && event.button_code() == BTN_LEFT
@@ -349,7 +349,11 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         && !state.pointer().is_grabbed()
         && let Some(window) = state.window_under(state.pointer_location)
     {
-        state.space.active_workspace_mut().focus(window);
+        // `focus_window` rather than the active workspace's own focus: the
+        // click may have landed on the other screen, and a window that is not
+        // on the active workspace would otherwise be highlighted by the ring
+        // and never given the keyboard.
+        state.space.focus_window(window);
         state.refresh_focus();
     }
 
