@@ -1,9 +1,9 @@
 //! Server side of `raven_shell_v1`.
 //!
-//! Muninn can see its own surfaces and nothing else — an ordinary Wayland
-//! client is deliberately blind to the rest of the session. This is the narrow,
-//! explicit hole through which the compositor tells the shell what it needs to
-//! draw a panel.
+//! A Wayland client sees its own surfaces and nothing else — it is deliberately
+//! blind to the rest of the session. This is the narrow, explicit hole through
+//! which the compositor tells a client what it needs to draw a panel: RoostBar
+//! for workspace state, `raven-output` for the screen layout.
 //!
 //! Kept small on purpose. Every request added here is a permanent commitment:
 //! the protocol is additive-only, so anything shipped has to keep working.

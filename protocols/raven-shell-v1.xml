@@ -6,7 +6,8 @@
   </copyright>
 
   <description summary="privileged shell protocol for the Huginn compositor">
-    The contract between the Huginn compositor and the Muninn desktop shell.
+    The contract between the Huginn compositor and the desktop software
+    around it — a bar, a settings page, a screen-layout tool.
 
     This protocol covers only what no standard protocol provides. Panels, the
     dock and the wallpaper are wlr-layer-shell surfaces; the lock screen is
