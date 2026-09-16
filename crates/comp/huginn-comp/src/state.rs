@@ -687,12 +687,21 @@ pub(crate) struct Huginn {
     /// Two fields because the halves have different costs: decoding a
     /// photograph is tens of milliseconds and its result never changes, while
     /// scaling it is one pass over the output and has to happen again whenever
-    /// the output does. A mode change re-scales; it does not re-read the disk.
-    /// `None` on either is the ordinary state of a machine with no wallpaper
+    /// the output does.
+    ///
+    /// The decoded source itself is deliberately *not* kept. It was, once, so
+    /// that a mode change re-scaled without re-reading the disk -- but the
+    /// source is the largest thing the compositor ever holds (a 4608x3456
+    /// photograph is 60 MB decoded, against the 5 MB of panel actually on
+    /// screen at 1536x864) and it is read on mode changes alone. Paying a few
+    /// hundred milliseconds when a connector changes shape, rather than 60 MB
+    /// for every minute of the session, is the better side of that trade on a
+    /// laptop. [`Self::wallpaper_panels_for`] reads it, composes, and drops it.
+    ///
+    /// `None` in a slot is the ordinary state of a machine with no wallpaper
     /// set, and leaves the backends' clear colour showing.
-    wallpaper: Option<crate::wallpaper::Wallpaper>,
     wallpaper_panels: Vec<Option<crate::canvas::Panel>>,
-    /// The files `wallpaper` was decoded from, as they were then, so a picture
+    /// The files the panels were composed from, as they were then, so a picture
     /// replaced at the same path is noticed; see [`Self::refresh_wallpaper`].
     wallpaper_sources: crate::wallpaper::Sources,
     /// What `~/.config/raven/desktop.toml` said when last read.
@@ -1101,7 +1110,6 @@ impl Huginn {
             // Stamped before decoding, and fields are evaluated in the order
             // written; see `Sources::of`.
             wallpaper_sources: crate::wallpaper::Sources::of(desktop_config.wallpaper().as_deref()),
-            wallpaper: crate::wallpaper::Wallpaper::chosen_or_installed(desktop_config.wallpaper()),
             desktop_config,
             blur_by_default: true,
             wallpaper_panels: Vec::new(),
@@ -1207,20 +1215,32 @@ impl Huginn {
         // is not decoded again on every event, while the finished copy of a
         // half-written one -- which stamps differently -- is.
         self.wallpaper_sources = sources;
-        match crate::wallpaper::Wallpaper::replacement(chosen) {
-            crate::wallpaper::Replacement::Show(wallpaper) => self.wallpaper = wallpaper,
+        let wallpaper = match crate::wallpaper::Wallpaper::replacement(chosen) {
+            crate::wallpaper::Replacement::Show(wallpaper) => wallpaper,
             crate::wallpaper::Replacement::Keep => return,
-        }
-        self.wallpaper_panels = self
-            .outputs
+        };
+        // `wallpaper` is dropped at the end of this statement: the panels are
+        // what the scene draws, and the source behind them is 60 MB that
+        // nothing reads again until an output changes shape.
+        self.wallpaper_panels = Self::wallpaper_panels_for(wallpaper.as_ref(), &self.outputs);
+        self.queue_redraw();
+    }
+
+    /// Compose one panel per screen from `wallpaper`, or none where there is
+    /// no wallpaper to compose.
+    ///
+    /// An associated function so the caller can hand it a source it is about
+    /// to drop, rather than one the compositor is holding on to.
+    fn wallpaper_panels_for(
+        wallpaper: Option<&crate::wallpaper::Wallpaper>,
+        outputs: &[OutputInfo],
+    ) -> Vec<Option<crate::canvas::Panel>> {
+        outputs
             .iter()
             .map(|output| {
-                self.wallpaper
-                    .as_ref()
-                    .map(|w| w.panel(output.scale.render, output.scale.advertised))
+                wallpaper.map(|w| w.panel(output.scale.render, output.scale.advertised))
             })
-            .collect();
-        self.queue_redraw();
+            .collect()
     }
 
     /// Where a change to the wallpaper could come from, for the watch.
@@ -1520,14 +1540,13 @@ impl Huginn {
         // Composed here rather than on demand: this is the one place the size
         // it has to match can change, and scaling a photograph in the middle
         // of assembling a frame would drop that frame.
-        self.wallpaper_panels = outputs
-            .iter()
-            .map(|output| {
-                self.wallpaper
-                    .as_ref()
-                    .map(|wallpaper| wallpaper.panel(output.scale.render, output.scale.advertised))
-            })
-            .collect();
+        // Read from disk here, and dropped again on the next line: this is the
+        // one place the size a panel has to match can change, and it happens
+        // when a connector comes, goes or changes mode -- rare enough to pay a
+        // decode for, and far rarer than the memory would otherwise be held.
+        let wallpaper =
+            crate::wallpaper::Wallpaper::chosen_or_installed(self.desktop_config.wallpaper());
+        self.wallpaper_panels = Self::wallpaper_panels_for(wallpaper.as_ref(), &outputs);
         self.space.set_outputs(
             outputs
                 .iter()

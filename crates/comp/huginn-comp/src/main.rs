@@ -82,7 +82,77 @@ mod window;
 #[cfg(target_os = "linux")]
 mod xwayland;
 
+/// What `--help` prints.
+///
+/// Written out rather than derived from an argument parser: huginn takes one
+/// flag, and a dependency that exists to format this paragraph would be a
+/// larger thing than the paragraph.
+const USAGE: &str = "\
+huginn -- the RavenLinux Wayland compositor.
+
+Usage: huginn [--backend <udev|winit>]
+
+Options:
+  --backend <udev|winit>
+          Which backend to drive.
+            udev   the real thing: DRM/KMS and libinput on a TTY.
+            winit  the whole compositor nested in a window on an existing
+                   desktop session, which is where development happens.
+          Default: winit when WAYLAND_DISPLAY is set -- running inside a
+          session almost always means development -- and udev otherwise.
+
+  -h, --help
+          Print this and exit.
+
+  -V, --version
+          Print the version and exit.
+
+Environment:
+  RUST_LOG          Log filter. Default: huginn=info,smithay=warn.
+  WAYLAND_DISPLAY   When set, selects the winit backend by default.
+
+huginn is normally started by raven-wayland-session, which execs it as
+`huginn --backend udev`. Running it by hand from inside a session gives you
+the nested backend: a compositor in a window, not a takeover of the screen.
+";
+
+/// Warn about flags that were passed and are not understood.
+///
+/// A warning rather than an error on purpose: this process is the desktop, and
+/// raven-wayland-session `exec`s it as the last line of the script. Refusing to
+/// start over an argument nobody reads would turn a typo into a machine with no
+/// session to log into, which is far worse than the typo.
+#[cfg(target_os = "linux")]
+fn warn_about_unknown_flags(args: &[String]) {
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            // The one flag that takes a value; the value is not a flag.
+            "--backend" => {
+                rest.next();
+            }
+            other if other.starts_with('-') => {
+                tracing::warn!(flag = other, "unrecognised flag, ignored; try --help");
+            }
+            other => tracing::warn!(argument = other, "unexpected argument, ignored"),
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Answered before the logger is up: these two are questions asked at a
+    // terminal, and the answer should be the only thing written there.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{USAGE}");
+        return;
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("huginn {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // Info by default. The session log is what an installed system keeps in
     // /var/log/raven/ravend.log, and at debug every window decoration and
     // every popup reposition went into it: on one desktop, half the lines
@@ -98,7 +168,7 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     {
-        let args: Vec<String> = std::env::args().collect();
+        warn_about_unknown_flags(&args);
         let chosen = backend::Backend::detect(&args);
         tracing::info!(backend = ?chosen, "starting huginn");
 
