@@ -73,8 +73,8 @@ pub(super) fn compose(
     };
     let tile_start = usize::from(has_result);
     let total_rows = tiles.len().div_ceil(COLUMNS);
-    let first_row = if grid { 0 } else { launcher.first_row() };
-    let drawn_rows = if grid {
+    let first_row = launcher.first_row();
+    let drawn_rows = if grid && !launcher.all_apps {
         total_rows.min(1)
     } else {
         total_rows.saturating_sub(first_row).min(GRID_ROWS)
@@ -129,7 +129,7 @@ pub(super) fn compose(
     let rect =
         |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
     let accent = crate::theme::accent();
-    canvas.material(0, 0, width_px, height, px(22.0), ALPHA);
+    canvas.material(0, 0, width_px, height, px(22.0), 0xEE);
 
     // The field: a well with the accent's edge, since it always has focus.
     let (fx, fy, fw) = (pad, pad, width - pad * 2.0);
@@ -225,14 +225,22 @@ pub(super) fn compose(
     if grid {
         text.draw_weighted(
             &mut canvas,
-            "Suggested",
+            if launcher.all_apps {
+                "All Apps"
+            } else {
+                "Suggested"
+            },
             px(12.5),
             (inset + px(4.0)) as i32,
             y as i32,
             TEXT,
             EMPHASIS,
         );
-        let note = "From what you opened recently";
+        let note = if launcher.all_apps {
+            "Suggested →"
+        } else {
+            "All Apps →"
+        };
         let note_w = text.measure(note, px(11.5)).0;
         text.draw(
             &mut canvas,
@@ -242,6 +250,37 @@ pub(super) fn compose(
             (y + px(1.0)) as i32,
             TEXT_DIM,
         );
+        layout.buttons.push((
+            rect(
+                inset + inner - note_w - px(12.0),
+                y - px(4.0),
+                note_w + px(16.0),
+                heading_h + px(8.0),
+            ),
+            Button::AllApps,
+        ));
+        if launcher.all_apps {
+            let label = format!("Sort: {}", launcher.sort().label());
+            let label_w = text.measure(&label, px(11.5)).0;
+            let sx = inset + inner - note_w - label_w - px(36.0);
+            text.draw(
+                &mut canvas,
+                &label,
+                px(11.5),
+                sx as i32,
+                (y + px(1.0)) as i32,
+                TEXT_DIM,
+            );
+            layout.buttons.push((
+                rect(
+                    sx - px(6.0),
+                    y - px(4.0),
+                    label_w + px(12.0),
+                    heading_h + px(8.0),
+                ),
+                Button::Sort,
+            ));
+        }
         y += heading_h + section;
     } else {
         // Tabs by kind, with how many of each the search found; the sort at
@@ -381,7 +420,9 @@ pub(super) fn compose(
                     continue;
                 };
                 let icon = app_icon(icons, pixmaps, entry, icon_size, density);
-                let sub = if grid {
+                let sub = if grid && launcher.all_apps {
+                    None
+                } else if grid {
                     launcher
                         .last_used(index)
                         .map(|at| ago(launcher.now().saturating_sub(at)))
@@ -426,7 +467,11 @@ pub(super) fn compose(
     }
     if nothing {
         let note = if grid {
-            "Open something and it will be suggested here."
+            if launcher.all_apps {
+                "No installed applications found."
+            } else {
+                "Open something and it will be suggested here."
+            }
         } else if launcher.filter() != Filter::All {
             "Nothing of this kind. Ctrl ← shows everything."
         } else {
@@ -508,6 +553,30 @@ pub(super) fn compose(
             body_bottom,
             pad + field_h + section,
         );
+    }
+
+    if grid && launcher.all_apps && total_rows > GRID_ROWS && launcher.menu().is_none() {
+        let label = format!(
+            "←   {}–{} of {}   →",
+            first_row * COLUMNS + 1,
+            ((first_row + drawn_rows) * COLUMNS).min(tiles.len()),
+            tiles.len()
+        );
+        let label_w = text.measure(&label, hint_size).0;
+        text.draw(
+            &mut canvas,
+            &label,
+            hint_size,
+            inset as i32,
+            (keys_top + section) as i32,
+            TEXT_DIM,
+        );
+        for (x, direction) in [(inset, -1), (inset + label_w - px(18.0), 1)] {
+            layout.buttons.push((
+                rect(x, keys_top + section - px(3.0), px(20.0), keys_h),
+                Button::Page(direction),
+            ));
+        }
     }
 
     let hints = hints_for(target, launcher.menu().is_some(), grid);
