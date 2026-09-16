@@ -142,6 +142,11 @@ impl Window {
         matches!(self.mode, WindowMode::Minimized)
     }
 
+    /// Whether this window is covering its whole screen.
+    pub const fn is_fullscreen(&self) -> bool {
+        matches!(self.mode, WindowMode::Fullscreen)
+    }
+
     /// Put the window in the background without closing its client.
     ///
     /// What it was — a tile or a floating window — is kept for

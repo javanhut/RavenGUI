@@ -144,6 +144,27 @@ the order painted over the film. The solo is the fullscreen's own: one the
 overview already gave the same window is not ended by the client leaving
 fullscreen, and a window alone on its workspace starts none.
 
+**A window arriving on a workspace a fullscreen one is holding takes the screen
+back.** The film covers the output, so a newcomer either opens behind it or
+paints a hole in it — and either way it is the window with the keyboard, which
+is a desktop that looks dead and answers nothing. Instead the holder leaves
+fullscreen, its client told so it can put its chrome back, and the windows its
+solo put away come back with it: exactly the state ending the fullscreen by hand
+would have left, and the two then tile. Every way onto a workspace goes through
+`Huginn::share_screen_with` — a toplevel or an X11 window mapping, a window
+restored from the dock, one sent across by a keybinding, one arrived at by
+Alt-Tab.
+
+**Focus never rests on a window nobody can see.** A workspace holds ids and
+hands focus to a neighbour by position whenever its membership changes, with no
+way to tell one still on screen from one put away in the dock, so
+`Space::settle_focus` moves it on afterwards — and clears it when everything
+here is away, because keystrokes delivered faithfully to a window in the dock
+are the same bug as keystrokes delivered nowhere, only harder to see. For the
+same reason click-to-focus goes through `Space::focus_window`, which focuses a
+window on whichever screen is showing it: a click lands on what is drawn under
+it, and with two monitors that is routinely the workspace the other one has.
+
 The tree is a cache, never an authority. `Space::arrange` reconciles it against
 the membership list and each window's mode before reading it, so a missed update
 costs a frame of staleness rather than a window tiled into a slot it no longer

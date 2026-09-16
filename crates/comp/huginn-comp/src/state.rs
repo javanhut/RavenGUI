@@ -1576,8 +1576,14 @@ impl Huginn {
     pub(crate) fn send_focused_to_next_output(&mut self) {
         let count = self.space.outputs().len();
         let next = (self.space.focused_output() + 1) % count;
-        if next != self.space.focused_output() {
-            self.space.send_focused_to_output(next);
+        if next == self.space.focused_output() {
+            return;
+        }
+        let Some(id) = self.space.focused() else {
+            return;
+        };
+        if self.space.send_focused_to_output(next) {
+            self.share_screen_with(id);
         }
     }
 
@@ -3245,6 +3251,55 @@ impl Huginn {
         self.refresh_dock();
     }
 
+    /// Give the screen back when a window arrives on a workspace a fullscreen
+    /// one is holding, so the two share it.
+    ///
+    /// A fullscreen window covers the output and the windows of a workspace
+    /// are painted in the order they were opened, so a newcomer either
+    /// disappears behind the film or paints a hole in it — and either way it
+    /// has the keyboard, which is a desktop that looks dead and answers
+    /// nothing. Neither is what opening an application means. The desktop's
+    /// answer is the one the user would have given before opening it: the
+    /// window holding the screen leaves fullscreen, its client told so it can
+    /// put its chrome back, and the windows its solo put away come back with
+    /// it — exactly as if the fullscreen had been ended by hand. The two then
+    /// tile, which is what asking for a second window on a screen means here.
+    ///
+    /// Every way onto a workspace goes through this: a toplevel mapping, an
+    /// X11 window mapping, a window restored from the dock, a window sent
+    /// here by a keybinding, and Alt-Tab arriving from somewhere else.
+    pub(crate) fn share_screen_with(&mut self, id: WindowId) {
+        let Some(workspace) = self.space.workspace_of(id) else {
+            return;
+        };
+        let Some(holder) = self.space.fullscreen_on(workspace) else {
+            return;
+        };
+        // The newcomer *is* the fullscreen one: a client that mapped already
+        // asking for the screen, or a window carrying its fullscreen from the
+        // workspace it came from. Nothing is being shared with anybody.
+        if holder == id {
+            return;
+        }
+        tracing::debug!(
+            window = holder.raw(),
+            newcomer = id.raw(),
+            "sharing the screen a fullscreen window was holding"
+        );
+        self.set_fullscreen(holder, false);
+    }
+
+    /// Send the focused window to workspace `index` — `Super`+`Ctrl`+`Shift`+
+    /// a digit — and give it room when it lands.
+    pub(crate) fn send_focused_to_workspace(&mut self, index: usize) {
+        let Some(id) = self.space.focused() else {
+            return;
+        };
+        if self.space.send_focused_to_workspace(index) {
+            self.share_screen_with(id);
+        }
+    }
+
     /// The window an XDG toplevel belongs to.
     fn xdg_window_id(&self, surface: &ToplevelSurface) -> Option<WindowId> {
         self.windows
@@ -3448,6 +3503,10 @@ impl Huginn {
         if let Some(surface) = self.windows.get(&id) {
             surface.set_fullscreen(false);
         }
+        // It is coming back onto a workspace that may have gone fullscreen
+        // without it; a window restored under the film is one the dock says
+        // it brought back and nobody can see.
+        self.share_screen_with(id);
         self.arrange();
         if let Some(surface) = self.windows.get(&id) {
             surface.send_configure();
@@ -3475,6 +3534,7 @@ impl Huginn {
             surface.set_fullscreen(false);
         }
         self.space.active_workspace_mut().focus(id);
+        self.share_screen_with(id);
         self.arrange();
         if was_minimized {
             if let Some(surface) = self.windows.get(&id) {
@@ -7049,6 +7109,11 @@ impl XdgShellHandler for Huginn {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let id = self.space.open_window();
+        // Before the surface is recorded against the id, not after: giving the
+        // screen back refreshes focus, and a window already in `self.windows`
+        // would be configured there — an extra configure, carrying no size,
+        // ahead of the single sized one this function exists to send.
+        self.share_screen_with(id);
         self.windows.insert(id, WindowSurface::Xdg(surface.clone()));
         tracing::debug!(window = id.raw(), "toplevel created");
 

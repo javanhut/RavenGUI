@@ -585,9 +585,7 @@ impl Nested {
                 }
             }
             Action::Workspace(i) => state.go_to_workspace(i),
-            Action::SendToWorkspace(i) => {
-                state.space.send_focused_to_workspace(i);
-            }
+            Action::SendToWorkspace(i) => state.send_focused_to_workspace(i),
             Action::FocusNextOutput => state.focus_next_output(),
             Action::SendToNextOutput => state.send_focused_to_next_output(),
             Action::EnterResize => {
