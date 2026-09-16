@@ -293,12 +293,8 @@ pub(crate) enum Outgoing {
 }
 
 /// Serve until the loop goes away. Runs on the notifications thread.
-pub(crate) fn serve<F>(
-    sink: F,
-    outgoing: &mpsc::Receiver<Outgoing>,
-    open: &Open,
-    listing: &Listing,
-) where
+pub(crate) fn serve<F>(sink: F, outgoing: &mpsc::Receiver<Outgoing>, open: &Open, listing: &Listing)
+where
     F: Fn(Incoming) -> bool + Send + Sync + 'static,
 {
     let sink: Sink = Arc::new(sink);

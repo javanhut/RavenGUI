@@ -4672,7 +4672,10 @@ impl Huginn {
     pub(crate) fn blur_alpha(&self) -> f32 {
         if self.panel_blur_open() {
             let clock = self.uptime();
-            self.launcher.reveal(clock).max(self.pinned.reveal(clock)).clamp(0.0, 1.0)
+            self.launcher
+                .reveal(clock)
+                .max(self.pinned.reveal(clock))
+                .clamp(0.0, 1.0)
         } else {
             1.0
         }

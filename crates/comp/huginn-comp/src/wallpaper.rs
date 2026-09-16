@@ -284,7 +284,11 @@ pub(crate) fn directories(chosen: Option<&Path>) -> Vec<PathBuf> {
     let set = Path::new(SET_DIR);
     let mut dirs = vec![set.to_owned()];
     dirs.extend(set.parent().map(Path::to_owned));
-    for file in chosen.map(Path::to_owned).into_iter().chain(installed_path()) {
+    for file in chosen
+        .map(Path::to_owned)
+        .into_iter()
+        .chain(installed_path())
+    {
         dirs.extend(file.parent().map(Path::to_owned));
         if let Ok(real) = std::fs::canonicalize(&file) {
             dirs.extend(real.parent().map(Path::to_owned));

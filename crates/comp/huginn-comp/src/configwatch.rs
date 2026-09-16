@@ -105,7 +105,9 @@ impl Watches {
                 Ok(wd) => {
                     next.insert(wd, dir.clone());
                 }
-                Err(e) => tracing::debug!(path = %dir.display(), "not watching for the wallpaper: {e}"),
+                Err(e) => {
+                    tracing::debug!(path = %dir.display(), "not watching for the wallpaper: {e}")
+                }
             }
         }
         for (wd, _) in self.wallpaper.drain() {
