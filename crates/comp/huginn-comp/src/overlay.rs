@@ -4,14 +4,9 @@
 //! through [`crate::text`] — real shaping and antialiased rasterization — which
 //! is what lets this be a panel someone reads rather than a debugging aid.
 //!
-//! Keys stay fixed while an accent outline fades through each chord in order.
-//! Labels and key geometry never move. Frames blend between two cached poses,
-//! so skipped frames and interrupted cycles cannot accumulate drawing errors.
-
-use std::time::Duration;
+//! Keycaps and labels are painted once when the panel opens.
 
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::utils::{Buffer, Rectangle};
 
 use huginn_core::geometry::Rect;
 
@@ -63,97 +58,18 @@ const TITLE: &str = "Huginn keybindings";
 const FOOTER: &str =
     "Esc or a click outside closes this. Plain Super belongs to the focused application.";
 
-/// Pause before the first key highlights.
-const LEAD: Duration = Duration::from_millis(300);
-/// Delay between highlights so the chord order is readable.
-const STEP: Duration = Duration::from_millis(280);
-/// How long a key takes to fade into its highlight.
-const PRESS: Duration = Duration::from_millis(240);
-/// How long the complete chord stays highlighted.
-const HOLD: Duration = Duration::from_millis(700);
-/// How long the highlights take to fade away.
-const RELEASE: Duration = Duration::from_millis(360);
-/// One press and the rest after it. The same for every row, whatever its
-/// length, so the rows keep one calm rhythm rather than drifting into noise.
-const CYCLE: Duration = Duration::from_millis(3600);
-/// Cached highlight levels. Geometry and labels are identical at every level.
-const STAGES: usize = 24;
-
 /// The keybinding overlay.
+#[derive(Debug)]
 pub(crate) struct Overlay {
     panel: Panel,
-    /// The canvas's width in pixels, which the buffer shares.
-    stride: usize,
-    rows: Vec<Row>,
-    /// Every keycap on the panel, row by row.
-    caps: Vec<Cap>,
-}
-
-impl std::fmt::Debug for Overlay {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Overlay")
-            .field("panel", &self.panel)
-            .field("caps", &self.caps.len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// A row's presses, and where its caps start in [`Overlay::caps`].
-struct Row {
-    presses: Vec<Vec<usize>>,
-    first: usize,
-}
-
-/// One keycap: where it is, its pixels at every highlight level, and which level the
-/// buffer shows now.
-struct Cap {
-    at: CapBox,
-    stages: Vec<Vec<u8>>,
-    shown: usize,
 }
 
 impl Overlay {
     /// Draw the overlay, sized to sit comfortably on `output`, at `density`
     /// pixels per logical one.
     pub(crate) fn render(output: Rect, text: &mut Text, density: u32) -> Self {
-        let layout = fit(output, text, density);
-        let base = paint_base(&layout, text);
-        let mut initial = Canvas {
-            pixels: base.pixels.clone(),
-            stride: base.stride,
-            height: base.height,
-        };
-        let mut rows = Vec::with_capacity(layout.rows.len());
-        let mut caps = Vec::new();
-        for row in &layout.rows {
-            rows.push(Row {
-                presses: row.chord.presses.clone(),
-                first: caps.len(),
-            });
-            let keys = row.chord.items.iter().filter_map(|item| match item {
-                Item::Cap(key) => Some(*key),
-                Item::Sep(_) => None,
-            });
-            for (&at, key) in row.caps.iter().zip(keys) {
-                let background = cut(&base, at);
-                let idle = cap_patch(&background, &layout, text, at, key, 0.0);
-                let active = cap_patch(&background, &layout, text, at, key, 1.0);
-                let stages: Vec<_> = (0..=STAGES)
-                    .map(|stage| blend_patch(&idle, &active, stage as f32 / STAGES as f32))
-                    .collect();
-                paste(&mut initial.pixels, initial.stride, at, &stages[0]);
-                caps.push(Cap {
-                    at,
-                    stages,
-                    shown: 0,
-                });
-            }
-        }
         Self {
-            panel: Panel::from_canvas(&initial, density),
-            stride: base.stride,
-            rows,
-            caps,
+            panel: Panel::from_canvas(&compose(output, text, density), density),
         }
     }
 
@@ -164,52 +80,6 @@ impl Overlay {
     /// Where the overlay goes: centred on the output.
     pub(crate) fn placement(&self, output: Rect) -> Rect {
         self.panel.centred_on(output)
-    }
-
-    /// Put every keycap where it is `elapsed` after the overlay opened.
-    /// Returns whether any of them moved.
-    ///
-    /// Only the caps that changed are copied into the buffer, and only their
-    /// rectangles are damaged, so a frame where nothing is pressed or let go
-    /// uploads nothing at all.
-    pub(crate) fn animate(&mut self, elapsed: Duration) -> bool {
-        let cycle = (elapsed.as_millis() / CYCLE.as_millis()) as usize;
-        let within = Duration::from_millis((elapsed.as_millis() % CYCLE.as_millis()) as u64);
-        let mut wanted = vec![0; self.caps.len()];
-        for row in &self.rows {
-            let Some(press) = row.presses.get(cycle % row.presses.len().max(1)) else {
-                continue;
-            };
-            for (order, &cap) in press.iter().enumerate() {
-                wanted[row.first + cap] = stage(amount(order, press.len(), within));
-            }
-        }
-        if self
-            .caps
-            .iter()
-            .zip(&wanted)
-            .all(|(cap, &want)| cap.shown == want)
-        {
-            return false;
-        }
-        let (stride, caps) = (self.stride, &mut self.caps);
-        let mut context = self.panel.buffer.render();
-        let Ok(()) = context.draw(|pixels| {
-            let mut damage = Vec::new();
-            for (cap, &want) in caps.iter_mut().zip(&wanted) {
-                if cap.shown == want {
-                    continue;
-                }
-                cap.shown = want;
-                paste(pixels, stride, cap.at, &cap.stages[want]);
-                damage.push(Rectangle::<i32, Buffer>::new(
-                    (cap.at.x as i32, cap.at.y as i32).into(),
-                    (cap.at.w as i32, cap.at.h as i32).into(),
-                ));
-            }
-            Ok::<_, std::convert::Infallible>(damage)
-        });
-        true
     }
 }
 
@@ -222,90 +92,35 @@ enum Item {
     Sep(&'static str),
 }
 
-/// A chord from [`BINDINGS`], taken apart into what to draw and what to press.
+/// A chord from [`BINDINGS`], taken apart into what to draw.
 #[derive(Debug, PartialEq, Eq)]
 struct Chord {
     items: Vec<Item>,
-    /// Each way of pressing it, as the caps that go down in order — indices
-    /// counting only the caps in `items`. One per alternative, taken in turn
-    /// from one cycle to the next.
-    presses: Vec<Vec<usize>>,
 }
 
-/// Take a chord as the table spells it apart.
-///
-/// `Super+Ctrl+Q / X` is two chords that share everything but their last key,
-/// and is drawn that way — the shared keys once, then the alternatives — so an
-/// alternative that is a single key is pressed with the first one's modifiers.
-/// One with a `+` of its own is a whole chord and is pressed as written.
+/// Keep shared modifiers and alternatives as written in the bindings table.
 fn parse(chord: &'static str) -> Chord {
     let mut items = Vec::new();
-    let mut presses = Vec::new();
-    let mut caps = 0;
-    let mut modifiers = Vec::new();
     for (i, alternative) in chord.split(" / ").enumerate() {
         if i > 0 {
             items.push(Item::Sep("/"));
         }
-        let keys: Vec<&'static str> = alternative
+        for (j, key) in alternative
             .split('+')
             .map(str::trim)
             .filter(|key| !key.is_empty())
-            .collect();
-        let mut press = if i > 0 && keys.len() == 1 {
-            modifiers.clone()
-        } else {
-            Vec::new()
-        };
-        for (j, key) in keys.into_iter().enumerate() {
+            .enumerate()
+        {
             if j > 0 {
                 items.push(Item::Sep("+"));
             }
             items.push(Item::Cap(key));
-            press.push(caps);
-            caps += 1;
         }
-        if i == 0 {
-            modifiers = press[..press.len().saturating_sub(1)].to_vec();
-        }
-        presses.push(press);
     }
-    Chord { items, presses }
+    Chord { items }
 }
 
-/// Highlight intensity of key `order` in a chord of `keys`, from 0 to 1,
-/// `within` a cycle.
-///
-/// Pure, so the choreography can be tested without a clock: each key starts
-/// highlighting [`STEP`] after the previous one and fades in over [`PRESS`];
-/// the complete chord stays lit for [`HOLD`], then fades out over [`RELEASE`].
-fn amount(order: usize, keys: usize, within: Duration) -> f32 {
-    let Some(t) = within.checked_sub(LEAD) else {
-        return 0.0;
-    };
-    let down = STEP * order as u32;
-    let release = STEP * keys.saturating_sub(1) as u32 + PRESS + HOLD;
-    if t < down {
-        0.0
-    } else if t < release {
-        ease((t - down).as_secs_f32() / PRESS.as_secs_f32())
-    } else {
-        1.0 - ease((t - release).as_secs_f32() / RELEASE.as_secs_f32())
-    }
-}
-
-/// Ease both ends so a press does not snap into motion or stop abruptly.
-fn ease(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// The cached highlight level nearest `amount`.
-fn stage(amount: f32) -> usize {
-    (amount.clamp(0.0, 1.0) * STAGES as f32).round() as usize
-}
-
-/// A keycap and its accent outline, in canvas pixels.
+/// A keycap and its padding, in canvas pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapBox {
     x: usize,
@@ -318,7 +133,7 @@ struct CapBox {
 struct RowLayout {
     chord: Chord,
     /// The left edge and width of each of the chord's items, in order. For a
-    /// cap that is the key itself, without its glow.
+    /// cap that is the key itself, without its padding.
     placed: Vec<(f32, f32)>,
     caps: Vec<CapBox>,
     /// The top of the row's boxes.
@@ -344,10 +159,9 @@ struct Layout {
     lip: f32,
     bevel: f32,
     radius: f32,
-    /// How far the glow reaches outside a key.
-    glow: f32,
-    ring_w: f32,
-    /// Space above the key for its outline.
+    /// Padding around each key.
+    cap_pad: f32,
+    /// Space above the key.
     cap_top: f32,
     label_size: f32,
     body_w: f32,
@@ -429,14 +243,13 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
     let lip = m(0.2).max(2.0 * px);
     let bevel = m(0.14);
     let radius = m(0.36);
-    let ring_w = m(0.11);
-    let glow = m(0.3).max(ring_w + 2.0 * px);
-    let cap_top = glow;
-    let cap_pad = m(0.6);
+    let cap_pad = m(0.3).max(m(0.11) + 2.0 * px);
+    let cap_top = cap_pad;
+    let label_pad = m(0.6);
     let sep_gap = m(0.3);
     let row_gap = m(0.15);
     let label_size = size * 0.88;
-    let box_h = cap_top + cap_h + lip + glow;
+    let box_h = cap_top + cap_h + lip + cap_pad;
 
     let line = size * 1.35;
     let (pad, column_gap, columns_gap, line_gap, rule) = (
@@ -456,7 +269,7 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
                 // Never much narrower than tall: a single letter is a square
                 // key, not a sliver.
                 Item::Cap(key) => (text.measure_weighted(key, label_size, Weight::BOLD).0
-                    + cap_pad * 2.0)
+                    + label_pad * 2.0)
                     .max(cap_h * 1.05)
                     .ceil(),
                 Item::Sep(sep) => {
@@ -483,21 +296,21 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
             .iter()
             .map(|(_, widths, _)| widths.iter().sum::<f32>())
             .fold(0.0_f32, f32::max)
-            + glow * 2.0;
+            + cap_pad * 2.0;
         let description_w = column.iter().map(|(_, _, w)| *w).fold(0.0_f32, f32::max);
         let desc_x = x + chord_w + column_gap;
         longest = longest.max(column.len());
         for (i, (chord, widths, _)) in column.into_iter().enumerate() {
             let y = (top + i as f32 * (box_h + row_gap)).round();
-            let mut left = x + glow;
+            let mut left = x + cap_pad;
             let mut placed = Vec::with_capacity(widths.len());
             let mut caps = Vec::new();
             for (item, width) in chord.items.iter().zip(widths) {
                 if let Item::Cap(_) = item {
                     caps.push(CapBox {
-                        x: (left - glow) as usize,
+                        x: (left - cap_pad) as usize,
                         y: y as usize,
-                        w: (width + glow * 2.0) as usize,
+                        w: (width + cap_pad * 2.0) as usize,
                         h: box_h as usize,
                     });
                 }
@@ -533,8 +346,7 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
         lip,
         bevel,
         radius,
-        glow,
-        ring_w,
+        cap_pad,
         cap_top,
         label_size,
         body_w,
@@ -607,58 +419,28 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
     canvas
 }
 
-/// Every key on the panel at highlight intensity `amount`.
-#[cfg(test)]
-fn draw_caps(canvas: &mut Canvas, l: &Layout, text: &mut Text, amount: f32) {
+/// Every key on the panel.
+fn draw_caps(canvas: &mut Canvas, l: &Layout, text: &mut Text) {
     for row in &l.rows {
         let mut caps = row.caps.iter();
         for item in &row.chord.items {
             if let Item::Cap(key) = *item
                 && let Some(&at) = caps.next()
             {
-                let background = cut(canvas, at);
-                let patch = cap_patch(&background, l, text, at, key, amount);
-                paste(&mut canvas.pixels, canvas.stride, at, &patch);
+                draw_cap(canvas, text, l, at, key);
             }
         }
     }
 }
 
-/// Two fixed poses share exactly the same face and label pixels. Only the
-/// outline changes, and each frame is reconstructed rather than overpainted.
-fn blend_patch(idle: &[u8], active: &[u8], t: f32) -> Vec<u8> {
-    idle.iter()
-        .zip(active)
-        .map(|(&a, &b)| (f32::from(a) * (1.0 - t) + f32::from(b) * t).round() as u8)
-        .collect()
-}
-
-fn cap_patch(
-    background: &[u8],
-    l: &Layout,
-    text: &mut Text,
-    at: CapBox,
-    key: &str,
-    t: f32,
-) -> Vec<u8> {
-    let mut canvas = Canvas {
-        pixels: background.to_vec(),
-        stride: at.w,
-        height: at.h,
-    };
-    draw_cap(&mut canvas, text, l, CapBox { x: 0, y: 0, ..at }, key, t);
-    canvas.pixels
-}
-
-/// A stationary key with a restrained accent outline indicating activation.
-fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &str, t: f32) {
-    let w = at.w as f32 - l.glow * 2.0;
-    let fx = at.x as f32 + l.glow;
+/// A stationary keycap.
+fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &str) {
+    let w = at.w as f32 - l.cap_pad * 2.0;
+    let fx = at.x as f32 + l.cap_pad;
     let fy = at.y as f32 + l.cap_top;
     let top = fy;
     let body_h = l.cap_h + l.lip;
     let (x, wu) = (fx as usize, w as usize);
-    let accent = |alpha: f32| theme::accent().with_alpha((alpha * t).round() as u8);
 
     canvas.fill_rounded(
         x,
@@ -668,31 +450,6 @@ fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &
         l.radius,
         CAP_SHADOW,
     );
-    if t > 0.0 {
-        // A soft halo out to the edge of the box, then a crisp ring just
-        // outside the key. Both before the key, which covers their inner
-        // edges.
-        canvas.stroke_rounded(
-            at.x,
-            (top - l.glow) as usize,
-            at.w,
-            (body_h + l.glow * 2.0) as usize,
-            l.radius + l.glow,
-            l.glow,
-            accent(24.0),
-        );
-        let off = l.ring_w + l.px;
-        canvas.stroke_rounded(
-            (fx - off) as usize,
-            (top - off) as usize,
-            (w + off * 2.0) as usize,
-            (body_h + off * 2.0) as usize,
-            l.radius + off,
-            l.ring_w,
-            accent(190.0),
-        );
-    }
-
     canvas.fill_rounded(x, top as usize, wu, body_h as usize, l.radius, CAP_SKIRT);
     canvas.fill_rounded(x, top as usize, wu, l.cap_h as usize, l.radius, CAP_RIM);
     let face_x = fx + l.bevel;
@@ -730,37 +487,12 @@ fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &
     );
 }
 
-/// The pixels of `at`, row by row.
-fn cut(canvas: &Canvas, at: CapBox) -> Vec<u8> {
-    let mut patch = Vec::with_capacity(at.w * at.h * 4);
-    for row in at.y..at.y + at.h {
-        let start = (row * canvas.stride + at.x) * 4;
-        patch.extend_from_slice(&canvas.pixels[start..start + at.w * 4]);
-    }
-    patch
-}
-
-/// Put a patch from [`cut`] back at `at`, in a buffer `stride` pixels wide.
-fn paste(pixels: &mut [u8], stride: usize, at: CapBox, patch: &[u8]) {
-    for (row, source) in patch.chunks_exact(at.w * 4).enumerate() {
-        let start = ((at.y + row) * stride + at.x) * 4;
-        pixels[start..start + source.len()].copy_from_slice(source);
-    }
-}
-
-/// The panel with every key at `amount`. Split from [`Overlay::render`] so a
-/// test can get at the pixels without going through a renderer.
-#[cfg(test)]
-fn compose_at(output: Rect, text: &mut Text, density: u32, amount: f32) -> Canvas {
+/// Paint the complete static panel.
+fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
     let layout = fit(output, text, density);
     let mut canvas = paint_base(&layout, text);
-    draw_caps(&mut canvas, &layout, text, amount);
+    draw_caps(&mut canvas, &layout, text);
     canvas
-}
-
-#[cfg(test)]
-fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
-    compose_at(output, text, density, 0.0)
 }
 
 #[cfg(test)]
@@ -827,8 +559,7 @@ mod tests {
 
     #[test]
     fn caps_never_overlap_each_other_or_the_descriptions() {
-        // A frame copies a cap's whole box in; a box that overlapped another
-        // cap, or a description, would paint over it with a stale copy.
+        // Keep keycaps separate from neighboring caps and descriptions.
         let mut text = Text::new();
         for output in [
             Rect::from_xywh(0, 0, 1920, 1080),
@@ -1001,7 +732,6 @@ mod tests {
                 Item::Cap("H"),
             ]
         );
-        assert_eq!(chord.presses, [vec![0, 1, 2]]);
     }
 
     #[test]
@@ -1011,186 +741,15 @@ mod tests {
         let chord = parse("Super+Ctrl+Q / X");
         assert_eq!(chord.items.last(), Some(&Item::Cap("X")));
         assert!(chord.items.contains(&Item::Sep("/")));
-        assert_eq!(chord.presses, [vec![0, 1, 2], vec![0, 1, 3]]);
 
         let pointer = parse("Super+click / drag");
-        assert_eq!(pointer.presses, [vec![0, 1], vec![0, 2]]);
+        assert_eq!(pointer.items.last(), Some(&Item::Cap("drag")));
     }
 
     #[test]
     fn a_lone_key_is_one_cap() {
-        assert_eq!(parse("Print").presses, [vec![0]]);
+        assert_eq!(parse("Print").items, [Item::Cap("Print")]);
         assert_eq!(parse("Volume keys").items, [Item::Cap("Volume keys")]);
-    }
-
-    #[test]
-    fn keys_go_down_one_at_a_time() {
-        let at = |order: usize, t: Duration| stage(amount(order, 3, t));
-        assert_eq!(at(0, Duration::ZERO), 0, "nothing before the lead-in");
-        // The first key is all the way down before the second has started.
-        assert_eq!(at(0, LEAD + PRESS), STAGES);
-        assert_eq!(at(1, LEAD + PRESS), 0);
-        assert_eq!(at(1, LEAD + STEP + PRESS), STAGES);
-        assert_eq!(at(2, LEAD + STEP + PRESS), 0);
-        assert_eq!(at(2, LEAD + STEP * 2 + PRESS), STAGES);
-        // Partway down in between, so the press eases rather than jumps.
-        let halfway = at(0, LEAD + PRESS / 4);
-        assert!(halfway > 0 && halfway < STAGES, "{halfway}");
-    }
-
-    #[test]
-    fn the_chord_is_held_then_let_go_together() {
-        let release = LEAD + STEP * 2 + PRESS + HOLD;
-        for order in 0..3 {
-            assert_eq!(
-                stage(amount(order, 3, release - Duration::from_millis(1))),
-                STAGES
-            );
-            assert_eq!(stage(amount(order, 3, release + RELEASE)), 0);
-        }
-    }
-
-    #[test]
-    fn alternatives_take_turns_from_one_cycle_to_the_next() {
-        let mut overlay = Overlay::render(Rect::from_xywh(0, 0, 1920, 1080), &mut Text::new(), 1);
-        // Row 0 is `Super+Ctrl+E / T`: E the first time round, T the next.
-        let row = &overlay.rows[0];
-        let (first, e, t) = (row.first, row.presses[0][2], row.presses[1][2]);
-        let chord_down = LEAD + STEP * 2 + PRESS;
-        overlay.animate(chord_down);
-        assert_eq!(overlay.caps[first + e].shown, STAGES);
-        assert_eq!(overlay.caps[first + t].shown, 0);
-        overlay.animate(CYCLE + chord_down);
-        assert_eq!(overlay.caps[first + e].shown, 0);
-        assert_eq!(overlay.caps[first + t].shown, STAGES);
-    }
-
-    #[test]
-    fn every_chord_finishes_before_its_cycle_ends() {
-        // A chord still held when the next cycle starts would never be seen
-        // let go, and its second alternative would begin half pressed.
-        for binding in BINDINGS {
-            let chord = parse(binding.chord);
-            for press in &chord.presses {
-                let busy =
-                    LEAD + STEP * press.len().saturating_sub(1) as u32 + PRESS + HOLD + RELEASE;
-                assert!(busy < CYCLE, "{} does not fit a cycle", binding.chord);
-            }
-        }
-    }
-
-    #[test]
-    fn a_pressed_cap_looks_different_from_a_raised_one() {
-        let mut overlay = Overlay::render(Rect::from_xywh(0, 0, 1920, 1080), &mut Text::new(), 1);
-        assert!(!overlay.caps.is_empty());
-        assert!(
-            overlay
-                .caps
-                .iter()
-                .all(|cap| cap.stages[0] != cap.stages[STAGES])
-        );
-        assert!(
-            !overlay.animate(Duration::ZERO),
-            "nothing is down at the start"
-        );
-        assert!(overlay.animate(LEAD + PRESS), "the first key goes down");
-        assert!(
-            !overlay.animate(LEAD + PRESS),
-            "and nothing more happens at the same moment"
-        );
-    }
-
-    #[test]
-    fn interrupted_cycles_restore_the_original_pixels() {
-        let mut overlay = Overlay::render(Rect::from_xywh(0, 0, 1920, 1080), &mut Text::new(), 1);
-        let snapshot = |overlay: &mut Overlay| {
-            let mut pixels = Vec::new();
-            overlay
-                .panel
-                .buffer
-                .render()
-                .draw(|buffer| {
-                    pixels = buffer.to_vec();
-                    Ok::<_, std::convert::Infallible>(Vec::new())
-                })
-                .unwrap();
-            pixels
-        };
-        let initial = snapshot(&mut overlay);
-        // Sample a partial press, skip to an alternative, then jump back to
-        // rest. Cached damage must not leave a glow or a shifted legend behind.
-        for elapsed in [
-            LEAD + PRESS / 2,
-            CYCLE + LEAD + STEP * 2 + PRESS,
-            CYCLE * 7 + LEAD + STEP,
-            CYCLE * 8,
-        ] {
-            overlay.animate(elapsed);
-        }
-        assert_eq!(snapshot(&mut overlay), initial);
-    }
-
-    #[test]
-    fn skipped_frames_match_continuous_playback() {
-        let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let mut text = Text::new();
-        let mut continuous = Overlay::render(output, &mut text, 1);
-        let mut skipped = Overlay::render(output, &mut text, 1);
-        let mut previous = 0;
-        for millis in [430, 970, 1750, 3600, 4670, 8950] {
-            for frame in (previous..millis).step_by(16) {
-                continuous.animate(Duration::from_millis(frame));
-            }
-            let time = Duration::from_millis(millis);
-            continuous.animate(time);
-            skipped.animate(time);
-            let mut expected = Vec::new();
-            continuous
-                .panel
-                .buffer
-                .render()
-                .draw(|pixels| {
-                    expected = pixels.to_vec();
-                    Ok::<_, std::convert::Infallible>(Vec::new())
-                })
-                .unwrap();
-            skipped
-                .panel
-                .buffer
-                .render()
-                .draw(|pixels| {
-                    assert_eq!(pixels, expected.as_slice(), "different frame at {millis}ms");
-                    Ok::<_, std::convert::Infallible>(Vec::new())
-                })
-                .unwrap();
-            previous = millis;
-        }
-    }
-
-    #[test]
-    fn highlighting_never_moves_or_changes_the_face_and_label() {
-        let mut text = Text::new();
-        let layout = fit(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
-        let at = layout.rows[0].caps[0];
-        let background = cut(&paint_base(&layout, &mut text), at);
-        let idle = cap_patch(&background, &layout, &mut text, at, "Super", 0.0);
-        let active = cap_patch(&background, &layout, &mut text, at, "Super", 1.0);
-        assert_ne!(idle, active, "the outline must highlight");
-        let left = (layout.glow + layout.radius).ceil() as usize;
-        let right = at.w - left;
-        let top = (layout.cap_top + layout.bevel).ceil() as usize;
-        let bottom = (layout.cap_top + layout.cap_h - layout.bevel).floor() as usize;
-        for stage in 0..=STAGES {
-            let pixels = blend_patch(&idle, &active, stage as f32 / STAGES as f32);
-            for y in top..bottom {
-                let span = (y * at.w + left) * 4..(y * at.w + right) * 4;
-                assert_eq!(
-                    pixels[span.clone()],
-                    idle[span],
-                    "face changed at stage {stage}"
-                );
-            }
-        }
     }
 
     /// Write the overlay to a binary PPM so a person can look at it.
@@ -1204,21 +763,14 @@ mod tests {
     /// HUGINN_OVERLAY_DUMP=/tmp/overlay.ppm cargo test -p huginn-comp overlay_dump
     /// ```
     ///
-    /// Set `HUGINN_OVERLAY_PRESSED=1` as well to see every key down.
-    ///
     /// Does nothing when the variable is unset, so it costs a CI run nothing.
     #[test]
     fn overlay_dump() {
         let Ok(path) = std::env::var("HUGINN_OVERLAY_DUMP") else {
             return;
         };
-        let amount = if std::env::var_os("HUGINN_OVERLAY_PRESSED").is_some() {
-            1.0
-        } else {
-            0.0
-        };
         let mut text = Text::new();
-        let canvas = compose_at(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, amount);
+        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let (w, h) = (canvas.stride, canvas.height);
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         // The canvas is RGBA and PPM is RGB, so the alpha is dropped. Every
