@@ -1237,9 +1237,7 @@ impl Huginn {
     ) -> Vec<Option<crate::canvas::Panel>> {
         outputs
             .iter()
-            .map(|output| {
-                wallpaper.map(|w| w.panel(output.scale.render, output.scale.advertised))
-            })
+            .map(|output| wallpaper.map(|w| w.panel(output.scale.render, output.scale.advertised)))
             .collect()
     }
 

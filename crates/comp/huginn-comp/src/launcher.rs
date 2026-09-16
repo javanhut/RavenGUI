@@ -372,6 +372,10 @@ impl Category {
 pub(crate) enum Button {
     /// The list's chevron: open the bar into the grid, or close it again.
     Expand,
+    /// Toggle between suggestions and every installed application.
+    AllApps,
+    /// Move through the app grid with the pointer.
+    Page(isize),
     Filter(Filter),
     Sort,
     /// A category on the arc's sidebar, as an index into
@@ -438,6 +442,8 @@ pub(crate) struct Launcher {
     /// the search field — and grows into the grid on Down, Tab or Return,
     /// or as soon as anything is typed. Meaningless on the arc.
     expanded: bool,
+    /// Browse every installed app in the list grid.
+    all_apps: bool,
     /// Which kinds of result a search shows.
     filter: Filter,
     /// How a search's results are ordered.
@@ -480,6 +486,7 @@ impl Default for Launcher {
             pinned: Vec::new(),
             style: Style::default(),
             expanded: false,
+            all_apps: false,
             filter: Filter::default(),
             sort: Sort::default(),
             categories: vec![Category::All],
@@ -584,7 +591,7 @@ impl Launcher {
     fn scroll_to_selection(&mut self) {
         let tiles = self.tile_range();
         let last_first = tiles.len().div_ceil(COLUMNS).saturating_sub(GRID_ROWS);
-        if self.style == Style::List && !self.is_grid() && tiles.contains(&self.selected) {
+        if self.style == Style::List && tiles.contains(&self.selected) {
             let row = (self.selected - tiles.start) / COLUMNS;
             self.first = self.first.clamp(row.saturating_sub(GRID_ROWS - 1), row);
         }
@@ -815,6 +822,7 @@ impl Launcher {
         // Every opening starts from the same place: the bar, every result
         // kind, best match first, and all the applications on the arc.
         self.expanded = false;
+        self.all_apps = false;
         self.filter = Filter::All;
         self.sort = Sort::Relevance;
         self.category = 0;
@@ -1209,6 +1217,11 @@ impl Launcher {
             }
             Button::Filter(filter) if filter == self.filter => return Outcome::Unchanged,
             Button::Filter(filter) => self.filter = filter,
+            Button::Page(direction) => return self.page(direction),
+            Button::AllApps => {
+                self.all_apps = !self.all_apps;
+                self.expanded = true;
+            }
             Button::Sort => self.sort = self.sort.toggled(),
             Button::Category(index) if index == self.category || index >= self.categories.len() => {
                 return Outcome::Unchanged;
@@ -1234,6 +1247,8 @@ impl Launcher {
     ) -> Outcome {
         if !self.query.is_empty() {
             self.filter = self.filter.stepped(delta);
+        } else if self.style == Style::List {
+            self.all_apps = !self.all_apps;
         } else if self.style == Style::Arc && self.categories.len() > 1 {
             let n = self.categories.len() as i32;
             self.category = (self.category as i32 + delta).rem_euclid(n) as usize;
@@ -1298,20 +1313,26 @@ impl Launcher {
                         .filter_map(|p| entries.iter().position(|e| e.path == *p))
                         .take(PINS_SHOWN)
                         .collect();
+                    if self.all_apps && self.sort == Sort::Name {
+                        self.results
+                            .sort_by_cached_key(|i| entries[*i].name.to_lowercase());
+                    }
                     let pins = &self.pins_shown;
                     self.suggested = self
                         .results
                         .iter()
                         .copied()
-                        .filter(|i| !pins.contains(i))
-                        .take(SUGGESTED)
+                        .filter(|i| self.all_apps || !pins.contains(i))
+                        .take(if self.all_apps { usize::MAX } else { SUGGESTED })
                         .collect();
                     let suggested = &self.suggested;
                     self.recent = self
                         .last_used
                         .iter()
                         .copied()
-                        .filter(|(i, _)| !suggested.contains(i) && !pins.contains(i))
+                        .filter(|(i, _)| {
+                            (self.all_apps || !suggested.contains(i)) && !pins.contains(i)
+                        })
                         .collect();
                     self.recent
                         .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -2149,6 +2170,28 @@ mod tests {
         assert!(matches!(launcher.target(), Some(Target::File(_))));
         // Two rows of applications and the file on a third: all drawn.
         assert_eq!(launcher.first_row(), 0);
+    }
+
+    #[test]
+    fn all_apps_includes_pins_and_pages_then_returns_to_suggestions() {
+        let apps = tools(30);
+        let frecency = Frecency::new();
+        let mut launcher = expanded(&apps, &frecency);
+        launcher.set_pinned(vec![apps[29].path.clone()]);
+        launcher.press_button(Button::AllApps, &apps, &frecency, NOW);
+        assert_eq!(launcher.suggested().len(), apps.len());
+        assert!(launcher.suggested().contains(&29));
+        assert_eq!(launcher.pins_shown(), &[29]);
+        launcher.press_button(Button::Page(1), &apps, &frecency, NOW);
+        assert!(launcher.first_row() > 0);
+        launcher.press_button(Button::Page(-1), &apps, &frecency, NOW);
+        assert_eq!(launcher.first_row(), 0);
+        launcher.press(Key::Insert('t'), &apps, &frecency, NOW, CLOCK, STILL);
+        launcher.press(Key::Clear, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.suggested().len(), apps.len());
+        launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL);
+        assert_eq!(launcher.suggested().len(), SUGGESTED);
+        assert!(!launcher.suggested().contains(&29));
     }
 
     #[test]
@@ -5015,6 +5058,9 @@ mod render_tests {
             .unwrap_or(0)
         {
             launcher.press(Key::Down, &apps, &frecency, now, CLOCK, STILL);
+        }
+        if std::env::var_os("LAUNCHER_ALL_APPS").is_some() {
+            launcher.press_button(Button::AllApps, &apps, &frecency, now);
         }
         // `LAUNCHER_TAB=2`: open the actions menu and move down twice.
         if let Some(steps) = std::env::var("LAUNCHER_TAB")
