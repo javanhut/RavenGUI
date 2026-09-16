@@ -995,7 +995,7 @@ impl Huginn {
         let mut seat = seat_state.new_wl_seat(dh, "huginn");
         // Advertised for every backend. A seat with no pointer capability makes
         // toolkits that expect a cursor misbehave, and silently breaks anything
-        // that relies on clicking — including Muninn's workspace pips.
+        // that relies on clicking — including a bar's workspace pips.
         seat.add_pointer();
 
         let mut huginn = Self {

@@ -1,11 +1,10 @@
-# Huginn & Muninn
+# Huginn
 
 The Wayland compositor and desktop shell for [RavenLinux](../RavenLinux),
 written in Rust on [Smithay](https://github.com/Smithay/smithay).
 
 Odin kept two ravens. **Huginn** — *thought* — flew out over the world each day
-and reported what he saw. **Muninn** — *memory* — is the half you actually look
-at.
+and reported what he saw.
 
 | Binary | What it is |
 |---|---|
@@ -44,12 +43,14 @@ else, and `frame_surfaces` stops handing out frame callbacks to anything below.
 There is no ordering rule that could be got wrong, no surface that could be
 raised above the lock, and nothing behind it still painting.
 
-**One repository, split at protocol v1.** The custom protocol is co-designed by
-both halves, so a change to it touches the XML, the compositor, and the shell in
-one commit that either builds or doesn't. `raven-protocol` is kept standalone
-and additive-only so that the eventual `git subtree split` stays mechanical.
+**One repository, both sides of the protocol.** `raven-protocol` generates the
+server bindings `huginn-comp` implements and the client bindings `raven-output`
+consumes, so a change to `raven_shell_v1` touches the XML and both sides in one
+commit that either builds or doesn't. It is kept standalone and additive-only
+so that the eventual `git subtree split` stays mechanical.
 
-Shared crates take the `raven-` prefix, since they belong to neither bird.
+Shared crates take the `raven-` prefix; crates that exist only for the
+compositor take `huginn-`.
 
 ```
 crates/
@@ -371,9 +372,10 @@ RUST_LOG=huginn::frametime=info,huginn=warn   # only the frame-time reports
 ## Status
 
 Working: Huginn runs nested via the winit backend, hosts xdg-shell clients and
-wlr-layer-shell surfaces, and lays both out from `huginn-core`. Muninn draws a
-top panel with workspace pips, receives workspace state over `raven_shell_v1`,
-and switches workspaces when a pip is clicked.
+wlr-layer-shell surfaces, and lays both out from `huginn-core`. The shell is
+drawn in the render loop — dock, launcher, overview, quick settings. Workspace
+count, active index and occupancy go out over `raven_shell_v1` to whatever binds
+it — RoostBar's panel today — which switches workspaces by asking back.
 
 The focused window wears a ring in the same accent the panel uses, and
 `Super`+`Ctrl`+arrows move it between tiles. Neighbours are found by position
@@ -383,11 +385,11 @@ sending the window off diagonally.
 
 `Super`+`Ctrl`+`H` draws the keybinding list over everything, and pressing it
 again takes it away. The compositor renders it itself, with a bitmap font it
-carries in the binary — the shell is a separate process precisely so it can
-crash, and a help screen that vanishes along with the panel would be missing
-exactly when it is wanted. Both the overlay and the line the compositor logs at
-startup are built from one table next to the keymap, and a test walks the
-keysym space to prove no binding has been added without a row in it.
+carries in the binary — no toolkit, no client, nothing that can fail to appear
+at exactly the moment it is wanted. Both the overlay and the line the
+compositor logs at startup are built from one table next to the keymap, and a
+test walks the keysym space to prove no binding has been added without a row
+in it.
 
 `Print` takes a screenshot — the whole screen, `Ctrl`+`Print` the focused
 window, `Shift`+`Print` a rectangle dragged out with the pointer. Like the help

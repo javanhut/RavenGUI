@@ -1,6 +1,6 @@
 //! The `raven_shell_v1` protocol.
 //!
-//! Everything Muninn needs that no standard protocol provides. Standard
+//! Everything a desktop shell needs that no standard protocol provides. Standard
 //! protocols cover the rest — panels and the wallpaper use `wlr-layer-shell`,
 //! the lock screen uses `ext-session-lock-v1`.
 //!
@@ -15,8 +15,8 @@
 //! # Layout
 //!
 //! The two sides are behind features so neither can reach for the other's
-//! types. Huginn takes `server`, Muninn takes `client`; a shell bug then
-//! cannot compile against a compositor-only interface.
+//! types. The compositor takes `server`, shell clients take `client`; a client
+//! bug then cannot compile against a compositor-only interface.
 
 #[cfg(feature = "server")]
 pub mod server {
@@ -33,7 +33,7 @@ pub mod server {
 
 #[cfg(feature = "client")]
 pub mod client {
-    //! Shell-side bindings, consumed by `muninn`.
+    //! Client-side bindings, consumed by `raven-output` and shell clients.
     use wayland_client;
 
     pub mod __interfaces {

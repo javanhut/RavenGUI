@@ -1,8 +1,7 @@
 //! The Huginn compositor.
 //!
 //! Huginn is one of Odin's two ravens — *thought*. It flies out over the world
-//! at dawn and reports back what it saw. Its counterpart Muninn — *memory* — is
-//! the desktop shell that renders what Huginn reports.
+//! at dawn and reports back what it saw.
 //!
 //! Window-management behaviour lives in `huginn-core`, which has no Wayland or
 //! GPU dependency and is tested on its own. This binary is the part that cannot

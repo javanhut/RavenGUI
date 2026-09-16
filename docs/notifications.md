@@ -16,14 +16,14 @@ shows; quick settings does not show the history yet.
 
 The README says the compositor draws the shell, notifications included, because
 "anything that must feel instant and must never fail does not get to be a
-separate process". The dock, launcher and quick settings exist; notifications
-do not. Until they do, nothing on a Raven session owns
-`org.freedesktop.Notifications`, so every application's notifications go
-nowhere, and the stopgap is a third-party daemon (mako) that knows nothing
-about the desktop: it guesses a layer, sits behind fullscreen windows, cannot
-see the lock screen, and does not look like Raven.
+separate process". When this was written the dock, launcher and quick settings
+existed and notifications did not, so nothing on a Raven session owned
+`org.freedesktop.Notifications`: every application's notifications went
+nowhere, and the stopgap was a third-party daemon (mako) that knew nothing
+about the desktop — it guessed a layer, sat behind fullscreen windows, could
+not see the lock screen, and did not look like Raven.
 
-This plan puts the whole thing inside Huginn, built from the parts the shell
+This plan put the whole thing inside Huginn, built from the parts the shell
 already uses.
 
 ## What it has to be
