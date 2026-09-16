@@ -678,13 +678,8 @@ pub(crate) struct Huginn {
     /// `apply` happened; the backend owes a re-arrange.
     layout_changed: bool,
 
-    /// The keybinding overlay, painted once when it is summoned; a frame only
-    /// swaps the keycaps that were pressed or let go since the last. `None`
-    /// when it is not on screen, which is almost always.
+    /// The keybinding overlay, painted once when summoned. `None` when closed.
     help: Option<crate::overlay::Overlay>,
-    /// When the overlay opened, on [`Self::uptime`]'s clock, which is where
-    /// its keycaps' presses count from.
-    help_opened: std::time::Duration,
 
     /// The wallpaper at its own size, read from disk once at startup, and the
     /// copies composed for each output, parallel to `outputs`.
@@ -1103,7 +1098,6 @@ impl Huginn {
             render_context: None,
             focus_ring_shown: None,
             help: None,
-            help_opened: std::time::Duration::ZERO,
             // Stamped before decoding, and fields are evaluated in the order
             // written; see `Sources::of`.
             wallpaper_sources: crate::wallpaper::Sources::of(desktop_config.wallpaper().as_deref()),
@@ -1281,7 +1275,6 @@ impl Huginn {
             &mut self.text,
             advertised,
         ));
-        self.help_opened = self.uptime();
         tracing::debug!(visible = true, "keybinding overlay");
         self.queue_redraw();
     }
@@ -1316,21 +1309,6 @@ impl Huginn {
             self.close_help();
         }
         true
-    }
-
-    /// Press and release the overlay's keycaps. Frames keep coming for as
-    /// long as it is up, since the presses go by the clock; under reduced
-    /// motion the caps stay still and the overlay costs no frames at all.
-    fn tick_help(&mut self, now: std::time::Duration) {
-        if self.settings.motion().is_reduced() {
-            return;
-        }
-        let opened = self.help_opened;
-        let Some(help) = self.help.as_mut() else {
-            return;
-        };
-        help.animate(now.saturating_sub(opened));
-        self.queue_redraw();
     }
 
     /// Set the full output rectangle and reflow everything beneath it.
@@ -4785,7 +4763,6 @@ impl Huginn {
         self.tick_found_pointer(now);
         self.tick_volume(now);
         self.tick_notifications(now);
-        self.tick_help(now);
         if let Some(since) = self.dock_hover_since {
             if now.saturating_sub(since) >= crate::dock::PREVIEW_DELAY {
                 self.dock_hover_since = None;
