@@ -4,13 +4,9 @@
 //! through [`crate::text`] — real shaping and antialiased rasterization — which
 //! is what lets this be a panel someone reads rather than a debugging aid.
 //!
-//! Every chord is drawn as real-looking keycaps — a pale face on a darker
-//! skirt — that go down one at a time, hold, and come back up. A pressed key
-//! sinks into its skirt, rings in the accent colour and throws three short
-//! rays above it. Each cap is painted at a handful of depths when the overlay
-//! opens, and a frame only copies across the caps whose depth changed, so the
-//! animation costs a few small copies rather than shaping every row of text
-//! sixty times a second.
+//! Keys stay fixed while an accent outline fades through each chord in order.
+//! Labels and key geometry never move. Frames blend between two cached poses,
+//! so skipped frames and interrupted cycles cannot accumulate drawing errors.
 
 use std::time::Duration;
 
@@ -55,35 +51,33 @@ const RADIUS: f32 = theme::PANEL_RADIUS;
 const CAP_FACE: Color = Color::from_argb(0xFFE4_E7EC);
 /// The sloped sides between the face and the skirt.
 const CAP_RIM: Color = Color::from_argb(0xFFC3_C8D1);
-/// The part of the key below its sides, which the press sinks into.
+/// The fixed base below the key face.
 const CAP_SKIRT: Color = Color::from_argb(0xFF96_9CA8);
 const CAP_LABEL: Color = Color::from_argb(0xFF1D_2027);
 /// The light along the top edge of the face.
 const CAP_SHINE: Color = Color::from_argb(0xFFFF_FFFF);
-/// The shadow a raised key casts; it goes as the key goes down.
+/// The fixed shadow below a key.
 const CAP_SHADOW: Color = Color::from_argb(0x5A00_0000);
 
 const TITLE: &str = "Huginn keybindings";
 const FOOTER: &str =
     "Esc or a click outside closes this. Plain Super belongs to the focused application.";
 
-/// Pause at the top of a cycle, before the first key goes down.
+/// Pause before the first key highlights.
 const LEAD: Duration = Duration::from_millis(300);
-/// Between one key going down and the next: long enough that the order reads.
+/// Delay between highlights so the chord order is readable.
 const STEP: Duration = Duration::from_millis(280);
-/// How long a key takes to go down.
-const PRESS: Duration = Duration::from_millis(160);
-/// How long the whole chord is held once its last key is down.
+/// How long a key takes to fade into its highlight.
+const PRESS: Duration = Duration::from_millis(240);
+/// How long the complete chord stays highlighted.
 const HOLD: Duration = Duration::from_millis(700);
-/// How long the keys take to come back up.
-const RELEASE: Duration = Duration::from_millis(220);
+/// How long the highlights take to fade away.
+const RELEASE: Duration = Duration::from_millis(360);
 /// One press and the rest after it. The same for every row, whatever its
 /// length, so the rows keep one calm rhythm rather than drifting into noise.
-const CYCLE: Duration = Duration::from_millis(3000);
-/// How many depths between up and down a cap is painted at. Enough that the
-/// press eases rather than jumps; each one is a copy of every cap kept while
-/// the overlay is up.
-const STAGES: usize = 12;
+const CYCLE: Duration = Duration::from_millis(3600);
+/// Cached highlight levels. Geometry and labels are identical at every level.
+const STAGES: usize = 24;
 
 /// The keybinding overlay.
 pub(crate) struct Overlay {
@@ -110,7 +104,7 @@ struct Row {
     first: usize,
 }
 
-/// One keycap: where it is, its pixels at every depth, and which depth the
+/// One keycap: where it is, its pixels at every highlight level, and which level the
 /// buffer shows now.
 struct Cap {
     at: CapBox,
@@ -142,17 +136,10 @@ impl Overlay {
             });
             for (&at, key) in row.caps.iter().zip(keys) {
                 let background = cut(&base, at);
+                let idle = cap_patch(&background, &layout, text, at, key, 0.0);
+                let active = cap_patch(&background, &layout, text, at, key, 1.0);
                 let stages: Vec<_> = (0..=STAGES)
-                    .map(|stage| {
-                        cap_patch(
-                            &background,
-                            &layout,
-                            text,
-                            at,
-                            key,
-                            stage as f32 / STAGES as f32,
-                        )
-                    })
+                    .map(|stage| blend_patch(&idle, &active, stage as f32 / STAGES as f32))
                     .collect();
                 paste(&mut initial.pixels, initial.stride, at, &stages[0]);
                 caps.push(Cap {
@@ -286,13 +273,12 @@ fn parse(chord: &'static str) -> Chord {
     Chord { items, presses }
 }
 
-/// How far down the key `order`-th in a chord of `keys` is, 0 up to 1 down,
+/// Highlight intensity of key `order` in a chord of `keys`, from 0 to 1,
 /// `within` a cycle.
 ///
 /// Pure, so the choreography can be tested without a clock: each key starts
-/// down [`STEP`] after the one before it and takes [`PRESS`] to get there;
-/// once the last is down the chord is held for [`HOLD`], and then every key
-/// comes up together over [`RELEASE`].
+/// highlighting [`STEP`] after the previous one and fades in over [`PRESS`];
+/// the complete chord stays lit for [`HOLD`], then fades out over [`RELEASE`].
 fn amount(order: usize, keys: usize, within: Duration) -> f32 {
     let Some(t) = within.checked_sub(LEAD) else {
         return 0.0;
@@ -314,13 +300,12 @@ fn ease(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The painted depth nearest `amount`.
+/// The cached highlight level nearest `amount`.
 fn stage(amount: f32) -> usize {
     (amount.clamp(0.0, 1.0) * STAGES as f32).round() as usize
 }
 
-/// A keycap's rectangle on the canvas, in pixels: the key, the glow around
-/// it, and the rays above it — everything that changes as it is pressed.
+/// A keycap and its accent outline, in canvas pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapBox {
     x: usize,
@@ -362,11 +347,8 @@ struct Layout {
     /// How far the glow reaches outside a key.
     glow: f32,
     ring_w: f32,
-    /// The space above a key its rays are drawn in.
-    ray_area: f32,
-    ray_len: f32,
-    ray_gap: f32,
-    ray_w: f32,
+    /// Space above the key for its outline.
+    cap_top: f32,
     label_size: f32,
     body_w: f32,
     footer_y: f32,
@@ -449,15 +431,12 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
     let radius = m(0.36);
     let ring_w = m(0.11);
     let glow = m(0.3).max(ring_w + 2.0 * px);
-    let ray_len = m(0.45);
-    let ray_gap = m(0.15);
-    let ray_w = m(0.12).max(px);
-    let ray_area = (ray_len + ray_gap + ray_w).max(glow);
+    let cap_top = glow;
     let cap_pad = m(0.6);
     let sep_gap = m(0.3);
     let row_gap = m(0.15);
     let label_size = size * 0.88;
-    let box_h = ray_area + cap_h + lip + glow;
+    let box_h = cap_top + cap_h + lip + glow;
 
     let line = size * 1.35;
     let (pad, column_gap, columns_gap, line_gap, rule) = (
@@ -556,10 +535,7 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
         radius,
         glow,
         ring_w,
-        ray_area,
-        ray_len,
-        ray_gap,
-        ray_w,
+        cap_top,
         label_size,
         body_w,
         footer_y,
@@ -594,7 +570,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
     );
 
     for (row, binding) in l.rows.iter().zip(BINDINGS) {
-        let face = row.y + l.ray_area;
+        let face = row.y + l.cap_top;
         for (item, &(x, width)) in row.chord.items.iter().zip(&row.placed) {
             if let Item::Sep(sep) = *item {
                 let (w, h) = text.measure_weighted(sep, l.size, Weight::BOLD);
@@ -631,7 +607,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
     canvas
 }
 
-/// Every key on the panel, `amount` of the way down.
+/// Every key on the panel at highlight intensity `amount`.
 #[cfg(test)]
 fn draw_caps(canvas: &mut Canvas, l: &Layout, text: &mut Text, amount: f32) {
     for row in &l.rows {
@@ -648,9 +624,15 @@ fn draw_caps(canvas: &mut Canvas, l: &Layout, text: &mut Text, amount: f32) {
     }
 }
 
-/// Render in an isolated patch so no cached key can contain a neighbour's
-/// pressed pixels. Blend adjacent pixel positions for subpixel travel of the
-/// whole face, including its legend, without reshaping text on each frame.
+/// Two fixed poses share exactly the same face and label pixels. Only the
+/// outline changes, and each frame is reconstructed rather than overpainted.
+fn blend_patch(idle: &[u8], active: &[u8], t: f32) -> Vec<u8> {
+    idle.iter()
+        .zip(active)
+        .map(|(&a, &b)| (f32::from(a) * (1.0 - t) + f32::from(b) * t).round() as u8)
+        .collect()
+}
+
 fn cap_patch(
     background: &[u8],
     l: &Layout,
@@ -659,62 +641,33 @@ fn cap_patch(
     key: &str,
     t: f32,
 ) -> Vec<u8> {
-    let travel = (l.lip - l.px) * t;
-    let local = CapBox { x: 0, y: 0, ..at };
-    let mut paint = |travel| {
-        let mut canvas = Canvas {
-            pixels: background.to_vec(),
-            stride: at.w,
-            height: at.h,
-        };
-        draw_cap(&mut canvas, text, l, local, key, t, travel);
-        canvas.pixels
+    let mut canvas = Canvas {
+        pixels: background.to_vec(),
+        stride: at.w,
+        height: at.h,
     };
-    let mut pixels = paint(travel.floor());
-    let fraction = travel.fract();
-    if fraction > 0.0 {
-        let next = paint(travel.ceil());
-        for (pixel, next) in pixels.iter_mut().zip(next) {
-            *pixel =
-                (f32::from(*pixel) * (1.0 - fraction) + f32::from(next) * fraction).round() as u8;
-        }
-    }
-    pixels
+    draw_cap(&mut canvas, text, l, CapBox { x: 0, y: 0, ..at }, key, t);
+    canvas.pixels
 }
 
-/// One keycap, `t` of the way down.
-///
-/// Raised, it is a pale face on sloped sides on a darker skirt, casting a
-/// shadow. Pressing sinks the face and sides into the skirt, fades the shadow
-/// out, and fades in an accent ring and the three rays above.
-fn draw_cap(
-    canvas: &mut Canvas,
-    text: &mut Text,
-    l: &Layout,
-    at: CapBox,
-    key: &str,
-    t: f32,
-    travel: f32,
-) {
+/// A stationary key with a restrained accent outline indicating activation.
+fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &str, t: f32) {
     let w = at.w as f32 - l.glow * 2.0;
     let fx = at.x as f32 + l.glow;
-    let fy = at.y as f32 + l.ray_area;
-    let top = fy + travel;
-    // The bottom of the skirt stays put; the top comes down to meet it.
-    let body_h = l.cap_h + l.lip - travel;
+    let fy = at.y as f32 + l.cap_top;
+    let top = fy;
+    let body_h = l.cap_h + l.lip;
     let (x, wu) = (fx as usize, w as usize);
     let accent = |alpha: f32| theme::accent().with_alpha((alpha * t).round() as u8);
 
-    if t < 1.0 {
-        canvas.fill_rounded(
-            x,
-            (fy + l.px * 2.0) as usize,
-            wu,
-            (l.cap_h + l.lip) as usize,
-            l.radius,
-            CAP_SHADOW.with_alpha((f32::from(CAP_SHADOW.to_rgba_bytes()[3]) * (1.0 - t)) as u8),
-        );
-    }
+    canvas.fill_rounded(
+        x,
+        (fy + l.px * 2.0) as usize,
+        wu,
+        (l.cap_h + l.lip) as usize,
+        l.radius,
+        CAP_SHADOW,
+    );
     if t > 0.0 {
         // A soft halo out to the edge of the box, then a crisp ring just
         // outside the key. Both before the key, which covers their inner
@@ -726,7 +679,7 @@ fn draw_cap(
             (body_h + l.glow * 2.0) as usize,
             l.radius + l.glow,
             l.glow,
-            accent(70.0),
+            accent(24.0),
         );
         let off = l.ring_w + l.px;
         canvas.stroke_rounded(
@@ -736,7 +689,7 @@ fn draw_cap(
             (body_h + off * 2.0) as usize,
             l.radius + off,
             l.ring_w,
-            accent(235.0),
+            accent(190.0),
         );
     }
 
@@ -774,50 +727,6 @@ fn draw_cap(
         (face_y + (face_h - th) / 2.0).round() as i32,
         CAP_LABEL,
         Weight::BOLD,
-    );
-
-    if t > 0.0 {
-        let color = accent(255.0);
-        let cx = fx + w / 2.0;
-        let bottom = fy - l.ray_gap - l.ray_w / 2.0;
-        let tip = bottom - l.ray_len;
-        let spread = l.ray_len * 0.9;
-        ray(canvas, (cx, bottom), (cx, tip), l.ray_w, color);
-        ray(
-            canvas,
-            (cx - spread, bottom),
-            (cx - spread - l.ray_len * 0.45, tip + l.ray_len * 0.15),
-            l.ray_w,
-            color,
-        );
-        ray(
-            canvas,
-            (cx + spread, bottom),
-            (cx + spread + l.ray_len * 0.45, tip + l.ray_len * 0.15),
-            l.ray_w,
-            color,
-        );
-    }
-}
-
-/// A straight stroke with round ends from `from` to `to`, antialiased.
-fn ray(canvas: &mut Canvas, from: (f32, f32), to: (f32, f32), width: f32, color: Color) {
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let length2 = (dx * dx + dy * dy).max(f32::EPSILON);
-    let reach = width;
-    let (left, top) = (from.0.min(to.0) - reach, from.1.min(to.1) - reach);
-    let (right, bottom) = (from.0.max(to.0) + reach, from.1.max(to.1) + reach);
-    canvas.paint(
-        left.floor() as i32,
-        top.floor() as i32,
-        (right - left).ceil() as i32,
-        (bottom - top).ceil() as i32,
-        |x, y| {
-            let along = (((x - from.0) * dx + (y - from.1) * dy) / length2).clamp(0.0, 1.0);
-            let distance = (x - (from.0 + along * dx)).hypot(y - (from.1 + along * dy));
-            let coverage = (width / 2.0 - distance + 0.5).clamp(0.0, 1.0);
-            (coverage > 0.0).then_some((color, coverage))
-        },
     );
 }
 
@@ -1222,29 +1131,65 @@ mod tests {
     }
 
     #[test]
-    fn fractional_travel_blends_the_face_and_legend_together() {
+    fn skipped_frames_match_continuous_playback() {
+        let output = Rect::from_xywh(0, 0, 1920, 1080);
+        let mut text = Text::new();
+        let mut continuous = Overlay::render(output, &mut text, 1);
+        let mut skipped = Overlay::render(output, &mut text, 1);
+        let mut previous = 0;
+        for millis in [430, 970, 1750, 3600, 4670, 8950] {
+            for frame in (previous..millis).step_by(16) {
+                continuous.animate(Duration::from_millis(frame));
+            }
+            let time = Duration::from_millis(millis);
+            continuous.animate(time);
+            skipped.animate(time);
+            let mut expected = Vec::new();
+            continuous
+                .panel
+                .buffer
+                .render()
+                .draw(|pixels| {
+                    expected = pixels.to_vec();
+                    Ok::<_, std::convert::Infallible>(Vec::new())
+                })
+                .unwrap();
+            skipped
+                .panel
+                .buffer
+                .render()
+                .draw(|pixels| {
+                    assert_eq!(pixels, expected.as_slice(), "different frame at {millis}ms");
+                    Ok::<_, std::convert::Infallible>(Vec::new())
+                })
+                .unwrap();
+            previous = millis;
+        }
+    }
+
+    #[test]
+    fn highlighting_never_moves_or_changes_the_face_and_label() {
         let mut text = Text::new();
         let layout = fit(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
         let at = layout.rows[0].caps[0];
         let background = cut(&paint_base(&layout, &mut text), at);
-        let local = CapBox { x: 0, y: 0, ..at };
-        let t = 0.25 / (layout.lip - layout.px);
-        let mut integer_pose = |travel| {
-            let mut canvas = Canvas {
-                pixels: background.clone(),
-                stride: at.w,
-                height: at.h,
-            };
-            draw_cap(&mut canvas, &mut text, &layout, local, "Super", t, travel);
-            canvas.pixels
-        };
-        let low = integer_pose(0.0);
-        let high = integer_pose(1.0);
-        let between = cap_patch(&background, &layout, &mut text, at, "Super", t);
-        assert_ne!(between, low);
-        assert_ne!(between, high);
-        for ((a, b), value) in low.iter().zip(&high).zip(&between) {
-            assert!(*value >= *a.min(b) && *value <= *a.max(b));
+        let idle = cap_patch(&background, &layout, &mut text, at, "Super", 0.0);
+        let active = cap_patch(&background, &layout, &mut text, at, "Super", 1.0);
+        assert_ne!(idle, active, "the outline must highlight");
+        let left = (layout.glow + layout.radius).ceil() as usize;
+        let right = at.w - left;
+        let top = (layout.cap_top + layout.bevel).ceil() as usize;
+        let bottom = (layout.cap_top + layout.cap_h - layout.bevel).floor() as usize;
+        for stage in 0..=STAGES {
+            let pixels = blend_patch(&idle, &active, stage as f32 / STAGES as f32);
+            for y in top..bottom {
+                let span = (y * at.w + left) * 4..(y * at.w + right) * 4;
+                assert_eq!(
+                    pixels[span.clone()],
+                    idle[span],
+                    "face changed at stage {stage}"
+                );
+            }
         }
     }
 
