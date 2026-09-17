@@ -255,10 +255,21 @@ EDID says how big each panel is — and falls back to the built-in panel. Focus
 follows the pointer, so a mapping that used it would move the touchscreen to the
 external monitor the moment somebody moved the mouse there.
 
-What is deliberately not here: an on-screen keyboard, and long-press as a right
-click. The first is a project; the second needs a timer and is worth doing when
-something asks for it, since Wayland toolkits already synthesise their own from
-`wl_touch`.
+**Two keys, because two of the answers above are guesses.** `touch.output` in
+`desktop.toml` pins the touchscreen to a connector by name and wins outright
+over the size matching, which is defeated by two same-size panels or by EDID
+millimetres that are simply wrong — and when it picks the wrong screen, every
+touch lands on a monitor nobody is touching and nothing inside the compositor
+can notice. `touch.enabled = false` stops listening altogether, which is the
+only repair that does not involve a screwdriver for a digitizer reporting
+contacts nobody made: a cracked panel, water under the glass, a loose ribbon.
+Turning it off mid-session releases whatever was down, so the fix cannot itself
+leave the cursor hidden and a swipe stopped between two workspaces.
+
+What is deliberately not here: a quick-settings row for either of those, an
+on-screen keyboard, and long-press as a right click. The first is worth adding
+when something asks; the second is a project; the third needs a timer and buys
+little, since Wayland toolkits already synthesise their own from `wl_touch`.
 
 ## Configuration: one file, written by Settings
 
@@ -279,7 +290,8 @@ when `ravencanvasd` is not running, and `blur` — which blurs the desktop
 behind the launcher, the pinned panel and *glass* windows (translucent
 clients that ask for it by `app_id`; Raven Settings today); off, the panels
 draw at their usual alpha over the sharp desktop. Clients' own minimize
-buttons (`xdg_toplevel.set_minimized`) go to the dock like the gesture. Every key is optional, an absent file is
+buttons (`xdg_toplevel.set_minimized`) go to the dock like the gesture. It also
+honours `[touch]` — see [Touch](#touch). Every key is optional, an absent file is
 the compiled-in look, and a file that does not parse is logged and ignored
 rather than half-applied. The rest of the file — theme mode, shadows,
 transparency, scale, the bar — is for the applications and RoostBar, which

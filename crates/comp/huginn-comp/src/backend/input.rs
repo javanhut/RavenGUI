@@ -93,15 +93,28 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
         }
         // Fingers on the glass. What a set of them means is [`crate::touch`]'s;
         // what happens to one is below.
-        InputEvent::TouchDown { event } => touch_down::<B>(state, &event),
-        InputEvent::TouchMotion { event } => touch_motion::<B>(state, &event),
-        InputEvent::TouchUp { event } => touch_up::<B>(state, &event),
-        InputEvent::TouchCancel { event } => touch_cancel::<B>(state, &event),
+        //
+        // `touch.enabled` is checked on each of them rather than once at
+        // startup, because it is turned off in the middle of a session by
+        // somebody whose digitizer has started reporting touches nobody made
+        // -- see [`crate::desktop_config::Touch`]. A hand that was down when
+        // it was turned off is released by `reload_desktop_config`, so there
+        // is nothing left here for these to close.
+        InputEvent::TouchDown { event } if state.touch_enabled() => {
+            touch_down::<B>(state, &event);
+        }
+        InputEvent::TouchMotion { event } if state.touch_enabled() => {
+            touch_motion::<B>(state, &event);
+        }
+        InputEvent::TouchUp { event } if state.touch_enabled() => touch_up::<B>(state, &event),
+        InputEvent::TouchCancel { event } if state.touch_enabled() => {
+            touch_cancel::<B>(state, &event);
+        }
         // The end of a set of touch events that belong together. Passed
         // straight through: the compositor groups its own sends around each
         // event it handles, and a client that batches on frames needs the
         // device's own boundaries as well as those.
-        InputEvent::TouchFrame { .. } => {
+        InputEvent::TouchFrame { .. } if state.touch_enabled() => {
             let touch = state.touch();
             touch.frame(state);
         }
@@ -602,14 +615,14 @@ fn touch_down<B: InputBackend>(state: &mut Huginn, event: &B::TouchDownEvent) {
             state.queue_redraw();
         }
         Landing::Route => {
-            let owner = route_touch::<B>(state, location, slot, time);
+            let owner = route_touch(state, location, slot, time);
             state.contacts.took(id, owner);
         }
     }
 }
 
 /// Send the first contact to whatever should have it, and say who that was.
-fn route_touch<B: InputBackend>(
+fn route_touch(
     state: &mut Huginn,
     location: Point<f64, Logical>,
     slot: TouchSlot,

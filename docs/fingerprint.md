@@ -133,7 +133,13 @@ not be driving the reader through a GLib service.
 Three things, all pure, all tested on a machine with no reader attached:
 
 **A bad reading is not a failed attempt.** `Scan::Retry` — too short, off
-centre, unreadable, unchanged — means the sensor saw something it could not use.
+centre, not enough finger, unreadable, unchanged — means the sensor saw
+something it could not use, and each carries the correction to show for it.
+`Retry::from_wire` parses the daemon's word and `Retry::advice` turns it into
+a sentence, which is why the copy lives here and not in a driver: off-centre
+says *move your finger* and not-enough says *cover more of the sensor*, and a
+stack that collapsed the two would tell somebody whose finger is already
+centred to move it.
 `Scan::NoMatch` means it saw a finger cleanly and did not know it. Only the
 second counts against anything. Conflating them is what makes a reader feel like
 it is accusing its owner of being a stranger, and spends all three tries on a

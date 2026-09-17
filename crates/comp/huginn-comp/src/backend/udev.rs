@@ -1726,7 +1726,8 @@ impl Udev {
                 // the panel it is glued to. See `Huginn::touch_output`.
                 if device.has_capability(DeviceCapability::Touch) {
                     let size = device.size();
-                    self.state.touch_device_added(device.name().to_owned(), size);
+                    self.state
+                        .touch_device_added(device.name().to_owned(), size);
                 }
                 if device.has_capability(DeviceCapability::Keyboard) {
                     device.led_update(self.state.keyboard_led_state.into());

@@ -155,9 +155,14 @@ pub enum Scan {
 pub enum Retry {
     /// Lifted before the sensor had finished reading.
     TooShort,
-    /// Not enough of the finger on the sensor — the edge of a fingertip, or a
-    /// finger laid across a corner of it.
+    /// Off to one side. The whole finger is there; it is in the wrong place.
     OffCentre,
+    /// Too little of the finger on the sensor — the edge of a fingertip, or a
+    /// finger laid across a corner of it. Distinct from [`Self::OffCentre`]
+    /// because the corrections are opposite: one is *move*, the other is
+    /// *press more of it down*, and telling somebody to move a finger that is
+    /// already centred makes a working sensor feel broken.
+    NotEnough,
     /// Wet, dry, dirty, or a reader that wants wiping. The sensor cannot tell
     /// which of those it is, so neither can this.
     Unreadable,
@@ -165,6 +170,47 @@ pub enum Retry {
     /// presentations, and a template built from ten copies of one patch of
     /// skin matches almost nothing.
     Unchanged,
+}
+
+impl Retry {
+    /// Read one off `raven-fprintd`'s socket.
+    ///
+    /// The daemon sends a single word per unusable reading — its driver's
+    /// `Retry::wire` in RavenLinux is the other half of this, and the two
+    /// vocabularies are pinned by a test on each side.
+    ///
+    /// A word this does not know becomes [`Self::Unreadable`] rather than an
+    /// error. A newer daemon that grew a fifth correction is not a reason to
+    /// fail an unlock, and "try again" is true for every one of them.
+    #[must_use]
+    pub fn from_wire(word: &str) -> Self {
+        match word {
+            "centre" => Self::OffCentre,
+            "cover" => Self::NotEnough,
+            "wipe" => Self::Unreadable,
+            "short" => Self::TooShort,
+            "same" => Self::Unchanged,
+            _ => Self::Unreadable,
+        }
+    }
+
+    /// What to put in front of the person.
+    ///
+    /// Imperative, and never blaming them for a sensor that could not read:
+    /// the reading failed, and every one of these is something they can
+    /// actually do about it. This is the copy, and it lives here rather than
+    /// in the driver because a driver has no business owning wording a desktop
+    /// will want to translate or replace.
+    #[must_use]
+    pub const fn advice(self) -> &'static str {
+        match self {
+            Self::TooShort => "Hold your finger there a moment longer",
+            Self::OffCentre => "Move your finger to the middle of the sensor",
+            Self::NotEnough => "Cover more of the sensor",
+            Self::Unreadable => "Wipe the sensor and try again",
+            Self::Unchanged => "Lift your finger and place it again, slightly moved",
+        }
+    }
 }
 
 /// Something wrong with the sensor or the machine, rather than with a finger.
@@ -258,4 +304,58 @@ pub trait Sensor {
     /// Forget every template. What a person leaving a machine does, and what
     /// an installer does to one that arrived with somebody else's finger on it.
     fn forget_all(&mut self) -> Result<(), Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The words `raven-fprintd` actually sends. Its driver's `Retry::wire`
+    /// in RavenLinux emits exactly these four, and its own test pins that end;
+    /// this pins ours. The two together are the whole of the contract, and
+    /// either one failing means a reading the desktop cannot explain.
+    #[test]
+    fn every_word_the_daemon_sends_is_understood() {
+        assert_eq!(Retry::from_wire("centre"), Retry::OffCentre);
+        assert_eq!(Retry::from_wire("cover"), Retry::NotEnough);
+        assert_eq!(Retry::from_wire("wipe"), Retry::Unreadable);
+        // "again" is the daemon's word for a code its sensor did not explain.
+        assert_eq!(Retry::from_wire("again"), Retry::Unreadable);
+    }
+
+    /// A daemon newer than this desktop must not be able to fail an unlock by
+    /// growing a word.
+    #[test]
+    fn a_word_from_the_future_is_still_a_retry() {
+        assert_eq!(Retry::from_wire("sideways"), Retry::Unreadable);
+        assert_eq!(Retry::from_wire(""), Retry::Unreadable);
+    }
+
+    /// Every correction is something a person can act on, and reads as an
+    /// instruction rather than as a verdict on them.
+    #[test]
+    fn every_retry_has_advice_that_can_be_acted_on() {
+        for why in [
+            Retry::TooShort,
+            Retry::OffCentre,
+            Retry::NotEnough,
+            Retry::Unreadable,
+            Retry::Unchanged,
+        ] {
+            let advice = why.advice();
+            assert!(!advice.is_empty(), "{why:?}");
+            assert!(
+                advice.starts_with(|c: char| c.is_uppercase()),
+                "{advice:?} is shown to somebody; it starts a sentence"
+            );
+        }
+    }
+
+    /// The two corrections that are most easily conflated must not say the
+    /// same thing: a finger that is centred but barely touching gets told to
+    /// move, and gives up.
+    #[test]
+    fn off_centre_and_not_enough_say_different_things() {
+        assert_ne!(Retry::OffCentre.advice(), Retry::NotEnough.advice());
+    }
 }

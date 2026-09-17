@@ -473,9 +473,6 @@ mod tests {
         assert_eq!(contacts.up(7), Lift::Quiet);
     }
 
-
-
-
     /// Only the first finger drives the swipe; see [`Contacts::drives`].
     #[test]
     fn only_the_first_finger_drives_the_gesture() {
@@ -484,7 +481,9 @@ mod tests {
             contacts.down(slot, at(100.0, 100.0));
         }
         assert!(contacts.drives(1, at(400.0, 100.0)).is_none());
-        let (dx, dy) = contacts.drives(0, at(400.0, 100.0)).expect("the first drives");
+        let (dx, dy) = contacts
+            .drives(0, at(400.0, 100.0))
+            .expect("the first drives");
         assert!((dx - travel(300.0, 0.0).0).abs() < f64::EPSILON);
         assert_eq!(dy, 0.0);
     }
@@ -579,7 +578,9 @@ mod tests {
         let mut swipe = crate::gesture::Swipe::new(crate::gesture::CAROUSEL_FINGERS);
         let (dx, dy) = travel(6.0, -3.0);
         assert!(
-            swipe.takes_hold(dx, dy, std::time::Duration::ZERO).is_none(),
+            swipe
+                .takes_hold(dx, dy, std::time::Duration::ZERO)
+                .is_none(),
             "a finger settling must not commit the axis"
         );
 
