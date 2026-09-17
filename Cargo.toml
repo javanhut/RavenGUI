@@ -96,3 +96,17 @@ opt-level = 1          # a compositor at opt-level 0 drops frames while you test
 
 [profile.dev.package."*"]
 opt-level = 3          # deps are rebuilt rarely; always optimize them
+
+# Patched smithay: upstream 0.7.0 creates the drag-and-drop `wl_data_offer` at
+# the client's own `wl_data_device` version and then sends `source_actions` on
+# it unconditionally. That event is new in version 3, so a client that binds
+# `wl_data_device_manager` at version 1 — GLFW 3.3 does, which is every app
+# built on it, RavenTerminal included — receives an opcode its listener has no
+# slot for, and libwayland-client answers that by aborting the process:
+#
+#   listener function for opcode 1 of wl_data_offer is NULL
+#
+# The window vanishes the instant a drag crosses it. third_party/smithay gates
+# both sends on the offer's version; drop it once upstream carries the fix.
+[patch.crates-io]
+smithay = { path = "third_party/smithay" }
