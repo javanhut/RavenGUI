@@ -177,7 +177,7 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         if let Some((surface, _)) = under.as_ref() {
             // Focus follows the click into the lock surface, so a compositor
             // that had the keyboard elsewhere hands it over on the first press.
-            state.set_keyboard_focus(Some(surface.clone()), serial);
+            state.set_keyboard_focus(Some(surface.clone().into()), serial);
         }
         pointer.button(
             state,

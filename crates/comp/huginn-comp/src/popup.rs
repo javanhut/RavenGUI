@@ -158,7 +158,7 @@ impl Huginn {
             return;
         };
 
-        let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else {
+        let Ok(mut grab) = self.popups.grab_popup(root.into(), kind, &seat, serial) else {
             return;
         };
 
