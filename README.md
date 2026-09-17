@@ -56,6 +56,8 @@ compositor take `huginn-`.
 crates/
 ├── raven-protocol/        raven_shell_v1 — shared, versioned, split-ready
 ├── raven-desktop/         ★ .desktop entries + icon lookup. Pure.
+├── raven-fprint/          ★ fingerprint rules + the Sensor trait. Pure.
+│                            Shared with RavenLogin; see docs/fingerprint.md
 ├── comp/
 │   ├── huginn-core/       ★ layout, focus, workspaces. Pure. Tests anywhere.
 │   ├── huginn-comp/       smithay glue, event loop, protocol handlers,
@@ -203,6 +205,60 @@ sampled down by 0.75 as it is drawn, once, by the compositor; the client never
 knows. That is macOS's "looks like 2560×1440" done per surface rather than to
 the finished frame, which costs nothing in code because `DrmCompositor` already
 composes at whatever fraction the output reports.
+
+## Touch
+
+A convertible has three pointing devices and they must not each get their own
+desktop. The rule is that a finger is a pointer until there are three of them,
+and then it is the touchpad's gesture.
+
+**One finger is the pointer.** Not a second cursor and not a parallel set of hit
+tests: the contact moves `pointer_location`, and everything the compositor draws
+— the dock, the launcher, the overview, notification cards, title bars,
+click-to-focus — is asked exactly the question a mouse button asks it, through
+the same `backend::input::shell_press`. That is why there is one press dispatch
+and not two. A copy for the touchscreen would be a copy to keep in step, and the
+first time it fell behind the answer would be that the dock works with a mouse
+and not with a finger.
+
+The cursor is not drawn while anything is touching. An arrow that teleports to
+wherever somebody last touched, and then sits there pointing at nothing once
+their hand comes away, is the single thing that makes a touchscreen desktop feel
+broken.
+
+**Two fingers are the application's.** Pinch to zoom and two-finger pan belong
+to the map, the photo viewer and the PDF reader, and a compositor that took them
+would break all three in exchange for one more shortcut.
+
+**Three fingers are the gestures you already have.** Sideways drives the
+carousel, up reveals the overview, down puts the window away — fed to the same
+`gesture::Swipe` the touchpad feeds, converted from screen pixels at
+`touch::PIXELS_PER_UNIT`, so there is one recogniser and one set of thresholds
+for every device. One workspace is about 540 logical pixels of travel.
+
+The third finger *takes* the hand rather than sharing it. Fingers do not land
+together, so by the time it arrives the first two have been down for tens of
+milliseconds and have already gone somewhere; `wl_touch.cancel` goes to whoever
+had them, which is what that event is for, and the whole hand is the
+compositor's until the last finger lifts.
+
+**X11 windows get a cursor instead.** XWayland speaks X11 to its clients and
+`wl_touch` never reaches them, so a finger on a legacy application would do
+nothing at all. The first contact on one moves the pointer and presses the
+primary button. Only the first: a second would be two cursors, and a pinch on an
+X11 window would read as the pointer teleporting between the fingers.
+
+**A touchscreen is mapped to a panel, never to the focused screen.** It reports a
+fraction of its own glass, not of the desktop, so `Huginn::touch_output` matches
+it to a screen by physical size — libinput knows how big the digitizer is and
+EDID says how big each panel is — and falls back to the built-in panel. Focus
+follows the pointer, so a mapping that used it would move the touchscreen to the
+external monitor the moment somebody moved the mouse there.
+
+What is deliberately not here: an on-screen keyboard, and long-press as a right
+click. The first is a project; the second needs a timer and is worth doing when
+something asks for it, since Wayland toolkits already synthesise their own from
+`wl_touch`.
 
 ## Configuration: one file, written by Settings
 

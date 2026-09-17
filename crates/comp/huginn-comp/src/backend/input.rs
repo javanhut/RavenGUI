@@ -1,27 +1,50 @@
-//! Pointer and touchpad input, shared by both backends.
+//! Pointer, touchpad and touchscreen input, shared by both backends.
 //!
 //! winit reports absolute positions inside its window; libinput reports
 //! relative deltas from a physical mouse. Both end up here so that focus
 //! behaviour, clamping and hit testing cannot drift between the two.
 //!
-//! Touchpad gestures only ever arrive from libinput — winit's backend types
-//! them as the uninhabited `UnusedEvent`, so the arms below compile there and
-//! can never run. What the gesture *means* still lives in [`crate::gesture`]
-//! rather than here, which is what keeps it testable without a touchpad.
+//! Touchpad gestures and touchscreen contacts only ever arrive from libinput —
+//! winit's backend types them as the uninhabited `UnusedEvent`, so the arms
+//! below compile there and can never run. What a gesture *means* still lives in
+//! [`crate::gesture`], and what a set of fingers means in [`crate::touch`],
+//! rather than here: that is what keeps both testable on a machine with
+//! neither.
+//!
+//! # One press, two devices
+//!
+//! A finger and a mouse button both press things the compositor draws, and the
+//! rules for which of those things gets the press — the card in front of
+//! everything, then the launcher, then the overview, then the dock, then a
+//! title bar, then the window — are subtle, ordered, and exactly the same for
+//! both. So they are written once, in [`shell_press`], and the two devices
+//! differ only in what they hand it. A second copy for the touchscreen would
+//! be a second copy to keep in step, and the first time it fell behind the
+//! answer would be that the dock works with a mouse and not with a finger.
 
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
         GestureBeginEvent, GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent,
-        PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent, TouchSlot,
     },
-    input::pointer::{AxisFrame, ButtonEvent, MotionEvent},
+    input::{
+        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        touch::{DownEvent, MotionEvent as TouchMoveEvent, UpEvent},
+    },
     utils::{Logical, Point, SERIAL_COUNTER, Size},
 };
 
-use crate::state::Huginn;
+use crate::{
+    state::Huginn,
+    touch::{Landing, Lift, Owner},
+};
 
-/// Feed a pointer event to the compositor. Non-pointer events are ignored.
+/// Feed one input event to the compositor.
+///
+/// Pointer motion and buttons, wheel and touchpad gestures, and touchscreen
+/// contacts. Keyboard events do not come here — each backend resolves those
+/// against its own keymap. Anything else is ignored.
 pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) {
     match event {
         InputEvent::PointerMotion { event } => {
@@ -67,6 +90,20 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
         InputEvent::GestureHoldBegin { event } => state.hold_begin(event.fingers()),
         InputEvent::GestureHoldEnd { event } => {
             state.hold_end(event.cancelled(), event.time_msec());
+        }
+        // Fingers on the glass. What a set of them means is [`crate::touch`]'s;
+        // what happens to one is below.
+        InputEvent::TouchDown { event } => touch_down::<B>(state, &event),
+        InputEvent::TouchMotion { event } => touch_motion::<B>(state, &event),
+        InputEvent::TouchUp { event } => touch_up::<B>(state, &event),
+        InputEvent::TouchCancel { event } => touch_cancel::<B>(state, &event),
+        // The end of a set of touch events that belong together. Passed
+        // straight through: the compositor groups its own sends around each
+        // event it handles, and a client that batches on frames needs the
+        // device's own boundaries as well as those.
+        InputEvent::TouchFrame { .. } => {
+            let touch = state.touch();
+            touch.frame(state);
         }
         _ => {}
     }
@@ -209,20 +246,83 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         return;
     }
 
+    // Everything the compositor itself draws gets the press before any client
+    // does, in the order it is drawn. Shared with the touchscreen; see
+    // [`shell_press`] and the module note above.
+    //
+    // Presses only. A release falls through, so that a swallowed press's
+    // release still goes out and no client sees the up of a button it never
+    // saw go down.
+    if button_state == ButtonState::Pressed {
+        let gesture_device = event.device().has_capability(DeviceCapability::Gesture);
+        let source = Source::Pointer { gesture_device };
+        if shell_press(state, event.button_code(), source) == Taken::Shell {
+            return;
+        }
+    }
+
+    let pointer = state.pointer();
+    pointer.button(
+        state,
+        &ButtonEvent {
+            button: event.button_code(),
+            state: button_state,
+            serial,
+            time: event.time_msec(),
+        },
+    );
+    pointer.frame(state);
+}
+
+/// Where a press came from, for the few steps of [`shell_press`] that differ
+/// between a button under a finger and a finger itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// A pointer button. Whether the device also reports gestures decides what
+    /// a middle press means: a touchpad's three-finger tap arrives as one, and
+    /// it is the strip's rather than the dock's.
+    Pointer { gesture_device: bool },
+    /// A finger on the glass. It carries no modifiers and has no second or
+    /// third button, so the chords are not consulted at all — see the arms
+    /// below that ask.
+    Touch,
+}
+
+/// Whether the compositor's own drawing took a press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Taken {
+    /// Something the compositor draws acted on it, and nothing is forwarded:
+    /// the press was aimed at a card, the launcher, the overview, the dock or
+    /// a title bar, and a client underneath must not also see it.
+    Shell,
+    /// Nothing there wanted it. It belongs to whatever is under it — which for
+    /// the last two steps below is a window that has just been focused by it.
+    No,
+}
+
+/// The shell's claim on a press, asked in the order the things that make it
+/// are drawn: front to back, so what you press is what you can see.
+///
+/// Every step here reads the desktop directly rather than through the scene —
+/// the dock and the launcher are compositor-drawn, and click-to-focus walks
+/// the window list — so an empty scene does not stop any of them on its own.
+///
+/// Called for presses only; see the caller.
+fn shell_press(state: &mut Huginn, button: u32, source: Source) -> Taken {
     // A notification card is drawn in front of everything but the recording
     // dot, so it is asked first. A press on a card acts on the card — a left
     // click takes it or the control it landed on, a right click dismisses it —
     // and never reaches what is behind. See `Huginn::notifications_click`.
-    if button_state == ButtonState::Pressed && state.notifications_click(event.button_code()) {
-        return;
+    if state.notifications_click(button) {
+        return Taken::Shell;
     }
 
     // The keybinding overlay takes any press while it is up: off the panel it
     // closes, on it nothing happens. Swallowed either way, as the launcher's
     // are — it is drawn over everything, so a click is aimed at the list or at
     // getting rid of it, not at a window the user can barely see behind it.
-    if button_state == ButtonState::Pressed && state.help_click() {
-        return;
+    if state.help_click() {
+        return Taken::Shell;
     }
 
     // `Super`+a button is the mouse's three-finger gesture — see
@@ -231,12 +331,15 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     // press that put a window away must not also focus what was under it.
     // Releases are not bound, so a swallowed press's release still goes
     // through, exactly as a dock click's does.
-    if button_state == ButtonState::Pressed
+    //
+    // A finger never reaches this. `Super`+tap is not a gesture anybody makes
+    // on a panel, and a touchscreen has the real three fingers to do it with.
+    if matches!(source, Source::Pointer { .. })
         && let Some(keyboard) = state.seat.get_keyboard()
-        && let Some(click) = crate::mouse::binding(event.button_code(), &keyboard.modifier_state())
+        && let Some(click) = crate::mouse::binding(button, &keyboard.modifier_state())
         && state.mouse_click(click)
     {
-        return;
+        return Taken::Shell;
     }
 
     // Click to focus. Done on press rather than release so that a click-drag
@@ -256,12 +359,8 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     // Asked before the dock, which the panel is drawn over. Other buttons
     // fall through unchanged — a right click has no meaning here, and
     // swallowing it would make the pointer feel dead.
-    const BTN_LEFT: u32 = 0x110;
-    if button_state == ButtonState::Pressed
-        && event.button_code() == BTN_LEFT
-        && (state.launcher_click() || state.pinned_click())
-    {
-        return;
+    if button == crate::mouse::BTN_LEFT && (state.launcher_click() || state.pinned_click()) {
+        return Taken::Shell;
     }
 
     // The overview owns the primary click while it is up: on a window's
@@ -269,55 +368,59 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     // goes back. Before the dock and the scene both — everything under the
     // overview is scenery while it is showing, and a click that fell through
     // to a window's stale rectangle would act on a desktop nobody can see.
-    if button_state == ButtonState::Pressed
-        && event.button_code() == BTN_LEFT
-        && state.overview_click()
-    {
-        return;
+    if button == crate::mouse::BTN_LEFT && state.overview_click() {
+        return Taken::Shell;
     }
 
     // The dock is compositor-drawn, so it is not under the pointer as far as
     // any client is concerned. It has to be asked first, or a click on it
     // falls through to whatever window is behind it.
-    if button_state == ButtonState::Pressed
-        && let Some(item) = state.dock_click()
-    {
+    if let Some(item) = state.dock_click() {
         // A middle click, or `Ctrl`+click, on an icon opens another window
         // of that application; any other press is the ordinary click that
         // starts or raises it. A touchpad's three-finger tap arrives as a
         // middle press too and is *not* this: that tap is the strip's, and
         // a tap on the dock that started a second copy of something would
         // be the touchpad shortcut misfiring on the wrong device.
-        let ctrl_click = event.button_code() == crate::mouse::BTN_LEFT
-            && state.seat.get_keyboard().is_some_and(|keyboard| {
-                let mods = keyboard.modifier_state();
-                mods.ctrl && !mods.logo && !mods.alt && !mods.shift
-            });
-        let middle_click = event.button_code() == crate::mouse::BTN_MIDDLE
-            && !event.device().has_capability(DeviceCapability::Gesture);
-        if ctrl_click || middle_click {
+        //
+        // A finger has neither of those, so a tap on the dock always starts
+        // or raises. Opening a second window stays something you do with a
+        // keyboard in reach, rather than a gesture invented for the glass
+        // that nothing on screen could tell you about.
+        let anew = match source {
+            Source::Pointer { gesture_device } => {
+                let ctrl_click = button == crate::mouse::BTN_LEFT
+                    && state.seat.get_keyboard().is_some_and(|keyboard| {
+                        let mods = keyboard.modifier_state();
+                        mods.ctrl && !mods.logo && !mods.alt && !mods.shift
+                    });
+                let middle_click = button == crate::mouse::BTN_MIDDLE && !gesture_device;
+                ctrl_click || middle_click
+            }
+            Source::Touch => false,
+        };
+        if anew {
             state.launch_dock_item_anew(&item);
         } else {
             state.activate_dock_item(&item);
         }
-        return;
+        return Taken::Shell;
     }
 
     // A click on a layer surface that asked for the keyboard is how it takes
     // focus, and a click anywhere else is how it gives it back. Settled before
     // click-to-focus, because a panel overlapping a tile must not also raise
     // the window behind it — the click belongs to whatever is drawn on top.
-    let clicked_layer =
-        if button_state == ButtonState::Pressed && !on_popup && !state.pointer().is_grabbed() {
-            let hit = state.layer_under(state.pointer_location);
-            let landed = hit.is_some();
-            if state.set_focused_layer(hit) {
-                state.refresh_focus();
-            }
-            landed
-        } else {
-            false
-        };
+    let clicked_layer = if !on_popup && !state.pointer().is_grabbed() {
+        let hit = state.layer_under(state.pointer_location);
+        let landed = hit.is_some();
+        if state.set_focused_layer(hit) {
+            state.refresh_focus();
+        }
+        landed
+    } else {
+        false
+    };
 
     // A title bar the compositor drew. A press anywhere on it focuses its
     // window; the primary button on the close button asks the window to
@@ -326,8 +429,7 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     // under it. Any button is swallowed, since the bar has no other use for
     // one and a right click falling through to the content would be a click
     // on something the user cannot see there.
-    if button_state == ButtonState::Pressed
-        && !on_popup
+    if !on_popup
         && !clicked_layer
         && !state.pointer().is_grabbed()
         && let Some((window, hit)) = state.decor_hit()
@@ -335,16 +437,15 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         state.space.focus_window(window);
         state.refresh_focus();
         if hit == crate::decor::Hit::Close
-            && event.button_code() == BTN_LEFT
+            && button == crate::mouse::BTN_LEFT
             && let Some(surface) = state.surface(window)
         {
             surface.close();
         }
-        return;
+        return Taken::Shell;
     }
 
-    if button_state == ButtonState::Pressed
-        && !on_popup
+    if !on_popup
         && !clicked_layer
         && !state.pointer().is_grabbed()
         && let Some(window) = state.window_under(state.pointer_location)
@@ -357,17 +458,8 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         state.refresh_focus();
     }
 
-    let pointer = state.pointer();
-    pointer.button(
-        state,
-        &ButtonEvent {
-            button: event.button_code(),
-            state: button_state,
-            serial,
-            time: event.time_msec(),
-        },
-    );
-    pointer.frame(state);
+    // Focus may have moved above, but the press itself is the client's.
+    Taken::No
 }
 
 fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
@@ -447,4 +539,335 @@ fn wheel_workspace<B: InputBackend>(
         return false;
     };
     state.wheel_workspace(axis, v120, chord)
+}
+
+/// Where on the desktop a contact belonging to `device` actually is.
+///
+/// A touchscreen reports a fraction of the panel it is stuck to, never of the
+/// desktop, which is the whole difference between this and the absolute-pointer
+/// arm in [`handle`]. See [`Huginn::touch_output`] for how the panel is found.
+///
+/// Clamped to that screen. A fraction is inside its own panel by construction,
+/// so this only ever catches a miscalibrated or lying device — and the failure
+/// it prevents is the interesting one: an out-of-range fraction on a laptop
+/// with a monitor plugged in puts the finger on the *other* screen, where it
+/// presses something the user is not looking at.
+fn touch_location<B: InputBackend>(
+    state: &Huginn,
+    device: &str,
+    event: &impl AbsolutePositionEvent<B>,
+) -> Point<f64, Logical> {
+    let area = state.touch_output(device).rect;
+    let extent: Size<i32, Logical> = (area.w(), area.h()).into();
+    let origin: Point<f64, Logical> = (f64::from(area.x()), f64::from(area.y())).into();
+    let at = event.position_transformed(extent) + origin;
+    let max_x = f64::from(area.right() - 1).max(f64::from(area.x()));
+    let max_y = f64::from(area.bottom() - 1).max(f64::from(area.y()));
+    (
+        at.x.clamp(f64::from(area.x()), max_x),
+        at.y.clamp(f64::from(area.y()), max_y),
+    )
+        .into()
+}
+
+/// A finger landed.
+fn touch_down<B: InputBackend>(state: &mut Huginn, event: &B::TouchDownEvent) {
+    let slot = event.slot();
+    let id = i32::from(slot);
+    let device = event.device().name();
+    let location = touch_location::<B>(state, &device, event);
+    let time = event.time_msec();
+    // Read before the contact is recorded: a claim below rewrites every
+    // finger's owner to the gesture's, and after that there is no way left to
+    // tell that one of them had been standing in for the pointer.
+    let was_emulating = state.contacts.any_emulating();
+
+    match state.contacts.down(id, location) {
+        // A gesture already has the hand. Counted, and nothing else.
+        Landing::Ignore => {}
+        // This contact completed the hand. Whoever had the earlier fingers is
+        // told the sequence was taken rather than left half finished -- that
+        // is what `wl_touch.cancel` is for -- and from here until the last
+        // finger lifts the hand drives the same recogniser the touchpad does.
+        Landing::Claims => {
+            let touch = state.touch();
+            touch.cancel(state);
+            // The pointer may have been emulating for an X11 window; that
+            // contact is the gesture's now, so the button it pressed has to be
+            // let go of or the window is left with it held down forever.
+            if was_emulating {
+                release_primary_button(state, time);
+            }
+            state.swipe_begin(crate::gesture::CAROUSEL_FINGERS);
+            state.queue_redraw();
+        }
+        Landing::Route => {
+            let owner = route_touch::<B>(state, location, slot, time);
+            state.contacts.took(id, owner);
+        }
+    }
+}
+
+/// Send the first contact to whatever should have it, and say who that was.
+fn route_touch<B: InputBackend>(
+    state: &mut Huginn,
+    location: Point<f64, Logical>,
+    slot: TouchSlot,
+    time: u32,
+) -> Owner {
+    let serial = SERIAL_COUNTER.next_serial();
+    // Everything the compositor draws asks where the *pointer* is, because
+    // until now the pointer was the only thing that could be anywhere. Rather
+    // than teach the dock, the launcher, the overview, the title bars and the
+    // hit tests to take a position, the finger becomes the pointer's position
+    // for as long as it is down. The cursor is not drawn while it is -- see
+    // `Huginn::pointer_visible` -- so nothing appears to jump.
+    state.pointer_location = location;
+
+    // Locked: the touch reaches the lock screen and nothing else, for exactly
+    // the reasons the pointer's button handler gives. Everything below this
+    // reads the desktop directly, so an empty scene does not stop it.
+    if state.is_locked() {
+        let under = state.surface_under(location);
+        if let Some((surface, _)) = under.as_ref() {
+            state.set_keyboard_focus(Some(surface.clone().into()), serial);
+        }
+        let touch = state.touch();
+        touch.down(
+            state,
+            under.map(|(surface, position)| (surface, position.to_f64())),
+            &DownEvent {
+                slot,
+                location,
+                serial,
+                time,
+            },
+        );
+        touch.frame(state);
+        state.queue_redraw();
+        return Owner::Client;
+    }
+
+    // A region screenshot owns the glass while it is up, as it owns the
+    // pointer. One event does what two do for a pointer: the finger names the
+    // corner and presses it in the same instant.
+    if state.region_active() {
+        state.region_pointer_moved();
+        state.region_press();
+        state.queue_redraw();
+        return Owner::Shell;
+    }
+
+    // The same reveals a pointer gets on its way to a press, so that a finger
+    // brought to the bottom of the screen raises the dock and a card under it
+    // knows it is being touched.
+    state.notifications_pointer_moved();
+    state.dock_pointer_moved();
+    state.launcher_pointer_moved();
+    state.pinned_pointer_moved();
+    state.overview_pointer_moved();
+
+    // A tap is the primary press, and only ever that.
+    if shell_press(state, crate::mouse::BTN_LEFT, Source::Touch) == Taken::Shell {
+        state.queue_redraw();
+        return Owner::Shell;
+    }
+
+    // An X11 window cannot hear a finger. See [`Owner::Pointer`]: the first
+    // contact on one becomes the cursor instead, and any later one is left
+    // alone rather than being made into a second.
+    if state.contacts.len() == 1 && touches_x11(state, location) {
+        motion(state, location, time);
+        let pointer = state.pointer();
+        pointer.button(
+            state,
+            &ButtonEvent {
+                button: crate::mouse::BTN_LEFT,
+                state: ButtonState::Pressed,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(state);
+        state.queue_redraw();
+        return Owner::Pointer;
+    }
+
+    let Some((surface, position)) = state.surface_under(location) else {
+        // The bare desktop. Counted so the finger tally stays right, and
+        // forwarded nowhere.
+        state.queue_redraw();
+        return Owner::Nobody;
+    };
+    let touch = state.touch();
+    touch.down(
+        state,
+        Some((surface, position.to_f64())),
+        &DownEvent {
+            slot,
+            location,
+            serial,
+            time,
+        },
+    );
+    touch.frame(state);
+    state.queue_redraw();
+    Owner::Client
+}
+
+/// Whether `location` is over a window that arrived through XWayland.
+///
+/// Asked of the window rather than of the surface: an X11 client's content and
+/// its subsurfaces are all equally deaf to `wl_touch`, and the window is what
+/// the compositor knows the provenance of.
+fn touches_x11(state: &Huginn, location: Point<f64, Logical>) -> bool {
+    state
+        .window_under(location)
+        .and_then(|window| state.surface(window))
+        .is_some_and(|surface| surface.as_x11().is_some())
+}
+
+/// A finger moved.
+fn touch_motion<B: InputBackend>(state: &mut Huginn, event: &B::TouchMotionEvent) {
+    let slot = event.slot();
+    let id = i32::from(slot);
+    let device = event.device().name();
+    let location = touch_location::<B>(state, &device, event);
+    let time = event.time_msec();
+
+    // A claimed hand drives the swipe and nothing else. Only the first finger
+    // of it counts; see `Contacts::drives`.
+    if state.contacts.claimed() {
+        if let Some((dx, dy)) = state.contacts.drives(id, location) {
+            state.swipe_update(dx, dy);
+        }
+        return;
+    }
+
+    let Some(owner) = state.contacts.owner(id) else {
+        return;
+    };
+    state.contacts.motion(id, location);
+
+    match owner {
+        Owner::Client => {
+            state.pointer_location = location;
+            let under = state.surface_under(location);
+            let touch = state.touch();
+            touch.motion(
+                state,
+                under.map(|(surface, position)| (surface, position.to_f64())),
+                &TouchMoveEvent {
+                    slot,
+                    location,
+                    time,
+                },
+            );
+            touch.frame(state);
+            state.queue_redraw();
+        }
+        // Standing in for the pointer, so it moves the pointer -- through the
+        // same path a mouse takes, hover, output crossing and all.
+        Owner::Pointer => motion(state, location, time),
+        // The shell acted when the finger landed, but a finger sliding along
+        // the dock should still light up what it passes over, and one framing
+        // a region screenshot is drawing the rectangle.
+        Owner::Shell => {
+            state.pointer_location = location;
+            if state.region_active() {
+                state.region_pointer_moved();
+            } else {
+                state.notifications_pointer_moved();
+                state.dock_pointer_moved();
+                state.launcher_pointer_moved();
+                state.pinned_pointer_moved();
+                state.overview_pointer_moved();
+            }
+            state.queue_redraw();
+        }
+        Owner::Nobody | Owner::Gesture => {}
+    }
+}
+
+/// A finger lifted.
+fn touch_up<B: InputBackend>(state: &mut Huginn, event: &B::TouchUpEvent) {
+    let slot = event.slot();
+    let id = i32::from(slot);
+    let time = event.time_msec();
+    let on_shell = state.contacts.owner(id) == Some(Owner::Shell);
+
+    match state.contacts.up(id) {
+        Lift::Client => {
+            let serial = SERIAL_COUNTER.next_serial();
+            let touch = state.touch();
+            touch.up(state, &UpEvent { slot, serial, time });
+            touch.frame(state);
+            state.queue_redraw();
+        }
+        Lift::Pointer => {
+            let serial = SERIAL_COUNTER.next_serial();
+            let pointer = state.pointer();
+            pointer.button(
+                state,
+                &ButtonEvent {
+                    button: crate::mouse::BTN_LEFT,
+                    state: ButtonState::Released,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(state);
+            state.queue_redraw();
+        }
+        Lift::EndsGesture => {
+            state.swipe_end();
+            state.queue_redraw();
+        }
+        Lift::Trailing => {}
+        Lift::Quiet => {
+            // A region screenshot is taken by letting go, as it is with a
+            // mouse. The shell's other presses did their work on the way down.
+            if on_shell && state.region_active() {
+                state.region_release();
+                state.queue_redraw();
+            }
+        }
+    }
+}
+
+/// The touch sequence was taken away from us — a device unplugged mid-gesture,
+/// a session switched away, libinput giving up on a contact it lost.
+///
+/// Everything is dropped and anything in flight is ended, because the state
+/// this leaves behind is state no further event will ever arrive to close: a
+/// carousel stopped between two workspaces, a button held down on an X11
+/// window, a client waiting for the up of a touch that will not come.
+fn touch_cancel<B: InputBackend>(state: &mut Huginn, event: &B::TouchCancelEvent) {
+    let time = event.time_msec();
+    if state.contacts.any_emulating() {
+        release_primary_button(state, time);
+    }
+    let touch = state.touch();
+    touch.cancel(state);
+    if state.contacts.clear() {
+        state.swipe_end();
+    }
+    state.queue_redraw();
+}
+
+/// Let go of the primary button a contact was holding down for an X11 window.
+/// See [`Owner::Pointer`].
+fn release_primary_button(state: &mut Huginn, time: u32) {
+    let serial = SERIAL_COUNTER.next_serial();
+    let pointer = state.pointer();
+    pointer.button(
+        state,
+        &ButtonEvent {
+            button: crate::mouse::BTN_LEFT,
+            state: ButtonState::Released,
+            serial,
+            time,
+        },
+    );
+    pointer.frame(state);
 }
