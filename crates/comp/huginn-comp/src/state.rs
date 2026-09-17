@@ -1213,6 +1213,16 @@ impl Huginn {
         }
 
         self.desktop_config = cfg;
+        // Touch may just have been switched off, and a hand that was down when
+        // it was is a hand no further event will ever close: the fingers are
+        // dropped on the floor from here on, so the contacts would stay down
+        // forever -- which hides the cursor forever, and leaves any swipe
+        // stopped between two workspaces. Switching it off is the repair for a
+        // digitizer reporting touches nobody made, so it must not itself wedge
+        // the desktop.
+        if !self.desktop_config.touch_enabled() {
+            self.release_touches();
+        }
         self.refresh_wallpaper();
 
         // Everything compositor-drawn reads the accent when it renders, so
@@ -1548,12 +1558,16 @@ impl Huginn {
     /// every touch at half the x it should have and lets a finger at the right
     /// edge of the laptop land on the external monitor.
     ///
-    /// Three answers, in order:
+    /// Four answers, in order:
     ///
-    /// 1. What the backend worked out for this device and recorded in
-    ///    [`Self::touch_outputs`] — the udev backend matches the touchscreen to
-    ///    a panel by size, which is the only evidence there is for a device
-    ///    that does not say.
+    /// 0. `touch.output` in `desktop.toml`, which wins outright. The rest of
+    ///    this is inference, and inference needs an override: two panels of
+    ///    the same size, or EDID millimetres that are simply wrong, put every
+    ///    touch on a monitor nobody is touching and nothing inside the
+    ///    compositor can notice that.
+    /// 1. The size the backend recorded for this device in
+    ///    [`Self::touch_devices`] — matched against each panel's, which is the
+    ///    only evidence there is for a device that does not say.
     /// 2. The built-in panel, if the machine has one. A touchscreen that was
     ///    not matched is overwhelmingly the one built into the lid.
     /// 3. The first screen, which on a machine with one screen is the right
@@ -1564,10 +1578,18 @@ impl Huginn {
     /// moment somebody moved the mouse there, and the glass under their other
     /// hand would stop reaching what is drawn on it.
     pub(crate) fn touch_output(&self, device: &str) -> &OutputInfo {
+        // What the file says, first and without argument. Everything below is
+        // the compositor guessing, and a person who has written a connector
+        // name into desktop.toml has already watched it guess wrong.
+        if let Some(name) = self.desktop_config.touch_output()
+            && let Some(output) = self.outputs.iter().find(|o| o.name == name)
+        {
+            return output;
+        }
         let sizes: Vec<(i32, i32)> = self
             .outputs
             .iter()
-            .map(|output| (output.mm.w(), output.mm.h()))
+            .map(|output| (output.mm.w, output.mm.h))
             .collect();
         if let Some(index) =
             crate::touch::panel_for(self.touch_devices.get(device).copied(), &sizes)
@@ -1605,6 +1627,23 @@ impl Huginn {
     /// gesture stays half finished.
     pub(crate) fn touch_device_removed(&mut self, name: &str) {
         self.touch_devices.remove(name);
+        self.release_touches();
+    }
+
+    /// Whether touchscreens are listened to at all; `touch.enabled` in
+    /// `desktop.toml`. See [`crate::desktop_config::Touch`] for why this is a
+    /// setting and not a compiled-in yes.
+    pub(crate) fn touch_enabled(&self) -> bool {
+        self.desktop_config.touch_enabled()
+    }
+
+    /// Drop every contact and close whatever they had open.
+    ///
+    /// The three things a hand leaves behind when no further event will arrive
+    /// for it, which is the case whenever the fingers stop being delivered
+    /// rather than stop being present: a device unplugged mid-drag, touch
+    /// switched off, a session locked.
+    pub(crate) fn release_touches(&mut self) {
         // A contact standing in for the pointer is holding the primary button
         // down on an X11 window. Nothing else will ever release it, and a
         // window left with a button held is a window that goes on selecting

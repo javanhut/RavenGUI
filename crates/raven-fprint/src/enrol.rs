@@ -203,10 +203,7 @@ mod tests {
 
         assert_eq!(
             enrolment.step(&mut sensor).unwrap(),
-            Progress::More {
-                done: 1,
-                stages: 4
-            }
+            Progress::More { done: 1, stages: 4 }
         );
         enrolment.step(&mut sensor).unwrap();
         enrolment.step(&mut sensor).unwrap();
@@ -238,10 +235,7 @@ mod tests {
         );
         assert_eq!(
             enrolment.step(&mut sensor).unwrap(),
-            Progress::More {
-                done: 2,
-                stages: 3
-            }
+            Progress::More { done: 2, stages: 3 }
         );
     }
 

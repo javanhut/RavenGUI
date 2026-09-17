@@ -162,10 +162,7 @@ mod tests {
         let mut sensor = Fake::absent();
         assert_eq!(sensor.stages(), 0);
         assert_eq!(sensor.verify(), Err(Error::NoSensor));
-        assert_eq!(
-            sensor.enrol_step(Finger::RightIndex),
-            Err(Error::NoSensor)
-        );
+        assert_eq!(sensor.enrol_step(Finger::RightIndex), Err(Error::NoSensor));
         assert_eq!(sensor.enrolled(), Err(Error::NoSensor));
         assert_eq!(sensor.forget_all(), Err(Error::NoSensor));
     }

@@ -1433,7 +1433,11 @@ mod tests {
         s.arrange();
 
         assert!(s.minimize(b), "b goes to the dock");
-        assert_eq!(s.focused(), Some(c), "minimizing an unfocused window is quiet");
+        assert_eq!(
+            s.focused(),
+            Some(c),
+            "minimizing an unfocused window is quiet"
+        );
 
         s.close_window(c);
         assert_eq!(
