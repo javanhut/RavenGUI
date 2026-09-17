@@ -29,6 +29,7 @@ mod dmabuf;
 #[cfg(target_os = "linux")]
 mod dock;
 mod fileindex;
+mod focus;
 mod frametime;
 #[cfg(target_os = "linux")]
 mod gesture;
