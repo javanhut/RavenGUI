@@ -13,7 +13,7 @@
 //!   indicator, panel highlights.
 //! - `appearance.smooth_animations` — [`crate::settings::Motion`].
 //! - `appearance.blur` — whether the desktop is blurred behind the launcher,
-//!   the pinned panel and glass windows; see `Huginn::blur_radius` and
+//!   the pin bar and glass windows; see `Huginn::blur_radius` and
 //!   `Huginn::glass_window`. The one key whose default is not compiled in:
 //!   when the file does not mention it, the backend's reading of the hardware
 //!   decides ([`crate::backend::gpu_class`]), which is why it is kept as an
@@ -22,6 +22,11 @@
 //!   `ravencanvasd` draws when it is running.
 //! - `appearance.launcher_layout` — `"list"` or `"arc"`,
 //!   [`crate::launcher::Style`]; also stepped from quick settings.
+//! - `dock.icon_size`, `dock.magnification`, `dock.labels`,
+//!   `dock.running_dots`, `dock.auto_hide` — [`crate::dock::Prefs`]: how big
+//!   the dock's icons are, how far the one under the pointer lifts, whether
+//!   it is named, whether a running application is marked, and whether the
+//!   dock hides itself.
 //! - `general.terminal` — what the spawn binding launches.
 //! - `general.lock_after_minutes` — [`crate::settings::IdleAfter`].
 //! - `notifications.do_not_disturb` — only critical notifications are shown;
@@ -29,6 +34,9 @@
 //! - `notifications.timeout_seconds` — how long a card stays when its
 //!   application leaves that to the desktop; see
 //!   [`huginn_core::notify::Timeouts`].
+//! - `touch.output` — which screen a touchscreen puts its fingers on, and
+//! - `touch.enabled` — whether it is listened to at all. See
+//!   [`Huginn::touch_output`] and the note on [`Touch`].
 //!
 //! The rest of the file (theme mode, shadows, scale, …) is for the
 //! applications and the bar, which read it themselves.
@@ -106,12 +114,101 @@ impl Default for Notifications {
     }
 }
 
+/// The dock.
+///
+/// Behaviour, not appearance: how big the icons are, how far they lift under
+/// the pointer, whether what is under it is named, whether a running
+/// application is marked, and whether the dock gets out of the way. There is
+/// deliberately no background or corner radius here — see [`crate::dock::Prefs`].
+///
+/// Every value is held to a range when it is read, so a hand-edited file
+/// cannot make a dock wider than the screen or divide the strip by nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct Dock {
+    /// Icon size at a 1080p output, in logical pixels.
+    pub icon_size: u32,
+    /// How far the icon under the pointer grows, as a percentage of that.
+    /// 100 is no magnification at all.
+    pub magnification: u32,
+    /// Whether the item under the pointer is named.
+    pub labels: bool,
+    /// Whether a running application is marked with a dot.
+    pub running_dots: bool,
+    /// Whether the dock hides itself when the pointer leaves the edge.
+    ///
+    /// Turned off, the dock stays on screen — over whatever is behind it. It
+    /// does not claim an exclusive zone, so a window is not made shorter to
+    /// make room for it; the dock is a strip that floats, and always was.
+    pub auto_hide: bool,
+}
+
+impl Default for Dock {
+    fn default() -> Self {
+        let compiled = crate::dock::Prefs::default();
+        Self {
+            icon_size: compiled.icon as u32,
+            magnification: (compiled.magnify * 100.0) as u32,
+            labels: compiled.labels,
+            running_dots: compiled.dots,
+            auto_hide: compiled.auto_hide,
+        }
+    }
+}
+
+/// The touchscreen.
+///
+/// Two keys, and both exist because the compositor's own answers are guesses
+/// that can be wrong on a real machine.
+///
+/// A touchscreen reports a fraction of its own glass, so a point on the
+/// desktop needs to know which panel that glass is stuck to, and nothing in
+/// the protocol says. `Huginn::touch_output` matches it by physical size --
+/// libinput knows how big the digitizer is, EDID says how big each panel is --
+/// which is the only evidence there is and is defeated by two same-size
+/// panels, or by EDID millimetres that are simply wrong. When it picks the
+/// wrong screen every touch lands on a monitor nobody is touching, and there
+/// is no way to discover that from inside the compositor. `output` is the
+/// override.
+///
+/// `enabled` is the other failure. A digitizer that has started reporting
+/// contacts nobody made -- a cracked panel, water under the glass, a loose
+/// ribbon -- makes the desktop unusable in a way no amount of careful input
+/// handling can help with, because the events are real. Turning it off is the
+/// only repair that does not involve a screwdriver, and a machine in that
+/// state must not need one to become usable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct Touch {
+    /// Whether touchscreens are listened to at all.
+    pub enabled: bool,
+    /// The connector name -- `eDP-1`, `HDMI-A-1` -- a touchscreen maps to.
+    /// Empty is "work it out", which is what almost every machine wants.
+    ///
+    /// One name and not a per-device table: a machine with two touchscreens
+    /// wants the matching to work rather than to be written out, and the
+    /// escape hatch is for the single-touchscreen laptop the heuristic got
+    /// wrong. A table can be added the day something has two.
+    pub output: String,
+}
+
+impl Default for Touch {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            output: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopConfig {
     pub appearance: Appearance,
     pub general: General,
+    pub dock: Dock,
     pub notifications: Notifications,
+    pub touch: Touch,
 }
 
 /// Where the file lives: `$XDG_CONFIG_HOME/raven/desktop.toml`.
@@ -165,6 +262,21 @@ impl DesktopConfig {
         }
     }
 
+    /// Whether touchscreens are listened to.
+    pub(crate) fn touch_enabled(&self) -> bool {
+        self.touch.enabled
+    }
+
+    /// The screen the file pins touchscreens to, if it names one.
+    ///
+    /// Trimmed and emptiness-checked here so that a blank or whitespace value
+    /// -- which is what `raven-settings` writes for "no override" -- reads the
+    /// same as an absent key rather than as a screen named "".
+    pub(crate) fn touch_output(&self) -> Option<&str> {
+        let name = self.touch.output.trim();
+        (!name.is_empty()).then_some(name)
+    }
+
     pub(crate) fn idle_after(&self) -> IdleAfter {
         IdleAfter::from_minutes(self.general.lock_after_minutes)
     }
@@ -187,6 +299,17 @@ impl DesktopConfig {
     pub(crate) fn wallpaper(&self) -> Option<PathBuf> {
         let w = self.appearance.wallpaper.trim();
         (!w.is_empty()).then(|| PathBuf::from(w))
+    }
+
+    /// What the dock was told, held to its bounds. See [`crate::dock::Prefs`].
+    pub(crate) fn dock(&self) -> crate::dock::Prefs {
+        crate::dock::Prefs::new(
+            self.dock.icon_size,
+            self.dock.magnification,
+            self.dock.labels,
+            self.dock.running_dots,
+            self.dock.auto_hide,
+        )
     }
 
     pub(crate) fn do_not_disturb(&self) -> bool {
@@ -234,6 +357,54 @@ mod tests {
         assert_eq!(cfg.terminal(), crate::theme::TERMINAL);
         assert_eq!(cfg.wallpaper(), None);
         assert_eq!(cfg.appearance.blur, None);
+    }
+
+    /// A machine that has never heard of the setting must still listen to its
+    /// touchscreen, and must still work the panel out for itself.
+    #[test]
+    fn touch_is_on_and_unpinned_when_the_file_says_nothing() {
+        let cfg = DesktopConfig::parse("").unwrap();
+        assert!(cfg.touch_enabled());
+        assert_eq!(cfg.touch_output(), None);
+    }
+
+    #[test]
+    fn a_pinned_screen_is_read_back() {
+        let cfg = DesktopConfig::parse("[touch]\noutput = \"eDP-1\"\n").unwrap();
+        assert_eq!(cfg.touch_output(), Some("eDP-1"));
+        assert!(cfg.touch_enabled(), "pinning a screen does not disable it");
+    }
+
+    /// `raven-settings` writes every key it knows, so "no override" reaches
+    /// this as a blank string rather than as an absent key. A blank must read
+    /// as absent and never as a screen whose name is empty -- which would
+    /// match no output and silently fall through to the guess anyway, but by
+    /// accident rather than on purpose.
+    #[test]
+    fn a_blank_screen_name_is_no_override() {
+        for text in ["[touch]\noutput = \"\"\n", "[touch]\noutput = \"   \"\n"] {
+            assert_eq!(DesktopConfig::parse(text).unwrap().touch_output(), None);
+        }
+    }
+
+    #[test]
+    fn touch_can_be_switched_off() {
+        let cfg = DesktopConfig::parse("[touch]\nenabled = false\n").unwrap();
+        assert!(!cfg.touch_enabled());
+    }
+
+    /// The whole file is one schema: a `[touch]` section must not cost the
+    /// keys around it, and an unknown key in it must not cost the section.
+    #[test]
+    fn touch_sits_beside_the_other_sections() {
+        let cfg = DesktopConfig::parse(
+            "[general]\nlock_after_minutes = 5\n\n\
+             [touch]\nenabled = false\noutput = \"DP-2\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.idle_after(), IdleAfter::Minutes5);
+        assert!(!cfg.touch_enabled());
+        assert_eq!(cfg.touch_output(), Some("DP-2"));
     }
 
     #[test]

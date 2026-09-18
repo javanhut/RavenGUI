@@ -672,9 +672,12 @@ impl Control for IdleLock {
     }
 }
 
-/// Where the pinned panel sits. Wired up: the compositor reads it back
+/// Which edge the pin bar rides. Wired up: the compositor reads it back
 /// through [`Settings::pins_position`] and writes it to [`crate::pins`],
-/// which is what the panel and the file take it from.
+/// which is what the bar and the file take it from.
+///
+/// One row, not two: the edge says which way the rail runs, so there is no
+/// layout to choose beside it. See [`crate::pins::Position`].
 #[derive(Debug)]
 struct PinsPosition {
     position: crate::pins::Position,
@@ -700,35 +703,8 @@ impl Control for PinsPosition {
     }
 }
 
-/// How the pinned panel lays its applications out. As [`PinsPosition`].
-#[derive(Debug)]
-struct PinsLayout {
-    orientation: crate::pins::Orientation,
-}
-
-impl Control for PinsLayout {
-    fn label(&self) -> &str {
-        PINS_LAYOUT
-    }
-    fn read(&self) -> Reading {
-        Reading {
-            value: self.orientation.value().to_owned(),
-            real: true,
-        }
-    }
-    fn activate(&mut self) -> bool {
-        self.orientation = self.orientation.stepped(1);
-        true
-    }
-    fn adjust(&mut self, delta: i32) -> bool {
-        self.orientation = self.orientation.stepped(delta);
-        true
-    }
-}
-
-/// The pinned panel rows' labels, which are also how the rows are found.
-const PINS_POSITION: &str = "Pinned apps";
-const PINS_LAYOUT: &str = "Pinned layout";
+/// The pin bar row's label, which is also how the row is found.
+const PINS_POSITION: &str = "Pin bar";
 
 /// How the launcher is laid out: the list or the arc. Wired up: the
 /// compositor reads it back through [`Settings::launcher_style`] and hands it
@@ -1054,9 +1030,6 @@ impl Settings {
                 Box::new(PinsPosition {
                     position: crate::pins::Position::default(),
                 }),
-                Box::new(PinsLayout {
-                    orientation: crate::pins::Orientation::default(),
-                }),
                 Box::new(Brightness { percent: 75 }),
                 Box::new(WiFi { on: true }),
                 Box::new(BluetoothRow::new(Box::new(crate::bluetooth::Unavailable))),
@@ -1129,21 +1102,12 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Where the pinned panel sits, read from the control that owns it.
+    /// Which edge the pin bar rides, read from the control that owns it.
     pub(crate) fn pins_position(&self) -> crate::pins::Position {
         self.controls
             .iter()
             .find(|c| c.label() == PINS_POSITION)
             .and_then(|c| crate::pins::Position::from_value(&c.read().value))
-            .unwrap_or_default()
-    }
-
-    /// How the pinned panel is laid out, read from the control that owns it.
-    pub(crate) fn pins_orientation(&self) -> crate::pins::Orientation {
-        self.controls
-            .iter()
-            .find(|c| c.label() == PINS_LAYOUT)
-            .and_then(|c| crate::pins::Orientation::from_value(&c.read().value))
             .unwrap_or_default()
     }
 
@@ -1159,7 +1123,7 @@ impl Settings {
     /// Give the Animations, Lock, Launcher and Do not disturb rows what
     /// `desktop.toml` said. Called at startup and whenever the file changes;
     /// between those the rows are the source, as with
-    /// [`Self::set_pins_layout`].
+    /// [`Self::set_pins_position`].
     pub(crate) fn apply_desktop_config(
         &mut self,
         motion: Motion,
@@ -1208,19 +1172,13 @@ impl Settings {
         self.controls.iter_mut().any(|c| c.take_show())
     }
 
-    /// Give the pinned rows what the file said. Called once at startup,
-    /// after the pins are loaded; from then on the rows are the source and
-    /// the compositor copies them out through the two readers above.
-    pub(crate) fn set_pins_layout(
-        &mut self,
-        position: crate::pins::Position,
-        orientation: crate::pins::Orientation,
-    ) {
+    /// Give the pin bar's row what the file said. Called once at startup,
+    /// after the pins are loaded; from then on the row is the source and the
+    /// compositor copies it out through the reader above.
+    pub(crate) fn set_pins_position(&mut self, position: crate::pins::Position) {
         for control in &mut self.controls {
             if control.label() == PINS_POSITION {
                 *control = Box::new(PinsPosition { position });
-            } else if control.label() == PINS_LAYOUT {
-                *control = Box::new(PinsLayout { orientation });
             }
         }
     }
@@ -1608,23 +1566,18 @@ mod tests {
     }
 
     #[test]
-    fn the_pinned_rows_step_and_read_back() {
-        use crate::pins::{Orientation, Position};
+    fn the_pin_bar_row_steps_and_reads_back() {
+        use crate::pins::Position;
         let mut settings = opened();
-        assert_eq!(settings.pins_position(), Position::Centre);
-        assert_eq!(settings.pins_orientation(), Orientation::Grid);
+        assert_eq!(settings.pins_position(), Position::Right);
         select(&mut settings, PINS_POSITION);
         assert_eq!(settings.press(Key::Activate, T0), Outcome::Redraw);
-        assert_eq!(settings.pins_position(), Position::Top);
+        assert_eq!(settings.pins_position(), Position::Left);
         assert_eq!(settings.press(Key::Left, T0), Outcome::Redraw);
-        assert_eq!(settings.pins_position(), Position::Centre);
-        select(&mut settings, PINS_LAYOUT);
-        settings.press(Key::Right, T0);
-        assert_eq!(settings.pins_orientation(), Orientation::Row);
-        // And what the file said at startup lands in the rows.
-        settings.set_pins_layout(Position::Right, Orientation::Column);
         assert_eq!(settings.pins_position(), Position::Right);
-        assert_eq!(settings.pins_orientation(), Orientation::Column);
+        // And what the file said at startup lands in the row.
+        settings.set_pins_position(Position::Bottom);
+        assert_eq!(settings.pins_position(), Position::Bottom);
     }
 
     #[test]

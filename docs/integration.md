@@ -210,7 +210,26 @@ one is up — bringing one back from the dock if that is where it went. A
 running: that is how you get a second window of something. Raven's own
 applications open one window per launch, so a second launch *is* a second
 window. (On a touchpad the three-finger tap is a middle press, but it keeps
-its own meaning over the dock; use `Ctrl`+click there.)
+its own meaning over the dock; use `Ctrl`+click there.) A **right click** on an
+icon opens that application's menu above the dock: its own desktop actions,
+then "Pin" (which puts it on the pin bar) and, when it is running, "Quit",
+which politely asks every window of it to close. A right click on the dock
+never starts anything, and while the menu is up the next press is the menu's —
+on a row it does what the row says, anywhere else it puts the menu away.
+`Escape` closes it too. The menu takes no keyboard grab, so every other key
+still reaches the focused window: a menu left open never stops you typing, and
+a panel opened over it — the launcher, quick settings — owns `Escape` first.
+
+The icon under the pointer grows, and its neighbours with it, and the dock
+names what is under it. Five things about the dock are settings, written to
+`[dock]` in `desktop.toml` by Raven Settings under Personalization: `icon_size`
+(28–72 logical pixels at 1080p), `magnification` (100–200%, where 100 is off),
+`labels`, `running_dots` and `auto_hide`. The compositor holds each of them to
+its range, so a hand-edited file cannot make a dock wider than the screen.
+There is no background or corner-radius setting: the dock is the desktop's one
+material, like the launcher and the pin bar. With `auto_hide = false` the dock
+stays on screen over whatever is behind it — it does not claim an exclusive
+zone, so no window is made shorter to make room for it.
 
 One pointer motion is the compositor's without any chord at all. **Shake the
 pointer** — a few quick back-and-forths, in any direction — and it grows to
@@ -242,17 +261,28 @@ through `wpctl`, so it needs PipeWire, and the slider says "not connected" when
 there is none. The same level is a row in quick settings (`Super+Ctrl+S`),
 where the left and right arrows step it and `Return` mutes.
 
-The pinned panel (`Super+Ctrl+A`) shows the applications the user has pinned,
-drawn the way the launcher draws its suggestions. Things get onto it through
-the launcher: `Tab` on an application opens its actions menu, whose last item
-is "Pin" (or "Unpin"). On the panel, `Return` opens the highlighted
-application, `Delete` unpins it, `Shift`+arrows move it, and `Tab` opens a
-menu with the same choices. Two rows in quick settings decide where the panel
-sits ("Pinned apps": centre, top, bottom, left or right) and how it is laid
-out ("Pinned layout": a grid, a single row, or a column). The pins, their
-order and that layout are kept in `$XDG_STATE_HOME/raven/pins`, beside the
-launch history and for the same reason — it is state the desktop writes, not
-configuration the user is expected to.
+The pin bar (`Super+Ctrl+A`) shows the applications the user has pinned, as a
+rail of icons riding one edge of the screen: one slot wide, as long as it has
+pins, and each icon in a well of its own. With nothing pinned it does not
+appear at all, and taking the last pin off an open bar closes it. Things get
+onto it through the launcher: `Tab` on an application opens its actions menu,
+whose last item is "Pin" (or "Unpin"). On the bar, `Return` opens the
+highlighted application, `Delete` unpins it, and `Shift`+arrows move it —
+along the rail, so up and down on a rail at the side and left and right on one
+at the top or bottom. `Tab` opens a menu beside the rail, holding that
+application's own desktop actions and, last, "Unpin". A pinned application
+with a window open is marked with the same dot the dock uses.
+
+One row in quick settings decides which edge the bar rides ("Pin bar": right,
+left, top or bottom), and the same choice is in Raven Settings under
+Personalization. The edge is the whole of the layout — a rail at the side runs
+down the screen and one at the top or bottom runs across it — so there is
+nothing else to choose. The pins, their order and that edge are kept in
+`$XDG_STATE_HOME/raven/pins`, beside the launch history and for the same
+reason — it is state the desktop writes, not configuration the user is
+expected to. A file from an earlier release that names a floating centre, or
+an `orientation` line beside the position, still reads: the centre becomes the
+default edge and the orientation is dropped.
 
 The Bluetooth row in the same panel talks to BlueZ over D-Bus (it needs
 `bluetoothd` running; without it the row says "not connected"). `Return` on

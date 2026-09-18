@@ -75,6 +75,12 @@ pub(crate) enum Action {
     /// overlay is up, which is why it has no row in [`BINDINGS`]; a click
     /// outside it does the same from the pointer side.
     CloseHelp,
+    /// Put the dock's context menu away.
+    ///
+    /// Reachable only while that menu is up, which is why it has no row in
+    /// [`BINDINGS`] — as with [`Action::CloseHelp`]. A click anywhere off the
+    /// menu does the same thing.
+    CloseDockMenu,
     /// Open the application launcher.
     OpenLauncher,
     /// Open the settings application — the full one, not the panel.
@@ -105,9 +111,9 @@ pub(crate) enum Action {
     /// there is no surface to focus and nothing to forward to. While it is
     /// open the keymap stops resolving chords entirely.
     Launcher(crate::launcher::Key),
-    /// Open the pinned panel.
+    /// Open the pin bar.
     OpenPinned,
-    /// A key while the pinned panel is open. Every key goes to it, for the
+    /// A key while the pin bar is open. Every key goes to it, for the
     /// reason every key goes to the launcher.
     Pinned(crate::pinned::Key),
     /// Open the window switcher, or step it while it is open: every window,
@@ -179,7 +185,7 @@ pub(crate) struct Modes {
     pub launcher: Option<Option<char>>,
     /// Quick settings is open, and takes every key.
     pub settings_open: bool,
-    /// The pinned panel is open, and takes every key.
+    /// The pin bar is open, and takes every key.
     pub pinned_open: bool,
     /// Resize mode is active, and owns the arrows.
     pub resizing: bool,
@@ -196,6 +202,8 @@ pub(crate) struct Modes {
     pub selecting_region: bool,
     /// The keybinding overlay is up, and Escape closes it.
     pub help_open: bool,
+    /// The dock's context menu is up, and Escape closes it.
+    pub dock_menu_open: bool,
 }
 
 /// One row of the keybinding overlay, and one clause of the startup log line.
@@ -571,7 +579,7 @@ pub(crate) fn resolve(
         return FilterResult::Intercept(pressed(key_state, Action::Settings(key)));
     }
 
-    // The pinned panel, likewise: compositor-drawn, and every key is its
+    // The pin bar, likewise: compositor-drawn, and every key is its
     // own — Shift turns the arrows into moves, so the modifier is passed
     // along rather than stripped.
     if mode.pinned_open {
@@ -586,6 +594,18 @@ pub(crate) fn resolve(
     if let Some(character) = mode.launcher {
         let key = crate::launcher::Key::from_keysym(sym, modifiers.ctrl, character);
         return FilterResult::Intercept(pressed(key_state, Action::Launcher(key)));
+    }
+
+    // The dock's context menu closes on Escape. After the panels above, so a
+    // launcher or quick settings opened over it owns the key first: the menu
+    // is the thing furthest back of the ones that answer a key at all.
+    //
+    // Only Escape, and only without Super. Everything else falls through to
+    // the focused window, because this menu is a pointer object and takes no
+    // grab — a menu that swallowed typing would make the desktop feel stuck
+    // for as long as somebody left it open. `Super`+`Ctrl`+`Esc` still quits.
+    if mode.dock_menu_open && sym == keysyms::KEY_Escape && !modifiers.logo {
+        return FilterResult::Intercept(pressed(key_state, Action::CloseDockMenu));
     }
 
     // Alt+Tab. The Alt layer is otherwise untouched — nothing below reads
@@ -801,6 +821,57 @@ mod tests {
             shift: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn escape_closes_the_docks_menu_and_nothing_else_is_taken() {
+        let menu = Modes {
+            dock_menu_open: true,
+            ..Modes::default()
+        };
+        let plain = ModifiersState::default();
+        assert!(matches!(
+            resolve(KeyState::Pressed, &plain, keysyms::KEY_Escape, menu),
+            FilterResult::Intercept(Some(Action::CloseDockMenu))
+        ));
+        // Its release is swallowed with it, and acts on nothing.
+        assert!(matches!(
+            resolve(KeyState::Released, &plain, keysyms::KEY_Escape, menu),
+            FilterResult::Intercept(None)
+        ));
+        // Every other key is the focused window's: the menu takes no grab,
+        // and typing must not stop because one was left open.
+        for sym in [keysyms::KEY_a, keysyms::KEY_Return, keysyms::KEY_Tab] {
+            assert!(matches!(
+                resolve(KeyState::Pressed, &plain, sym, menu),
+                FilterResult::Forward
+            ));
+        }
+        // Super+Ctrl+Escape still quits rather than closing the menu.
+        assert!(matches!(
+            resolve(KeyState::Pressed, &super_ctrl(), keysyms::KEY_Escape, menu),
+            FilterResult::Intercept(Some(Action::Quit))
+        ));
+        // A panel over it owns Escape first.
+        let over = Modes {
+            dock_menu_open: true,
+            settings_open: true,
+            ..Modes::default()
+        };
+        assert!(matches!(
+            resolve(KeyState::Pressed, &plain, keysyms::KEY_Escape, over),
+            FilterResult::Intercept(Some(Action::Settings(_)))
+        ));
+        // And with no menu up it is the window's, as it always was.
+        assert!(matches!(
+            resolve(
+                KeyState::Pressed,
+                &plain,
+                keysyms::KEY_Escape,
+                Modes::default()
+            ),
+            FilterResult::Forward
+        ));
     }
 
     #[test]
