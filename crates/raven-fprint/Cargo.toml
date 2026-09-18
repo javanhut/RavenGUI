@@ -1,0 +1,18 @@
+[package]
+name = "raven-fprint"
+description = "Fingerprint enrolment and verification, and the sensors behind them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Nothing. The rules about how many times a finger may be presented, how many
+# tries an unlock gets and what a sensor is allowed to say are the part of this
+# that decides whether somebody gets into a machine, and they are pure — see
+# the crate documentation. A transport that needs a dependency brings it behind
+# the `Sensor` trait, in a crate of its own.
+[dependencies]
+
+[lints]
+workspace = true

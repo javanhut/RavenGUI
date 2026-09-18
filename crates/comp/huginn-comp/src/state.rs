@@ -499,6 +499,18 @@ pub(crate) struct Huginn {
     pub seat: Seat<Self>,
     /// Pointer position in compositor-global logical coordinates.
     pub pointer_location: Point<f64, Logical>,
+    /// Every finger currently on a touchscreen. See [`crate::touch`].
+    pub(crate) contacts: crate::touch::Contacts,
+    /// Each touchscreen's active area in millimetres, by libinput device name.
+    ///
+    /// A touchscreen reports a fraction of *itself*, not of the desktop, so
+    /// turning that into a point needs to know which panel the glass is stuck
+    /// to — and the only evidence a device that does not say offers is how big
+    /// it is. Recorded as the device arrives and resolved to a screen at every
+    /// touch rather than once, because the two facts turn up in either order:
+    /// a touchscreen is there before any connector on a cold boot, and screens
+    /// come and go all session. See [`Huginn::touch_output`].
+    pub(crate) touch_devices: HashMap<String, (f64, f64)>,
     /// When input last arrived, for the idle lock.
     ///
     /// `Instant` is `CLOCK_MONOTONIC`, which on Linux does not advance while
@@ -1002,6 +1014,16 @@ impl Huginn {
         // toolkits that expect a cursor misbehave, and silently breaks anything
         // that relies on clicking — including a bar's workspace pips.
         seat.add_pointer();
+        // And a touch, for the same reason and one more. A convertible has the
+        // glass whether or not the compositor advertises `wl_touch`, and a seat
+        // without the capability does not merely lose gestures: a toolkit that
+        // sees no touch on the seat routes a finger nowhere at all, so the
+        // panel reads as dead rather than as unsupported. Advertised for every
+        // backend, as the pointer is -- the nested backend has no touchscreen
+        // and the capability costs nothing there, while a machine that has one
+        // must never depend on the compositor having guessed right at startup
+        // about hardware that can be plugged in later.
+        seat.add_touch();
 
         let mut huginn = Self {
             compositor_state: CompositorState::new::<Self>(dh),
@@ -1040,6 +1062,8 @@ impl Huginn {
             data_device_state: DataDeviceState::new::<Self>(dh),
             seat,
             pointer_location: (0.0, 0.0).into(),
+            contacts: crate::touch::Contacts::default(),
+            touch_devices: HashMap::new(),
             last_input: Instant::now(),
             greeter: hosting_greeter(),
             // Default until a client sets its own on pointer enter.
@@ -1189,6 +1213,16 @@ impl Huginn {
         }
 
         self.desktop_config = cfg;
+        // Touch may just have been switched off, and a hand that was down when
+        // it was is a hand no further event will ever close: the fingers are
+        // dropped on the floor from here on, so the contacts would stay down
+        // forever -- which hides the cursor forever, and leaves any swipe
+        // stopped between two workspaces. Switching it off is the repair for a
+        // digitizer reporting touches nobody made, so it must not itself wedge
+        // the desktop.
+        if !self.desktop_config.touch_enabled() {
+            self.release_touches();
+        }
         self.refresh_wallpaper();
 
         // Everything compositor-drawn reads the accent when it renders, so
@@ -1487,6 +1521,152 @@ impl Huginn {
         self.seat
             .get_pointer()
             .expect("the seat is constructed with a pointer")
+    }
+
+    /// Whether the cursor should be drawn.
+    ///
+    /// It should not be while a finger is on the glass. Everything the
+    /// compositor draws asks where the pointer is, so a touch moves the pointer
+    /// to the finger — and an arrow that teleports to wherever somebody last
+    /// touched, and then sits there pointing at nothing once they take their
+    /// hand away, is the single thing that makes a touchscreen desktop feel
+    /// broken. Hidden while touching and back the moment the pointer itself
+    /// moves, which is what every laptop with both does.
+    ///
+    /// Only while a contact is down, rather than latched until the mouse is
+    /// moved again: a hand on the glass is a hand that can see where it is,
+    /// and the arrow reappearing where the last tap left it is honest about
+    /// where a click would land.
+    pub(crate) fn pointer_visible(&self) -> bool {
+        self.contacts.is_empty()
+    }
+
+    /// The touch handle. Always present: the seat is built with one.
+    pub(crate) fn touch(&self) -> smithay::input::touch::TouchHandle<Self> {
+        self.seat
+            .get_touch()
+            .expect("the seat is constructed with a touch")
+    }
+
+    /// The screen a touchscreen named `device` puts its fingers on.
+    ///
+    /// A pointer lives in the desktop and a finger lives on a particular sheet
+    /// of glass, which is the whole difference between this and
+    /// [`Self::output_area`]. An absolute pointer reports a fraction of the
+    /// desktop and may be clamped anywhere on it; a touchscreen reports a
+    /// fraction of one panel, and mapping that onto a two-monitor desktop puts
+    /// every touch at half the x it should have and lets a finger at the right
+    /// edge of the laptop land on the external monitor.
+    ///
+    /// Four answers, in order:
+    ///
+    /// 0. `touch.output` in `desktop.toml`, which wins outright. The rest of
+    ///    this is inference, and inference needs an override: two panels of
+    ///    the same size, or EDID millimetres that are simply wrong, put every
+    ///    touch on a monitor nobody is touching and nothing inside the
+    ///    compositor can notice that.
+    /// 1. The size the backend recorded for this device in
+    ///    [`Self::touch_devices`] — matched against each panel's, which is the
+    ///    only evidence there is for a device that does not say.
+    /// 2. The built-in panel, if the machine has one. A touchscreen that was
+    ///    not matched is overwhelmingly the one built into the lid.
+    /// 3. The first screen, which on a machine with one screen is the right
+    ///    answer and on a machine with several is at least a consistent one.
+    ///
+    /// Never the *focused* screen. Focus follows the pointer, so a mapping
+    /// that used it would move the touchscreen to the external monitor the
+    /// moment somebody moved the mouse there, and the glass under their other
+    /// hand would stop reaching what is drawn on it.
+    pub(crate) fn touch_output(&self, device: &str) -> &OutputInfo {
+        // What the file says, first and without argument. Everything below is
+        // the compositor guessing, and a person who has written a connector
+        // name into desktop.toml has already watched it guess wrong.
+        if let Some(name) = self.desktop_config.touch_output()
+            && let Some(output) = self.outputs.iter().find(|o| o.name == name)
+        {
+            return output;
+        }
+        let sizes: Vec<(i32, i32)> = self
+            .outputs
+            .iter()
+            .map(|output| (output.mm.w, output.mm.h))
+            .collect();
+        if let Some(index) =
+            crate::touch::panel_for(self.touch_devices.get(device).copied(), &sizes)
+            && let Some(output) = self.outputs.get(index)
+        {
+            return output;
+        }
+        self.outputs
+            .iter()
+            .find(|o| is_builtin_panel(&o.name))
+            .or_else(|| self.outputs.first())
+            .expect("a Huginn always has at least the placeholder screen")
+    }
+
+    /// A touchscreen arrived, with the size of its active area in millimetres
+    /// if libinput knows it.
+    ///
+    /// Kept by name rather than by libinput's device id, which is reused for
+    /// later devices: a touchscreen that goes away and comes back -- a USB
+    /// panel, a session resuming -- must map to the same screen it did before,
+    /// and the name is the identity that survives that.
+    pub(crate) fn touch_device_added(&mut self, name: String, size: Option<(f64, f64)>) {
+        let Some(size) = size.filter(|(w, h)| *w > 0.0 && *h > 0.0) else {
+            tracing::info!(device = %name, "touchscreen with no size; mapping it to the built-in panel");
+            self.touch_devices.remove(&name);
+            return;
+        };
+        tracing::info!(device = %name, mm = %format!("{:.0}x{:.0}", size.0, size.1), "touchscreen");
+        self.touch_devices.insert(name, size);
+    }
+
+    /// A touchscreen went away. Its contacts go with it: libinput sends no up
+    /// for a finger that was on a device at the moment it was unplugged, and
+    /// without this the hand is down forever -- the cursor stays hidden, and a
+    /// gesture stays half finished.
+    pub(crate) fn touch_device_removed(&mut self, name: &str) {
+        self.touch_devices.remove(name);
+        self.release_touches();
+    }
+
+    /// Whether touchscreens are listened to at all; `touch.enabled` in
+    /// `desktop.toml`. See [`crate::desktop_config::Touch`] for why this is a
+    /// setting and not a compiled-in yes.
+    pub(crate) fn touch_enabled(&self) -> bool {
+        self.desktop_config.touch_enabled()
+    }
+
+    /// Drop every contact and close whatever they had open.
+    ///
+    /// The three things a hand leaves behind when no further event will arrive
+    /// for it, which is the case whenever the fingers stop being delivered
+    /// rather than stop being present: a device unplugged mid-drag, touch
+    /// switched off, a session locked.
+    pub(crate) fn release_touches(&mut self) {
+        // A contact standing in for the pointer is holding the primary button
+        // down on an X11 window. Nothing else will ever release it, and a
+        // window left with a button held is a window that goes on selecting
+        // text or dragging a scrollbar with nobody touching anything.
+        if self.contacts.any_emulating() {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let time = self.uptime().as_millis() as u32;
+            let pointer = self.pointer();
+            pointer.button(
+                self,
+                &smithay::input::pointer::ButtonEvent {
+                    button: crate::mouse::BTN_LEFT,
+                    state: smithay::backend::input::ButtonState::Released,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(self);
+        }
+        if self.contacts.clear() {
+            self.swipe_end();
+        }
+        self.queue_redraw();
     }
 
     /// The focused screen's rectangle, before panels reserve any of it.
@@ -2147,6 +2327,15 @@ impl Huginn {
             return false;
         }
         tracing::info!("locking the session");
+        // Whatever was on the glass is dropped. A hand still down across a lock
+        // is a hand whose fingers were routed to a desktop that is no longer
+        // being drawn: the up events would reach a window behind the lock
+        // screen, and a gesture half way through would go on moving the
+        // workspace row underneath it. The lock screen's own touches start
+        // from nothing, as its keystrokes do.
+        if self.contacts.clear() {
+            self.swipe_end();
+        }
         // The quick settings panel goes down with the session, disarmed. Its
         // Power row stays armed until something stands it down, and the
         // keymap forwards nothing to the panel while locked, so left open it
@@ -7876,6 +8065,16 @@ impl OutputInfo {
             output: None,
         }
     }
+}
+
+/// Whether a connector name is the panel built into the machine.
+///
+/// The three prefixes DRM uses for something soldered to a lid: `eDP` for a
+/// laptop panel, `LVDS` for an older one, `DSI` for a tablet's. Everything else
+/// is a cable. Used for placing screens (the built-in one anchors the layout)
+/// and for guessing which panel a touchscreen is stuck to.
+pub(crate) fn is_builtin_panel(name: &str) -> bool {
+    name.starts_with("eDP") || name.starts_with("LVDS") || name.starts_with("DSI")
 }
 
 /// Translate the protocol's layer into the core's own vocabulary.
