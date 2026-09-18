@@ -8113,6 +8113,13 @@ impl SessionLockHandler for Huginn {
     fn unlock(&mut self) {
         tracing::info!("session unlocked");
         self.lock = None;
+        // Unlocking is somebody at the machine, and the idle count starts
+        // over from here. A password was typed, which already counted; a
+        // finger on the sensor is not input this compositor sees, so after a
+        // fingerprint unlock `last_input` was still from before the lock and
+        // the idle timer found the session past its mark on its next tick --
+        // locking it again seconds after it was opened.
+        self.last_input = Instant::now();
         // The desktop is in the scene again, and the keyboard has to be given
         // back to whatever had it before the lock -- otherwise the session
         // comes back with every keystroke going nowhere.
