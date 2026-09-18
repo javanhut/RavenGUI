@@ -21,14 +21,15 @@
 //!
 //! # What a fingerprint is allowed to do
 //!
-//! Unlock a session that is already somebody's. That is the whole of it.
+//! Whatever its owner turned on, per account, in Settings: unlocking their
+//! session, logging in as the account shown on the login screen, and approving
+//! `sudo`. All three are off until switched on, and switching one on takes the
+//! password.
 //!
-//! It cannot log in — the greeter asks for a password and always will, because
-//! at the login screen the machine does not yet know whose session it would be
-//! and a finger is an answer to "is this you?", never to "who are you?" on a
-//! sensor that holds a handful of templates. It cannot authorise anything. And
-//! it is never the only way past a lock screen: the password field stays on
-//! screen, focused, the entire time. A reader that has broken, got dirty, or
+//! At the login screen a finger still answers "is this you?" and never "who
+//! are you?": the greeter names the account on screen and only that account's
+//! fingers count. And it is never the only way in: the password field stays on
+//! screen, focused, the entire time, and `sudo` falls back to its password. A reader that has broken, got dirty, or
 //! decided today that this is not the finger it enrolled must be an
 //! inconvenience and never a locked-out machine, which is exactly what
 //! [`Gate`] is for.
