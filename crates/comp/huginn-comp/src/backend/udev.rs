@@ -1388,9 +1388,7 @@ impl Udev {
 
     fn relayout(&mut self) {
         let saved = self.state.output_layout().to_vec();
-        let builtin = |name: &str| {
-            name.starts_with("eDP") || name.starts_with("LVDS") || name.starts_with("DSI")
-        };
+        let builtin = crate::state::is_builtin_panel;
 
         let mut keys: Vec<ScreenKey> = self.screens.keys().copied().collect();
         keys.sort_by(|a, b| self.screens[a].name.cmp(&self.screens[b].name));
@@ -1723,6 +1721,14 @@ impl Udev {
         // trusted to already show it.
         match event {
             InputEvent::DeviceAdded { mut device } => {
+                // A touchscreen is noted with the size of its active area, so
+                // that the fractions it reports can be turned into points on
+                // the panel it is glued to. See `Huginn::touch_output`.
+                if device.has_capability(DeviceCapability::Touch) {
+                    let size = device.size();
+                    self.state
+                        .touch_device_added(device.name().to_owned(), size);
+                }
                 if device.has_capability(DeviceCapability::Keyboard) {
                     device.led_update(self.state.keyboard_led_state.into());
                     self.state.keyboard_led_devices.push(device);
@@ -1730,6 +1736,9 @@ impl Udev {
                 return;
             }
             InputEvent::DeviceRemoved { device } => {
+                if device.has_capability(DeviceCapability::Touch) {
+                    self.state.touch_device_removed(device.name());
+                }
                 self.state.keyboard_led_devices.retain(|d| d != &device);
                 return;
             }

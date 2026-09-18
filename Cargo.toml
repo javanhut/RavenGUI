@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/raven-protocol",
     "crates/raven-desktop",
+    "crates/raven-fprint",
     "crates/raven-rec",
     "crates/raven-h264",
     "crates/comp/huginn-core",
@@ -36,6 +37,7 @@ dbg_macro = "warn"
 
 [workspace.dependencies]
 raven-desktop = { path = "crates/raven-desktop" }
+raven-fprint = { path = "crates/raven-fprint" }
 raven-rec = { path = "crates/raven-rec" }
 raven-h264 = { path = "crates/raven-h264" }
 huginn-core = { path = "crates/comp/huginn-core" }
