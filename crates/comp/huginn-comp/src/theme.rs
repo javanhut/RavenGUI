@@ -106,7 +106,7 @@ pub(crate) const TEXT_DIM: Color = Color::from_argb(0xFFAB_ABC2);
 // ---------------------------------------------------------------------------
 // The material
 // ---------------------------------------------------------------------------
-// Every floating panel — dock, launcher, pinned panel, keybinding overlay,
+// Every floating panel — dock, launcher, pin bar, keybinding overlay,
 // caption pills — is one material: a translucent layer of [`BACKGROUND`]
 // over the blurred desktop, edged with a hairline of light rather than a
 // drawn border, and lit along its top edge as a real sheet of glass would

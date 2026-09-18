@@ -671,8 +671,8 @@ fn draw_tile(
     }
 }
 
-/// The foot of the opened list: "Pinned & Recent" with a link to the pinned
-/// panel, then the pinned applications as icons and, past a divider, the
+/// The foot of the opened list: "Pinned & Recent" with a link to the pin
+/// bar, then the pinned applications as icons and, past a divider, the
 /// recently used ones as cards saying when.
 #[allow(clippy::too_many_arguments)]
 fn draw_strip(
@@ -709,9 +709,16 @@ fn draw_strip(
         TEXT,
         EMPHASIS,
     );
-    let link = "Pinned panel →";
+    // A shortcut to the pin bar — drawn only when something is pinned,
+    // because the bar itself only exists then: with nothing on it there is
+    // nothing to link to, and a link that opens nothing is worse than none.
+    let link = "Pin bar →";
     let link_size = px(12.0);
-    let link_w = text.measure(link, link_size).0;
+    let link_w = if pins.is_empty() {
+        0.0
+    } else {
+        text.measure(link, link_size).0
+    };
     let link_x = x + inner - link_w - px(6.0);
     if on_strip
         && let Some(Target::App(index)) = launcher.visible().get(selected)
@@ -727,11 +734,13 @@ fn draw_strip(
         );
         text.draw(canvas, &name, head_size, name_x as i32, y as i32, TEXT_DIM);
     }
-    text.draw(canvas, link, link_size, link_x as i32, y as i32, TEXT_DIM);
-    layout.buttons.push((
-        rect(link_x - px(6.0), y - px(4.0), link_w + px(12.0), px(22.0)),
-        Button::PinnedPanel,
-    ));
+    if !pins.is_empty() {
+        text.draw(canvas, link, link_size, link_x as i32, y as i32, TEXT_DIM);
+        layout.buttons.push((
+            rect(link_x - px(6.0), y - px(4.0), link_w + px(12.0), px(22.0)),
+            Button::PinnedPanel,
+        ));
+    }
 
     let row_y = y + px(28.0);
     let box_size = px(54.0);

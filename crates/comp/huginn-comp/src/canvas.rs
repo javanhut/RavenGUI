@@ -218,7 +218,7 @@ impl Canvas {
     /// along the top edge between the corner arcs.
     ///
     /// Every floating panel goes through here — the dock, the launcher, the
-    /// pinned panel, the overlay, a caption — which is what keeps them one
+    /// pin bar, the overlay, a caption — which is what keeps them one
     /// surface rather than five that agree today. `alpha` is the ground's
     /// opacity; see [`crate::theme::PANEL_ALPHA`].
     pub(crate) fn material(
