@@ -292,6 +292,12 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
     let serial = SERIAL_COUNTER.next_serial();
     let button_state = event.state();
 
+    // A capture drawing clicks rings every press, whoever it goes to. Only
+    // into the capture: the screen itself never shows it.
+    if button_state == ButtonState::Pressed {
+        state.note_capture_click();
+    }
+
     // The button that began a `Super`+left drag ends it, however `Super`
     // stands by then and whatever has happened since — a lock included,
     // which is why this is first. The release is the compositor's, as the

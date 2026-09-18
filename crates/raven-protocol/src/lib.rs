@@ -22,8 +22,12 @@
 pub mod server {
     //! Compositor-side bindings, implemented by `huginn-comp`.
     use wayland_server;
+    // raven_capture_v1.frame takes a wl_buffer, so the core protocol's
+    // interfaces and types are in scope for the generated code.
+    use wayland_server::protocol::*;
 
     pub mod __interfaces {
+        use wayland_server::protocol::__interfaces::*;
         wayland_scanner::generate_interfaces!("../../protocols/raven-shell-v1.xml");
     }
     use self::__interfaces::*;
@@ -35,8 +39,11 @@ pub mod server {
 pub mod client {
     //! Client-side bindings, consumed by `raven-output` and shell clients.
     use wayland_client;
+    // See the server side: wl_buffer comes from the core protocol.
+    use wayland_client::protocol::*;
 
     pub mod __interfaces {
+        use wayland_client::protocol::__interfaces::*;
         wayland_scanner::generate_interfaces!("../../protocols/raven-shell-v1.xml");
     }
     use self::__interfaces::*;

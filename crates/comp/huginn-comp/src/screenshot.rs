@@ -155,6 +155,23 @@ pub(crate) fn draw_offscreen(
     scale: f64,
     block: bool,
 ) -> Result<GlesMapping> {
+    draw_offscreen_over(renderer, texture, elements, size, scale, block, CLEAR)
+}
+
+/// [`draw_offscreen`] over a background of `clear` rather than the desktop's.
+///
+/// A capture of one window clears to transparent, so its rounded corners and
+/// shadow come out as the window drew them rather than on a slab of the
+/// empty-desktop colour.
+pub(crate) fn draw_offscreen_over(
+    renderer: &mut GlesRenderer,
+    texture: &mut GlesTexture,
+    elements: &[HuginnElement],
+    size: Size<i32, Physical>,
+    scale: f64,
+    block: bool,
+    clear: Color32F,
+) -> Result<GlesMapping> {
     let damage = [Rectangle::from_size(size)];
     let mut framebuffer = renderer
         .bind(texture)
@@ -164,7 +181,7 @@ pub(crate) fn draw_offscreen(
             .render(&mut framebuffer, size, Transform::Normal)
             .map_err(|e| anyhow::anyhow!("starting the capture frame: {e}"))?;
         frame
-            .clear(CLEAR, &damage)
+            .clear(clear, &damage)
             .map_err(|e| anyhow::anyhow!("clearing the capture: {e}"))?;
         draw_render_elements::<GlesRenderer, _, _>(
             &mut frame,

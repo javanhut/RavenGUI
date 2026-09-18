@@ -14,7 +14,7 @@ For how to actually use these, see `docs/integration.md`.
 | `xdg_wm_base` | ordinary application windows |
 | `zxdg_decoration_manager_v1` | a title bar drawn by the compositor — the title and a close button, in the desktop's palette — for a toplevel that creates a decoration object and does not ask for `client_side`. A toplevel that never binds this is client-side, as the protocol says; GTK and Firefox draw their own and get no bar. See `docs/integration.md` |
 | `zwlr_layer_shell_v1` | panels, docks, bars, wallpapers |
-| `raven_shell_manager_v1` | workspace count, active index, occupancy, switching; opening quick settings |
+| `raven_shell_manager_v1` | workspace count, active index, occupancy, switching; opening quick settings; the screen layout; capturing a screen, window or region, and the compositor's region picker |
 | `wl_shm` | shared-memory buffers |
 | `zwp_linux_dmabuf_v1` | hardware buffers; advertised once the backend has a renderer |
 | `wp_viewporter` | source cropping and destination scaling |
@@ -39,7 +39,7 @@ The contract between Huginn and the desktop shell, covering only what no
 standard protocol provides. Panels, the dock and the wallpaper are layer-shell
 surfaces; this file does not duplicate them.
 
-### `raven_shell_manager_v1` — version 3
+### `raven_shell_manager_v1` — version 4
 
 | | |
 |---|---|
@@ -47,11 +47,70 @@ surfaces; this file does not duplicate them.
 | `get_workspace_state` | request. Creates a `raven_workspace_state_v1`. |
 | `open_quick_settings` | request, since 2. Opens the compositor-drawn quick settings panel as the keybinding would. A no-op if it is already open, and while the session is locked. |
 | `get_output_layout` | request, since 3. Creates a `raven_output_layout_v1`. |
+| `capture_output(id, output, options)` | request, since 4. Creates a `raven_capture_v1` of the screen with that connector name. A name that matches no screen gives a capture whose only event is `stopped`. |
+| `capture_window(id, identifier, options)` | request, since 4. Creates a `raven_capture_v1` of the window with that `ext_foreign_toplevel_handle_v1` identifier: the window alone, with its compositor-drawn bar, nothing overlapping it, at its screen's density. An unknown identifier gives a capture whose only event is `stopped`. |
+| `capture_region(id, output, x, y, width, height, options)` | request, since 4. Creates a `raven_capture_v1` of a rectangle of a screen, in logical pixels relative to its top-left corner, clipped to the screen. Empty after clipping, or an unknown screen, gives a capture whose only event is `stopped`. |
+| `select_region(id)` | request, since 4. Creates a `raven_region_selection_v1` and puts up the compositor's own region picker — the one `Shift+Print` uses. |
 
 The second version exists for a bar whose battery reading is a natural place
 to click: the panel it should lead to is drawn by the compositor, so the bar
 cannot open it by showing a surface of its own and has to ask. A client bound
 at version 1 sees no difference.
+
+Version 4 exists for Raven Camera, a screen recorder with a live preview: see
+below, and the privilege note, which matters more now that this global can read
+the screen.
+
+### `raven_capture_v1` — version 1
+
+| | |
+|---|---|
+| `destroy` | request, destructor. A pending frame is abandoned; its buffer is the client's again. |
+| `frame(buffer)` | request. Draw the next frame into this `wl_shm` buffer. Answered by exactly one of `ready` and `failed`. A buffer that is not `wl_shm`, not `argb8888`/`xrgb8888`, not the last `buffer_size`, or with a stride under four bytes a pixel, is answered `failed`. Asking again before the answer is the `already_pending` protocol error. |
+| `buffer_size(width, height)` | event. The size in physical pixels a buffer must be. First event of every capture, and again whenever the source changes size — which fails a pending frame. |
+| `ready(tv_sec_hi, tv_sec_lo, tv_nsec)` | event. The buffer holds the source as drawn at that `CLOCK_MONOTONIC` time. |
+| `failed()` | event. The buffer was not filled: reallocate after a `buffer_size`, otherwise the buffer was unusable. |
+| `stopped()` | event. The screen was unplugged, the window closed, or the source never existed. A pending frame is failed first; nothing follows. |
+
+Options, a bitfield on the creating request: `cursor` (1) draws the pointer
+into frames; `clicks` (2) draws a fading accent ring where the pointer is
+pressed, into frames only, never onto the screen.
+
+How Huginn serves it:
+
+- **Paced by the client.** No frame is drawn that was not asked for, and none
+  is drawn until the source has changed since the last one delivered — except
+  the first, which is answered at once. A still desktop asked for a frame keeps
+  it pending. Frames are drawn no faster than the screen's refresh rate.
+- **A frame takes two ticks.** It is rendered offscreen the way a recording
+  frame is, and read back from the GPU on the next tick rather than waited on,
+  so the desktop never stalls for a capture. Expect one to two refreshes of
+  latency.
+- **Physical pixels.** Frames are at the screen's own density, as screenshots
+  are. A window capture uses the density of the screen the window's centre is
+  on.
+- **A window capture is the window at rest**: where the layout puts it, not
+  where an animation is drawing it this frame, so a tile easing into place is
+  not a new size every frame. While the window is minimized, on a workspace no
+  screen shows, or off every screen, a pending frame waits.
+- **Locked means nothing.** While the session is locked no capture delivers
+  anything; a pending frame waits for the unlock, and a frame drawn just before
+  the lock is thrown away rather than delivered after it. The lock screen is
+  never captured.
+- **The recording dot** shows in the top-right corner of every screen a capture
+  has delivered a frame of in the last second, as it does for `Super+Print`.
+  It is not in the frames, and neither are notification cards.
+
+### `raven_region_selection_v1` — version 1
+
+| | |
+|---|---|
+| `destroy` | request, destructor. Takes the picker down if it is still up. |
+| `selected(output, x, y, width, height)` | event. The rectangle dragged out, in logical pixels relative to the screen the drag started on, clipped to it. |
+| `cancelled()` | event. `Escape`, a click that dragged nothing, the session locking, or a picker that could not go up — one was already up (the client's or `Shift+Print`'s), or the session was locked. |
+
+Exactly one of the two events is sent. The result is shaped for
+`capture_region`.
 
 ### `raven_workspace_state_v1` — version 1
 
@@ -94,6 +153,14 @@ considers privileged. **Huginn does not enforce that yet** — every client can
 bind it. This is a tracked gap rather than a design decision, and any future
 gating will apply to this global, so do not build on being able to bind it from
 arbitrary software.
+
+Since version 4 the gap is a real one: **any client on the session can read
+the screen** through `raven_capture_v1`, and any window on it by identifier.
+The recording dot is the only sign a capture is running, and it cannot stop
+one. On a single-user machine every client already runs as the person whose
+screen it is, which is why this shipped ungated; it must be gated before
+anything untrusted — a sandboxed application, a remote client — runs on
+Huginn.
 
 ## `ext-session-lock-v1`
 
@@ -153,7 +220,7 @@ find them in the registry.
 | Missing | Consequence |
 |---|---|
 | `wlr-foreign-toplevel-management-v1` | No window *management* from outside: an external dock or switcher can list windows (see `ext_foreign_toplevel_list_v1` above) but cannot activate, close or minimize one. |
-| `wlr-screencopy`, `ext-image-copy-capture-v1` | No *client* screen capture: no screen sharing, and no third-party screen recorder. The compositor takes its own screenshots on `Print` and records the screen on `Super+Print` (see `docs/integration.md`), so there is no protocol here to do either through. |
+| `wlr-screencopy`, `ext-image-copy-capture-v1` | No *standard* screen capture: no screen sharing through the portal or PipeWire, and third-party recorders (OBS, wf-recorder) find nothing to use. Client capture exists, but through `raven_capture_v1` above, which only Raven's own software speaks. |
 | `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. |
 | `zwp_primary_selection_v1` | No middle-click paste. The regular clipboard works. |
 | `text-input-v3`, `input-method-v2` | No input methods. CJK and other IME input will not work. |

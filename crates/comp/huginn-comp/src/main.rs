@@ -20,6 +20,8 @@ mod bluetooth;
 mod blur;
 #[cfg(target_os = "linux")]
 mod canvas;
+#[cfg(target_os = "linux")]
+mod capture;
 mod configwatch;
 #[cfg(target_os = "linux")]
 mod decor;

@@ -21,6 +21,7 @@ protocol a client speaks, not a file it edits.
 | A panel that takes typing | `keyboard_interactivity` | Works |
 | Workspace indicators | `raven_shell_v1` | Works |
 | An ordinary application window | `xdg-shell` | Works |
+| A screen recorder or capture preview | `raven_shell_v1` `raven_capture_v1` | Works, Raven-only; not the standard capture protocols |
 | A task switcher or window list | `ext-foreign-toplevel-list-v1` | Works, read-only: titles and app ids, no activating or closing from outside |
 | Replacing the launcher or dock | role claiming | **Not designed in** |
 | Reading the desktop's accent colour | appearance protocol | **Not implemented** |
@@ -368,8 +369,8 @@ there closes with reason 2, the same as a dismissed card.
 ## Screenshots
 
 `Print` takes a screenshot; the compositor does it, not a client. A Wayland
-client can only read the screen through a capture protocol, and Huginn
-advertises none (`wlr-screencopy` and `ext-image-copy-capture-v1` are both
+client can only read the screen through a capture protocol; Huginn advertises
+neither standard one (`wlr-screencopy` and `ext-image-copy-capture-v1` are both
 absent — see `docs/protocols.md`), so the screenshotter is a compositor feature
 in the same way the launcher and the help overlay are. It renders the scene a
 second time into an offscreen buffer, reads it back, and writes a PNG.
@@ -383,10 +384,30 @@ second time into an offscreen buffer, reads it back, and writes a PNG.
 Files land in `<pictures>/Screenshots`, where `<pictures>` is
 `$XDG_PICTURES_DIR`, the value in `user-dirs.dirs`, or `~/Pictures` — named
 `Screenshot-YYYY-MM-DD-HHMMSS.png`, in UTC. The pointer is not in the image, and
-a white flash confirms the capture. There is no client-facing side to this: it
-cannot be triggered over a protocol, and there is no capture protocol for other
-software to record the screen through, so third-party screen recorders and share
-tools still do not work.
+a white flash confirms the capture. The keys cannot be triggered over a
+protocol.
+
+## Capturing from a client
+
+Raven Camera records a screen, a window or a region with a live preview, and
+does it through `raven_capture_v1`, part of the privileged `raven_shell_v1`
+(version 4; the full contract is in `docs/protocols.md`). The client creates a
+capture with `capture_output`, `capture_window` (by
+`ext_foreign_toplevel_handle_v1` identifier) or `capture_region`, is told the
+size with `buffer_size`, and hands over `wl_shm` buffers of that size one
+`frame` at a time; each comes back `ready` with a timestamp, or `failed`. It can
+ask for the pointer and for click rings to be drawn in. `select_region` puts up
+the same rectangle picker as `Shift`+`Print` and reports the result in the
+shape `capture_region` takes.
+
+The same rules as the compositor's own recording apply: the red dot shows on a
+screen while it is being captured and is not in the frames, notification cards
+are left out, and nothing is delivered while the session is locked. A still
+desktop costs nothing — a frame is only drawn when something has changed.
+
+Only Raven's own software speaks this. Third-party recorders and screen
+sharing look for the standard protocols and still find nothing, and the
+global is not yet limited to privileged clients: any client can bind it.
 
 ## Screen recording
 

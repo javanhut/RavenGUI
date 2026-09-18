@@ -8,14 +8,14 @@
 //! Huginn records into Raven's own lossless format (`raven-rec`), which is
 //! cheap to write while the desktop is in use and which nothing else opens.
 //! This reads one, converts each frame to YUV, encodes it with Raven's own
-//! H.264 encoder (`raven-h264`) and writes an MP4. Nothing outside the tree is
-//! involved, so nothing outside the tree can break it.
+//! H.264 encoder (`raven-h264`) and writes an MP4 with Raven's own writer
+//! (`raven-mp4`). Nothing outside the tree is involved, so nothing outside
+//! the tree can break it.
 //!
 //! The video keeps the recording's timing: frames are only recorded when the
 //! screen changes, and each lasts until the next.
 
 mod color;
-mod mp4;
 
 use std::error::Error;
 use std::fs::File;
@@ -104,14 +104,14 @@ fn export(options: &Options) -> Result<(), Box<dyn Error>> {
         ..Config::new(picture.width as u32, picture.height as u32)
     };
     let mut encoder = Encoder::new(config)?;
-    let mut mp4 = mp4::Mp4::create(
-        &options.output,
-        picture.width,
-        picture.height,
-        encoder.sps(),
-        encoder.pps(),
-    )
-    .map_err(|e| format!("creating {}: {e}", options.output.display()))?;
+    let video = raven_mp4::Video {
+        width: picture.width as u32,
+        height: picture.height as u32,
+        sps: encoder.sps().to_vec(),
+        pps: encoder.pps().to_vec(),
+    };
+    let mut mp4 = raven_mp4::Mp4::create(&options.output, Some(video), None)
+        .map_err(|e| format!("creating {}: {e}", options.output.display()))?;
 
     let started = Instant::now();
     let mut last_report = started;
@@ -148,7 +148,7 @@ fn export(options: &Options) -> Result<(), Box<dyn Error>> {
             },
             key,
         )?;
-        mp4.push(ticks(pts), &encoded.nals, encoded.idr)?;
+        mp4.push_video(ticks(pts), &encoded.nals, encoded.idr)?;
         if encoded.idr {
             last_key = Some(pts);
         }

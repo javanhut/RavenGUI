@@ -11,11 +11,12 @@ publish = false
 name = "raven-export"
 path = "src/main.rs"
 
-# Only the tree's own crates: the recording format and the encoder. The MP4
-# container and the colour conversion are written here.
+# Only the tree's own crates: the recording format, the encoder and the MP4
+# writer. The colour conversion is written here.
 [dependencies]
 raven-rec.workspace = true
 raven-h264.workspace = true
+raven-mp4.workspace = true
 
 [lints]
 workspace = true

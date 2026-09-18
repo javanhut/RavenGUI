@@ -96,6 +96,9 @@ struct Nested {
     recording: Option<crate::record::Recording>,
     /// The timer that ticks it, so stopping can take the timer out too.
     recording_timer: Option<RegistrationToken>,
+    /// The timer that serves clients' captures, while it has anything to
+    /// do. See `crate::capture`.
+    capture_timer: Option<RegistrationToken>,
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -265,6 +268,7 @@ pub(crate) fn run() -> Result<()> {
         handle: handle.clone(),
         recording: None,
         recording_timer: None,
+        capture_timer: None,
     };
 
     // NOTE: no SIGTERM handling. calloop's signal source needs its `signals`
@@ -319,12 +323,58 @@ impl Nested {
             if let Some(recording) = self.recording.as_mut() {
                 recording.note_damage();
             }
+            // And of every client's capture, for the same reason.
+            self.state.captures.note_damage_all();
         } else {
             // Flush even without a frame: a client waiting on a configure it
             // never receives will sit there forever.
             self.display.flush_clients().context("flushing clients")?;
         }
+        self.schedule_captures();
         Ok(())
+    }
+
+    /// Arm the capture timer if a client's capture has work and it is not
+    /// armed, or fire it at once if something has asked for that — a frame
+    /// requested, or a source with a frame pending that just changed.
+    fn schedule_captures(&mut self) {
+        let kick = self.state.captures.take_kick();
+        if !kick && (self.capture_timer.is_some() || !self.state.captures.wants_ticks()) {
+            return;
+        }
+        if let Some(token) = self.capture_timer.take() {
+            self.handle.remove(token);
+        }
+        let timer = Timer::immediate();
+        match self.handle.insert_source(timer, |_, _, data: &mut Nested| {
+            match data.tick_captures() {
+                Some(wait) => TimeoutAction::ToDuration(wait),
+                None => {
+                    data.capture_timer = None;
+                    TimeoutAction::Drop
+                }
+            }
+        }) {
+            Ok(token) => self.capture_timer = Some(token),
+            Err(e) => tracing::error!(error = %e, "cannot arm the capture timer"),
+        }
+    }
+
+    /// One tick of the clients' captures; see `crate::capture::tick`. The
+    /// events it sends go out with the end-of-cycle flush.
+    fn tick_captures(&mut self) -> Option<std::time::Duration> {
+        let icon = match &self.state.cursor_status {
+            CursorImageStatus::Named(icon) => *icon,
+            _ => CursorIcon::Default,
+        };
+        let cursors = &self.cursors;
+        // One window at one density: the density is not a key here.
+        let cursor = |_density: u32| {
+            cursors
+                .get(&icon)
+                .or_else(|| cursors.get(&CursorIcon::Default))
+        };
+        crate::capture::tick(self.backend.renderer(), &mut self.state, &cursor)
     }
 
     fn render(&mut self) -> Result<()> {

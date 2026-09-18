@@ -902,6 +902,16 @@ pub(crate) struct Huginn {
     /// The dot on a screen being recorded: the screen's connector name, and
     /// the dot drawn at its density. See [`crate::record`].
     recording_dot: Option<(String, crate::canvas::Panel)>,
+    /// The same dot on every screen a client's capture has delivered a frame
+    /// of within the last second. See [`crate::capture`].
+    capture_dots: Vec<(String, crate::canvas::Panel)>,
+    /// Clients' screen captures (`raven_capture_v1`). See [`crate::capture`].
+    pub(crate) captures: crate::capture::Captures,
+    /// The client a region selection is being dragged out for, when it was
+    /// asked for over `raven_region_selection_v1` rather than by
+    /// `Shift`+`Print`: the release answers it instead of taking a
+    /// screenshot.
+    region_client: Option<raven_protocol::server::raven_region_selection_v1::RavenRegionSelectionV1>,
     /// Windows whose drawn rectangle is still on its way to the layout's.
     ///
     /// A relayout moves the layout's rectangles at once; these are what the
@@ -1188,6 +1198,9 @@ impl Huginn {
             flash: None,
             flash_buffer: SolidColorBuffer::new((area.w(), area.h()), [1.0, 1.0, 1.0, 1.0]),
             recording_dot: None,
+            capture_dots: Vec::new(),
+            captures: crate::capture::Captures::default(),
+            region_client: None,
             motions: HashMap::new(),
             opening: HashMap::new(),
             closing: Vec::new(),
@@ -1811,6 +1824,9 @@ impl Huginn {
         self.pointer_location = self.clamp_pointer(self.pointer_location);
         self.apply_output_geometry();
         self.broadcast_outputs();
+        // A screen gone is a capture of it stopped; a new mode is a new
+        // buffer size. Both are told now, not at the next frame.
+        self.refresh_captures();
     }
 
     /// Move focus to the screen after the focused one, wrapping round.
@@ -1932,7 +1948,7 @@ impl Huginn {
         // captured, so nothing may cover it. It leads the list because captures
         // leave it out by skipping the leading items; see
         // [`Self::capture_hidden_len`].
-        if let Some((buffer, rect)) = self.recording_dot_at() {
+        for (buffer, rect) in self.recording_dots() {
             out.push(SceneItem::Overlay(buffer, rect, 1.0));
         }
         // Then the notification cards, for the same reason from the other
@@ -2436,6 +2452,10 @@ impl Huginn {
             self.pinned.close(now, motion);
             self.refresh_pinned();
         }
+        // A region selection goes down too — the keyboard's or a client's,
+        // which is told `cancelled`. Left up, it would own the pointer under
+        // the lock screen and take its answer from a drag across it.
+        self.cancel_region();
         self.lock = Some(Lock::default());
         self.refresh_focus();
         self.queue_redraw();
@@ -5198,7 +5218,7 @@ impl Huginn {
         // the scene, above the panels, so they are counted here too — the
         // boundary is the number of items in front of it, and an undercount
         // would push a real panel into the blurred group.
-        usize::from(self.recording_dot_at().is_some())
+        self.recording_dots().len()
             + self.notifications.drawn_count()
             + usize::from(self.flash_at().is_some())
             + self.region_ring_len()
@@ -6131,6 +6151,104 @@ impl Huginn {
         }))
     }
 
+    /// The window whose `ext_foreign_toplevel_handle_v1` identifier is
+    /// `identifier`, if it is still open. How a client's window capture names
+    /// its window: the identifier is the one name for a window that a client
+    /// can learn and the compositor can check.
+    pub(crate) fn window_by_identifier(&self, identifier: &str) -> Option<WindowId> {
+        self.foreign_handles
+            .iter()
+            .find(|(_, handle)| handle.identifier() == identifier)
+            .map(|(id, _)| *id)
+    }
+
+    /// What a capture of window `id` covers, in global logical pixels, whether
+    /// the window is on screen to be captured, and its surface — so a commit
+    /// to it can be told apart from a commit to anything else.
+    ///
+    /// The window *at rest*: its bar and content where the layout puts them,
+    /// not where an animation is drawing them this frame. A tile easing into
+    /// a new pane would otherwise be a new capture size every frame of the
+    /// ease, and every one of those is a failed frame for the client. With a
+    /// compositor-drawn bar that is the whole pane, bar included; without,
+    /// it is the frame the client says it drew — its window geometry, which
+    /// leaves out a client-side shadow — cut to its pane if it is tiled.
+    ///
+    /// Not on screen: unmapped, minimized, on a workspace no screen shows, or
+    /// off every screen. The capture waits rather than stops; see
+    /// `raven_capture_v1`.
+    pub(crate) fn window_capture_frame(&self, id: WindowId) -> Option<(Rect, bool, WlSurface)> {
+        let window = self.space.window(id)?;
+        let surface = self.windows.get(&id)?.wl_surface()?;
+        let content = window.content();
+        let rect = if self.rest_bar_rect(id).is_some() {
+            window.geometry
+        } else {
+            let mut frame = crate::popup::window_geometry(&surface);
+            if frame.size.w <= 0 || frame.size.h <= 0 {
+                frame = smithay::desktop::utils::bbox_from_surface_tree(&surface, (0, 0));
+            }
+            match self.placed_rect(id) {
+                Some(placed) if frame.size.w > 0 && frame.size.h > 0 => {
+                    let drawn = Rect::from_xywh(
+                        placed.x() + frame.loc.x,
+                        placed.y() + frame.loc.y,
+                        frame.size.w,
+                        frame.size.h,
+                    );
+                    if window.is_tiled() {
+                        drawn.intersection(content).unwrap_or(drawn)
+                    } else {
+                        drawn
+                    }
+                }
+                _ => content,
+            }
+        };
+        let shown = self.mapped.contains(&id)
+            && !window.is_minimized()
+            && self.visible_window_ids().contains(&id)
+            && self.outputs.iter().any(|output| output.rect.overlaps(rect));
+        Some((rect, shown, surface))
+    }
+
+    /// Where `id`'s compositor-drawn bar sits at rest, if it has one.
+    fn rest_bar_rect(&self, id: WindowId) -> Option<Rect> {
+        let top = self.frame_top(id);
+        if top <= 0 || self.decor.get(&id)?.mode != crate::decor::DecorMode::Server {
+            return None;
+        }
+        Some(crate::decor::bar_rect(self.space.window(id)?.content(), top))
+    }
+
+    /// Window `id` alone, at rest, as scene items front to back: its popups,
+    /// its bar, and the window. What a client's capture of that window draws;
+    /// see [`Self::window_capture_frame`] for why at rest. Nothing else in
+    /// the scene is here, so a window over it, a panel or the pointer's
+    /// neighbourhood cannot end up in the capture.
+    pub(crate) fn window_capture_items(&self, id: WindowId) -> Vec<SceneItem<'_>> {
+        let mut out = Vec::new();
+        let (Some(window), Some(surface), Some(placed)) = (
+            self.space.window(id),
+            self.windows.get(&id).and_then(WindowSurface::wl_surface),
+            self.placed_rect(id),
+        ) else {
+            return out;
+        };
+        out.extend(self.popups_of(&surface, placed));
+        if let Some(rect) = self.rest_bar_rect(id)
+            && let Some(bar) = self.decor.get(&id).and_then(|entry| entry.bar.as_ref())
+        {
+            out.push(SceneItem::Overlay(bar.panel.buffer(), rect, 1.0));
+        }
+        if window.is_tiled() {
+            out.push(SceneItem::Clipped(surface, placed, window.content(), 1.0));
+        } else {
+            out.push(SceneItem::Surface(surface, placed));
+        }
+        out
+    }
+
     /// Start a white flash over `output`, and ask for the frame that begins it.
     pub(crate) fn begin_flash(&mut self, output: usize) {
         if let Some(rect) = self.outputs.get(output).map(|o| o.rect) {
@@ -6149,26 +6267,68 @@ impl Huginn {
         self.queue_redraw();
     }
 
-    /// The recording dot's buffer and where it goes, or `None` when nothing is
-    /// being recorded.
-    ///
-    /// `None` while locked as well: the lock's scene is the lock and nothing
-    /// else. The recording carries on and records the lock screen, so there
-    /// is nothing to warn about that the lock screen does not already show.
-    fn recording_dot_at(&self) -> Option<(&MemoryRenderBuffer, Rect)> {
-        if self.lock.is_some() {
-            return None;
+    /// Show the recording dot on each screen named in `outputs`, for clients'
+    /// captures, or on none. Separate from [`Self::set_recording_dot`], which
+    /// is the compositor's own recording's, so neither can take down the
+    /// other's. Does nothing — no redraw — when the set is unchanged, which
+    /// is every capture tick but the ones where it changes.
+    pub(crate) fn set_capture_dots(&mut self, outputs: &[String]) {
+        let same = self.capture_dots.len() == outputs.len()
+            && self
+                .capture_dots
+                .iter()
+                .zip(outputs)
+                .all(|((have, _), want)| have == want);
+        if same {
+            return;
         }
-        let (name, panel) = self.recording_dot.as_ref()?;
-        let screen = self.outputs.get(self.output_index(name)?)?.rect;
-        Some((
-            panel.buffer(),
-            crate::record::indicator_placement(screen, panel.size()),
-        ))
+        self.capture_dots = outputs
+            .iter()
+            .filter_map(|name| {
+                let density = self.outputs.get(self.output_index(name)?)?.scale.advertised;
+                Some((name.clone(), crate::record::indicator(density)))
+            })
+            .collect();
+        self.queue_redraw();
+    }
+
+    /// Whether a client's capture has the recording dot up anywhere.
+    pub(crate) fn capture_dots_up(&self) -> bool {
+        !self.capture_dots.is_empty()
+    }
+
+    /// The recording dots' buffers and where they go: one per screen being
+    /// recorded or captured, whoever is doing it. Empty when nothing is.
+    ///
+    /// Empty while locked as well: the lock's scene is the lock and nothing
+    /// else. The compositor's own recording carries on and records the lock
+    /// screen, so there is nothing to warn about that the lock screen does
+    /// not already show; a client's capture delivers nothing while locked.
+    fn recording_dots(&self) -> Vec<(&MemoryRenderBuffer, Rect)> {
+        if self.lock.is_some() {
+            return Vec::new();
+        }
+        let mut out: Vec<(&MemoryRenderBuffer, Rect)> = Vec::new();
+        let mut shown: Vec<&str> = Vec::new();
+        for (name, panel) in self.recording_dot.iter().chain(&self.capture_dots) {
+            // One dot per screen, however many things are capturing it.
+            if shown.contains(&name.as_str()) {
+                continue;
+            }
+            let Some(screen) = self.output_index(name).and_then(|i| self.outputs.get(i)) else {
+                continue;
+            };
+            shown.push(name);
+            out.push((
+                panel.buffer(),
+                crate::record::indicator_placement(screen.rect, panel.size()),
+            ));
+        }
+        out
     }
 
     /// How many of [`Self::scene`]'s leading items a capture leaves out: the
-    /// recording dot, when it is up.
+    /// recording dots, when they are up.
     ///
     /// The dot is on the screen for the person at it, not for the recording it
     /// is warning them about, nor for a screenshot taken while it runs. Worked
@@ -6178,7 +6338,7 @@ impl Huginn {
     /// The notification cards follow the dot and are left out with it: what a
     /// notification said is for the person who was there when it arrived.
     pub(crate) fn capture_hidden_len(&self) -> usize {
-        usize::from(self.recording_dot_at().is_some()) + self.notifications.drawn_count()
+        self.recording_dots().len() + self.notifications.drawn_count()
     }
 
     /// The flash's screen rectangle and current opacity, or `None` when it is
@@ -6244,6 +6404,11 @@ impl Huginn {
     /// and put the pointer back. A release with no meaningful drag — a click, a
     /// one-pixel twitch — cancels instead, since a screenshot of nothing is not
     /// what the click asked for.
+    ///
+    /// A selection a client asked for (`raven_region_selection_v1`) is
+    /// answered instead: `selected`, in logical pixels relative to the screen
+    /// the drag started on, or `cancelled` for a click that dragged nothing.
+    /// No screenshot is taken for it.
     pub(crate) fn region_release(&mut self) {
         let Some(region) = self.region.take() else {
             return;
@@ -6251,25 +6416,88 @@ impl Huginn {
         self.region_edges_at = None;
         self.cursor_status = CursorImageStatus::default_named();
         self.queue_redraw();
-        if let Some(rect) = region.rect().filter(|r| r.w() > 1 && r.h() > 1) {
-            // Clamp to the screen it was drawn on, so a drag that ran off the
-            // edge does not ask the capture to read outside the framebuffer. The
-            // screen may have been unplugged mid-drag, in which case there is
-            // nothing to capture and the selection is simply dropped.
-            if let Some(bounds) = self.outputs.get(region.output).map(|o| o.rect)
-                && let Some(clipped) = rect.intersection(bounds)
-            {
-                self.pending_capture = Some((region.output, clipped));
+        let client = self.region_client.take();
+        // The screen the drag started on: the one under the press. The screen
+        // the selection was armed on is the fallback, for a press that landed
+        // in a gap between screens of different heights.
+        let output = region
+            .origin
+            .and_then(|origin| {
+                let point = huginn_core::geometry::Point::new(
+                    origin.x.floor() as i32,
+                    origin.y.floor() as i32,
+                );
+                self.outputs.iter().position(|o| o.rect.contains(point))
+            })
+            .unwrap_or(region.output);
+        // Clamp to that screen, so a drag that ran off the edge does not ask
+        // the capture to read outside the framebuffer. The screen may have
+        // been unplugged mid-drag, in which case there is nothing to capture
+        // and the selection is simply dropped.
+        let taken = region
+            .rect()
+            .filter(|r| r.w() > 1 && r.h() > 1)
+            .and_then(|rect| {
+                let bounds = self.outputs.get(output)?.rect;
+                rect.intersection(bounds)
+            });
+        match (client, taken) {
+            (Some(client), Some(rect)) => {
+                let screen = &self.outputs[output];
+                tracing::debug!(output = %screen.name, ?rect, "region selected for a client");
+                client.selected(
+                    screen.name.clone(),
+                    rect.x() - screen.rect.x(),
+                    rect.y() - screen.rect.y(),
+                    rect.w(),
+                    rect.h(),
+                );
             }
+            (Some(client), None) => client.cancelled(),
+            (None, Some(rect)) => self.pending_capture = Some((output, rect)),
+            (None, None) => {}
         }
     }
 
-    /// Abandon a region selection without capturing.
+    /// Abandon a region selection without capturing. A client that asked for
+    /// it is told `cancelled`.
     pub(crate) fn cancel_region(&mut self) {
         if self.region.take().is_some() {
             self.region_edges_at = None;
             self.cursor_status = CursorImageStatus::default_named();
             self.queue_redraw();
+        }
+        if let Some(client) = self.region_client.take() {
+            client.cancelled();
+        }
+    }
+
+    /// Put the region selection up for a client (`raven_region_selection_v1`).
+    ///
+    /// Cancelled at once if a selection is already up — the client's or the
+    /// keyboard's — or the session is locked, or there is no screen to put it
+    /// on: exactly one of `selected` and `cancelled` is ever sent.
+    pub(crate) fn begin_client_region_select(
+        &mut self,
+        client: raven_protocol::server::raven_region_selection_v1::RavenRegionSelectionV1,
+    ) {
+        if self.is_locked() || self.region_active() || !self.begin_region_select() {
+            tracing::debug!("a client asked for a region selection that cannot go up now");
+            client.cancelled();
+            return;
+        }
+        self.region_client = Some(client);
+    }
+
+    /// A client let go of its region selection object. If the selection is
+    /// still up for it, it comes down, silently: there is nobody to tell.
+    pub(crate) fn region_client_gone(
+        &mut self,
+        client: &raven_protocol::server::raven_region_selection_v1::RavenRegionSelectionV1,
+    ) {
+        if self.region_client.as_ref() == Some(client) {
+            self.region_client = None;
+            self.cancel_region();
         }
     }
 
@@ -7379,6 +7607,15 @@ impl CompositorHandler for Huginn {
 
         on_commit_buffer_handler::<Self>(surface);
         self.queue_redraw();
+        // A window being captured has something new to capture, whether or
+        // not any of it reaches the screen: it may be covered by another.
+        if self.captures.has_windows() {
+            let mut root = surface.clone();
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
+            }
+            self.captures.note_commit(&root);
+        }
 
         // A buffer arriving is what makes a window visible — not its creation,
         // and not its configure. Until then the window holds a reserved and
@@ -8218,6 +8455,9 @@ impl Huginn {
     fn withdraw_toplevel(&mut self, id: WindowId) {
         if let Some(handle) = self.foreign_handles.remove(&id) {
             self.foreign_toplevel_list.remove_toplevel(&handle);
+            // A capture of it is over: `failed`, if a frame was pending, then
+            // `stopped`, now rather than at the next tick.
+            self.refresh_captures();
         }
     }
 }

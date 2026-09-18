@@ -6,6 +6,8 @@ members = [
     "crates/raven-fprint",
     "crates/raven-rec",
     "crates/raven-h264",
+    "crates/raven-aac",
+    "crates/raven-mp4",
     "crates/comp/huginn-core",
     "crates/comp/huginn-comp",
     "crates/comp/huginn-egl",
@@ -40,6 +42,8 @@ raven-desktop = { path = "crates/raven-desktop" }
 raven-fprint = { path = "crates/raven-fprint" }
 raven-rec = { path = "crates/raven-rec" }
 raven-h264 = { path = "crates/raven-h264" }
+raven-aac = { path = "crates/raven-aac" }
+raven-mp4 = { path = "crates/raven-mp4" }
 huginn-core = { path = "crates/comp/huginn-core" }
 huginn-egl = { path = "crates/comp/huginn-egl" }
 raven-protocol = { path = "crates/raven-protocol" }

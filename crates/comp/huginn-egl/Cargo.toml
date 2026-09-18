@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-smithay = { workspace = true, features = ["backend_egl", "renderer_gl"] }
+smithay = { workspace = true, features = ["backend_egl", "renderer_gl", "wayland_frontend"] }
 
 [dependencies]
 thiserror.workspace = true
