@@ -371,7 +371,7 @@ pub(crate) fn rubberband_within(value: f32, min: f32, max: f32, give: f32) -> f3
 /// How a panel comes and goes: 0 is hidden, 1 is shown, and a spring is
 /// what moves between them.
 ///
-/// One type for the launcher, quick settings, the pinned panel and the dock,
+/// One type for the launcher, quick settings, the pin bar and the dock,
 /// so a panel is a panel: they all arrive and leave the same way, and a
 /// change to the way is a change here. A spring rather than a curve so that
 /// a panel dismissed while still arriving turns round with the speed it

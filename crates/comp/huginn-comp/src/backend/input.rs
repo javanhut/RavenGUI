@@ -385,6 +385,25 @@ fn shell_press(state: &mut Huginn, button: u32, source: Source) -> Taken {
         return Taken::Shell;
     }
 
+    // The dock's context menu owns the press while it is up: on a row it does
+    // what the row says, anywhere else it puts the menu away. Either way the
+    // press is the menu's and reaches nothing behind it — which is what a
+    // menu being open means.
+    if state.dock_menu_is_open() {
+        state.dock_menu_click();
+        return Taken::Shell;
+    }
+
+    // The right button on a dock icon opens that icon's menu. Swallowed even
+    // when nothing opens — on the launcher button, which is not an
+    // application — so that a right click on the dock never starts anything:
+    // a button that launches a browser because there was no menu to show is
+    // a button nobody can trust.
+    if button == crate::mouse::BTN_RIGHT && state.dock_click().is_some() {
+        state.open_dock_menu();
+        return Taken::Shell;
+    }
+
     // The dock is compositor-drawn, so it is not under the pointer as far as
     // any client is concerned. It has to be asked first, or a click on it
     // falls through to whatever window is behind it.

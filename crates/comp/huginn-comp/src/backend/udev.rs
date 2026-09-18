@@ -1779,6 +1779,7 @@ impl Udev {
         let switcher_open = self.state.app_switcher_open();
         let selecting_region = self.state.region_active();
         let help_open = self.state.help_open();
+        let dock_menu_open = self.state.dock_menu_is_open();
         let action = self
             .keyboard
             .input::<Option<Action>, _>(
@@ -1810,6 +1811,7 @@ impl Udev {
                                 switcher_open,
                                 selecting_region,
                                 help_open,
+                                dock_menu_open,
                             },
                         )
                     }
@@ -1862,6 +1864,10 @@ impl Udev {
             }
             Action::CloseHelp => {
                 state.close_help();
+                return;
+            }
+            Action::CloseDockMenu => {
+                state.close_dock_menu();
                 return;
             }
             Action::CloseFocused => {

@@ -409,6 +409,41 @@ pub(crate) fn has_buffer(surface: &WlSurface) -> bool {
 }
 
 /// The compositor.
+/// The dock's context menu: what it is about, what its rows do, and where
+/// they were drawn.
+///
+/// Opened with the right button on a dock icon, and driven by the pointer
+/// alone — it is not a keyboard surface, so it takes no grab and the
+/// keyboard stays with whatever had it. A click anywhere but on a row puts
+/// it away.
+#[derive(Debug)]
+struct DockMenu {
+    /// The item it belongs to, as an index into `dock_items`; the menu is
+    /// drawn above that slot.
+    item: usize,
+    /// The application it names, as an index into the application list.
+    entry: usize,
+    /// Which row is under the pointer.
+    selected: Option<usize>,
+    /// What each row does, in the order they are drawn.
+    acts: Vec<DockAct>,
+    panel: crate::canvas::Panel,
+    rect: Rect,
+    layout: crate::launcher::Layout,
+}
+
+/// What a row of [`DockMenu`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockAct {
+    /// The entry's `n`th desktop action — "New Window", and the rest of what
+    /// the application advertised.
+    Action(usize),
+    /// Put the application on the pin bar, or take it off.
+    Pin,
+    /// Ask every window of it to close.
+    Quit,
+}
+
 pub(crate) struct Huginn {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -741,6 +776,8 @@ pub(crate) struct Huginn {
 
     /// The dock, and its rendered strip.
     pub(crate) dock: crate::dock::Dock,
+    /// The dock's context menu, while one is up.
+    dock_menu: Option<DockMenu>,
     dock_panel: Option<crate::canvas::Panel>,
     /// Thumbnails above the strip: the switcher's highlighted window, or every
     /// window of the application the pointer is over.
@@ -754,6 +791,15 @@ pub(crate) struct Huginn {
     /// The items the strip currently holds, so a click can be resolved against
     /// the same list that was drawn.
     dock_items: Vec<crate::dock::Item>,
+    /// Where the pointer is along the dock's bar, in logical pixels from its
+    /// left edge, or `None` when it is not on the dock.
+    ///
+    /// Quantized to [`crate::dock::POINTER_STEP`]: the icons are magnified
+    /// around this, so every change to it repaints the strip, and a raw
+    /// pointer position would repaint on every motion event the device
+    /// managed to send. At a few pixels a step the lift still looks
+    /// continuous.
+    dock_pointer: Option<f32>,
 
     /// Quick settings, and its rendered panel.
     pub(crate) settings: crate::settings::Settings,
@@ -780,7 +826,7 @@ pub(crate) struct Huginn {
     /// frame — a search field repainted at the refresh rate is how one ends up
     /// feeling slower than the typing that drives it.
     launcher_panel: Option<crate::canvas::Panel>,
-    /// The pinned panel, the pins it shows, and its pixels. The pins are
+    /// The pin bar, the pins it shows, and its pixels. The pins are
     /// held here rather than in the panel because three things write them:
     /// the panel, the launcher's menu, and quick settings.
     pub(crate) pinned: crate::pinned::Pinned,
@@ -1141,6 +1187,8 @@ impl Huginn {
             resizing: false,
             socket: String::new(),
             dock: crate::dock::Dock::default(),
+            dock_menu: None,
+            dock_pointer: None,
             dock_panel: None,
             dock_previews: Vec::new(),
             dock_hover: None,
@@ -1166,11 +1214,10 @@ impl Huginn {
             text: crate::text::Text::new(),
             display: dh.clone(),
         };
-        // The rows in quick settings are where the pinned panel's layout is
-        // changed, so they start from what the file said.
-        huginn
-            .settings
-            .set_pins_layout(huginn.pins.position(), huginn.pins.orientation());
+        // The row in quick settings is where the pin bar's edge is changed,
+        // so it starts from what the file said.
+        huginn.settings.set_pins_position(huginn.pins.position());
+        huginn.dock.set_prefs(huginn.desktop_config.dock());
         huginn.settings.apply_desktop_config(
             huginn.desktop_config.motion(),
             huginn.desktop_config.idle_after(),
@@ -1205,6 +1252,13 @@ impl Huginn {
             cfg.do_not_disturb(),
         );
         self.notifications.set_timeouts(cfg.notification_timeouts());
+        // The dock's icons may just have changed size, which changes where
+        // every one of them is: it has to be laid out and painted again, and
+        // the pointer's place along it no longer means what it did.
+        if self.dock.set_prefs(cfg.dock()) {
+            self.dock_pointer = None;
+            self.refresh_dock();
+        }
         // The launcher row may just have changed under an open launcher.
         if self.launcher.set_style(self.settings.launcher_style()) && self.launcher.is_open() {
             let now = self.now();
@@ -1400,7 +1454,9 @@ impl Huginn {
             // as a global rect when the launcher opened. The dock has moved
             // with the focused output, so re-aim before re-placing — the old
             // rect can point at another screen entirely.
-            let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
+            let origin = self
+                .dock_rect()
+                .map(|dock| crate::dock::item_rect(dock, 0, self.dock.prefs()));
             self.launcher.set_origin(origin);
             self.refresh_launcher();
         }
@@ -1946,10 +2002,15 @@ impl Huginn {
         }
         // --- blur boundary: everything below here is what a panel blurs ---
         if let Some(panel) = &self.dock_panel
-            && let Some(rect) = self.dock_rect()
+            && let Some(rect) = self.dock_panel_rect()
         {
             out.push(SceneItem::Overlay(panel.buffer(), rect, 1.0));
             out.extend(self.dock_preview_items());
+        }
+        // The dock's own menu, directly over the dock: it was opened from an
+        // icon and belongs to it, the way a panel's menu belongs to it.
+        if let Some(menu) = &self.dock_menu {
+            out.push(SceneItem::Overlay(menu.panel.buffer(), menu.rect, 1.0));
         }
         // A panel's own menu belongs directly on top of the panel, not on top
         // of everything, so each layer surface carries its popups with it.
@@ -2350,7 +2411,7 @@ impl Huginn {
         if dismissed == crate::settings::Outcome::Dismissed {
             self.refresh_settings();
         }
-        // The pinned panel too: it takes every key, and a locked session
+        // The pin bar too: it takes every key, and a locked session
         // must not come back with a panel that swallows the first thing
         // typed at it.
         if self.pinned.is_open() {
@@ -2643,6 +2704,7 @@ impl Huginn {
             return Some(crate::dock::centred_placement(
                 self.output_area(),
                 self.dock_items.len().max(1),
+                self.dock.prefs(),
             ));
         }
         let now = self.uptime();
@@ -2653,11 +2715,287 @@ impl Huginn {
             self.output_area(),
             self.dock_items.len().max(1),
             self.dock.reveal(now),
+            self.dock.prefs(),
+        ))
+    }
+
+    /// Whether the dock's context menu is up.
+    pub(crate) fn dock_menu_is_open(&self) -> bool {
+        self.dock_menu.is_some()
+    }
+
+    /// Put the menu away. Returns whether there was one.
+    pub(crate) fn close_dock_menu(&mut self) -> bool {
+        let had = self.dock_menu.take().is_some();
+        if had {
+            self.queue_redraw();
+        }
+        had
+    }
+
+    /// Open the context menu for whatever dock icon the pointer is on.
+    ///
+    /// Returns whether one opened. It does not for the launcher button,
+    /// which is not an application and has nothing to offer, nor for a
+    /// switcher tile — that strip is the keyboard's.
+    pub(crate) fn open_dock_menu(&mut self) -> bool {
+        if self.app_switcher.is_some() {
+            return false;
+        }
+        let Some(bar) = self.dock_rect() else {
+            return false;
+        };
+        let point = self.pointer_point();
+        if !bar.contains(point) {
+            return false;
+        }
+        let Some(index) = self.dock.item_at(point.x, bar, self.dock_items.len()) else {
+            return false;
+        };
+        let Some(item) = self.dock_items.get(index) else {
+            return false;
+        };
+        let (Some(entry), running) = (item.entry, item.running) else {
+            return false;
+        };
+        let Some(app) = self.apps.get(entry) else {
+            return false;
+        };
+        // What the application advertised, then what the desktop can do with
+        // it. Quit only when there is something to quit.
+        let mut acts: Vec<DockAct> = (0..app.actions.len()).map(DockAct::Action).collect();
+        acts.push(DockAct::Pin);
+        if running {
+            acts.push(DockAct::Quit);
+        }
+        // A menu takes the room a preview would, and two things in one place
+        // is one thing too many.
+        self.dock_previews.clear();
+        self.dock_hover_since = None;
+        let Some((panel, rect, layout)) = self.draw_dock_menu(index, entry, &acts, None) else {
+            return false;
+        };
+        self.dock_menu = Some(DockMenu {
+            item: index,
+            entry,
+            selected: None,
+            acts,
+            panel,
+            rect,
+            layout,
+        });
+        self.queue_redraw();
+        true
+    }
+
+    /// Lay the menu out and paint it, and say where it went.
+    fn draw_dock_menu(
+        &mut self,
+        item: usize,
+        entry: usize,
+        acts: &[DockAct],
+        selected: Option<usize>,
+    ) -> Option<(crate::canvas::Panel, Rect, crate::launcher::Layout)> {
+        let app = self.apps.get(entry)?;
+        // Owned before the drawing, which wants the application list's
+        // neighbours in `self` mutably.
+        let pinned = self.pins.is_pinned(&app.path);
+        let title = (app.name.clone(), app.icon.clone());
+        let labels: Vec<(String, Option<String>, bool)> = acts
+            .iter()
+            .filter_map(|act| match act {
+                DockAct::Action(n) => app
+                    .actions
+                    .get(*n)
+                    .map(|action| (action.name.clone(), action.icon.clone(), false)),
+                // The theme's own bookmark pair for the mark, which is
+                // what KDE's vocabulary calls pinning; `breeze`'s `pin` is a
+                // dark glyph meant for a light panel, and this one is drawn
+                // for a dark one. A theme that has neither falls back to the
+                // drawn mark, so nothing depends on it being there.
+                DockAct::Pin => Some(if pinned {
+                    (
+                        crate::launcher::UNPIN.to_owned(),
+                        Some("bookmark-remove".to_owned()),
+                        false,
+                    )
+                } else {
+                    (
+                        crate::launcher::PIN.to_owned(),
+                        Some("bookmark-new".to_owned()),
+                        false,
+                    )
+                }),
+                DockAct::Quit => Some((crate::dock::QUIT.to_owned(), None, true)),
+            })
+            .collect();
+        let rows: Vec<crate::menu::Row> = labels
+            .iter()
+            .map(|(label, icon, danger)| {
+                if *danger {
+                    crate::menu::Row::danger(label)
+                } else {
+                    crate::menu::Row::action(label, icon.as_deref())
+                }
+            })
+            .collect();
+        // The application's own actions, then the desktop's: `acts` is built
+        // in that order, so the split is the first row that is not an action.
+        let split = acts
+            .iter()
+            .position(|act| !matches!(act, DockAct::Action(_)))
+            .unwrap_or(rows.len());
+        let (offered, desktop) = rows.split_at(split);
+        let (area, density) = (self.output_area(), self.scale().advertised);
+        let bar = self.dock_rect()?;
+        let (panel, layout) = crate::dock::menu(
+            &mut self.text,
+            &self.icons,
+            &mut self.pixmaps,
+            (&title.0, title.1.as_deref()),
+            &[offered, desktop],
+            selected,
+            area,
+            density,
+        );
+        let slot = crate::dock::item_rect(bar, item, self.dock.prefs());
+        let rect = crate::dock::menu_placement(panel.size(), slot, bar, area);
+        Some((panel, rect, layout))
+    }
+
+    /// The pointer moved while the menu is up: the highlight follows it.
+    pub(crate) fn dock_menu_pointer_moved(&mut self) {
+        let Some(menu) = self.dock_menu.as_ref() else {
+            return;
+        };
+        let at = menu
+            .layout
+            .canvas_point(menu.rect, self.pointer_point())
+            .and_then(|point| menu.layout.menu_hit(point));
+        if menu.selected == at {
+            return;
+        }
+        let (item, entry) = (menu.item, menu.entry);
+        let acts = menu.acts.clone();
+        let Some((panel, rect, layout)) = self.draw_dock_menu(item, entry, &acts, at) else {
+            self.close_dock_menu();
+            return;
+        };
+        if let Some(menu) = self.dock_menu.as_mut() {
+            menu.selected = at;
+            menu.panel = panel;
+            menu.rect = rect;
+            menu.layout = layout;
+        }
+        self.queue_redraw();
+    }
+
+    /// A click while the menu is up: a row does what it says, and anywhere
+    /// else puts the menu away. Either way the click is the menu's.
+    pub(crate) fn dock_menu_click(&mut self) {
+        let Some(menu) = self.dock_menu.as_ref() else {
+            return;
+        };
+        let row = menu
+            .layout
+            .canvas_point(menu.rect, self.pointer_point())
+            .and_then(|point| menu.layout.menu_hit(point));
+        let (Some(row), Some(act)) = (row, row.and_then(|n| menu.acts.get(n).copied())) else {
+            self.close_dock_menu();
+            return;
+        };
+        let _ = row;
+        let entry = menu.entry;
+        self.close_dock_menu();
+        self.run_dock_act(entry, act);
+    }
+
+    /// Do what a menu row said.
+    fn run_dock_act(&mut self, entry: usize, act: DockAct) {
+        let Some(app) = self.apps.get(entry) else {
+            return;
+        };
+        match act {
+            DockAct::Action(n) => {
+                let Some(argv) = app
+                    .actions
+                    .get(n)
+                    .and_then(|action| app.action_argv(action, &[]))
+                else {
+                    return;
+                };
+                let argv = if app.terminal {
+                    crate::launcher::in_terminal(argv, &self.apps)
+                } else {
+                    argv
+                };
+                let path = app.path.clone();
+                self.launch(Some(path), &argv);
+            }
+            DockAct::Pin => {
+                let path = app.path.clone();
+                self.toggle_pin(&path);
+            }
+            DockAct::Quit => {
+                let app = app.clone();
+                self.quit_app(&app);
+            }
+        }
+    }
+
+    /// Ask every window of `app` to close.
+    ///
+    /// Politely, through the same request the close binding sends: a client
+    /// is free to answer with a save dialog, and nothing here kills anything.
+    /// Across every workspace rather than the visible one, because "Quit"
+    /// means the application — a window left behind on another page would
+    /// make it look as though it had not worked.
+    fn quit_app(&mut self, app: &raven_desktop::Entry) {
+        let ids: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|(_, window)| {
+                window
+                    .app_id()
+                    .is_some_and(|id| crate::dock::matches(app, &id))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        tracing::info!(app = %app.name, windows = ids.len(), "quit from the dock");
+        for id in ids {
+            if let Some(window) = self.windows.get(&id) {
+                window.close();
+            }
+        }
+    }
+
+    /// Where the dock's *panel* goes, which is not where its bar goes: the
+    /// canvas keeps room above the bar for an icon magnified under the
+    /// pointer and the label over it. The switcher has neither, so there its
+    /// panel is its bar.
+    ///
+    /// Only the drawing wants this. Everything else — hit testing, previews,
+    /// the launcher's origin — wants [`Self::dock_rect`], the bar.
+    pub(crate) fn dock_panel_rect(&self) -> Option<Rect> {
+        let bar = self.dock_rect()?;
+        if self.app_switcher.is_some() {
+            return Some(bar);
+        }
+        Some(crate::dock::panel_placement(
+            self.output_area(),
+            self.dock_items.len().max(1),
+            self.dock.reveal(self.uptime()),
+            self.dock.prefs(),
         ))
     }
 
     /// Rebuild the dock strip from what is running.
     pub(crate) fn refresh_dock(&mut self) {
+        // A menu belongs to an icon of the dock. If the dock has gone, or the
+        // strip has become the switcher, so has the thing it was about.
+        if self.dock_menu.is_some() && (self.app_switcher.is_some() || self.dock_rect().is_none()) {
+            self.close_dock_menu();
+        }
         if self.has_fullscreen() && self.app_switcher.is_none() {
             self.dock.hide_now();
             self.dock_panel = None;
@@ -2685,7 +3023,16 @@ impl Huginn {
                 switcher.selected = switcher.selected.min(len - 1);
             }
         }
-        let selected = self.app_switcher.map(|switcher| switcher.selected);
+        let strip = match self.app_switcher {
+            Some(switcher) => crate::dock::Strip::Switcher {
+                selected: Some(switcher.selected),
+            },
+            // Where the pointer is along the bar, so the icons under it lift.
+            // `None` when it is anywhere else, which is a dock at rest.
+            None => crate::dock::Strip::Dock {
+                pointer: self.dock_pointer,
+            },
+        };
         self.rebuild_dock_previews();
         let (area, advertised) = (self.output_area(), self.scale().advertised);
         self.dock_panel = (self.app_switcher.is_some() || self.dock.is_visible(self.uptime()))
@@ -2698,7 +3045,8 @@ impl Huginn {
                     &mut self.text,
                     area,
                     advertised,
-                    selected,
+                    strip,
+                    self.dock.prefs(),
                 )
             });
         self.queue_redraw();
@@ -2745,7 +3093,7 @@ impl Huginn {
                     .is_some_and(|app_id| crate::dock::matches(entry, &app_id))
             })
             .collect();
-        let tile = crate::dock::item_rect(dock, index);
+        let tile = crate::dock::item_rect(dock, index, self.dock.prefs());
         (windows, Some(tile.x() + tile.w() / 2))
     }
 
@@ -2837,11 +3185,11 @@ impl Huginn {
                     .and_then(|entry| self.apps.get(entry))
                     .is_some_and(|entry| crate::dock::matches(entry, &app_id))
             })?;
-            Some(crate::dock::item_rect(dock, index))
+            Some(crate::dock::item_rect(dock, index, self.dock.prefs()))
         });
         tile.unwrap_or_else(|| {
             let area = self.output_area();
-            let side = crate::dock::placement(area, 1, 1.0).h();
+            let side = crate::dock::placement(area, 1, 1.0, self.dock.prefs()).h();
             Rect::from_xywh(
                 area.x() + (area.w() - side) / 2,
                 area.bottom() - side,
@@ -3078,17 +3426,41 @@ impl Huginn {
         // not appear ahead of the visible strip.
         let approaching_dock = self.app_switcher.is_none()
             && self.dock.is_animating(now)
-            && crate::dock::placement(self.output_area(), self.dock_items.len().max(1), 1.0)
-                .contains(pointer);
+            && crate::dock::placement(
+                self.output_area(),
+                self.dock_items.len().max(1),
+                1.0,
+                self.dock.prefs(),
+            )
+            .contains(pointer);
         let motion = self.settings.motion();
         let y = self.pointer_location.y.round() as i32;
         if self.dock.pointer_moved(
             y,
             self.output_area(),
-            over_dock || approaching_dock,
+            over_dock || approaching_dock || self.dock_menu.is_some(),
             now,
             motion,
         ) {
+            self.refresh_dock();
+        }
+        // The menu's highlight follows the pointer, as every other menu's does.
+        if self.dock_menu.is_some() {
+            self.dock_menu_pointer_moved();
+        }
+        // And where along the dock it is, which is what the icons lift
+        // around. Not for a switcher: its tiles are chosen by the keyboard,
+        // and tiles that grew under a passing pointer would move the thing
+        // being aimed at.
+        let along = (self.app_switcher.is_none() && over_dock)
+            .then(|| self.dock_rect())
+            .flatten()
+            .map(|rect| {
+                let step = crate::dock::POINTER_STEP;
+                ((pointer.x - rect.x()) as f32 / step).round() * step
+            });
+        if self.dock_pointer != along {
+            self.dock_pointer = along;
             self.refresh_dock();
         }
         // The strip's highlight follows the pointer, as the overview's does:
@@ -4423,7 +4795,9 @@ impl Huginn {
     /// cannot follow. Without one it grows in place from the centre.
     pub(crate) fn open_launcher(&mut self) {
         self.request_file_index_if_stale();
-        let origin = self.dock_rect().map(|dock| crate::dock::item_rect(dock, 0));
+        let origin = self
+            .dock_rect()
+            .map(|dock| crate::dock::item_rect(dock, 0, self.dock.prefs()));
         let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
         self.launcher.set_pinned(self.pins.paths().to_vec());
         self.launcher.set_style(self.settings.launcher_style());
@@ -4546,7 +4920,7 @@ impl Huginn {
     }
 
     /// The pin list or its layout changed: save it, and bring every view of
-    /// it up to date — the launcher's menu label, the pinned panel's items.
+    /// it up to date — the launcher's menu label, the pin bar's items.
     fn pins_changed(&mut self) {
         self.save_pins();
         self.launcher.set_pinned(self.pins.paths().to_vec());
@@ -4567,14 +4941,14 @@ impl Huginn {
         }
     }
 
-    /// Open the pinned panel where quick settings put it.
+    /// Open the pin bar where quick settings put it.
     pub(crate) fn open_pinned(&mut self) {
         let (clock, motion) = (self.uptime(), self.settings.motion());
         self.pinned.open(&self.apps, &self.pins, clock, motion);
         self.refresh_pinned();
     }
 
-    /// Apply a keystroke to the pinned panel, and act on what it asks for.
+    /// Apply a keystroke to the pin bar, and act on what it asks for.
     pub(crate) fn pinned_key(&mut self, key: crate::pinned::Key) {
         let (clock, motion) = (self.uptime(), self.settings.motion());
         let outcome = self
@@ -4583,7 +4957,7 @@ impl Huginn {
         self.act_on_pinned(outcome);
     }
 
-    /// The pointer, as a pixel of the pinned panel's canvas, when it is over
+    /// The pointer, as a pixel of the pin bar's canvas, when it is over
     /// the open panel. See [`Huginn::launcher_canvas_point`].
     fn pinned_canvas_point(&self) -> Option<huginn_core::geometry::Point> {
         if !self.pinned.is_open() {
@@ -4601,12 +4975,12 @@ impl Huginn {
             .canvas_point(placed, self.pointer_point())
     }
 
-    /// Whether the open pinned panel is under the pointer.
+    /// Whether the open pin bar is under the pointer.
     pub(crate) fn pinned_covers_pointer(&self) -> bool {
         self.pinned_canvas_point().is_some()
     }
 
-    /// Tell the pinned panel where the pointer went.
+    /// Tell the pin bar where the pointer went.
     pub(crate) fn pinned_pointer_moved(&mut self) {
         let Some(point) = self.pinned_canvas_point() else {
             return;
@@ -4615,7 +4989,7 @@ impl Huginn {
         self.act_on_pinned(outcome);
     }
 
-    /// A press while the pinned panel is open. Returns whether it was
+    /// A press while the pin bar is open. Returns whether it was
     /// taken: on the panel it opens what it landed on, anywhere else it
     /// dismisses the panel, as Escape would.
     pub(crate) fn pinned_click(&mut self) -> bool {
@@ -4635,7 +5009,7 @@ impl Huginn {
         true
     }
 
-    /// Do what the pinned panel asked for after a key or a click.
+    /// Do what the pin bar asked for after a key or a click.
     fn act_on_pinned(&mut self, outcome: crate::pinned::Outcome) {
         match outcome {
             crate::pinned::Outcome::Launch { entry, argv } => {
@@ -4650,13 +5024,17 @@ impl Huginn {
         }
     }
 
-    /// Redraw the pinned panel, or drop it when it is closed.
+    /// Redraw the pin bar, or drop it when it is closed.
     pub(crate) fn refresh_pinned(&mut self) {
         let (area, advertised) = (self.output_area(), self.scale().advertised);
+        // A pinned application that is running says so, with the mark the
+        // dock uses for the same fact — and from the same list.
+        let running = self.running_app_ids();
         self.pinned_panel = self.pinned.is_visible(self.uptime()).then(|| {
             let (panel, layout) = crate::pinned::render(
                 &self.pinned,
                 &self.apps,
+                &running,
                 &mut self.text,
                 &self.icons,
                 &mut self.pixmaps,
@@ -4771,7 +5149,7 @@ impl Huginn {
     /// Start the application behind a dock entry. The launcher opens
     /// applications rather than documents, so there are no targets to
     /// substitute. A `Terminal=true` entry is wrapped in the terminal here
-    /// just as the launcher and the pinned panel wrap it — the dock must not
+    /// just as the launcher and the pin bar wrap it — the dock must not
     /// be the one place a TUI app launches without its terminal.
     fn launch_dock_entry(&mut self, index: usize) {
         let Some(entry) = self.apps.get(index) else {
@@ -4954,10 +5332,11 @@ impl Huginn {
                 self.launcher.style(),
             ));
         }
-        // The pinned panel is drawn with the launcher's corners, so its
-        // blur is inset the same way.
+        // The pin bar blurs its rail rather than its canvas: the canvas is
+        // rail, menu and the transparent air between them. See
+        // [`crate::pinned::Pinned::blur_region`].
         if let Some(panel) = self.pinned_panel.as_ref() {
-            return crate::launcher::blur_rect(crate::pinned::placement(
+            return self.pinned.blur_region(crate::pinned::placement(
                 self.output_area(),
                 panel.size(),
                 self.pinned.position(),
@@ -5206,11 +5585,9 @@ impl Huginn {
         if self.volume.borrow().is_visible(now) {
             self.refresh_volume();
         }
-        // The pinned rows may just have been stepped. The rows own the
-        // value; the pins take a copy, and the file and the panel follow.
-        let position = self.settings.pins_position();
-        let orientation = self.settings.pins_orientation();
-        if self.pins.set_position(position) | self.pins.set_orientation(orientation) {
+        // The pin bar's row may just have been stepped. The row owns the
+        // value; the pins take a copy, and the file and the bar follow.
+        if self.pins.set_position(self.settings.pins_position()) {
             self.pins_changed();
         }
         // The launcher row, likewise: the row owns the value and the
@@ -5258,7 +5635,7 @@ impl Huginn {
             self.launcher.reindex(&self.apps, &self.frecency, now);
         }
         self.refresh_launcher();
-        // The pinned panel holds indices into the same list.
+        // The pin bar holds indices into the same list.
         if self.pinned.is_visible(self.uptime()) {
             self.pinned.refresh(&self.apps, &self.pins);
             self.refresh_pinned();
