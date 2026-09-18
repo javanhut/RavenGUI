@@ -68,9 +68,12 @@ needs the device, and the device is the daemon's.
 | The `elanmoc` driver — usbfs transport and protocol | `init/src/fprint.rs`, **RavenLinux** | **Done** |
 | `raven-fprintd` — the daemon that owns the device | `init/src/fprintd.rs`, **RavenLinux** | **Done** |
 | Build and install wiring — `imlazy dev`, the ISO stage, the service | RavenLinux | **Done** |
-| `ravend` asking the daemon, protocol extension | RavenLogin | Not written |
-| `raven-lock` offering the finger beside the password | RavenLogin | Not written |
-| Enrolment UI | `raven-settings` | Not written |
+| `ravend` asking the daemon, protocol extension | RavenLogin (`crates/ravend/src/finger.rs`, `raven-greet-proto`) | **Done** |
+| Per-account policy file, sensor client | RavenLogin (`crates/raven-finger`) | **Done** |
+| `raven-lock` offering the finger beside the password | RavenLogin | **Done** |
+| `raven-greeter` offering it at login, opt-in per account | RavenLogin | **Done** |
+| `sudo` through `pam_exec`, opt-in per account | RavenLogin (`raven-finger-auth`) | **Done** |
+| Enrolment UI and the switches | `raven-settings`, Security page | **Done** |
 
 `raven-fprint` is deliberately in RavenGUI rather than RavenLogin, alongside
 `raven-protocol`, and for the same reason: both repositories consume it, it is
@@ -191,20 +194,49 @@ stays on the device, enrolment feeds it frames until it says it has enough, and
 verification asks it which stored finger matched. A host that cannot read a
 template cannot leak one.
 
-## What is left
+## Where a finger may be used
 
-`ravend` asking the daemon, and the lock screen offering the finger. The driver
-answers on `/run/raven-fprint/sensor.sock` today — `status`, `list`, `verify`,
-`enrol`, `forget`, `forget-all`, one line each — and can be driven by hand with
-`socat` as root. What it cannot yet do is unlock anything, because nothing asks
-it to.
+Nowhere, until its owner says so. Settings > Security has three switches --
+**Log in**, **Unlock the screen**, **Approve sudo** -- and they are stored per
+account in `/var/lib/raven-login/fingerprint/<account>.toml`, a root-only file
+that only `ravend` writes. Enrolling a finger and switching any of them *on*
+take the account's password, because a finger can be enrolled by whoever is
+sitting at an unlocked machine and a password cannot. Switching one off and
+removing a finger never do; removing the last finger switches everything off.
+
+The password is never taken away. The login and lock screens keep the field
+focused and typeable the whole time the reader is being watched, and `sudo`
+falls through to its password prompt on a miss, a timeout, or Enter.
+
+**The login screen** was the one place this document used to rule out, on the
+grounds that a finger answers "is this you?" and not "who are you?". That holds,
+and it is why the greeter names the account: `LoginByFinger { username }`
+watches for *that* account's fingers only, the account on screen, and a finger
+enrolled to anybody else is a miss however cleanly it matched. The account must
+be one the screen offers, its owner must have turned login on, and it still has
+to pass every rule the password would -- locked, expired and root are refused
+by `Authenticator::admit` exactly as `authenticate` refuses them.
+
+**`sudo`** goes through PAM: `pam_exec` runs `raven-finger-auth` as a
+`sufficient` module ahead of `pam_unix`. It steps aside silently unless the
+account turned sudo on, has a finger enrolled, `sudo` has a terminal and reads
+its password from it, and the `sudo` did not come in over SSH. Echo is off while
+it waits so a password typed early does not land in the scrollback. The line in
+`/etc/pam.d/sudo` is added by `raven-finger-auth --install-pam`, which Settings
+offers to run in a terminal the first time the switch goes on.
+
+**Misses** are counted by `ravend` per account, across both screens and across
+watches, so a client cannot reset the count by starting a new watch. Three, and
+the reader stops being offered until the password is used or fifteen minutes
+pass.
 
 ## The protocol extension
 
-`raven-greet-proto`, on `VERIFY_SOCKET_PATH` only, never on the greet socket:
-there is no fingerprint login, because at the login screen the machine does not
-know whose session it would be, and a finger answers "is this you?" and not "who
-are you?".
+`raven-greet-proto`. Everything but `LoginByFinger` is on `VERIFY_SOCKET_PATH`
+and about the connection's own account; `LoginByFinger` is on the greet socket
+only, for the reason given above. As built, the request names are `WatchFinger`,
+`LoginByFinger`, `FingerStatus`, `EnrolFinger` (with the password),
+`ForgetFinger` and `SetFingerPolicy`; the sketch below is the original design.
 
 Unlike `Verify`, this cannot be one request and one response. A finger takes
 seconds and reports retries along the way, and a lock screen that said "touch
