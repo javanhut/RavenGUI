@@ -594,6 +594,7 @@ fn draw_sidebar(
         |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
     let accent = crate::theme::accent();
     let (found_apps, found_files) = launcher.found();
+    #[allow(clippy::type_complexity)]
     let rows: Vec<(&str, Option<usize>, Button, bool, &[&str])> = if typing {
         Filter::ALL
             .into_iter()

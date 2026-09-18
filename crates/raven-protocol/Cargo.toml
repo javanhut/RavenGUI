@@ -19,6 +19,11 @@ wayland-backend.workspace = true
 wayland-scanner.workspace = true
 wayland-server = { workspace = true, optional = true }
 wayland-client = { workspace = true, optional = true }
+# The generated code spells bitfield enums — raven_capture_v1.options — as
+# `bitflags!`, and names the crate from the caller's side. Already in the tree
+# through wayland-server and wayland-client; declared here, not in the
+# workspace, since this crate is meant to move to its own repository.
+bitflags = "2"
 
 
 

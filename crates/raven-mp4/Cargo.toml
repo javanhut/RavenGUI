@@ -1,0 +1,22 @@
+[package]
+name = "raven-mp4"
+description = "Raven's own MP4 writer: H.264 video, AAC audio, or both."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Nothing beyond std: the container every recording ends up in cannot be one
+# somebody else can break.
+[dependencies]
+
+# The tests fill the audio track with real AAC from Raven's own encoder, and
+# check that a demuxer and decoder somebody else wrote read it back. Only the
+# tests build these; nothing that ships links them.
+[dev-dependencies]
+raven-aac.workspace = true
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
+
+[lints]
+workspace = true

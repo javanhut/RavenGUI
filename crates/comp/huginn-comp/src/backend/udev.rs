@@ -217,6 +217,9 @@ struct Udev {
     recording: Option<crate::record::Recording>,
     /// The timer that ticks it, so stopping can take the timer out too.
     recording_timer: Option<RegistrationToken>,
+    /// The timer that serves clients' captures, while it has anything to
+    /// do. See `crate::capture`.
+    capture_timer: Option<RegistrationToken>,
 }
 
 /// How long a withdrawn `wl_output` global stays bindable before it is
@@ -544,6 +547,7 @@ pub(crate) fn run() -> Result<()> {
         retired_globals: Vec::new(),
         recording: None,
         recording_timer: None,
+        capture_timer: None,
     };
 
     // Every other DRM device on the seat: the discrete GPU on a hybrid
@@ -602,6 +606,7 @@ pub(crate) fn run() -> Result<()> {
             data.reap_retired_globals();
             data.state.refresh();
             data.render_dirty();
+            data.schedule_captures();
             if let Err(e) = data.display.flush_clients() {
                 tracing::warn!(error = %e, "flushing clients");
             }
@@ -1569,6 +1574,7 @@ impl Udev {
         elements.extend(behind);
 
         let Udev {
+            state,
             renderer,
             allocator,
             screens,
@@ -1612,6 +1618,8 @@ impl Udev {
                 {
                     recording.note_damage();
                 }
+                // Likewise every client's capture of it.
+                state.captures.note_damage(&screen.name);
             }
             // Nothing changed on screen; do not burn a page flip on it.
             Ok(false) => {
@@ -2034,6 +2042,58 @@ impl Udev {
             ),
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "recording failed"),
         }
+    }
+
+    /// Arm the capture timer if a client's capture has work and it is not
+    /// armed, or fire it at once if something has asked for that — a frame
+    /// requested, or a source with a frame pending that just changed.
+    fn schedule_captures(&mut self) {
+        let kick = self.state.captures.take_kick();
+        if !kick && (self.capture_timer.is_some() || !self.state.captures.wants_ticks()) {
+            return;
+        }
+        if let Some(token) = self.capture_timer.take() {
+            self.handle.remove(token);
+        }
+        let timer = Timer::immediate();
+        match self.handle.insert_source(timer, |_, _, data: &mut Udev| {
+            match data.tick_captures() {
+                Some(wait) => TimeoutAction::ToDuration(wait),
+                None => {
+                    data.capture_timer = None;
+                    TimeoutAction::Drop
+                }
+            }
+        }) {
+            Ok(token) => self.capture_timer = Some(token),
+            Err(e) => tracing::error!(error = %e, "cannot arm the capture timer"),
+        }
+    }
+
+    /// One tick of the clients' captures; see `crate::capture::tick`. The
+    /// events it sends go out with the end-of-cycle flush.
+    ///
+    /// Switched away to another VT, nothing is drawn — the GPU is not ours
+    /// to draw with — and the timer stays armed at a relaxed pace for the
+    /// session's return.
+    fn tick_captures(&mut self) -> Option<std::time::Duration> {
+        if !self.session.is_active() {
+            let busy = self.state.captures.wants_ticks() || self.state.capture_dots_up();
+            return busy.then_some(std::time::Duration::from_millis(250));
+        }
+        let icon = match &self.state.cursor_status {
+            CursorImageStatus::Named(icon) => *icon,
+            _ => CursorIcon::Default,
+        };
+        let cursors = &self.cursors;
+        // The pointer as the captured screen draws it: at that screen's
+        // density, in the shape a client asked for.
+        let cursor = |density: u32| {
+            cursors
+                .get(&(density, icon))
+                .or_else(|| cursors.get(&(density, CursorIcon::Default)))
+        };
+        crate::capture::tick(&mut self.renderer, &mut self.state, &cursor)
     }
 
     /// One tick of the recording. Returns whether it is still going.

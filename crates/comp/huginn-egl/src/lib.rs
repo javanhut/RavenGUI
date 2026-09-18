@@ -8,20 +8,21 @@
 //! `unsafe` entirely: creating an EGL display for a GBM device and building a
 //! GLES renderer on it are both `unsafe fn` in smithay.
 //!
-//! Exactly two calls need it, and both are here:
+//! Exactly three calls need it, and all are here:
 //!
 //! | Call | Obligation |
 //! |---|---|
 //! | [`EGLDisplay::new`] | nothing outside smithay may create or terminate EGL displays for this device |
 //! | [`GlesRenderer::new`] | the context must not be current on another thread |
+//! | `ptr::copy_nonoverlapping` into a `wl_shm` pool | the write stays inside the mapping, and no reference into client-shared memory is made |
 //!
 //! Rather than spread those obligations across the compositor, they are
-//! discharged once, here, and this is the only file a reviewer has to audit for
+//! discharged once, here, and this is the only crate a reviewer has to audit for
 //! memory safety.
 //!
-//! Note the nested `winit` backend needs none of this — `winit::init` is a safe
-//! function that builds its renderer internally. This crate exists solely for
-//! the udev/DRM path.
+//! Note the nested `winit` backend needs none of the EGL half — `winit::init`
+//! is a safe function that builds its renderer internally. The shm write is
+//! used by both backends, for client screen capture (`raven_capture_v1`).
 //!
 //! # Rules for this crate
 //!
@@ -42,4 +43,9 @@
 mod egl;
 
 #[cfg(target_os = "linux")]
+mod shm;
+
+#[cfg(target_os = "linux")]
 pub use egl::{EglError, renderer_for};
+#[cfg(target_os = "linux")]
+pub use shm::{ShmWriteError, write_shm_rows};

@@ -3,7 +3,9 @@
 //! A Wayland client sees its own surfaces and nothing else — it is deliberately
 //! blind to the rest of the session. This is the narrow, explicit hole through
 //! which the compositor tells a client what it needs to draw a panel: RoostBar
-//! for workspace state, `raven-output` for the screen layout.
+//! for workspace state, `raven-output` for the screen layout, and — since
+//! version 4 — Raven Camera for the pixels themselves. The capture objects
+//! are served by [`crate::capture`].
 //!
 //! Kept small on purpose. Every request added here is a permanent commitment:
 //! the protocol is additive-only, so anything shipped has to keep working.
@@ -67,10 +69,12 @@ impl RavenShellState {
         // NOTE: advertised to every client. The protocol says this global
         // belongs to privileged clients only; Huginn has no notion of
         // privilege yet, so any client can currently watch workspace state and
-        // switch workspaces. Harmless on a single-user session, but it must be
-        // gated (security-context, or a socket only the shell can reach)
-        // before anything untrusted runs on this compositor.
-        dh.create_global::<Huginn, RavenShellManagerV1, ()>(3, ());
+        // switch workspaces — and, since version 4, read the screen. Harmless
+        // on a single-user session, but it must be gated (security-context,
+        // or a socket only the shell can reach) before anything untrusted runs
+        // on this compositor. Until then the recording dot is the only sign a
+        // capture is running.
+        dh.create_global::<Huginn, RavenShellManagerV1, ()>(4, ());
         Self::default()
     }
 }
@@ -200,6 +204,60 @@ impl Dispatch<RavenShellManagerV1, ()> for Huginn {
                 let observer = data_init.init(id, ());
                 state.send_outputs(&observer);
                 state.raven_shell.layout_observers.push(observer);
+            }
+            raven_shell_manager_v1::Request::CaptureOutput {
+                id,
+                output,
+                options,
+            } => {
+                let capture = data_init.init(id, ());
+                state.create_capture(
+                    capture,
+                    crate::capture::Source::Output(output),
+                    crate::capture::options(options),
+                );
+            }
+            raven_shell_manager_v1::Request::CaptureWindow {
+                id,
+                identifier,
+                options,
+            } => {
+                let capture = data_init.init(id, ());
+                state.create_capture(
+                    capture,
+                    crate::capture::Source::Window(identifier),
+                    crate::capture::options(options),
+                );
+            }
+            raven_shell_manager_v1::Request::CaptureRegion {
+                id,
+                output,
+                x,
+                y,
+                width,
+                height,
+                options,
+            } => {
+                let capture = data_init.init(id, ());
+                state.create_capture(
+                    capture,
+                    crate::capture::Source::Region {
+                        output,
+                        // A negative size is empty, and an empty region is a
+                        // stopped capture, as the protocol says.
+                        rect: huginn_core::geometry::Rect::from_xywh(
+                            x,
+                            y,
+                            width.max(0),
+                            height.max(0),
+                        ),
+                    },
+                    crate::capture::options(options),
+                );
+            }
+            raven_shell_manager_v1::Request::SelectRegion { id } => {
+                let selection = data_init.init(id, ());
+                state.begin_client_region_select(selection);
             }
             raven_shell_manager_v1::Request::Destroy => {}
             _ => {}

@@ -655,6 +655,7 @@ pub(crate) fn placement(output: Rect, panel: (i32, i32), position: Position, rev
 ///
 /// `running` is the `app_id` of every open window, so a pinned application
 /// that is running can say so. The same list the dock is built from.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
     pinned: &Pinned,
     apps: &[Entry],
@@ -684,6 +685,7 @@ pub(crate) fn render(
 /// The air between the rail and the menu is transparent and belongs to the
 /// desktop, not to the bar. [`Layout::surfaces`] says so, which is what
 /// makes a click there a click on the desktop.
+#[allow(clippy::too_many_arguments)]
 fn compose(
     pinned: &Pinned,
     apps: &[Entry],
@@ -909,7 +911,7 @@ fn compose(
         ));
         layout
             .menu_hits
-            .extend(hits.into_iter().zip(0..).map(|(rect, n)| (rect, n)));
+            .extend(hits.into_iter().zip(0..));
     }
 
     (canvas, layout)

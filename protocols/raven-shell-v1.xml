@@ -22,7 +22,7 @@
     is what makes moving this file to its own repository a mechanical step.
   </description>
 
-  <interface name="raven_shell_manager_v1" version="3">
+  <interface name="raven_shell_manager_v1" version="4">
     <description summary="entry point for the desktop shell">
       Handed to the shell so it can observe compositor state it cannot see as an
       ordinary Wayland client.
@@ -71,6 +71,63 @@
         their geometry changes.
       </description>
       <arg name="id" type="new_id" interface="raven_output_layout_v1"/>
+    </request>
+    <request name="capture_output" since="4">
+      <description summary="capture a whole screen">
+        Create a capture of the screen with this connector name, as reported
+        by raven_output_layout_v1.output. A name that matches no connected
+        screen creates a capture that is already stopped: its first and only
+        event is stopped.
+      </description>
+      <arg name="id" type="new_id" interface="raven_capture_v1"/>
+      <arg name="output" type="string" summary="connector name"/>
+      <arg name="options" type="uint" enum="raven_capture_v1.options"/>
+    </request>
+
+    <request name="capture_window" since="4">
+      <description summary="capture one window">
+        Create a capture of the window whose ext_foreign_toplevel_handle_v1
+        identifier is 'identifier'. The capture is the window alone, with the
+        decorations the compositor draws for it and nothing that overlaps it,
+        at the density of the screen it is on. It follows the window as it
+        moves and resizes (a resize is a new buffer_size), and while the
+        window is off screen — minimized, put away, on a workspace no screen
+        shows — no frames are delivered until it is back.
+
+        An identifier that names no window creates a capture whose first and
+        only event is stopped.
+      </description>
+      <arg name="id" type="new_id" interface="raven_capture_v1"/>
+      <arg name="identifier" type="string" summary="ext_foreign_toplevel_handle_v1 identifier"/>
+      <arg name="options" type="uint" enum="raven_capture_v1.options"/>
+    </request>
+
+    <request name="capture_region" since="4">
+      <description summary="capture a rectangle of one screen">
+        Create a capture of a rectangle of the named screen, in logical
+        pixels relative to that screen's top-left corner, as
+        raven_region_selection_v1.selected reports one. The rectangle is
+        clipped to the screen; one that is empty after clipping, or a name
+        that matches no screen, creates a capture whose first and only event
+        is stopped.
+      </description>
+      <arg name="id" type="new_id" interface="raven_capture_v1"/>
+      <arg name="output" type="string" summary="connector name"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="options" type="uint" enum="raven_capture_v1.options"/>
+    </request>
+
+    <request name="select_region" since="4">
+      <description summary="let the user drag out a rectangle">
+        Put up the compositor's own region selection — the one Shift+Print
+        uses — and report what the user drags out. Escape cancels it. Only
+        one selection is up at a time: asking while one is already up, or
+        while the session is locked, cancels the new one at once.
+      </description>
+      <arg name="id" type="new_id" interface="raven_region_selection_v1"/>
     </request>
   </interface>
 
@@ -172,6 +229,120 @@
       <arg name="active" type="uint" summary="zero-based index of the active workspace"/>
       <arg name="occupied" type="uint"
            summary="bitmask; bit N is set if workspace N holds at least one window. Caps at 32 workspaces, which is well beyond any sane count"/>
+    </event>
+  </interface>
+  <interface name="raven_capture_v1" version="1">
+    <description summary="frames of a screen, a window or a region">
+      Created through the capture requests of raven_shell_manager_v1.
+
+      The client supplies the memory: it creates a wl_shm buffer of the size
+      buffer_size last announced, in format argb8888 or xrgb8888 with a
+      stride of at least four bytes a pixel, and hands it over with frame.
+      The compositor draws the source into it and answers ready, or failed.
+      A capture never delivers a frame the client did not ask for, so the
+      client sets the frame rate by how often it asks.
+
+      Frames are drawn only when the source has changed since the last one
+      this capture delivered. A still desktop asked for a frame keeps the
+      request pending until something moves; the first request is always
+      answered straight away.
+
+      While any capture is delivering frames the compositor shows its
+      recording indicator on the screens involved, and while the session is
+      locked no capture delivers anything: a pending frame waits for the
+      unlock.
+    </description>
+
+    <enum name="options" bitfield="true">
+      <entry name="none" value="0"/>
+      <entry name="cursor" value="1" summary="draw the pointer into frames"/>
+      <entry name="clicks" value="2"
+             summary="draw a fading ring where the pointer is pressed, into frames only, never onto the screen"/>
+    </enum>
+
+    <enum name="error">
+      <entry name="already_pending" value="0" summary="frame while another frame is pending"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop capturing">
+        A pending frame is abandoned; its buffer is the client's again.
+      </description>
+    </request>
+
+    <request name="frame">
+      <description summary="draw the next frame into this buffer">
+        Ask for the next frame. Exactly one of ready and failed answers it.
+        Asking again before that answer is the already_pending error.
+
+        A buffer that is not wl_shm, is not argb8888 or xrgb8888, or is not
+        the size of the last buffer_size, is answered with failed.
+      </description>
+      <arg name="buffer" type="object" interface="wl_buffer"/>
+    </request>
+
+    <event name="buffer_size">
+      <description summary="the size frames are drawn at">
+        The size in physical pixels a buffer must have. Sent before any other
+        event, and again whenever the source changes size; a frame pending
+        at that moment is answered with failed, since its buffer is now the
+        wrong size.
+      </description>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+    </event>
+
+    <event name="ready">
+      <description summary="the buffer holds a frame">
+        The buffer from the last frame request now holds the source as it
+        was drawn at this CLOCK_MONOTONIC time, and is the client's again.
+      </description>
+      <arg name="tv_sec_hi" type="uint"/>
+      <arg name="tv_sec_lo" type="uint"/>
+      <arg name="tv_nsec" type="uint"/>
+    </event>
+
+    <event name="failed">
+      <description summary="the buffer was not filled">
+        The last frame request could not be answered with this buffer. If a
+        buffer_size came just before, allocate a buffer of that size and ask
+        again; otherwise the buffer itself was unusable.
+      </description>
+    </event>
+
+    <event name="stopped">
+      <description summary="the source is gone">
+        The screen was unplugged, the window closed, or the source never
+        existed. A pending frame is answered with failed first. Nothing more
+        is sent; destroy the object.
+      </description>
+    </event>
+  </interface>
+
+  <interface name="raven_region_selection_v1" version="1">
+    <description summary="a rectangle the user drags out">
+      Created through raven_shell_manager_v1.select_region. Exactly one of
+      selected and cancelled is sent, and then nothing else.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="release the selection, taking it down if it is still up"/>
+    </request>
+
+    <event name="selected">
+      <description summary="the user finished dragging">
+        In logical pixels, relative to the top-left corner of the screen
+        named, which is the screen the drag started on.
+      </description>
+      <arg name="output" type="string" summary="connector name"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </event>
+
+    <event name="cancelled">
+      <description summary="Escape, or the selection could not be put up"/>
     </event>
   </interface>
 </protocol>

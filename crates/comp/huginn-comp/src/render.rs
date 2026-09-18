@@ -176,106 +176,151 @@ fn elements_with_boundary(
         Pass::Screen => 0,
         Pass::Screenshot | Pass::Recording => state.capture_hidden_len(),
     };
-    let (ox, oy) = (view.x(), view.y());
-    // Everything `scene` hands out is in desktop coordinates; this is the
-    // one place they become this screen's.
-    let local = |rect: Rect| Rect::from_xywh(rect.x() - ox, rect.y() - oy, rect.w(), rect.h());
-    let on_screen = |rect: Rect| rect.overlaps(view);
-    let pointer: Point<f64, Logical> = (
-        state.pointer_location.x - f64::from(ox),
-        state.pointer_location.y - f64::from(oy),
-    )
-        .into();
 
     let mut out: Vec<HuginnElement> = Vec::new();
 
     // The cursor goes first because the scene is painted front to back, and
     // nothing is ever meant to occlude the pointer. Skipped entirely for a
     // capture, which wants the desktop without an arrow on it.
-    //
-    // A pointer being found is drawn larger, scaled about the hotspot so the
-    // tip stays exactly where the pointer is: it is still a pointer, and a
-    // click while it is large lands where it looks like it will. Exactly 1 —
-    // which is what a settled size is — takes the ordinary path, so a frame
-    // on an idle desktop costs what it always did.
     if include_cursor {
-        let found = state.pointer_size();
-        let origin = pointer.to_physical(scale).to_i32_round();
-        match &state.cursor_status {
-            // The client drew its own cursor. Its hotspot lives in the surface's
-            // own state, and ignoring it puts the arrow's tip in the wrong place.
-            CursorImageStatus::Surface(surface) => {
-                let hotspot = with_states(surface, |states| {
-                    states
-                        .data_map
-                        .get::<Mutex<CursorImageAttributes>>()
-                        .map(|attrs| attrs.lock().unwrap().hotspot)
-                        .unwrap_or_default()
-                });
-                let position: Point<i32, Logical> = pointer.to_i32_round::<i32>() - hotspot;
-                let elements = render_elements_from_surface_tree(
-                    renderer,
-                    surface,
-                    position.to_physical_precise_round::<f64, i32>(scale),
-                    scale,
-                    1.0,
-                    Kind::Cursor,
-                );
-                if found == 1.0 {
-                    out.extend(elements.into_iter().map(HuginnElement::Surface));
-                } else {
-                    out.extend(elements.into_iter().map(|element| {
-                        HuginnElement::FoundClientCursor(RescaleRenderElement::from_element(
-                            element, origin, found,
-                        ))
-                    }));
-                }
+        push_cursor(renderer, state, fallback_cursor, view, scale, &mut out);
+    }
+
+    let boundary = push_items(
+        renderer,
+        state.scene(),
+        view,
+        scale,
+        hidden,
+        state.blur_boundary(),
+        &mut out,
+    );
+    // Every scene item was above the boundary (or the scene was empty, as it
+    // is on a locked session): nothing to blur, everything in front.
+    let boundary = boundary.unwrap_or(out.len());
+    (out, boundary)
+}
+
+/// The pointer as seen from `view`, appended to `out`.
+///
+/// A pointer being found is drawn larger, scaled about the hotspot so the
+/// tip stays exactly where the pointer is: it is still a pointer, and a
+/// click while it is large lands where it looks like it will. Exactly 1 —
+/// which is what a settled size is — takes the ordinary path, so a frame
+/// on an idle desktop costs what it always did.
+fn push_cursor(
+    renderer: &mut GlesRenderer,
+    state: &Huginn,
+    fallback_cursor: Option<&Cursor>,
+    view: Rect,
+    scale: f64,
+    out: &mut Vec<HuginnElement>,
+) {
+    let (ox, oy) = (view.x(), view.y());
+    let pointer: Point<f64, Logical> = (
+        state.pointer_location.x - f64::from(ox),
+        state.pointer_location.y - f64::from(oy),
+    )
+        .into();
+    let found = state.pointer_size();
+    let origin = pointer.to_physical(scale).to_i32_round();
+    match &state.cursor_status {
+        // The client drew its own cursor. Its hotspot lives in the surface's
+        // own state, and ignoring it puts the arrow's tip in the wrong place.
+        CursorImageStatus::Surface(surface) => {
+            let hotspot = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<Mutex<CursorImageAttributes>>()
+                    .map(|attrs| attrs.lock().unwrap().hotspot)
+                    .unwrap_or_default()
+            });
+            let position: Point<i32, Logical> = pointer.to_i32_round::<i32>() - hotspot;
+            let elements = render_elements_from_surface_tree(
+                renderer,
+                surface,
+                position.to_physical_precise_round::<f64, i32>(scale),
+                scale,
+                1.0,
+                Kind::Cursor,
+            );
+            if found == 1.0 {
+                out.extend(elements.into_iter().map(HuginnElement::Surface));
+            } else {
+                out.extend(elements.into_iter().map(|element| {
+                    HuginnElement::FoundClientCursor(RescaleRenderElement::from_element(
+                        element, origin, found,
+                    ))
+                }));
             }
-            // Nothing has claimed the cursor, so draw the theme's default.
-            //
-            // While being found it is drawn from the theme's bitmap for that
-            // size when there is one, scaled only by whatever the theme's
-            // size falls short of the size wanted — the ordinary bitmap
-            // stretched threefold is blurred and stepped at once. See
-            // [`crate::pointer::Found`].
-            CursorImageStatus::Named(_) => {
-                if let Some(cursor) = fallback_cursor {
-                    let (buffer, hotspot, rescale): (_, Point<f64, Logical>, _) =
-                        match &cursor.found {
-                            Some(big) if found != 1.0 => {
-                                (&big.buffer, big.hotspot, found / big.magnification)
-                            }
-                            _ => (&cursor.buffer, cursor.hotspot.to_f64(), found),
-                        };
-                    let position: Point<f64, Logical> =
-                        (pointer.x - hotspot.x, pointer.y - hotspot.y).into();
-                    if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
-                        renderer,
-                        position.to_physical(scale),
-                        buffer,
-                        None,
-                        None,
-                        None,
-                        Kind::Cursor,
-                    ) {
-                        if found == 1.0 {
-                            out.push(HuginnElement::Cursor(element));
-                        } else {
-                            out.push(HuginnElement::FoundCursor(
-                                RescaleRenderElement::from_element(element, origin, rescale),
-                            ));
+        }
+        // Nothing has claimed the cursor, so draw the theme's default.
+        //
+        // While being found it is drawn from the theme's bitmap for that
+        // size when there is one, scaled only by whatever the theme's
+        // size falls short of the size wanted — the ordinary bitmap
+        // stretched threefold is blurred and stepped at once. See
+        // [`crate::pointer::Found`].
+        CursorImageStatus::Named(_) => {
+            if let Some(cursor) = fallback_cursor {
+                let (buffer, hotspot, rescale): (_, Point<f64, Logical>, _) =
+                    match &cursor.found {
+                        Some(big) if found != 1.0 => {
+                            (&big.buffer, big.hotspot, found / big.magnification)
                         }
+                        _ => (&cursor.buffer, cursor.hotspot.to_f64(), found),
+                    };
+                let position: Point<f64, Logical> =
+                    (pointer.x - hotspot.x, pointer.y - hotspot.y).into();
+                if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    position.to_physical(scale),
+                    buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Cursor,
+                ) {
+                    if found == 1.0 {
+                        out.push(HuginnElement::Cursor(element));
+                    } else {
+                        out.push(HuginnElement::FoundCursor(
+                            RescaleRenderElement::from_element(element, origin, rescale),
+                        ));
                     }
                 }
             }
-            // A client asked for no cursor at all, e.g. while typing or in a game.
-            CursorImageStatus::Hidden => {}
         }
+        // A client asked for no cursor at all, e.g. while typing or in a game.
+        CursorImageStatus::Hidden => {}
     }
+}
 
-    let above = state.blur_boundary();
+/// `items` — scene items, front to back, in the desktop's coordinates —
+/// turned into elements as seen from `view` at `scale`, and appended to
+/// `out`. The first `hidden` items are left out, and anything wholly outside
+/// `view` costs nothing.
+///
+/// Returns the index in `out` at which item number `above` landed: the blur
+/// boundary, counted while the list is built because a scene index is not an
+/// element index. `None` if the list never got that far.
+fn push_items(
+    renderer: &mut GlesRenderer,
+    items: Vec<SceneItem<'_>>,
+    view: Rect,
+    scale: f64,
+    hidden: usize,
+    above: usize,
+    out: &mut Vec<HuginnElement>,
+) -> Option<usize> {
+    let (ox, oy) = (view.x(), view.y());
+    // Everything `scene` hands out is in desktop coordinates; this is the
+    // one place they become this screen's.
+    let local = |rect: Rect| Rect::from_xywh(rect.x() - ox, rect.y() - oy, rect.w(), rect.h());
+    let on_screen = |rect: Rect| rect.overlaps(view);
+
     let mut boundary = None;
-    for (index, item) in state.scene().into_iter().enumerate() {
+    for (index, item) in items.into_iter().enumerate() {
         if index == above {
             boundary = Some(out.len());
         }
@@ -442,10 +487,7 @@ fn elements_with_boundary(
         }
     }
 
-    // Every scene item was above the boundary (or the scene was empty, as it
-    // is on a locked session): nothing to blur, everything in front.
-    let boundary = boundary.unwrap_or(out.len());
-    (out, boundary)
+    boundary
 }
 
 /// The scene as one flat front-to-back list for a screenshot: the desktop as
@@ -485,6 +527,65 @@ pub(crate) fn recording_elements(
         Pass::Recording,
     )
     .0
+}
+
+/// The scene as one flat front-to-back list for a frame of a client's
+/// capture (`raven_capture_v1`): the desktop as seen from `view`, or — with
+/// `window` — that one window alone, at rest, with its bar and its popups and
+/// nothing that overlaps it. See [`crate::capture`].
+///
+/// `with_pointer` is the client's cursor option. `rings` are the click rings,
+/// each a centre in desktop coordinates, a radius in logical pixels and an
+/// opacity, drawn from `ring` in front of everything but the pointer: they
+/// exist in the capture's elements and nowhere else, so the screen itself
+/// never shows them.
+///
+/// The recording dot and the notification cards are left out, as they are
+/// from a screenshot and from a recording.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn client_capture_elements(
+    renderer: &mut GlesRenderer,
+    state: &Huginn,
+    fallback_cursor: Option<&Cursor>,
+    with_pointer: bool,
+    window: Option<huginn_core::window::WindowId>,
+    view: Rect,
+    scale: f64,
+    rings: &[(Point<f64, Logical>, f64, f32)],
+    ring: Option<&smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
+) -> Vec<HuginnElement> {
+    let mut out = Vec::new();
+    if with_pointer && state.pointer_visible() && !state.pointer_locked() {
+        push_cursor(renderer, state, fallback_cursor, view, scale, &mut out);
+    }
+    if let Some(ring) = ring {
+        for &(centre, radius, alpha) in rings {
+            let corner: Point<f64, Logical> = (
+                centre.x - radius - f64::from(view.x()),
+                centre.y - radius - f64::from(view.y()),
+            )
+                .into();
+            let side = (radius * 2.0).round() as i32;
+            if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                corner.to_physical(scale),
+                ring,
+                Some(alpha),
+                None,
+                Some((side, side).into()),
+                Kind::Unspecified,
+            ) {
+                out.push(HuginnElement::Cursor(element));
+            }
+        }
+    }
+    let (items, hidden) = match window {
+        Some(id) => (state.window_capture_items(id), 0),
+        None => (state.scene(), state.capture_hidden_len()),
+    };
+    // `above` past the end: a capture has no blur split to find.
+    push_items(renderer, items, view, scale, hidden, usize::MAX, &mut out);
+    out
 }
 
 /// Who a scene is being assembled for, which decides what it leaves out.

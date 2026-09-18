@@ -1,0 +1,21 @@
+[package]
+name = "raven-aac"
+description = "Raven's own AAC-LC encoder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Nothing beyond std, for the reason raven-h264 has none: the encoder every
+# recording's sound goes through cannot be one somebody else can break.
+[dependencies]
+
+# A decoder somebody else wrote, as the oracle the tests hold the encoder to.
+# Only the tests build it; nothing that ships links it. The host has no ffmpeg,
+# and a decoder that is not ours is the point: it cannot share our mistakes.
+[dev-dependencies]
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
+
+[lints]
+workspace = true
