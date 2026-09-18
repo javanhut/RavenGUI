@@ -36,6 +36,8 @@ mod gesture;
 #[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
+mod menu;
+#[cfg(target_os = "linux")]
 mod motion;
 #[cfg(target_os = "linux")]
 mod mouse;
@@ -72,6 +74,8 @@ mod switcher;
 mod text;
 #[cfg(target_os = "linux")]
 mod theme;
+#[cfg(target_os = "linux")]
+mod touch;
 #[cfg(target_os = "linux")]
 mod userdirs;
 #[cfg(target_os = "linux")]

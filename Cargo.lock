@@ -1831,6 +1831,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-fprint"
+version = "0.0.1"
+
+[[package]]
 name = "raven-h264"
 version = "0.0.1"
 
