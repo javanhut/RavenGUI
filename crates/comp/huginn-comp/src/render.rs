@@ -168,7 +168,8 @@ fn elements_with_boundary(
 ) -> (Vec<HuginnElement>, usize) {
     // Skipped entirely for a capture, and while a finger is on the glass: see
     // `Huginn::pointer_visible`.
-    let include_cursor = pass != Pass::Screenshot && state.pointer_visible();
+    let include_cursor =
+        pass != Pass::Screenshot && state.pointer_visible() && !state.pointer_locked();
     // The recording dot is on the screen for the person at it, and must not be
     // in the captures it is warning them about. See `Huginn::capture_hidden_len`.
     let hidden = match pass {

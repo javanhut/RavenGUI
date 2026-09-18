@@ -44,8 +44,6 @@ use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use huginn_core::geometry::Rect;
 
-use crate::focus::KeyboardFocusTarget;
-
 /// A window the layout knows about, whichever protocol it speaks.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WindowSurface {
@@ -115,25 +113,6 @@ impl WindowSurface {
         match self {
             Self::Xdg(t) => Some(t.wl_surface().clone()),
             Self::X11(x) => x.wl_surface(),
-        }
-    }
-
-    /// What the seat must focus to give this window the keyboard.
-    ///
-    /// An X11 window is focused *as* an `X11Surface` and not as the surface
-    /// behind it: only that path sets X input focus, without which the client
-    /// is never told it is focused. See [`crate::focus`].
-    ///
-    /// `None` has the same meaning as in [`Self::wl_surface`] — an X11 window
-    /// whose surface has not been associated yet is not on screen, so it is
-    /// not somewhere the keyboard can go.
-    pub(crate) fn keyboard_target(&self) -> Option<KeyboardFocusTarget> {
-        match self {
-            Self::Xdg(t) => Some(KeyboardFocusTarget::Wayland(t.wl_surface().clone())),
-            Self::X11(x) => x.wl_surface().map(|wl| KeyboardFocusTarget::X11 {
-                surface: Box::new(x.clone()),
-                wl,
-            }),
         }
     }
 

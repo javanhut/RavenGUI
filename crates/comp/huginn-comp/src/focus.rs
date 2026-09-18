@@ -1,39 +1,22 @@
-//! What the seat's keyboard focus points at.
+//! What the keyboard can be focused on.
 //!
-//! Before XWayland there was one answer — a `WlSurface` — and the seat was
-//! declared with it directly. An X11 window is backed by a `wl_surface` too,
-//! and focusing that surface does deliver key events, which is exactly why
-//! focusing it looks like it works. It is not enough.
+//! A bare `WlSurface` is not enough once X11 clients exist. Giving XWayland's
+//! surface `wl_keyboard.enter` tells the X *server* it has the keyboard; it
+//! says nothing about which X11 *window* holds the input focus, and that is a
+//! separate piece of state only the window manager — Huginn — can set. Nobody
+//! setting it fails in a way that looks like the client's fault: pointer
+//! events are routed by position and keep working, while key events are routed
+//! by X11 focus and go nowhere. Wine makes it total rather than intermittent,
+//! because its windows use the globally-active input model (`WM_HINTS.input`
+//! false, `WM_TAKE_FOCUS` in `WM_PROTOCOLS`): they never take the keyboard
+//! until the window manager sends `WM_TAKE_FOCUS`. A game under Proton gets a
+//! working mouse and a dead keyboard.
 //!
-//! smithay sets real X input focus in one place only: `KeyboardTarget for
-//! X11Surface`'s `enter`, which calls `SetInputFocus` and sends
-//! `WM_TAKE_FOCUS`. Reach an X11 window through its `wl_surface` and that impl
-//! never runs, so no X11 client is ever focused as far as the X server is
-//! concerned. No `FocusIn` follows; the X11 window manager updates
-//! `_NET_ACTIVE_WINDOW` from `FocusIn`/`FocusOut`, so that root property stays
-//! pointed at the root window and every client reading it concludes nobody
-//! holds the keyboard.
-//!
-//! Wine is the client that makes this visible. It takes focus and fullscreen
-//! confirmation from EWMH rather than from the events it is handed, so a game
-//! that is plainly receiving keystrokes still believes it is unfocused, and
-//! never grabs the pointer or the keyboard. The window cannot be typed into
-//! and the cursor will not stay inside it.
-//!
-//! So the seat holds this instead, and an X11 window is focused *as* an
-//! [`X11Surface`].
-//!
-//! ## Why the X11 variant carries its `wl_surface`
-//!
-//! [`PopupGrab`](smithay::desktop::PopupGrab) requires
-//! `PointerFocus: From<KeyboardFocus>`, and the pointer still focuses a plain
-//! `WlSurface`. An `X11Surface` is associated with its `wl_surface` a round
-//! trip after the X11 window appears, so asking one for its surface is
-//! fallible and that conversion could not be written. Holding the surface in
-//! the variant makes it total, and costs nothing: a window with no surface has
-//! nothing on screen and is not somewhere the keyboard can go, so the only
-//! constructor ([`WindowSurface::keyboard_target`](crate::window::WindowSurface::keyboard_target))
-//! already declines to build one.
+//! smithay already knows how to do the X11 half — `SetInputFocus`,
+//! `WM_TAKE_FOCUS`, and clearing both on the way out — but only inside
+//! `X11Surface`'s own [`KeyboardTarget`] impl. So the fix is to focus the
+//! `X11Surface` rather than the `WlSurface` under it, and [`FocusTarget`] is
+//! the type that lets the seat hold either.
 
 use std::borrow::Cow;
 
@@ -52,87 +35,77 @@ use smithay::{
 
 use crate::state::Huginn;
 
-/// Whatever currently holds the keyboard.
+/// Whoever holds the keyboard.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum KeyboardFocusTarget {
-    /// A native Wayland surface: an `xdg_toplevel`, a layer surface, a popup,
-    /// or the lock screen.
-    Wayland(WlSurface),
-    /// An X11 window, focused through the X11 window manager.
+pub(crate) enum FocusTarget {
+    /// A Wayland client's surface: a toplevel, a popup, a layer surface, the
+    /// lock screen.
+    Surface(WlSurface),
+    /// An X11 window.
     ///
-    /// `wl` is the surface XWayland associated with `surface`; see the module
-    /// documentation for why it is stored rather than asked for.
+    /// Carries the `WlSurface` it had when focus was resolved as well as the
+    /// window. smithay's popup grabs need `WlSurface: From<FocusTarget>`, and
+    /// an `X11Surface` alone cannot promise one — it has none between creation
+    /// and XWayland associating it. Resolving it up front keeps that
+    /// conversion total, and a window that remaps onto a new surface compares
+    /// unequal to its old self, so focus is re-sent rather than assumed.
     ///
-    /// Boxed because an `X11Surface` is several times the size of a
-    /// `WlSurface`, and this enum is copied around on every focus change.
+    /// Boxed because an `X11Surface` carries the whole atom table and would
+    /// otherwise size every Wayland focus to match.
     X11 {
-        surface: Box<X11Surface>,
-        wl: WlSurface,
+        window: Box<X11Surface>,
+        surface: WlSurface,
     },
 }
 
-impl KeyboardFocusTarget {
-    /// The Wayland surface behind this focus.
-    ///
-    /// The clipboard is handed out per client and a client is found from a
-    /// surface, so the data device needs this for X11 windows as much as for
-    /// native ones.
+impl FocusTarget {
+    /// The Wayland surface the keystrokes end up on, whichever kind this is.
     pub(crate) fn surface(&self) -> &WlSurface {
         match self {
-            Self::Wayland(s) => s,
-            Self::X11 { wl, .. } => wl,
+            Self::Surface(surface) | Self::X11 { surface, .. } => surface,
         }
     }
 }
 
-impl From<WlSurface> for KeyboardFocusTarget {
+impl From<WlSurface> for FocusTarget {
     fn from(surface: WlSurface) -> Self {
-        Self::Wayland(surface)
+        Self::Surface(surface)
     }
 }
 
-/// What a popup grab hands back when the grab ends and focus returns to the
-/// surface underneath.
-impl From<PopupKind> for KeyboardFocusTarget {
+impl From<PopupKind> for FocusTarget {
     fn from(popup: PopupKind) -> Self {
-        Self::Wayland(popup.wl_surface().clone())
+        Self::Surface(popup.into())
     }
 }
 
-/// Total by construction — see the module documentation.
-impl From<KeyboardFocusTarget> for WlSurface {
-    fn from(target: KeyboardFocusTarget) -> Self {
+impl From<FocusTarget> for WlSurface {
+    fn from(target: FocusTarget) -> Self {
         match target {
-            KeyboardFocusTarget::Wayland(s) => s,
-            KeyboardFocusTarget::X11 { wl, .. } => wl,
+            FocusTarget::Surface(surface) | FocusTarget::X11 { surface, .. } => surface,
         }
     }
 }
 
-impl WaylandFocus for KeyboardFocusTarget {
-    #[inline]
+impl IsAlive for FocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Surface(surface) => surface.alive(),
+            Self::X11 { window, .. } => window.alive(),
+        }
+    }
+}
+
+impl WaylandFocus for FocusTarget {
     fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
         Some(Cow::Borrowed(self.surface()))
     }
 }
 
-impl IsAlive for KeyboardFocusTarget {
-    #[inline]
-    fn alive(&self) -> bool {
-        match self {
-            Self::Wayland(s) => s.alive(),
-            // The X11 window is the thing that is focused, so it is the thing
-            // whose death ends the focus. Its surface can outlive the X11
-            // window it was associated with.
-            Self::X11 { surface, .. } => surface.alive(),
-        }
-    }
-}
-
-// Every method forwards to the variant's own `KeyboardTarget`. The X11 arm is
-// the entire point of this enum: that impl is what sets X input focus, and it
-// forwards to the `wl_surface` itself once it has.
-impl KeyboardTarget<Huginn> for KeyboardFocusTarget {
+// The X11 arm forwards to the `X11Surface`, never to the `WlSurface` beside
+// it: the window's impl does the X11 focus work and then forwards to its own
+// surface, so going to both would send every event twice.
+impl KeyboardTarget<Huginn> for FocusTarget {
     fn enter(
         &self,
         seat: &Seat<Huginn>,
@@ -141,17 +114,15 @@ impl KeyboardTarget<Huginn> for KeyboardFocusTarget {
         serial: Serial,
     ) {
         match self {
-            Self::Wayland(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
-            Self::X11 { surface, .. } => {
-                KeyboardTarget::enter(&**surface, seat, data, keys, serial)
-            }
+            Self::Surface(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+            Self::X11 { window, .. } => KeyboardTarget::enter(&**window, seat, data, keys, serial),
         }
     }
 
     fn leave(&self, seat: &Seat<Huginn>, data: &mut Huginn, serial: Serial) {
         match self {
-            Self::Wayland(s) => KeyboardTarget::leave(s, seat, data, serial),
-            Self::X11 { surface, .. } => KeyboardTarget::leave(&**surface, seat, data, serial),
+            Self::Surface(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+            Self::X11 { window, .. } => KeyboardTarget::leave(&**window, seat, data, serial),
         }
     }
 
@@ -165,9 +136,11 @@ impl KeyboardTarget<Huginn> for KeyboardFocusTarget {
         time: u32,
     ) {
         match self {
-            Self::Wayland(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
-            Self::X11 { surface, .. } => {
-                KeyboardTarget::key(&**surface, seat, data, key, state, serial, time)
+            Self::Surface(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time);
+            }
+            Self::X11 { window, .. } => {
+                KeyboardTarget::key(&**window, seat, data, key, state, serial, time);
             }
         }
     }
@@ -180,9 +153,11 @@ impl KeyboardTarget<Huginn> for KeyboardFocusTarget {
         serial: Serial,
     ) {
         match self {
-            Self::Wayland(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
-            Self::X11 { surface, .. } => {
-                KeyboardTarget::modifiers(&**surface, seat, data, modifiers, serial)
+            Self::Surface(surface) => {
+                KeyboardTarget::modifiers(surface, seat, data, modifiers, serial);
+            }
+            Self::X11 { window, .. } => {
+                KeyboardTarget::modifiers(&**window, seat, data, modifiers, serial);
             }
         }
     }
