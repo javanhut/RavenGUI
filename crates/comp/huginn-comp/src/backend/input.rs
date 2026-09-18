@@ -29,10 +29,14 @@ use smithay::{
         PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent, TouchSlot,
     },
     input::{
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
         touch::{DownEvent, MotionEvent as TouchMoveEvent, UpEvent},
     },
     utils::{Logical, Point, SERIAL_COUNTER, Size},
+    wayland::{
+        compositor::RegionAttributes,
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    },
 };
 
 use crate::{
@@ -53,11 +57,22 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
             // run into the edge of the screen, as fingers keep travelling
             // when the cursor they are not drawing has.
             let delta = event.delta();
+            relative_motion(
+                state,
+                delta,
+                event.delta_unaccel(),
+                event.time(),
+            );
+            if state.pointer_locked() {
+                state.pointer().frame(state);
+                return;
+            }
             state.drag_moved(delta.x, delta.y);
             // Raw as well, for the same reason: a pointer shaken against the
             // edge of the screen is still being shaken.
             state.pointer_moved_by(delta.x, delta.y, event.time_msec());
-            let location = state.clamp_pointer(state.pointer_location + delta);
+            let location =
+                constrained_location(state, state.clamp_pointer(state.pointer_location + delta));
             motion(state, location, event.time_msec());
         }
         InputEvent::PointerMotionAbsolute { event } => {
@@ -67,7 +82,13 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
             let area = state.output_area();
             let extent: Size<i32, Logical> = (area.w(), area.h()).into();
             let origin: Point<f64, Logical> = (f64::from(area.x()), f64::from(area.y())).into();
-            let location = state.clamp_pointer(event.position_transformed(extent) + origin);
+            if state.pointer_locked() {
+                return;
+            }
+            let location = constrained_location(
+                state,
+                state.clamp_pointer(event.position_transformed(extent) + origin),
+            );
             // No raw delta here; the difference in position is the best
             // there is, and a nested window's edge is where it ends.
             let delta = location - state.pointer_location;
@@ -122,6 +143,75 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
     }
 }
 
+/// Send the unbounded device delta before absolute cursor handling. Relative
+/// pointer clients receive these events even without a lock; while locked this
+/// is the only motion they receive, so mouse-look never runs into an edge.
+fn relative_motion(
+    state: &mut Huginn,
+    delta: Point<f64, Logical>,
+    delta_unaccel: Point<f64, Logical>,
+    utime: u64,
+) {
+    let pointer = state.pointer();
+    pointer.relative_motion(
+        state,
+        None,
+        &RelativeMotionEvent {
+            delta,
+            delta_unaccel,
+            utime,
+        },
+    );
+}
+
+/// Keep an active confinement inside its surface (and optional region). A
+/// binary search preserves as much of a large physical delta as possible
+/// instead of making the pointer stick one whole event before the edge.
+fn constrained_location(state: &Huginn, proposed: Point<f64, Logical>) -> Point<f64, Logical> {
+    let pointer = state.pointer();
+    let Some(surface) = pointer.current_focus() else {
+        return proposed;
+    };
+    let region = with_pointer_constraint(&surface, &pointer, |constraint| {
+        constraint.and_then(|constraint| {
+            (constraint.is_active() && matches!(*constraint, PointerConstraint::Confined(_)))
+                .then(|| constraint.region().cloned())
+        })
+    });
+    let Some(region) = region else {
+        return proposed;
+    };
+
+    let allowed = |location: Point<f64, Logical>| {
+        state
+            .surface_under(location)
+            .is_some_and(|(under, origin)| {
+                under == surface
+                    && region.as_ref().is_none_or(|region: &RegionAttributes| {
+                        region.contains((location - origin.to_f64()).to_i32_round())
+                    })
+            })
+    };
+    if allowed(proposed) {
+        return proposed;
+    }
+
+    let start = state.pointer_location;
+    let delta = proposed - start;
+    let mut inside = 0.0;
+    let mut outside = 1.0;
+    for _ in 0..16 {
+        let middle = (inside + outside) / 2.0;
+        let candidate = Point::from((start.x + delta.x * middle, start.y + delta.y * middle));
+        if allowed(candidate) {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+    }
+    Point::from((start.x + delta.x * inside, start.y + delta.y * inside))
+}
+
 fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     state.pointer_location = location;
     // A region screenshot is being framed: the pointer draws the rectangle and
@@ -170,13 +260,28 @@ fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     let pointer = state.pointer();
     pointer.motion(
         state,
-        under.map(|(surface, position)| (surface, position.to_f64())),
+        under
+            .as_ref()
+            .map(|(surface, position)| (surface.clone(), position.to_f64())),
         &MotionEvent {
             location,
             serial: SERIAL_COUNTER.next_serial(),
             time,
         },
     );
+    if let Some((surface, origin)) = under {
+        let local = location - origin.to_f64();
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            if let Some(constraint) = constraint
+                && !constraint.is_active()
+                && constraint
+                    .region()
+                    .is_none_or(|region| region.contains(local.to_i32_round()))
+            {
+                constraint.activate();
+            }
+        });
+    }
     pointer.frame(state);
     // The cursor moved, so the frame on screen is stale even if no client
     // changed anything.

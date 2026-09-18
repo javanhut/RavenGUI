@@ -22,6 +22,7 @@ For how to actually use these, see `docs/integration.md`.
 | `wl_output`, `xdg_output` | mode, integer scale, logical size, position; `wl_surface.enter`/`leave` per screen |
 | `wl_seat` | keyboard and pointer |
 | `wp_cursor_shape_manager_v1` | a client names its cursor and the compositor draws it from the system theme, at the screen's density |
+| `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1` | pointer confinement and lock with unbounded relative motion; used by games, XWayland and 3D applications to capture the mouse |
 | `wl_data_device_manager` | clipboard and drag-and-drop |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
 | `ext_session_lock_manager_v1` | locking the session. See below |
@@ -156,7 +157,6 @@ find them in the registry.
 | `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. |
 | `zwp_primary_selection_v1` | No middle-click paste. The regular clipboard works. |
 | `text-input-v3`, `input-method-v2` | No input methods. CJK and other IME input will not work. |
-| `pointer-constraints`, `relative-pointer` | No pointer lock or warping. Games and 3D applications cannot capture the cursor. |
 | `wlr-virtual-pointer`, `virtual-keyboard-v1` | No input injection. Remote-desktop and automation tools cannot drive the session. |
 | `ext-idle-notify-v1` | A client cannot be told the session went idle. The compositor locks on its own timer, so auto-lock works — what is missing is any way for *other* software to react to idleness. |
 | `tablet-v2` | Graphics tablets are not routed. |

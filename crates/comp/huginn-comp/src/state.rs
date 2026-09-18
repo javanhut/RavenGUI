@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
 
-use crate::focus::KeyboardFocusTarget;
+use crate::focus::FocusTarget;
 use crate::window::WindowSurface;
 use huginn_core::{
     Space,
@@ -37,8 +37,9 @@ use smithay::{
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_device,
     delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_inhibit,
-    delegate_layer_shell, delegate_output, delegate_seat, delegate_session_lock, delegate_shm,
-    delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_layer_shell, delegate_output, delegate_pointer_constraints, delegate_relative_pointer,
+    delegate_seat, delegate_session_lock, delegate_shm, delegate_viewporter,
+    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -73,6 +74,11 @@ use smithay::{
         },
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::{
+            PointerConstraint, PointerConstraintsHandler, PointerConstraintsState,
+            with_pointer_constraint,
+        },
+        relative_pointer::RelativePointerManagerState,
         selection::{
             SelectionHandler,
             data_device::{
@@ -492,6 +498,15 @@ pub(crate) struct Huginn {
     /// grows the moment it crosses into a GTK window. Held, not read.
     #[allow(dead_code)]
     pub cursor_shape_state: CursorShapeManagerState,
+    /// `zwp_pointer_constraints_v1`: lets games and other clients confine or
+    /// lock the pointer to a surface. Held, not read: dropping it withdraws
+    /// the global.
+    #[allow(dead_code)]
+    pub pointer_constraints_state: PointerConstraintsState,
+    /// `zwp_relative_pointer_manager_v1`: carries the unbounded mouse deltas
+    /// used while a client holds a pointer lock. Held, not read.
+    #[allow(dead_code)]
+    pub relative_pointer_state: RelativePointerManagerState,
     /// Held, not read: dropping this would withdraw the xdg-output global
     /// and clients would lose their output information mid-session.
     #[allow(dead_code)]
@@ -1088,6 +1103,8 @@ impl Huginn {
             viewporter_state: ViewporterState::new::<Self>(dh),
             fractional_scale_state: FractionalScaleManagerState::new::<Self>(dh),
             cursor_shape_state: CursorShapeManagerState::new::<Self>(dh),
+            pointer_constraints_state: PointerConstraintsState::new::<Self>(dh),
+            relative_pointer_state: RelativePointerManagerState::new::<Self>(dh),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(dh),
             // Any client may lock. The protocol's filter exists to restrict the
             // global to a privileged client, which needs a way to tell one
@@ -7187,7 +7204,7 @@ impl Huginn {
     /// works in. Surfaces are keyed by their index in [`Self::layers`], which is
     /// push order and therefore also mapping order — so one number serves as
     /// both the identity and the recency tie-break.
-    fn resolve_keyboard_focus(&self) -> (Option<KeyboardFocusTarget>, KeyboardOn) {
+    fn resolve_keyboard_focus(&self) -> (Option<FocusTarget>, KeyboardOn) {
         // Locked: the lock screen has the keyboard, and nothing else is even a
         // candidate. Returning `None` while the lock has no surface yet is
         // deliberate -- for those few milliseconds the keystrokes go nowhere at
@@ -7255,13 +7272,21 @@ impl Huginn {
                 } else {
                     KeyboardOn::Panel
                 };
-                (
-                    Some(KeyboardFocusTarget::Wayland(surface.wl_surface().clone())),
-                    on,
-                )
+                (Some(surface.wl_surface().clone().into()), on)
             }
+            // An X11 window is focused as the window, not as the surface under
+            // it: that is what sets the X11 input focus. See [`FocusTarget`].
             KeyboardFocus::Window(id) => (
-                self.windows.get(&id).and_then(|w| w.keyboard_target()),
+                self.windows.get(&id).and_then(|w| {
+                    let surface = w.wl_surface()?;
+                    Some(match w.as_x11() {
+                        Some(window) => FocusTarget::X11 {
+                            window: Box::new(window.clone()),
+                            surface,
+                        },
+                        None => FocusTarget::Surface(surface),
+                    })
+                }),
                 KeyboardOn::Window,
             ),
             // Nothing holds the keyboard. Both callers want the ordinary answer:
@@ -7285,11 +7310,7 @@ impl Huginn {
     /// The extra call is free when the hook did fire: smithay's
     /// `set_clipboard_focus` compares against the focus it already has and
     /// returns without sending anything if they agree.
-    pub(crate) fn set_keyboard_focus(
-        &mut self,
-        target: Option<KeyboardFocusTarget>,
-        serial: Serial,
-    ) {
+    pub(crate) fn set_keyboard_focus(&mut self, target: Option<FocusTarget>, serial: Serial) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
@@ -7836,7 +7857,7 @@ impl BufferHandler for Huginn {
 }
 
 impl SeatHandler for Huginn {
-    type KeyboardFocus = KeyboardFocusTarget;
+    type KeyboardFocus = FocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -7866,7 +7887,7 @@ impl SeatHandler for Huginn {
     /// offers it to nobody, including back to the client that set it. A
     /// terminal asking to paste gets no offer, reads an empty clipboard, and
     /// silently does nothing.
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&FocusTarget>) {
         let client = focused.and_then(|target| self.display.get_client(target.surface().id()).ok());
         set_data_device_focus(&self.display, seat, client);
     }
@@ -7880,6 +7901,61 @@ impl SeatHandler for Huginn {
         }
         self.cursor_status = image;
         self.queue_redraw();
+    }
+}
+
+impl PointerConstraintsHandler for Huginn {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // A constraint only becomes active while its surface has pointer
+        // focus. XWayland normally creates the lock after the game already
+        // has focus, so activate it immediately instead of waiting for the
+        // next physical mouse event.
+        if pointer.current_focus().as_ref() != Some(surface) {
+            return;
+        }
+        let Some((under, origin)) = self.surface_under(self.pointer_location) else {
+            return;
+        };
+        if under != *surface {
+            return;
+        }
+        let local = self.pointer_location - origin.to_f64();
+        with_pointer_constraint(surface, pointer, |constraint| {
+            if let Some(constraint) = constraint
+                && constraint
+                    .region()
+                    .is_none_or(|region| region.contains(local.to_i32_round()))
+            {
+                constraint.activate();
+            }
+        });
+        self.queue_redraw();
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        // The hint is optional compositor policy. Keeping the physical cursor
+        // where the lock began avoids a visible jump when the lock is released.
+    }
+}
+
+impl Huginn {
+    /// Whether the focused client currently owns an active pointer lock.
+    /// Used by rendering as well as input: the protocol requires the cursor
+    /// to disappear for the duration of a lock.
+    pub(crate) fn pointer_locked(&self) -> bool {
+        let pointer = self.pointer();
+        pointer.current_focus().is_some_and(|surface| {
+            with_pointer_constraint(&surface, &pointer, |constraint| {
+                constraint.is_some_and(|constraint| {
+                    constraint.is_active() && matches!(*constraint, PointerConstraint::Locked(_))
+                })
+            })
+        })
     }
 }
 
@@ -7972,6 +8048,8 @@ delegate_compositor!(Huginn);
 delegate_xdg_shell!(Huginn);
 delegate_shm!(Huginn);
 delegate_seat!(Huginn);
+delegate_pointer_constraints!(Huginn);
+delegate_relative_pointer!(Huginn);
 delegate_data_device!(Huginn);
 delegate_output!(Huginn);
 delegate_viewporter!(Huginn);
