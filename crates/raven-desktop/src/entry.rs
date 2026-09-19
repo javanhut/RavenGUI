@@ -131,6 +131,9 @@ pub struct Entry {
     pub keywords: Vec<String>,
     /// `Terminal=true`: must be run inside a terminal emulator.
     pub terminal: bool,
+    /// `MimeType`, split on `;`: the file types and URL schemes
+    /// (`x-scheme-handler/https`) this application says it can open.
+    pub mime_types: Vec<String>,
     /// `StartupWMClass`, which is how a dock matches a window back to the
     /// entry that launched it when the `app_id` does not match the file name.
     pub startup_wm_class: Option<String>,
@@ -173,6 +176,31 @@ pub enum Skipped {
 /// are excluded and `NotShowIn` entries are included — the session really
 /// should set it, or entries gated to `OnlyShowIn=Raven` will vanish.
 pub fn parse(text: &str, path: &Path, current_desktop: &[String]) -> Result<Entry, Skipped> {
+    parse_as(text, path, current_desktop, true)
+}
+
+/// Parse one desktop file as a possible handler for files and URLs, or say
+/// why it cannot be one.
+///
+/// The same rules as [`parse`] except one: `NoDisplay=true` is accepted.
+/// The spec defines it as "do not show in menus", not "does not exist", and
+/// handlers are routinely hidden that way -- an application that only makes
+/// sense given a file to open has nothing to offer a launcher. Deciding what
+/// opens a link has to see them; a launcher must not.
+pub fn parse_handler(
+    text: &str,
+    path: &Path,
+    current_desktop: &[String],
+) -> Result<Entry, Skipped> {
+    parse_as(text, path, current_desktop, false)
+}
+
+fn parse_as(
+    text: &str,
+    path: &Path,
+    current_desktop: &[String],
+    for_menus: bool,
+) -> Result<Entry, Skipped> {
     let fields = desktop_entry_group(text);
 
     if fields.get("Type").map(String::as_str) != Some("Application") {
@@ -181,7 +209,7 @@ pub fn parse(text: &str, path: &Path, current_desktop: &[String]) -> Result<Entr
     if is_true(fields.get("Hidden")) {
         return Err(Skipped::Hidden);
     }
-    if is_true(fields.get("NoDisplay")) {
+    if for_menus && is_true(fields.get("NoDisplay")) {
         return Err(Skipped::NoDisplay);
     }
     if !shows_in(&fields, current_desktop) {
@@ -226,6 +254,7 @@ pub fn parse(text: &str, path: &Path, current_desktop: &[String]) -> Result<Entr
         categories: semicolon_list(fields.get("Categories")),
         keywords: semicolon_list(fields.get("Keywords")),
         terminal: is_true(fields.get("Terminal")),
+        mime_types: semicolon_list(fields.get("MimeType")),
         startup_wm_class: fields.get("StartupWMClass").cloned(),
         path: path.to_owned(),
         actions,
@@ -464,6 +493,7 @@ mod tests {
             categories: Vec::new(),
             keywords: Vec::new(),
             terminal: false,
+            mime_types: Vec::new(),
             startup_wm_class: None,
             path: PathBuf::from("/usr/share/applications/raven-terminal.desktop"),
             actions: Vec::new(),
@@ -524,6 +554,46 @@ StartupWMClass=raven-terminal
                 "wrong verdict for {body:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_handler_hidden_from_menus_is_still_a_handler() {
+        let text = "[Desktop Entry]\nType=Application\nNoDisplay=true\nName=n\nExec=e %u\n\
+                    MimeType=x-scheme-handler/https;text/html;\n";
+        assert_eq!(
+            parse(text, Path::new("/x.desktop"), &[]),
+            Err(Skipped::NoDisplay)
+        );
+        let e = parse_handler(text, Path::new("/x.desktop"), &[]).expect("a handler");
+        assert_eq!(e.mime_types, ["x-scheme-handler/https", "text/html"]);
+    }
+
+    #[test]
+    fn a_handler_obeys_every_rule_but_no_display() {
+        // Hidden means deleted; a missing Exec means nothing to run. Neither
+        // is a handler, whatever it claims to open.
+        let cases = [
+            ("Type=Link\nName=n\nExec=e\n", Skipped::NotAnApplication),
+            (
+                "Type=Application\nHidden=true\nName=n\nExec=e\n",
+                Skipped::Hidden,
+            ),
+            ("Type=Application\nName=n\n", Skipped::Incomplete),
+        ];
+        for (body, expected) in cases {
+            let text = format!("[Desktop Entry]\n{body}MimeType=text/plain;\n");
+            assert_eq!(
+                parse_handler(&text, Path::new("/x.desktop"), &[]),
+                Err(expected),
+                "wrong verdict for {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_without_mime_types_opens_nothing() {
+        let e = parse(REAL, Path::new("/x.desktop"), &[]).expect("parses");
+        assert!(e.mime_types.is_empty());
     }
 
     #[test]

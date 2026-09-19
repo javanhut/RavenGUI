@@ -26,12 +26,14 @@ pub mod calc;
 pub mod entry;
 pub mod files;
 pub mod icon;
+#[cfg(feature = "pixmap")]
 pub mod pixmap;
 pub mod search;
 
 pub use calc::calculate;
-pub use entry::{Entry, Skipped, directories};
+pub use entry::{Entry, Skipped, directories, parse_handler};
 pub use files::FileIndex;
 pub use icon::Icons;
+#[cfg(feature = "pixmap")]
 pub use pixmap::{Pixmap, Pixmaps};
 pub use search::{Frecency, Hit, Quality, search};

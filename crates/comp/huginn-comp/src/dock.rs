@@ -1181,6 +1181,7 @@ mod tests {
             categories: Vec::new(),
             keywords: Vec::new(),
             terminal: false,
+            mime_types: Vec::new(),
             startup_wm_class: wm_class.map(str::to_owned),
             path: PathBuf::from(format!("/apps/{stem}.desktop")),
             actions: Vec::new(),

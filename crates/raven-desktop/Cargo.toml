@@ -8,7 +8,14 @@ license.workspace = true
 
 [dependencies]
 tracing.workspace = true
-resvg.workspace = true
+resvg = { workspace = true, optional = true }
+
+[features]
+# Rasterising icons is the launcher's and dock's business. Something that only
+# needs to know what is installed and how to run it -- raven-open -- builds
+# without it and without resvg's weight.
+default = ["pixmap"]
+pixmap = ["dep:resvg"]
 
 [lints]
 workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "raven-open"
+description = "Open a file or URL with its default application. Raven's xdg-open."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "raven-open"
+path = "src/main.rs"
+
+[dependencies]
+# Without the default `pixmap` feature: this only needs to know what is
+# installed and how to run it, not how to draw its icon. Named by path rather
+# than `workspace = true` because a member cannot turn off a workspace
+# dependency's default features.
+raven-desktop = { path = "../../raven-desktop", default-features = false }
+
+[lints]
+workspace = true
