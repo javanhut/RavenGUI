@@ -700,10 +700,20 @@ fn touch_location<B: InputBackend>(
     device: &str,
     event: &impl AbsolutePositionEvent<B>,
 ) -> Point<f64, Logical> {
-    let area = state.touch_output(device).rect;
-    let extent: Size<i32, Logical> = (area.w(), area.h()).into();
+    let output = state.touch_output(device);
+    let area = output.rect;
     let origin: Point<f64, Logical> = (f64::from(area.x()), f64::from(area.y())).into();
-    let at = event.position_transformed(extent) + origin;
+    // The digitiser is glued to the panel and reports in the panel's own
+    // orientation. On a turned screen the finger is found on the upright
+    // panel and then turned the way the scene was, backwards.
+    let transform = output
+        .output
+        .as_ref()
+        .map_or(smithay::utils::Transform::Normal, |o| o.current_transform());
+    let turned: Size<f64, Logical> = (f64::from(area.w()), f64::from(area.h())).into();
+    let panel = transform.transform_size(turned);
+    let raw = event.position_transformed((panel.w as i32, panel.h as i32).into());
+    let at = transform.invert().transform_point_in(raw, &panel) + origin;
     let max_x = f64::from(area.right() - 1).max(f64::from(area.x()));
     let max_y = f64::from(area.bottom() - 1).max(f64::from(area.y()));
     (

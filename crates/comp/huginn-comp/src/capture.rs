@@ -447,7 +447,7 @@ impl Huginn {
                     rect: info.rect,
                     scale: info.scale.fractional(),
                     density: info.scale.advertised,
-                    size: mode.size,
+                    size: info.frame_size()?,
                     output: info.name.clone(),
                     period: frame_period(mode.refresh),
                     window: None,
@@ -458,7 +458,7 @@ impl Huginn {
                 let info = screen(output)?;
                 let mode = info.output.as_ref()?.current_mode()?;
                 let scale = info.scale.fractional();
-                let (local, physical) = clip_region(*rect, info.rect, scale, mode.size)?;
+                let (local, physical) = clip_region(*rect, info.rect, scale, info.frame_size()?)?;
                 Some(View {
                     rect: Rect::from_xywh(
                         info.rect.x() + local.x(),

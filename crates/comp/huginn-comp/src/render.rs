@@ -42,7 +42,7 @@ use smithay::{
 };
 
 use crate::pointer::Cursor;
-use crate::state::{Huginn, SceneItem};
+use crate::state::{Huginn, SceneItem, WorkspacePreview};
 use huginn_core::geometry::Rect;
 
 render_elements! {
@@ -304,6 +304,16 @@ fn push_cursor(
 /// Returns the index in `out` at which item number `above` landed: the blur
 /// boundary, counted while the list is built because a scene index is not an
 /// element index. `None` if the list never got that far.
+/// A transform's shift as seen from the screen `view`: the transform scales
+/// about the desktop's origin, an element about `view`'s corner, and the
+/// difference is how far the scale moves that corner.
+fn local_shift(transform: &WorkspacePreview, view: Rect) -> (f64, f64) {
+    (
+        transform.offset_x - f64::from(view.x()) * (1.0 - transform.scale_x),
+        transform.offset_y - f64::from(view.y()) * (1.0 - transform.scale_y),
+    )
+}
+
 fn push_items(
     renderer: &mut GlesRenderer,
     items: Vec<SceneItem<'_>>,
@@ -318,6 +328,14 @@ fn push_items(
     // one place they become this screen's.
     let local = |rect: Rect| Rect::from_xywh(rect.x() - ox, rect.y() - oy, rect.w(), rect.h());
     let on_screen = |rect: Rect| rect.overlaps(view);
+    // A transform's shift, from the desktop's coordinates into this screen's.
+    // Transforms are worked out as a scale about the desktop's origin and a
+    // shift; the elements here scale about the screen's corner instead, which
+    // is the same thing only on the screen at the origin. Everywhere else the
+    // difference is the corner's own movement under the scale.
+    let shift = |transform: &WorkspacePreview| {
+        Point::<f64, Logical>::from(local_shift(transform, view)).to_physical_precise_round::<f64, i32>(scale)
+    };
 
     let mut boundary = None;
     for (index, item) in items.into_iter().enumerate() {
@@ -327,6 +345,14 @@ fn push_items(
         if index < hidden {
             continue;
         }
+        // Something that belongs to one screen alone -- the overview, and the
+        // stages sliding through it -- is drawn there and nowhere else, even
+        // where it spills past that screen's edge onto the one beside it.
+        let item = match item {
+            SceneItem::OnScreen(screen, inner) if screen == view => *inner,
+            SceneItem::OnScreen(..) => continue,
+            item => item,
+        };
         match item {
             SceneItem::Surface(_, rect)
             | SceneItem::Clipped(_, rect, _, _)
@@ -334,11 +360,12 @@ fn push_items(
             | SceneItem::Ring(_, rect, _)
             | SceneItem::Ghost(_, rect, _)
                 if !on_screen(rect) => {}
+            // Unwrapped above; one inside another says nothing more.
+            SceneItem::OnScreen(..) => {}
             SceneItem::Ghost(snapshot, rect, transform) => {
                 let origin = Point::<i32, Logical>::from((rect.x() - ox, rect.y() - oy))
                     .to_physical_precise_round::<f64, i32>(scale);
-                let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))
-                    .to_physical_precise_round::<f64, i32>(scale);
+                let offset = shift(&transform);
                 let element = TextureRenderElement::from_static_texture(
                     snapshot.id.clone(),
                     renderer.context_id(),
@@ -404,8 +431,7 @@ fn push_items(
             | SceneItem::Preview(surface, rect, transform) => {
                 let origin = Point::<i32, Logical>::from((rect.x() - ox, rect.y() - oy))
                     .to_physical_precise_round::<f64, i32>(scale);
-                let offset = Point::<f64, Logical>::from((transform.offset_x, transform.offset_y))
-                    .to_physical_precise_round::<f64, i32>(scale);
+                let offset = shift(&transform);
                 out.extend(
                     render_elements_from_surface_tree(
                         renderer,
@@ -429,12 +455,11 @@ fn push_items(
                     .map(HuginnElement::Workspace),
                 );
             }
+            // A card is a whole screen, transformed: its buffer is that
+            // screen's size and it is only ever drawn there (it comes wrapped
+            // in `OnScreen`), so this screen's corner is where it starts.
             SceneItem::WorkspaceCard(buffer, transform) => {
-                let offset = Point::<f64, Logical>::from((
-                    transform.offset_x - f64::from(ox),
-                    transform.offset_y - f64::from(oy),
-                ))
-                .to_physical_precise_round::<f64, i32>(scale);
+                let offset = shift(&transform);
                 let element = SolidColorRenderElement::from_buffer(
                     buffer,
                     (0, 0),
@@ -597,4 +622,47 @@ enum Pass {
     Screenshot,
     /// A frame of a recording: the pointer, but no recording dot.
     Recording,
+}
+
+#[cfg(test)]
+mod local_shift_tests {
+    use super::*;
+
+    /// Where the renderer puts `placed`'s corner on the screen `view`: in
+    /// screen coordinates, scaled about the screen's corner, then shifted.
+    fn drawn_corner(placed: Rect, transform: &WorkspacePreview, view: Rect) -> (f64, f64) {
+        let (dx, dy) = local_shift(transform, view);
+        (
+            f64::from(placed.x() - view.x()) * transform.scale_x + dx,
+            f64::from(placed.y() - view.y()) * transform.scale_y + dy,
+        )
+    }
+
+    #[test]
+    fn a_window_animation_lands_where_it_was_aimed_on_any_screen() {
+        for view in [
+            Rect::from_xywh(0, 0, 1920, 1080),
+            Rect::from_xywh(1920, 0, 2560, 1440),
+            Rect::from_xywh(4480, 200, 1440, 2560),
+        ] {
+            let placed = Rect::from_xywh(view.x() + 100, view.y() + 50, 800, 600);
+            let drawn = crate::motion::appear_rect(placed, 0.3);
+            let transform = crate::motion::fit(placed, drawn, 1.0);
+            let (x, y) = drawn_corner(placed, &transform, view);
+            assert!((x - f64::from(drawn.x() - view.x())).abs() < 0.5, "{view:?}: x {x}");
+            assert!((y - f64::from(drawn.y() - view.y())).abs() < 0.5, "{view:?}: y {y}");
+        }
+    }
+
+    #[test]
+    fn an_unscaled_transform_is_the_same_on_every_screen() {
+        let transform = WorkspacePreview {
+            scale_x: 1.0,
+            scale_y: 1.0,
+            offset_x: 12.0,
+            offset_y: -7.0,
+            alpha: 1.0,
+        };
+        assert_eq!(local_shift(&transform, Rect::from_xywh(1920, 300, 10, 10)), (12.0, -7.0));
+    }
 }

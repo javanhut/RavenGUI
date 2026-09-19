@@ -65,6 +65,76 @@ back above the laptop.
 A saved scale overrides the one the panel's size implies, through the same
 integer-advertised, fractional-laid-out policy as the automatic one.
 
+## Main display
+
+One screen may be marked main: `primary` at the end of its line in the saved
+layout, set from Settings or `raven-output primary DP-1` through
+`raven_output_layout_v1.set_primary` (since version 7). It is kept by name,
+like the rest of the layout, and found again whenever the screens change.
+
+- The dock, launcher, quick settings, notifications and the other
+  compositor-drawn panels stay on it (`Huginn::panel_output`), as does a
+  layer-shell bar that did not choose a screen. Without a main display they
+  follow the focused screen, as before.
+- New windows open on the workspace it is showing, and focus goes with them
+  (`Space::set_primary`).
+- Focus and the pointer are put on it when the session's first screens
+  arrive and at every unlock.
+- It is numbered 1; the rest follow left to right.
+
+## Workspaces across screens
+
+Every screen shows one workspace from a shared row, and no workspace is on
+two screens. The rule for moving between them is that navigating on one
+screen never changes another:
+
+- `Super`+`Ctrl`+a digit for a workspace another screen is showing moves
+  focus to that screen; nothing is rearranged.
+- A swipe, the overview and `Super`+wheel step over workspaces another screen
+  is showing. The overview draws them dimmed, and their label carries that
+  screen's number in a square badge.
+- Screens are numbered from 1: the main display first, then left to right
+  and top to bottom (`overview::screen_numbers`). While the overview is up every screen shows
+  its number in a large badge in its top-left corner, and the Settings
+  Display page titles its cards the same way ("Display 2 (HDMI-A-1)").
+- The overview belongs to the screen it opened on, and only that screen draws
+  it; the others go on showing their own workspaces.
+
+Taking something from another screen is always asked for:
+
+- Holding `Shift` while letting go of a swipe on another screen's workspace
+  pulls it (`Space::pull_workspace`). A workspace with windows is merged into
+  this one, and the screen that showed it is left on its now empty desktop;
+  an empty one is swapped, so this screen gets the empty desktop and that one
+  gets what was here.
+- `Super`+`Ctrl`+`Shift`+an arrow brings the focused window of the screen that
+  way into this workspace (`Space::pull_focused_from_output`); focus stays
+  here.
+
+A pulled window is taken out of fullscreen, and a merge is not held to the
+tile cap.
+
+## Rotation
+
+A line may end with `rotate=90`, `rotate=180` or `rotate=270` — quarter turns
+counter-clockwise, numbered as `wl_output.transform` numbers them — as in
+`DP-1 1920,0 rotate=90` or `DP-1 - 1.5 rotate=270`. Set it with
+`raven-output rotate DP-1 90`, or from the Display page in Settings; both go
+through `raven_output_layout_v1.set_rotation` (since version 5).
+
+A turned screen is measured turned: `relayout` sets the output's transform and
+derives the scale from the panel's size with width and height traded, so the
+core, the layer shell and clients all see a portrait screen as tall. Only that
+screen's workspace is laid out again. The panel's mode is unchanged.
+
+Where the frame is turned depends on how the screen is driven. On the
+rendering GPU the DRM compositor follows the output's transform, as it does
+for the bridge's copy on a second GPU (the bridge itself is drawn upright, at
+the turned size); a display-only device's dumb buffer is drawn turned directly.
+Screenshots, recordings and captures are the turned frame
+(`OutputInfo::frame_size`), and a touchscreen's reports, which are in the
+panel's own orientation, are turned back to the scene in `touch_location`.
+
 ## Second GPU and display-only devices
 
 The compositor renders on the primary GPU and drives the connectors of every
@@ -103,8 +173,6 @@ dock on the laptop reserves nothing on the monitor.
 
 ## Not done
 
-- **A chosen primary.** The focused screen follows the pointer; there is no
-  way to say the shell's panels should stay on one screen regardless.
 - **Direct scan-out on a second GPU.** A fullscreen client on a screen of the
   discrete GPU still goes through the bridge; its buffer would have to live on
   that GPU to be scanned out directly.

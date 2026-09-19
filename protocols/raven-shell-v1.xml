@@ -22,7 +22,7 @@
     is what makes moving this file to its own repository a mechanical step.
   </description>
 
-  <interface name="raven_shell_manager_v1" version="4">
+  <interface name="raven_shell_manager_v1" version="7">
     <description summary="entry point for the desktop shell">
       Handed to the shell so it can observe compositor state it cannot see as an
       ordinary Wayland client.
@@ -131,13 +131,13 @@
     </request>
   </interface>
 
-  <interface name="raven_output_layout_v1" version="1">
+  <interface name="raven_output_layout_v1" version="7">
     <description summary="where each screen sits, and the means to move it">
       Created through raven_shell_manager_v1.get_output_layout.
 
       Positions are in the desktop's logical pixels, shared by every screen.
-      Changes are staged with set_position and set_scale and take effect on
-      apply, together, so a client arranging three screens does not have the
+      Changes are staged with set_position, set_scale and (since version 5)
+      set_rotation and take effect on apply, together, so a client arranging three screens does not have the
       desktop reflow three times. Whatever is applied is saved and reapplied
       the next time a screen of that name connects.
     </description>
@@ -169,6 +169,47 @@
       <arg name="scale" type="fixed" summary="effective scale, or 0 for automatic"/>
     </request>
 
+    <enum name="rotation">
+      <description summary="which way up a screen is">
+        Quarter turns counter-clockwise, numbered as the first four values of
+        wl_output.transform.
+      </description>
+      <entry name="normal" value="0"/>
+      <entry name="rotate_90" value="1"/>
+      <entry name="rotate_180" value="2"/>
+      <entry name="rotate_270" value="3"/>
+    </enum>
+
+    <request name="set_rotation" since="5">
+      <description summary="stage a rotation for a screen">
+        Turn the screen. A quarter turn trades its logical width and height,
+        so it is placed again on apply like any other change of size. Only
+        that screen's windows are laid out again.
+      </description>
+      <arg name="name" type="string" summary="connector name"/>
+      <arg name="rotation" type="uint" summary="a value of the rotation enum"/>
+    </request>
+
+    <request name="set_primary" since="7">
+      <description summary="stage the main screen">
+        The screen the desktop's panels stay on, new windows open on and
+        focus starts on, and which is numbered 1. An empty name stages no
+        main screen: panels follow the focused screen. A name that matches no
+        connected screen is kept for when it connects.
+      </description>
+      <arg name="name" type="string" summary="connector name, or empty for none"/>
+    </request>
+
+    <request name="identify" since="6">
+      <description summary="show each screen's number on it">
+        Every screen shows its number in a badge in its corner for a few
+        seconds -- the numbers the overview uses, left to right and then top
+        to bottom from 1 -- so a person can tell which monitor is which.
+        Asking again while they are up starts the time over. Changes nothing
+        and saves nothing.
+      </description>
+    </request>
+
     <request name="apply">
       <description summary="apply and save the staged changes">
         Apply every staged change at once, save the result, and report the
@@ -193,6 +234,24 @@
       <arg name="mm_width" type="int" summary="panel width in millimetres, 0 if unknown"/>
       <arg name="mm_height" type="int" summary="panel height in millimetres, 0 if unknown"/>
       <arg name="focused" type="uint" summary="1 if this is the focused screen"/>
+    </event>
+
+    <event name="rotation" since="5">
+      <description summary="which way up the screen just reported is">
+        Sent straight after each output event, for the screen it named. The
+        width and height in that output event are already the turned ones.
+      </description>
+      <arg name="name" type="string" summary="connector name"/>
+      <arg name="rotation" type="uint" summary="a value of the rotation enum"/>
+    </event>
+
+    <event name="primary" since="7">
+      <description summary="the main screen">
+        Sent after the output events and before done, when a main screen is
+        set, with its name -- which may be a screen not connected now. No
+        event means none is set.
+      </description>
+      <arg name="name" type="string" summary="connector name"/>
     </event>
 
     <event name="done">

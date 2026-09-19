@@ -111,6 +111,9 @@ pub struct Space {
     /// exactly one workspace, no workspace is visible on two outputs, and the
     /// active workspace is the one visible on the focused output.
     visible: Vec<usize>,
+    /// The main screen, if one is set: where new windows open. See
+    /// [`Self::set_primary`].
+    primary: Option<usize>,
     /// Space between tiled windows and around the edge of the pane.
     ///
     /// Held here rather than read from a constant so `huginn-core` keeps
@@ -162,6 +165,7 @@ impl Space {
             active: 0,
             outputs: vec![OutputArea::new(area)],
             visible: vec![0],
+            primary: None,
             gap: DEFAULT_GAP,
             carousel_columns: strip::DEFAULT_COLUMNS,
             carousel_offset: None,
@@ -548,6 +552,19 @@ impl Space {
         debug_assert_eq!(self.visible.len(), self.outputs.len());
     }
 
+    /// Set the main screen, as an output index, or `None` for none. New
+    /// windows open on the workspace it is showing. An index past the end is
+    /// taken as none. The compositor sets it again after every change to the
+    /// outputs, since indices move when a monitor comes or goes.
+    pub fn set_primary(&mut self, index: Option<usize>) {
+        self.primary = index.filter(|&i| i < self.outputs.len());
+    }
+
+    /// The main screen, if one is set.
+    pub const fn primary(&self) -> Option<usize> {
+        self.primary
+    }
+
     /// Move focus to output `index`, onto the workspace it is showing.
     pub fn focus_output(&mut self, index: usize) -> bool {
         let Some(&workspace) = self.visible.get(index) else {
@@ -615,6 +632,11 @@ impl Space {
         let id = WindowId::from_raw(self.next_window);
         self.next_window += 1;
         self.windows.insert(id, Window::new(id));
+        // With a main screen, that is where a new window opens, and focus
+        // goes with it: it is what was just asked for.
+        if let Some(&home) = self.primary.and_then(|screen| self.visible.get(screen)) {
+            self.active = home;
+        }
         if self.workspaces[self.active].is_full()
             && let Some(target) = self.workspace_with_room().or_else(|| self.add_workspace())
         {
@@ -763,11 +785,12 @@ impl Space {
     /// than clamped, so a stray keybinding cannot silently jump to the last
     /// workspace.
     ///
-    /// A workspace already showing on another screen is not pulled across:
-    /// focus goes to it where it is. Anything else is shown on the focused
-    /// screen, replacing what that screen showed, and moves there if it lived
-    /// on a different screen -- the screen you are looking at is the one you
-    /// mean.
+    /// Navigation never changes another screen. A workspace already showing
+    /// on one is not pulled across: focus goes to it where it is. Anything
+    /// else is shown on the focused screen, replacing what that screen
+    /// showed, and moves there if it lived on a different screen -- the
+    /// screen you are looking at is the one you mean. Taking a workspace from
+    /// another screen is [`Self::pull_workspace`], and only ever asked for.
     pub fn activate_workspace(&mut self, index: usize) -> bool {
         if index >= self.workspaces.len() || index == self.active {
             return false;
@@ -778,11 +801,146 @@ impl Space {
             return true;
         }
         let output = self.focused_output();
-        self.workspaces[index].set_output(output);
+        self.move_workspace_to_output(index, output);
         self.visible[output] = index;
         self.active = index;
         self.settle_focus(index);
         true
+    }
+
+    /// Whether workspace `index` is on a screen other than the focused one:
+    /// what a swipe or the wheel steps over rather than lands on.
+    pub fn shown_elsewhere(&self, index: usize) -> bool {
+        self.visible
+            .iter()
+            .enumerate()
+            .any(|(output, &shown)| shown == index && output != self.focused_output())
+    }
+
+    /// Bring workspace `index` to the focused screen on purpose, and return
+    /// the windows that moved into the workspace on this screen.
+    ///
+    /// A workspace with windows is merged: they join the active workspace,
+    /// tiled in beside what is already here, and whatever screen was showing
+    /// it is left on its now empty desktop. An empty workspace another screen
+    /// is showing is swapped instead -- this screen gets the empty desktop and
+    /// that one gets what was here -- since there is nothing to merge. An
+    /// empty one nobody is showing is simply gone to.
+    ///
+    /// Merged windows are not held to the tile cap: they were asked for.
+    /// Focus lands on the window that had it where they came from.
+    pub fn pull_workspace(&mut self, index: usize) -> Vec<WindowId> {
+        if index >= self.workspaces.len() || index == self.active {
+            return Vec::new();
+        }
+        if self.workspaces[index].is_empty() {
+            let output = self.focused_output();
+            if let Some(other) = self.visible.iter().position(|&shown| shown == index) {
+                let current = self.active;
+                self.move_workspace_to_output(current, other);
+                self.visible[other] = current;
+                self.move_workspace_to_output(index, output);
+                self.visible[output] = index;
+                self.active = index;
+                self.settle_focus(index);
+            } else {
+                self.activate_workspace(index);
+            }
+            return Vec::new();
+        }
+        self.end_solo_on(index);
+        self.end_solo_on(self.active);
+        let focus = self.workspaces[index].focused();
+        let ids: Vec<WindowId> = self.workspaces[index].windows().to_vec();
+        for &id in &ids {
+            self.carry_window(id, index, self.active);
+        }
+        if let Some(focus) = focus {
+            self.workspaces[self.active].focus(focus);
+        }
+        self.settle_focus(self.active);
+        ids
+    }
+
+    /// The output beside the focused one in direction `dir`: the nearest whose
+    /// centre lies that way and which shares some extent across it, the rule
+    /// moving between tiles follows.
+    pub fn output_toward(&self, dir: Dir) -> Option<usize> {
+        let from = self.outputs[self.focused_output()].output;
+        self.outputs
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != self.focused_output())
+            .filter(|(_, screen)| dir.advances(from, screen.output) && dir.aligned(from, screen.output))
+            .min_by_key(|(_, screen)| dir.distance(from, screen.output))
+            .map(|(index, _)| index)
+    }
+
+    /// Take the focused window of what output `index` is showing into the
+    /// active workspace, focused there, without focus leaving this screen.
+    /// Returns the window, or `None` when that screen has nothing focused.
+    pub fn pull_focused_from_output(&mut self, index: usize) -> Option<WindowId> {
+        let from = *self.visible.get(index)?;
+        if from == self.active {
+            return None;
+        }
+        let id = self.workspaces[from].focused().filter(|id| {
+            self.windows
+                .get(id)
+                .is_some_and(|window| !window.is_minimized())
+        })?;
+        if self.workspaces[from].solo().is_some() {
+            self.end_solo_on(from);
+        }
+        self.carry_window(id, from, self.active);
+        self.workspaces[self.active].focus(id);
+        self.settle_focus(from);
+        Some(id)
+    }
+
+    /// Move window `id` from workspace `from` to workspace `to`, carrying a
+    /// floating window by the offset between their screens.
+    fn carry_window(&mut self, id: WindowId, from: usize, to: usize) {
+        let (a, b) = (self.workspaces[from].output(), self.workspaces[to].output());
+        if let (Some(old), Some(new)) = (self.outputs.get(a), self.outputs.get(b))
+            && let Some(win) = self.windows.get_mut(&id)
+            && win.mode == WindowMode::Floating
+        {
+            let g = win.geometry;
+            win.geometry = Rect::from_xywh(
+                g.x() + new.area.x() - old.area.x(),
+                g.y() + new.area.y() - old.area.y(),
+                g.w(),
+                g.h(),
+            );
+        }
+        self.workspaces[from].remove(id);
+        self.workspaces[to].insert(id);
+    }
+
+    /// Put workspace `index` on output `output`, carrying its floating
+    /// windows by the offset between the two screens so they land where they
+    /// were relative to the screen, not clamped against its edge. Tiled and
+    /// fullscreen windows are laid out afresh by [`Self::arrange`], which
+    /// also pulls a floating window back on screen when the new screen is
+    /// smaller or rotated.
+    fn move_workspace_to_output(&mut self, index: usize, output: usize) {
+        let from = self.workspaces[index].output();
+        if from == output {
+            return;
+        }
+        if let (Some(old), Some(new)) = (self.outputs.get(from), self.outputs.get(output)) {
+            let (dx, dy) = (new.area.x() - old.area.x(), new.area.y() - old.area.y());
+            for id in self.workspaces[index].windows() {
+                if let Some(win) = self.windows.get_mut(id)
+                    && win.mode == WindowMode::Floating
+                {
+                    let g = win.geometry;
+                    win.geometry = Rect::from_xywh(g.x() + dx, g.y() + dy, g.w(), g.h());
+                }
+            }
+        }
+        self.workspaces[index].set_output(output);
     }
 
     /// The output rectangle of the screen holding window `id`, or the focused
@@ -2579,7 +2737,7 @@ mod tests {
     fn each_screen_lays_its_workspace_out_in_its_own_area() {
         let mut s = two_screens();
         let left = s.open_window();
-        s.activate_workspace(1);
+        s.focus_output(1);
         let right = s.open_window();
         let changed = s.arrange();
         assert_eq!(changed.len(), 2);
@@ -2602,9 +2760,166 @@ mod tests {
         let mut s = two_screens();
         assert!(s.activate_workspace(1));
         assert_eq!(s.focused_output(), 1);
-        // It did not get pulled across: the left screen still shows workspace 1.
-        assert_eq!(s.visible_on(0), Some(0));
+        assert_eq!(s.visible_on(0), Some(0), "neither screen changed");
         assert_eq!(s.visible_on(1), Some(1));
+    }
+
+    #[test]
+    fn a_workspace_on_another_screen_is_shown_elsewhere_and_this_one_is_not() {
+        let s = two_screens();
+        assert!(s.shown_elsewhere(1));
+        assert!(!s.shown_elsewhere(0), "the focused screen's own");
+        assert!(!s.shown_elsewhere(3), "hidden");
+    }
+
+    fn three_screens() -> Space {
+        const THIRD: Rect = Rect::from_xywh(4480, 0, 1920, 1080);
+        let mut s = padded(Space::new(LEFT));
+        s.set_outputs(vec![
+            OutputArea::new(LEFT),
+            OutputArea::new(RIGHT),
+            OutputArea::new(THIRD),
+        ]);
+        s
+    }
+
+    #[test]
+    fn pulling_a_workspace_with_windows_merges_them_into_this_one() {
+        let mut s = three_screens();
+        let terminal = s.open_window();
+        s.focus_output(1);
+        let brave = s.open_window();
+        s.focus_output(2);
+        let third = s.open_window();
+        s.focus_output(0);
+        s.arrange();
+        let before = s.window(third).unwrap().geometry;
+
+        assert_eq!(s.pull_workspace(1), vec![brave]);
+        assert_eq!(s.focused_output(), 0, "focus never left");
+        assert_eq!(s.active_workspace().windows(), &[terminal, brave]);
+        assert_eq!(s.focused(), Some(brave), "the pulled window has focus");
+        assert_eq!(s.visible_on(1), Some(1), "that screen keeps its workspace");
+        assert!(s.workspaces()[1].is_empty(), "now an empty desktop");
+        assert_eq!(s.visible_on(2), Some(2));
+
+        let changed = s.arrange();
+        assert!(changed.iter().all(|&(id, _)| id != third), "the third screen is untouched");
+        assert_eq!(s.window(third).unwrap().geometry, before);
+        for id in [terminal, brave] {
+            assert!(LEFT.contains(s.window(id).unwrap().geometry.center()));
+        }
+    }
+
+    #[test]
+    fn pulling_an_empty_workspace_from_another_screen_swaps() {
+        let mut s = two_screens();
+        let terminal = s.open_window();
+
+        assert_eq!(s.pull_workspace(1), Vec::new());
+        assert_eq!(s.visible_on(0), Some(1), "the empty desktop is here");
+        assert_eq!(s.visible_on(1), Some(0), "and the terminal went over there");
+        assert_eq!(s.focused_output(), 0);
+        s.arrange();
+        assert!(RIGHT.contains(s.window(terminal).unwrap().geometry.center()));
+    }
+
+    #[test]
+    fn pulling_an_empty_hidden_workspace_just_goes_there() {
+        let mut s = two_screens();
+        s.open_window();
+        assert_eq!(s.pull_workspace(3), Vec::new());
+        assert_eq!(s.visible_on(0), Some(3));
+        assert_eq!(s.visible_on(1), Some(1), "the other screen is untouched");
+    }
+
+    #[test]
+    fn a_pulled_floating_window_keeps_its_place_on_this_screen() {
+        let mut s = two_screens();
+        s.focus_output(1);
+        let id = s.open_window();
+        s.window_mut(id).unwrap().mode = WindowMode::Floating;
+        s.window_mut(id).unwrap().geometry = Rect::from_xywh(1920 + 100, 200, 640, 480);
+        s.focus_output(0);
+
+        s.pull_workspace(1);
+        s.arrange();
+        assert_eq!(s.window(id).unwrap().geometry, Rect::from_xywh(100, 200, 640, 480));
+    }
+
+    #[test]
+    fn with_a_main_screen_new_windows_open_there_and_focus_follows() {
+        let mut s = two_screens();
+        s.set_primary(Some(1));
+        let id = s.open_window();
+        assert_eq!(s.workspace_of(id), Some(1));
+        assert_eq!(s.focused_output(), 1);
+        s.set_primary(None);
+        s.focus_output(0);
+        let here = s.open_window();
+        assert_eq!(s.workspace_of(here), Some(0), "without one, where focus is");
+        s.set_primary(Some(7));
+        assert_eq!(s.primary(), None, "no such screen");
+    }
+
+    #[test]
+    fn the_output_toward_a_direction_is_the_one_beside_it() {
+        let mut s = three_screens();
+        assert_eq!(s.output_toward(Dir::Right), Some(1), "the nearest, not the furthest");
+        assert_eq!(s.output_toward(Dir::Left), None);
+        assert_eq!(s.output_toward(Dir::Up), None);
+        s.focus_output(2);
+        assert_eq!(s.output_toward(Dir::Left), Some(1));
+    }
+
+    #[test]
+    fn pulling_the_focused_window_of_another_screen_leaves_the_rest() {
+        let mut s = two_screens();
+        let terminal = s.open_window();
+        s.focus_output(1);
+        let editor = s.open_window();
+        let brave = s.open_window();
+        s.focus_output(0);
+
+        assert_eq!(s.pull_focused_from_output(1), Some(brave));
+        assert_eq!(s.focused_output(), 0, "focus stays on this screen");
+        assert_eq!(s.focused(), Some(brave));
+        assert_eq!(s.active_workspace().windows(), &[terminal, brave]);
+        assert_eq!(s.workspaces()[1].windows(), &[editor], "the rest stay");
+        assert_eq!(s.workspaces()[1].focused(), Some(editor), "and something there has focus");
+        assert_eq!(s.visible_on(1), Some(1));
+    }
+
+    #[test]
+    fn pulling_from_a_screen_with_nothing_focused_does_nothing() {
+        let mut s = two_screens();
+        s.open_window();
+        assert_eq!(s.pull_focused_from_output(1), None);
+        assert_eq!(s.pull_focused_from_output(0), None, "this screen's own");
+        assert_eq!(s.pull_focused_from_output(9), None);
+    }
+
+    #[test]
+    fn a_portrait_screen_lays_out_tall_and_leaves_the_other_alone() {
+        const PORTRAIT: Rect = Rect::from_xywh(1920, 0, 1440, 2560);
+        let mut s = two_screens();
+        let left = s.open_window();
+        s.focus_output(1);
+        let top = s.open_window();
+        s.open_window();
+        s.arrange();
+        let before = s.window(left).unwrap().geometry;
+
+        // Rotating the right screen: the backend hands over its new size.
+        s.set_outputs(vec![OutputArea::new(LEFT), OutputArea::new(PORTRAIT)]);
+        let changed = s.arrange();
+        assert!(changed.iter().all(|&(id, _)| id != left));
+        assert_eq!(s.window(left).unwrap().geometry, before);
+        let g = s.window(top).unwrap().geometry;
+        assert!(PORTRAIT.contains(g.center()));
+        assert!(g.w() <= PORTRAIT.w());
+        assert_eq!(s.visible_on(1), Some(1), "the rotated screen keeps its workspace");
+        assert_eq!(s.focused_output(), 1);
     }
 
     #[test]

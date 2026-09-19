@@ -294,12 +294,10 @@ fn write(
     Ok(written)
 }
 
-/// The screen's mode, in physical pixels: the size a recording of it is.
+/// The screen's mode, in physical pixels and turned the way the screen is:
+/// the size a recording of it is.
 fn mode_size(info: &OutputInfo) -> Option<Size<i32, Physical>> {
-    info.output
-        .as_ref()
-        .and_then(|output| output.current_mode())
-        .map(|mode| mode.size)
+    info.frame_size()
 }
 
 /// Diameter of the recording dot, in logical pixels.

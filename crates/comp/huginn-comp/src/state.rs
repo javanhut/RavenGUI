@@ -185,6 +185,23 @@ pub(crate) enum SceneItem<'a> {
     /// invisible to hit testing and owed no frame callback, since there is no
     /// client behind it any more.
     Ghost(&'a Snapshot, Rect, WorkspacePreview),
+    /// An item drawn on the screen with this rectangle and on no other, even
+    /// where it reaches past that screen's edge. The overview is one screen's:
+    /// its neighbouring stages sit a screen-width to either side, which on a
+    /// desktop of several monitors is exactly where the next monitor is.
+    OnScreen(Rect, Box<SceneItem<'a>>),
+}
+
+impl SceneItem<'_> {
+    /// The item itself, out of any [`SceneItem::OnScreen`] around it: for
+    /// the questions -- what can be clicked, who is owed a frame -- that are
+    /// about the item and not about which screen draws it.
+    fn unwrapped(self) -> Self {
+        match self {
+            SceneItem::OnScreen(_, inner) => inner.unwrapped(),
+            item => item,
+        }
+    }
 }
 
 /// What the renderer needs to draw a surface after the surface is gone.
@@ -257,6 +274,10 @@ struct WorkspaceCarousel {
     /// `selected` so that a pointer resting on nothing leaves the arrows'
     /// choice alone: only *leaving* a window clears the highlight.
     hover: Option<huginn_core::window::WindowId>,
+    /// The output the overview was opened on, and stays on until it closes.
+    /// Fixed rather than read from focus each frame: the pointer wandering
+    /// onto another monitor mid-swipe must not carry the overview with it.
+    screen: usize,
 }
 
 impl WorkspaceCarousel {
@@ -282,7 +303,7 @@ impl WorkspaceCarousel {
     const THROW_DAMPING: f32 = 0.8;
 
     /// At rest, with stage `position` at the front and the reveal at `reveal`.
-    fn at(position: f32, reveal: f32) -> Self {
+    fn at(position: f32, reveal: f32, screen: usize) -> Self {
         Self {
             position: crate::anim::Spring::at_rest(position, Self::POSITION_STIFFNESS)
                 .with_tolerance(Self::TOLERANCE),
@@ -291,6 +312,7 @@ impl WorkspaceCarousel {
             closing: false,
             selected: None,
             hover: None,
+            screen,
         }
     }
 }
@@ -298,12 +320,23 @@ impl WorkspaceCarousel {
 /// The overview's chrome, composed for what it is showing; see
 /// [`crate::overview`].
 #[derive(Debug)]
+/// Each screen's number badge, and what they were composed for: every
+/// screen's usable area, number and density.
+struct ScreenBadges {
+    key: Vec<(Rect, u32, u32)>,
+    badges: Vec<crate::overview::ScreenBadge>,
+}
+
+#[derive(Debug)]
 struct OverviewChrome {
     /// What the chrome was composed for: each window's stage, settled frame
     /// and title. When the overview would show something else, it is redone.
     key: Vec<(usize, WindowId, Rect, Option<String>)>,
     /// Which stage the space labels mark as the front.
     front: usize,
+    /// For each stage, the number of the screen showing it if that is not
+    /// the overview's.
+    elsewhere: Vec<Option<u32>>,
     bar: Option<crate::overview::SpacesBar>,
     thumbs: Vec<crate::overview::Thumb>,
 }
@@ -384,6 +417,12 @@ const APP_SWITCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// strip. Longer than the run of events a free-spinning wheel reports for one
 /// flick, and shorter than the gap before anyone deliberately turns it again.
 const WHEEL_QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long the screens show their numbers when Settings asks which is which:
+/// long enough to look from one monitor to the next.
+const IDENTIFY_FOR: std::time::Duration = std::time::Duration::from_millis(3500);
+/// The fade at either end of that, in seconds.
+const IDENTIFY_FADE: f32 = 0.2;
 
 /// Applications that drive the `Super` layer themselves.
 ///
@@ -671,6 +710,11 @@ pub(crate) struct Huginn {
     carousel_scroll: crate::anim::Animated,
     /// Workspace-level Cover Flow shown while a three-finger swipe is active.
     workspace_carousel: Option<WorkspaceCarousel>,
+    /// The screens' number badges, composed while something shows them.
+    screen_badges: Option<ScreenBadges>,
+    /// When the screens were last asked to show their numbers on their own,
+    /// through `raven_output_layout_v1.identify`.
+    identify_since: Option<std::time::Duration>,
     /// The touchpad swipe in progress, if any.
     ///
     /// Held on the compositor rather than in the core because a gesture is
@@ -738,8 +782,13 @@ pub(crate) struct Huginn {
     layout: Vec<huginn_core::layout::Saved>,
     /// Changes a client has staged and not yet applied.
     staged_layout: Vec<huginn_core::layout::Saved>,
+    /// A main screen a client has staged: `Some(None)` is "no main screen".
+    staged_primary: Option<Option<String>>,
     /// `apply` happened; the backend owes a re-arrange.
     layout_changed: bool,
+    /// Focus has been put on the main screen for this session. Done once,
+    /// when the first real screens arrive, and again at every unlock.
+    homed: bool,
 
     /// The keybinding overlay, painted once when summoned. `None` when closed.
     help: Option<crate::overlay::Overlay>,
@@ -1159,6 +1208,8 @@ impl Huginn {
             layers: Vec::new(),
             carousel_scroll: crate::anim::Animated::settled(0.0),
             workspace_carousel: None,
+            screen_badges: None,
+            identify_since: None,
             swipe: None,
             fullscreen_solo: HashSet::new(),
             drag: false,
@@ -1176,7 +1227,9 @@ impl Huginn {
             outputs: vec![OutputInfo::bare(area)],
             layout: load_layout(),
             staged_layout: Vec::new(),
+            staged_primary: None,
             layout_changed: false,
+            homed: false,
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), crate::theme::accent().to_rgba_f32())
             }),
@@ -1755,17 +1808,58 @@ impl Huginn {
         self.queue_redraw();
     }
 
-    /// The focused screen's rectangle, before panels reserve any of it.
+    /// The panel screen's rectangle, before panels reserve any of it.
     ///
-    /// The focused screen is the one the shell's own panels sit on and the
-    /// one keybindings act on; it follows the pointer between screens.
+    /// The panel screen is the one the shell's own panels sit on -- the dock,
+    /// the launcher, quick settings, notifications. With a main screen set it
+    /// is that one, and they stay there; without, it is the focused screen
+    /// and they follow the pointer between screens.
     pub(crate) fn output_area(&self) -> Rect {
+        self.outputs[self.panel_output()].rect
+    }
+
+    /// The panel screen's scale: what the shell composes its panels at.
+    pub(crate) fn scale(&self) -> OutputScale {
+        self.outputs[self.panel_output()].scale
+    }
+
+    /// The screen the panels sit on. See [`Self::output_area`].
+    fn panel_output(&self) -> usize {
+        self.primary_output()
+            .unwrap_or_else(|| self.space.focused_output())
+            .min(self.outputs.len() - 1)
+    }
+
+    /// The focused screen's rectangle, for what belongs where the person is
+    /// working rather than with the panels: a popup kept on screen.
+    pub(crate) fn focused_output_area(&self) -> Rect {
         self.outputs[self.space.focused_output().min(self.outputs.len() - 1)].rect
     }
 
-    /// The focused screen's scale: what the shell composes its panels at.
-    pub(crate) fn scale(&self) -> OutputScale {
+    /// The focused screen's scale.
+    fn focused_scale(&self) -> OutputScale {
         self.outputs[self.space.focused_output().min(self.outputs.len() - 1)].scale
+    }
+
+    /// The main screen, if one is set and connected.
+    pub(crate) fn primary_output(&self) -> Option<usize> {
+        huginn_core::layout::primary(&self.layout).and_then(|name| self.output_index(name))
+    }
+
+    /// Put focus, and the pointer, on the main screen. At the start of the
+    /// session and at every unlock; nowhere else, since in between the
+    /// person moves between screens and the desktop follows.
+    fn home_to_primary(&mut self) {
+        let Some(screen) = self.primary_output() else {
+            return;
+        };
+        self.space.focus_output(screen);
+        let rect = self.outputs[screen].rect;
+        let centre = rect.center();
+        self.pointer_location = (f64::from(centre.x), f64::from(centre.y)).into();
+        self.refresh_output_panels();
+        self.refresh_focus();
+        self.broadcast_workspaces();
     }
 
     /// Every screen, in output order.
@@ -1819,10 +1913,17 @@ impl Huginn {
                 .collect(),
         );
         self.outputs = outputs;
+        // Indices move when a monitor comes or goes; the main screen is kept
+        // by name, so it is found again every time.
+        self.space.set_primary(self.primary_output());
         // Somewhere on a screen, always: a pointer left on a monitor that was
         // just unplugged is invisible and can reach nothing.
         self.pointer_location = self.clamp_pointer(self.pointer_location);
         self.apply_output_geometry();
+        if !self.homed && self.outputs.iter().any(|output| output.output.is_some()) {
+            self.homed = true;
+            self.home_to_primary();
+        }
         self.broadcast_outputs();
         // A screen gone is a capture of it stopped; a new mode is a new
         // buffer size. Both are told now, not at the next frame.
@@ -2082,6 +2183,19 @@ impl Huginn {
             out.extend(self.popups_of(&surface, rect));
             out.push(SceneItem::Surface(surface, rect));
         }
+        // Every screen shows its number while the overview is up, so a stage
+        // labelled with one can be matched to the monitor at a glance, and
+        // for a few seconds when Settings asks which screen is which. Each
+        // badge sits on its own screen, so it is drawn only there without
+        // being told to.
+        let badge_alpha = self.badge_alpha();
+        if badge_alpha > 0.0
+            && let Some(badges) = &self.screen_badges
+        {
+            for badge in &badges.badges {
+                out.push(SceneItem::Overlay(badge.panel.buffer(), badge.rect, badge_alpha));
+            }
+        }
         if let Some(previews) = self.workspace_previews() {
             // The centre stage is first because scene order is front-to-back.
             // Popups and the focus ring belong to the interactive full-size
@@ -2093,9 +2207,13 @@ impl Huginn {
                 )
             });
             let front = self.overview_front();
+            // Everything the overview draws is its own screen's. The other
+            // screens go on showing their workspaces, untouched.
+            let screen = self.overview_output();
+            let mut overview = Vec::new();
             // The space labels stay put while the stages slide beneath them.
             if let Some(bar) = self.overview_chrome.as_ref().and_then(|c| c.bar.as_ref()) {
-                out.push(SceneItem::Overlay(
+                overview.push(SceneItem::Overlay(
                     bar.panel.buffer(),
                     bar.rect,
                     reveal as f32,
@@ -2104,12 +2222,12 @@ impl Huginn {
             for (workspace, card) in previews {
                 // The highlight lives on the front stage alone.
                 let highlight = selected.filter(|_| Some(workspace) == front);
-                out.extend(self.workspace_pane_items(workspace, card, reveal, highlight));
-                out.push(SceneItem::WorkspaceCard(&self.workspace_card, card));
+                overview.extend(self.workspace_pane_items(workspace, card, reveal, highlight));
+                overview.push(SceneItem::WorkspaceCard(&self.workspace_card, card));
             }
             // Behind every stage: the desktop steps back as the windows come
             // forward, and comes back as they settle.
-            out.push(SceneItem::WorkspaceCard(
+            overview.push(SceneItem::WorkspaceCard(
                 &self.overview_veil,
                 WorkspacePreview {
                     scale_x: 1.0,
@@ -2119,6 +2237,16 @@ impl Huginn {
                     alpha: reveal as f32,
                 },
             ));
+            out.extend(
+                overview
+                    .into_iter()
+                    .map(|item| SceneItem::OnScreen(screen, Box::new(item))),
+            );
+            let skip = self.space.visible_on(self.overview_screen());
+            for (surface, rect) in self.render_list_except(skip) {
+                out.extend(self.popups_of(&surface, rect));
+            }
+            out.extend(self.window_items_except(skip));
         } else {
             for (surface, rect) in self.render_list() {
                 out.extend(self.popups_of(&surface, rect));
@@ -2157,7 +2285,7 @@ impl Huginn {
     /// Hit testing and frame callbacks both want a client on the other end, and
     /// the focus ring has none.
     pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (WlSurface, Rect, Option<Rect>)> {
-        self.scene().into_iter().filter_map(|item| match item {
+        self.scene().into_iter().map(SceneItem::unwrapped).filter_map(|item| match item {
             SceneItem::Surface(surface, rect) | SceneItem::WorkspaceSurface(surface, rect, _) => {
                 Some((surface, rect, None))
             }
@@ -2166,7 +2294,8 @@ impl Huginn {
             | SceneItem::Ghost(..)
             | SceneItem::Ring(..)
             | SceneItem::Overlay(..)
-            | SceneItem::WorkspaceCard(..) => None,
+            | SceneItem::WorkspaceCard(..)
+            | SceneItem::OnScreen(..) => None,
         })
     }
 
@@ -2186,7 +2315,7 @@ impl Huginn {
         // The switcher's thumbnail is a picture, not a surface to click, so
         // it is not in the scene list -- but it is on screen, and a window
         // that is on screen should be allowed to keep painting itself.
-        out.extend(self.scene().into_iter().filter_map(|item| match item {
+        out.extend(self.scene().into_iter().map(SceneItem::unwrapped).filter_map(|item| match item {
             SceneItem::Preview(surface, rect, _) => Some((surface, rect)),
             _ => None,
         }));
@@ -2216,8 +2345,13 @@ impl Huginn {
 
     /// Every window on a workspace some screen is showing, screen by screen.
     pub(crate) fn visible_window_ids(&self) -> Vec<huginn_core::window::WindowId> {
+        self.visible_window_ids_except(None)
+    }
+
+    fn visible_window_ids_except(&self, skip: Option<usize>) -> Vec<huginn_core::window::WindowId> {
         self.space
             .visible_workspaces()
+            .filter(|&(_, ws)| Some(ws) != skip)
             .filter_map(|(_, ws)| self.space.workspaces().get(ws))
             .flat_map(|ws| ws.windows().iter().copied())
             .collect()
@@ -2284,6 +2418,7 @@ impl Huginn {
     /// idle period, which is the most a broken lock screen should cost.
     fn reveal_unlocked(&mut self) {
         self.lock = None;
+        self.home_to_primary();
         self.last_input = Instant::now();
         self.refresh_focus();
         self.queue_redraw();
@@ -2619,9 +2754,21 @@ impl Huginn {
         &self.layout
     }
 
+    /// Start a staged entry for `name` from what is saved for it, so staging
+    /// one thing keeps the rest: a scale change keeps the position, and a
+    /// position change keeps the scale and the rotation.
+    fn seed_staged(&mut self, name: &str) {
+        if !self.staged_layout.iter().any(|s| s.name == name)
+            && let Some(saved) = self.layout.iter().find(|s| s.name == name)
+        {
+            self.staged_layout.push(saved.clone());
+        }
+    }
+
     /// Stage a position for a named screen; nothing moves until
     /// [`Self::apply_output_layout`].
     pub(crate) fn stage_output_position(&mut self, name: &str, x: i32, y: i32) {
+        self.seed_staged(name);
         huginn_core::layout::set_position(
             &mut self.staged_layout,
             name,
@@ -2631,13 +2778,23 @@ impl Huginn {
 
     /// Stage a scale override, or `None` to go back to the derived one.
     pub(crate) fn stage_output_scale(&mut self, name: &str, scale: Option<f64>) {
-        if !self.staged_layout.iter().any(|s| s.name == name)
-            && let Some(saved) = self.layout.iter().find(|s| s.name == name)
-        {
-            // Start from what is saved so a scale change keeps the position.
-            self.staged_layout.push(saved.clone());
-        }
+        self.seed_staged(name);
         huginn_core::layout::set_scale(&mut self.staged_layout, name, scale);
+    }
+
+    /// Stage the main screen by name, or `None` for none.
+    pub(crate) fn stage_output_primary(&mut self, name: Option<String>) {
+        self.staged_primary = Some(name);
+    }
+
+    /// Stage which way up a named screen is.
+    pub(crate) fn stage_output_rotation(
+        &mut self,
+        name: &str,
+        rotation: huginn_core::layout::Rotation,
+    ) {
+        self.seed_staged(name);
+        huginn_core::layout::set_rotation(&mut self.staged_layout, name, rotation);
     }
 
     /// Make the staged layout the saved one and ask the backend to re-arrange.
@@ -2653,6 +2810,14 @@ impl Huginn {
             // A staged entry carries the scale it wants, including `None`
             // for "back to automatic".
             huginn_core::layout::set_scale(&mut self.layout, &entry.name, entry.scale);
+            huginn_core::layout::set_rotation(&mut self.layout, &entry.name, entry.rotation);
+        }
+        if let Some(primary) = self.staged_primary.take() {
+            huginn_core::layout::set_primary(&mut self.layout, primary.as_deref());
+            self.space.set_primary(self.primary_output());
+            // The panels move to it now, not at the next pointer crossing.
+            self.refresh_output_panels();
+            self.broadcast_outputs();
         }
         self.save_layout();
         self.layout_changed = true;
@@ -3332,6 +3497,11 @@ impl Huginn {
     /// pane still flying into the dock on top, then the tiles, each drawn at
     /// its motion's rectangle if it has one and at its pane if not.
     fn window_items(&self) -> Vec<SceneItem<'_>> {
+        self.window_items_except(None)
+    }
+
+    /// [`Self::window_items`] for every visible workspace but `skip`.
+    fn window_items_except(&self, skip: Option<usize>) -> Vec<SceneItem<'_>> {
         let now = self.uptime();
         // Windows on their way out go in front: they were on top a moment ago
         // and are fading, and a pane reflowing underneath must not paint over
@@ -3354,7 +3524,7 @@ impl Huginn {
             out.extend(self.bar_item(*id, now));
             out.push(SceneItem::Preview(surface, placed, transform));
         }
-        for id in &self.visible_window_ids() {
+        for id in &self.visible_window_ids_except(skip) {
             if !self.mapped.contains(id)
                 || self
                     .space
@@ -3678,8 +3848,7 @@ impl Huginn {
                             // Born pinned shut: the fingers drive the reveal
                             // from here, not the open animation.
                             self.tidy_workspaces();
-                            self.workspace_carousel =
-                                Some(WorkspaceCarousel::at(self.space.active_index() as f32, 0.0));
+                            self.workspace_carousel = Some(self.new_carousel());
                             0.0
                         };
                         swipe.drives_reveal(origin);
@@ -4225,6 +4394,173 @@ impl Huginn {
         }
     }
 
+    /// Whether Shift is held: what turns letting go of a swipe onto another
+    /// screen's workspace from "not that one" into "bring it here". Shift
+    /// rather than Super because the mouse's swipe is Super+drag, so Super is
+    /// already down for every one of those; Shift is free on the touchpad,
+    /// the mouse and the wheel alike, and is what widens a chord's reach
+    /// everywhere else in the keymap.
+    fn pull_held(&self) -> bool {
+        self.seat
+            .get_keyboard()
+            .is_some_and(|keyboard| keyboard.modifier_state().shift)
+    }
+
+    /// The stage nearest `wanted` that no other screen is showing, ties going
+    /// to the side of the workspace this screen is on -- the way the fingers
+    /// came. There is always one: this screen's own.
+    fn nearest_own_stage(&self, wanted: usize) -> usize {
+        let home = self.space.active_index();
+        (0..self.space.workspaces().len())
+            .filter(|&index| !self.space.shown_elsewhere(index))
+            .min_by_key(|&index| (index.abs_diff(wanted), index.abs_diff(home)))
+            .unwrap_or(home)
+    }
+
+    /// Bring workspace `index` to the focused screen on purpose -- merge its
+    /// windows in, or swap an empty one -- and give them their places. See
+    /// `Space::pull_workspace`.
+    fn pull_workspace(&mut self, index: usize) {
+        let moved = self.space.pull_workspace(index);
+        for &id in &moved {
+            // A window that had another screen to itself is sharing this one.
+            if self.space.window(id).is_some_and(|w| w.is_fullscreen()) {
+                self.set_fullscreen(id, false);
+            }
+        }
+        self.arrange();
+        self.refresh_focus();
+        self.broadcast_workspaces();
+    }
+
+    /// Take the focused window of the screen in direction `dir` into this
+    /// one -- `Super`+`Ctrl`+`Shift`+an arrow -- without going there.
+    pub(crate) fn pull_from_output(&mut self, dir: huginn_core::geometry::Dir) {
+        let Some(output) = self.space.output_toward(dir) else {
+            return;
+        };
+        let Some(id) = self.space.pull_focused_from_output(output) else {
+            return;
+        };
+        if self.space.window(id).is_some_and(|w| w.is_fullscreen()) {
+            self.set_fullscreen(id, false);
+        }
+        self.share_screen_with(id);
+        self.arrange();
+        self.refresh_focus();
+        self.broadcast_workspaces();
+    }
+
+    /// A shut overview at the active workspace, on the focused screen.
+    ///
+    /// The stage backings and the veil are sized to that screen here: they
+    /// are otherwise sized to whichever screen had focus when the outputs last
+    /// changed, which beside a monitor of another size is the wrong one.
+    fn new_carousel(&mut self) -> WorkspaceCarousel {
+        let screen = self.space.focused_output();
+        let rect = self.outputs[screen.min(self.outputs.len() - 1)].rect;
+        self.workspace_card.resize((rect.w(), rect.h()));
+        self.overview_veil.resize((rect.w(), rect.h()));
+        WorkspaceCarousel::at(self.space.active_index() as f32, 0.0, screen)
+    }
+
+    /// The overview's screen: the output it was opened on, or the focused one
+    /// when it is not open. Clamped, since an unplugged monitor can take the
+    /// index out from under an open overview.
+    fn overview_screen(&self) -> usize {
+        self.workspace_carousel
+            .map_or(self.space.focused_output(), |carousel| carousel.screen)
+            .min(self.outputs.len() - 1)
+    }
+
+    /// The screen showing workspace `index`, if that is not the overview's
+    /// own: a stage the overview dims and slides past.
+    fn shown_off_overview(&self, index: usize) -> Option<usize> {
+        let own = self.overview_screen();
+        self.space
+            .visible_workspaces()
+            .find(|&(output, shown)| shown == index && output != own)
+            .map(|(output, _)| output)
+    }
+
+    /// Show every screen's number for a few seconds: Settings' "Identify
+    /// displays". Asking again while they are up starts the time over.
+    pub(crate) fn identify_screens(&mut self) {
+        self.identify_since = Some(self.uptime());
+        self.refresh_screen_badges();
+        self.queue_redraw();
+    }
+
+    /// How opaque the badges are now: as far as the overview has opened, or
+    /// where the identify fade has got to, whichever is more.
+    fn badge_alpha(&self) -> f32 {
+        let now = self.uptime();
+        let overview = self
+            .workspace_carousel
+            .map_or(0.0, |carousel| carousel.reveal.value(now).clamp(0.0, 1.0));
+        let identify = self.identify_since.map_or(0.0, |since| {
+            let t = now.saturating_sub(since).as_secs_f32();
+            let total = IDENTIFY_FOR.as_secs_f32();
+            (t / IDENTIFY_FADE).min((total - t) / IDENTIFY_FADE).clamp(0.0, 1.0)
+        });
+        if self.reduced_motion() && identify > 0.0 {
+            return 1.0;
+        }
+        overview.max(identify)
+    }
+
+    /// Compose the badges again if a screen's area, number or density has
+    /// changed since they were last composed.
+    fn refresh_screen_badges(&mut self) {
+        let numbers = self.screen_numbers();
+        // In from the corner of the part of each screen panels leave free,
+        // so a bar along the top does not cover it.
+        let key: Vec<(Rect, u32, u32)> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let usable = self
+                    .space
+                    .outputs()
+                    .get(index)
+                    .map_or(output.rect, |screen| screen.area);
+                (usable, numbers[index], output.scale.advertised)
+            })
+            .collect();
+        if self.screen_badges.as_ref().is_some_and(|badges| badges.key == key) {
+            return;
+        }
+        let badges = key
+            .iter()
+            .filter_map(|&(usable, number, density)| {
+                crate::overview::screen_badge(&mut self.text, number, usable, density)
+            })
+            .collect();
+        self.screen_badges = Some(ScreenBadges { key, badges });
+    }
+
+    /// Each screen's number, in output order. See
+    /// `crate::overview::screen_numbers`.
+    fn screen_numbers(&self) -> Vec<u32> {
+        let rects: Vec<Rect> = self.outputs.iter().map(|output| output.rect).collect();
+        crate::overview::screen_numbers(&rects, self.primary_output())
+    }
+
+    /// The overview's whole screen, in desktop coordinates.
+    fn overview_output(&self) -> Rect {
+        self.outputs[self.overview_screen()].rect
+    }
+
+    /// The overview's screen less what panels reserve on it.
+    fn overview_usable(&self) -> Rect {
+        let screen = self.overview_screen();
+        self.space
+            .outputs()
+            .get(screen)
+            .map_or_else(|| self.space.area(), |output| output.area)
+    }
+
     /// Open the workspace Cover Flow at the active workspace.
     pub(crate) fn open_workspace_carousel(&mut self) {
         let now = self.uptime();
@@ -4242,7 +4578,7 @@ impl Huginn {
         // Last chance before the row holds indices: make sure the spare to
         // slide into is there.
         self.tidy_workspaces();
-        let mut carousel = WorkspaceCarousel::at(self.space.active_index() as f32, 0.0);
+        let mut carousel = self.new_carousel();
         carousel.reveal.go_to(1.0, now, instant);
         self.workspace_carousel = Some(carousel);
         self.refresh_overview_chrome();
@@ -4275,19 +4611,61 @@ impl Huginn {
         let Some(carousel) = &mut self.workspace_carousel else {
             return;
         };
-        let target = match land {
+        let wanted = match land {
             Some(stage) => stage.min(last),
             None => {
                 carousel.position.set_damping(1.0, now);
                 carousel.position.value(now).round().clamp(0.0, last as f32) as usize
             }
         };
+        let screen = carousel.screen;
+        // The stage lands on the overview's own screen, wherever the pointer
+        // has wandered since it opened: that is the screen the fingers were
+        // moving, and "another screen's" is judged from there.
+        self.space.focus_output(screen);
+        // A window picked on another screen's stage: go to it there. The
+        // pick is deliberate, but it is a pick of the window, not a request
+        // to rearrange that screen, so its layout is left as it stands.
+        if let Some(id) = select
+            && self.space.shown_elsewhere(wanted)
+            && !self.pull_held()
+        {
+            let home = self.space.active_index();
+            if let Some(carousel) = &mut self.workspace_carousel {
+                carousel.position.go_to(home as f32, now, instant);
+                carousel.reveal.go_to(0.0, now, instant);
+                carousel.closing = true;
+                carousel.selected = None;
+                carousel.hover = None;
+            }
+            self.space.focus_window(id);
+            self.refresh_focus();
+            return;
+        }
+        let target = if !self.space.shown_elsewhere(wanted) {
+            self.space.activate_workspace(wanted);
+            wanted
+        } else if self.pull_held() {
+            // Asked for: its windows come here, or an empty one swaps. See
+            // `Space::pull_workspace`. Either way the stage to settle on is
+            // whatever this screen now shows.
+            self.pull_workspace(wanted);
+            self.space.active_index()
+        } else {
+            // Another screen's, and not asked for: the row does not stop
+            // there. The nearest stage that is this screen's to show instead.
+            let own = self.nearest_own_stage(wanted);
+            self.space.activate_workspace(own);
+            own
+        };
+        let Some(carousel) = &mut self.workspace_carousel else {
+            return;
+        };
         carousel.position.go_to(target as f32, now, instant);
         carousel.reveal.go_to(0.0, now, instant);
         carousel.closing = true;
         carousel.selected = None;
         carousel.hover = None;
-        self.space.activate_workspace(target);
         // The overview's solo is the overview's to end, so a fullscreen
         // request's record of its own solo is stale once the overview has
         // taken the workspace one way or the other.
@@ -4474,7 +4852,23 @@ impl Huginn {
         // all the way back to the first.
         let last = self.space.workspaces().len().saturating_sub(1) as i32;
         let active = self.space.active_index() as i32;
-        let target = active.saturating_add(steps).clamp(0, last);
+        // Each notch is one of this screen's workspaces: one another screen
+        // is showing is stepped over, not landed on, and a run of them at
+        // the end of the row leaves the wheel where it was.
+        let step = steps.signum();
+        let mut target = active;
+        let mut left = steps.abs();
+        let mut probe = active;
+        while left > 0 {
+            probe += step;
+            if probe < 0 || probe > last {
+                break;
+            }
+            if !self.space.shown_elsewhere(probe as usize) {
+                target = probe;
+                left -= 1;
+            }
+        }
         if target == active {
             return true;
         }
@@ -5477,6 +5871,18 @@ impl Huginn {
         }
         if self.workspace_carousel.is_some() {
             self.refresh_overview_chrome();
+        }
+        if let Some(since) = self.identify_since {
+            if now.saturating_sub(since) >= IDENTIFY_FOR {
+                self.identify_since = None;
+            }
+            // Frames for the fade, and one more to take the badges down.
+            self.queue_redraw();
+        }
+        if self.workspace_carousel.is_some() || self.identify_since.is_some() {
+            self.refresh_screen_badges();
+        } else {
+            self.screen_badges = None;
         }
         if finish_workspace_carousel {
             self.workspace_carousel = None;
@@ -6674,8 +7080,15 @@ impl Huginn {
     /// builder do not each have to decide what an X11 window with no surface yet
     /// should mean. It means the same thing as an unmapped window: skip it.
     pub(crate) fn render_list(&self) -> Vec<(WlSurface, Rect)> {
+        self.render_list_except(None)
+    }
+
+    /// [`Self::render_list`] less the workspace `skip`: the one under the
+    /// overview, which draws that screen itself.
+    fn render_list_except(&self, skip: Option<usize>) -> Vec<(WlSurface, Rect)> {
         self.space
             .visible_workspaces()
+            .filter(|&(_, ws)| Some(ws) != skip)
             .flat_map(|(_, ws)| self.render_list_for(ws))
             .collect()
     }
@@ -6718,7 +7131,7 @@ impl Huginn {
         let now = self.uptime();
         let position = carousel.position.value(now);
         let reveal = carousel.reveal.value(now).clamp(0.0, 1.0) as f64;
-        let area = self.output_area();
+        let area = self.overview_output();
         let mut cards: Vec<(usize, f32, WorkspacePreview)> = self
             .space
             .workspaces()
@@ -6737,10 +7150,20 @@ impl Huginn {
                     // the workspace just left flashing on the one arrived at.
                     let pitch = 1.0 - 0.04 * reveal;
                     let slot = f64::from(distance) * f64::from(area.w()) * pitch;
-                    let offset_x = (1.0 - scale) * f64::from(area.w()) * 0.5 + slot;
-                    let offset_y = (1.0 - scale) * f64::from(area.h()) * 0.5;
+                    // Scaled about the screen's centre, in the desktop's
+                    // coordinates like every other transform: the centre is
+                    // where the renderer's scale about the origin moves it
+                    // from, so the shift puts it back and slides it along.
+                    let centre_x = f64::from(area.x()) + f64::from(area.w()) * 0.5;
+                    let centre_y = f64::from(area.y()) + f64::from(area.h()) * 0.5;
+                    let offset_x = (1.0 - scale) * centre_x + slot;
+                    let offset_y = (1.0 - scale) * centre_y;
                     let side = (f64::from(distance.abs()) - 0.15).clamp(0.0, 1.0);
-                    let alpha = (1.0 - side * 0.48 * reveal) as f32;
+                    let mut alpha = (1.0 - side * 0.48 * reveal) as f32;
+                    // Another screen's: there to see, not to land on.
+                    if self.shown_off_overview(index).is_some() {
+                        alpha *= 0.45;
+                    }
                     (
                         index,
                         distance.abs(),
@@ -6785,7 +7208,7 @@ impl Huginn {
         highlight: Option<WindowId>,
     ) -> Vec<SceneItem<'_>> {
         let windows = self.overview_windows_for(workspace);
-        let area = self.output_area();
+        let area = self.overview_output();
         let cells = overview_cells(windows.len(), self.overview_area());
         // A stage's chrome is drawn in the stage's own coordinates and then
         // carried along with it: a compositor-drawn panel takes a rectangle,
@@ -6858,8 +7281,8 @@ impl Huginn {
     /// area less the strip the space labels take and the room a caption
     /// needs under the lowest row.
     fn overview_area(&self) -> Rect {
-        let area = self.space.area();
-        let output = self.output_area();
+        let area = self.overview_usable();
+        let output = self.overview_output();
         let top = crate::overview::bar_room(output);
         let bottom = crate::overview::caption_room(output);
         Rect::from_xywh(
@@ -6913,17 +7336,26 @@ impl Huginn {
                 (workspace, id, frame, title)
             })
             .collect();
-        let (output, density) = (self.output_area(), self.scale().advertised);
-        let stale = self
-            .overview_chrome
-            .as_ref()
-            .is_none_or(|chrome| chrome.key != key || chrome.front != front);
+        let (output, density) = (
+            self.overview_output(),
+            self.outputs[self.overview_screen()].scale.advertised,
+        );
+        let numbers = self.screen_numbers();
+        let elsewhere: Vec<Option<u32>> = (0..count)
+            .map(|index| self.shown_off_overview(index).map(|screen| numbers[screen]))
+            .collect();
+
+        let stale = self.overview_chrome.as_ref().is_none_or(|chrome| {
+            chrome.key != key || chrome.front != front || chrome.elsewhere != elsewhere
+        });
         if stale {
+            let usable = self.overview_usable();
             let bar = crate::overview::spaces_bar(
                 &mut self.text,
                 count,
                 front,
-                self.space.area(),
+                &elsewhere,
+                usable,
                 density,
             );
             let thumbs = key
@@ -6956,6 +7388,7 @@ impl Huginn {
             self.overview_chrome = Some(OverviewChrome {
                 key,
                 front,
+                elsewhere,
                 bar,
                 thumbs,
             });
@@ -7010,6 +7443,17 @@ impl Huginn {
         let Some(workspace) = self.space.workspaces().get(workspace) else {
             return Vec::new();
         };
+        // A workspace is laid out on the screen it last lived on, which need
+        // not be the overview's: one another monitor is showing, or one last
+        // seen there. Its windows are carried across by the difference
+        // between the two screens' corners, so the stage shows them on the
+        // overview's screen, where they will be if it is picked.
+        let here = self.overview_output();
+        let there = self
+            .outputs
+            .get(workspace.output())
+            .map_or(here, |output| output.rect);
+        let (dx, dy) = (here.x() - there.x(), here.y() - there.y());
         workspace
             .windows()
             .iter()
@@ -7018,6 +7462,7 @@ impl Huginn {
                 let surface = self.windows.get(id)?.wl_surface()?;
                 let pane = self.space.window(*id)?.content();
                 let placed = place_in_pane(&surface, pane);
+                let placed = Rect::from_xywh(placed.x() + dx, placed.y() + dy, placed.w(), placed.h());
                 Some((*id, surface, placed))
             })
             .collect()
@@ -8274,14 +8719,16 @@ impl WlrLayerShellHandler for Huginn {
         layer: Layer,
         namespace: String,
     ) {
-        // The screen the client asked for, or the focused one when it left
+        // The screen the client asked for, or the panel screen when it left
         // the choice to us. Resolved to an index now and re-clamped on every
         // refresh, so a panel outlives the screen it was made for.
         let on = output
             .as_ref()
             .and_then(Output::from_resource)
             .and_then(|o| self.output_index(&o.name()))
-            .unwrap_or_else(|| self.space.focused_output());
+            // A bar that did not choose goes where the desktop's own panels
+            // are: the main screen when there is one.
+            .unwrap_or_else(|| self.panel_output());
         tracing::debug!(%namespace, ?layer, output = %self.outputs[on.min(self.outputs.len() - 1)].name, "layer surface created");
         // Only record it. Do NOT configure yet: the client sets its anchor,
         // size and exclusive zone *after* creating the surface and before its
@@ -8323,7 +8770,7 @@ impl FractionalScaleHandler for Huginn {
     /// binds this and gets no scale back has to guess, and guessing is the
     /// thing this exists to remove.
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let scale = f64::from(self.scale().advertised);
+        let scale = f64::from(self.focused_scale().advertised);
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional| {
                 fractional.set_preferred_scale(scale);
@@ -8401,6 +8848,7 @@ impl SessionLockHandler for Huginn {
     fn unlock(&mut self) {
         tracing::info!("session unlocked");
         self.lock = None;
+        self.home_to_primary();
         // Unlocking is somebody at the machine, and the idle count starts
         // over from here. A password was typed, which already counted; a
         // finger on the sensor is not input this compositor sees, so after a
@@ -8817,6 +9265,29 @@ impl OutputInfo {
             mm: Size::ZERO,
             output: None,
         }
+    }
+
+    /// Which way up the screen is, read back from the transform the backend
+    /// gave its output. Upright for the placeholder.
+    pub(crate) fn rotation(&self) -> huginn_core::layout::Rotation {
+        use huginn_core::layout::Rotation;
+        use smithay::utils::Transform;
+        match self.output.as_ref().map(Output::current_transform) {
+            Some(Transform::_90) => Rotation::Deg90,
+            Some(Transform::_180) => Rotation::Deg180,
+            Some(Transform::_270) => Rotation::Deg270,
+            _ => Rotation::Normal,
+        }
+    }
+
+    /// The size of a frame of this screen, in physical pixels and turned the
+    /// way the screen is: the size its scene is composed at, so what a
+    /// screenshot, a recording or a capture of it is. The mode alone is the
+    /// panel's own orientation, which on a turned screen is sideways.
+    pub(crate) fn frame_size(&self) -> Option<smithay::utils::Size<i32, smithay::utils::Physical>> {
+        let output = self.output.as_ref()?;
+        let mode = output.current_mode()?;
+        Some(output.current_transform().transform_size(mode.size))
     }
 }
 

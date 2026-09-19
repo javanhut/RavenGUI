@@ -27,6 +27,65 @@ pub struct Candidate {
     pub builtin: bool,
 }
 
+/// How a screen is turned, in quarter turns counter-clockwise -- the
+/// numbering `wl_output.transform` uses for its first four values, so the
+/// protocol and the backend can pass it through unchanged.
+///
+/// A monitor stood on its side is [`Self::Deg90`] or [`Self::Deg270`]
+/// depending on which way it was turned; which is which is easiest found by
+/// trying one, so the settings page offers both by what they look like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rotation {
+    #[default]
+    Normal,
+    Deg90,
+    Deg180,
+    Deg270,
+}
+
+impl Rotation {
+    /// From the protocol's number; anything past 3 is not a rotation.
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Normal),
+            1 => Some(Self::Deg90),
+            2 => Some(Self::Deg180),
+            3 => Some(Self::Deg270),
+            _ => None,
+        }
+    }
+
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn degrees(self) -> u32 {
+        self.raw() * 90
+    }
+
+    fn from_degrees(degrees: u32) -> Option<Self> {
+        if degrees.is_multiple_of(90) {
+            Self::from_raw(degrees / 90)
+        } else {
+            None
+        }
+    }
+
+    /// Whether width and height trade places: a portrait screen.
+    pub const fn swaps_axes(self) -> bool {
+        matches!(self, Self::Deg90 | Self::Deg270)
+    }
+
+    /// `size` as the desktop sees it once the screen is turned.
+    pub const fn apply(self, size: Size) -> Size {
+        if self.swaps_axes() {
+            Size::new(size.h, size.w)
+        } else {
+            size
+        }
+    }
+}
+
 /// What was asked for one screen, by name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Saved {
@@ -35,6 +94,11 @@ pub struct Saved {
     pub position: Option<Point>,
     /// The effective scale to run it at instead of the one its size implies.
     pub scale: Option<f64>,
+    /// Which way up it is.
+    pub rotation: Rotation,
+    /// Whether this is the main screen: where the shell's panels stay, new
+    /// windows open, focus starts, and which is numbered 1. At most one.
+    pub primary: bool,
 }
 
 impl Saved {
@@ -44,6 +108,8 @@ impl Saved {
             name: name.into(),
             position: None,
             scale: None,
+            rotation: Rotation::Normal,
+            primary: false,
         }
     }
 }
@@ -120,7 +186,9 @@ fn right_of(taken: &[Rect], size: Size, y: i32) -> Rect {
 /// Read the saved layout.
 ///
 /// One screen per line: `name x,y` or `name x,y scale` or `name - scale`,
-/// where `-` is no position. Lines that do not parse are dropped rather than
+/// where `-` is no position, optionally followed by `rotate=90` (or 180,
+/// 270; counter-clockwise) and `primary`. Only the first `primary` in the
+/// file counts. Lines that do not parse are dropped rather than
 /// failing the file: a typo in one entry should cost that entry, not every
 /// screen's place. Comments start with `#`.
 pub fn parse(text: &str) -> Vec<Saved> {
@@ -137,15 +205,35 @@ pub fn parse(text: &str) -> Vec<Saved> {
                     Some(Point::new(x.parse().ok()?, y.parse().ok()?))
                 }
             };
-            let scale = match parts.next() {
-                None => None,
-                Some(s) => Some(s.parse::<f64>().ok().filter(|s| *s > 0.0)?),
-            };
+            let mut scale = None;
+            let mut rotation = Rotation::Normal;
+            let mut primary = false;
+            for part in parts {
+                if part == "primary" {
+                    primary = true;
+                    continue;
+                }
+                match part.strip_prefix("rotate=") {
+                    Some(degrees) => rotation = Rotation::from_degrees(degrees.parse().ok()?)?,
+                    None if scale.is_none() => {
+                        scale = Some(part.parse::<f64>().ok().filter(|s| *s > 0.0)?);
+                    }
+                    None => return None,
+                }
+            }
             Some(Saved {
                 name: name.to_owned(),
                 position,
                 scale,
+                rotation,
+                primary,
             })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .scan(false, |seen, mut entry| {
+            entry.primary &= !std::mem::replace(seen, *seen || entry.primary);
+            Some(entry)
         })
         .collect()
 }
@@ -153,7 +241,7 @@ pub fn parse(text: &str) -> Vec<Saved> {
 /// Write the saved layout, in the format [`parse`] reads.
 pub fn to_text(saved: &[Saved]) -> String {
     let mut out =
-        String::from("# raven outputs: name x,y [scale]  -- see huginn docs/outputs.md\n");
+        String::from("# raven outputs: name x,y [scale] [rotate=90] [primary]  -- see huginn docs/outputs.md\n");
     for entry in saved {
         out.push_str(&entry.name);
         out.push(' ');
@@ -163,6 +251,12 @@ pub fn to_text(saved: &[Saved]) -> String {
         }
         if let Some(scale) = entry.scale {
             out.push_str(&format!(" {scale}"));
+        }
+        if entry.rotation != Rotation::Normal {
+            out.push_str(&format!(" rotate={}", entry.rotation.degrees()));
+        }
+        if entry.primary {
+            out.push_str(" primary");
         }
         out.push('\n');
     }
@@ -177,6 +271,26 @@ pub fn set_position(saved: &mut Vec<Saved>, name: &str, at: Point) {
 /// Record a scale for `name`, or clear it with `None`.
 pub fn set_scale(saved: &mut Vec<Saved>, name: &str, scale: Option<f64>) {
     entry(saved, name).scale = scale;
+}
+
+/// Make `name` the main screen, or with `None` have no main screen.
+pub fn set_primary(saved: &mut Vec<Saved>, name: Option<&str>) {
+    for entry in saved.iter_mut() {
+        entry.primary = false;
+    }
+    if let Some(name) = name {
+        entry(saved, name).primary = true;
+    }
+}
+
+/// The main screen's name, if one is set.
+pub fn primary(saved: &[Saved]) -> Option<&str> {
+    saved.iter().find(|s| s.primary).map(|s| s.name.as_str())
+}
+
+/// Record which way up `name` is.
+pub fn set_rotation(saved: &mut Vec<Saved>, name: &str, rotation: Rotation) {
+    entry(saved, name).rotation = rotation;
 }
 
 fn entry<'a>(saved: &'a mut Vec<Saved>, name: &str) -> &'a mut Saved {
@@ -202,9 +316,8 @@ mod tests {
 
     fn at(name: &str, x: i32, y: i32) -> Saved {
         Saved {
-            name: name.into(),
             position: Some(Point::new(x, y)),
-            scale: None,
+            ..Saved::named(name)
         }
     }
 
@@ -328,6 +441,61 @@ mod tests {
         assert_eq!(parsed[1].name, "eDP-1");
         assert_eq!(parsed[1].position, None);
         assert_eq!(parsed[1].scale, Some(1.5));
+    }
+
+    #[test]
+    fn rotation_round_trips_beside_or_without_a_scale() {
+        let mut saved = vec![at("DP-1", 0, 0), Saved::named("DP-2"), at("eDP-1", 0, 0)];
+        set_rotation(&mut saved, "DP-1", Rotation::Deg90);
+        set_scale(&mut saved, "DP-1", Some(1.5));
+        set_rotation(&mut saved, "DP-2", Rotation::Deg270);
+        let text = to_text(&saved);
+        assert!(text.contains("DP-1 0,0 1.5 rotate=90\n"));
+        assert!(text.contains("DP-2 - rotate=270\n"));
+        assert!(text.contains("eDP-1 0,0\n"), "upright writes nothing extra");
+        assert_eq!(parse(&text), saved);
+    }
+
+    #[test]
+    fn the_main_screen_round_trips_and_there_is_only_ever_one() {
+        let mut saved = vec![at("eDP-1", 0, 0), at("DP-1", 1920, 0)];
+        set_primary(&mut saved, Some("DP-1"));
+        assert_eq!(primary(&saved), Some("DP-1"));
+        let text = to_text(&saved);
+        assert!(text.contains("DP-1 1920,0 primary\n"));
+        assert_eq!(parse(&text), saved);
+
+        set_primary(&mut saved, Some("eDP-1"));
+        assert_eq!(primary(&saved), Some("eDP-1"));
+        assert!(!saved[1].primary, "the old one gave it up");
+        set_primary(&mut saved, Some("HDMI-A-1"));
+        assert_eq!(saved.len(), 3, "a screen not seen yet can be main");
+        set_primary(&mut saved, None);
+        assert_eq!(primary(&saved), None);
+
+        let two = parse("DP-1 0,0 primary\neDP-1 - 1.5 rotate=90 primary\n");
+        assert!(two[0].primary && !two[1].primary, "a hand-edited second one is ignored");
+        assert_eq!(two[1].rotation, Rotation::Deg90);
+    }
+
+    #[test]
+    fn a_rotation_that_is_not_a_quarter_turn_costs_its_line() {
+        let parsed = parse("DP-1 0,0 rotate=45\nDP-2 0,0 rotate=sideways\nDP-3 0,0 1 2\neDP-1 - rotate=180\n");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].rotation, Rotation::Deg180);
+    }
+
+    #[test]
+    fn a_turned_screen_is_placed_at_its_turned_size() {
+        let portrait = Rotation::Deg90.apply(Size::new(2560, 1440));
+        let placed = arrange(
+            &[
+                screen("eDP-1", 1920, 1080, true),
+                screen("DP-1", portrait.w, portrait.h, false),
+            ],
+            &[],
+        );
+        assert_eq!(placed[1], Rect::from_xywh(1920, 0, 1440, 2560));
     }
 
     #[test]
