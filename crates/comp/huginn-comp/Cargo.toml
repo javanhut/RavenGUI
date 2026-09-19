@@ -28,6 +28,10 @@ huginn-egl.workspace = true
 # For dev_t in the dmabuf main-device hint. No unsafe involved: the type is a
 # plain integer alias.
 libc = "0.2"
+# For kill(2) behind the force-close binding. `libc::kill` is an `unsafe fn`
+# and this workspace forbids unsafe; rustix wraps the same syscall safely and
+# is already in the tree through smithay, so this adds a feature, not a crate.
+rustix = { version = "1", features = ["process"] }
 raven-protocol = { workspace = true, features = ["server"] }
 smithay = { workspace = true, features = [
     "backend_drm",

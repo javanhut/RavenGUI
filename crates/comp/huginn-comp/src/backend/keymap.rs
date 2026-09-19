@@ -35,6 +35,11 @@ pub(crate) enum Action {
     /// Open or accept the workspace carousel.
     ToggleCarousel,
     CloseFocused,
+    /// Close a window whether or not its client is listening: the close
+    /// request, a `SIGTERM` to the process behind it, and a `SIGKILL` if that
+    /// has not worked a moment later. The way out of a client that has taken
+    /// the pointer and stopped answering.
+    ForceCloseFocused,
     /// Move the focused window one tile in a direction.
     Move(Dir),
     /// Take the focused window of the screen in a direction onto this one,
@@ -245,8 +250,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         action: Action::CloseFocused,
-        chord: "Super+Ctrl+Q / X",
+        chord: "Super+Ctrl+Q",
         description: "close the focused window",
+    },
+    Binding {
+        action: Action::ForceCloseFocused,
+        chord: "Super+Ctrl+X",
+        description: "force the focused window closed, killing its process",
     },
     Binding {
         action: Action::FocusNext,
@@ -687,7 +697,10 @@ pub(crate) fn resolve(
         keysyms::KEY_j | keysyms::KEY_J => Action::FocusNext,
         keysyms::KEY_k | keysyms::KEY_K => Action::FocusPrev,
         keysyms::KEY_Return => Action::PromoteFocused,
-        keysyms::KEY_q | keysyms::KEY_Q | keysyms::KEY_x | keysyms::KEY_X => Action::CloseFocused,
+        keysyms::KEY_q | keysyms::KEY_Q => Action::CloseFocused,
+        // X is Q without the asking: Q leaves a client free to answer with a
+        // save dialog, which a hung one never will.
+        keysyms::KEY_x | keysyms::KEY_X => Action::ForceCloseFocused,
         keysyms::KEY_e | keysyms::KEY_E | keysyms::KEY_t | keysyms::KEY_T => Action::Spawn,
         // Adding Shift reaches across a bezel instead of across a tile.
         keysyms::KEY_Left if modifiers.shift => Action::PullFrom(Dir::Left),
@@ -1514,11 +1527,21 @@ mod tests {
     }
 
     #[test]
-    fn close_and_spawn_have_two_bindings_each() {
+    fn x_forces_what_q_asks_for() {
         assert_eq!(
             intercepted(super_ctrl(), keysyms::KEY_X),
-            Some(Action::CloseFocused)
+            Some(Action::ForceCloseFocused)
         );
+        // Over the overview too: a client holding the pointer is closed from
+        // there as readily as from its own tile.
+        assert!(matches!(
+            while_overviewing(super_ctrl(), keysyms::KEY_x),
+            FilterResult::Intercept(Some(Action::ForceCloseFocused))
+        ));
+    }
+
+    #[test]
+    fn spawn_has_two_bindings() {
         assert_eq!(
             intercepted(super_ctrl(), keysyms::KEY_T),
             Some(Action::Spawn)

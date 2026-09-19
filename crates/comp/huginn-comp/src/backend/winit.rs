@@ -635,14 +635,8 @@ impl Nested {
                 state.close_dock_menu();
                 return;
             }
-            Action::CloseFocused => {
-                if let Some(surface) = state.space.focused().and_then(|id| state.surface(id)) {
-                    // Ask politely. The client unmaps itself, which arrives back
-                    // as toplevel_destroyed; killing it here would lose unsaved
-                    // work.
-                    surface.close();
-                }
-            }
+            Action::CloseFocused => state.close_focused(),
+            Action::ForceCloseFocused => state.force_close_focused(),
             Action::Workspace(i) => state.go_to_workspace(i),
             Action::SendToWorkspace(i) => state.send_focused_to_workspace(i),
             Action::FocusNextOutput => state.focus_next_output(),

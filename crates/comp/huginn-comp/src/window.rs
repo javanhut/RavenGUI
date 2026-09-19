@@ -34,7 +34,7 @@
 //!   through the layout for a client that is already gone.
 
 use smithay::{
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{DisplayHandle, Resource, protocol::wl_surface::WlSurface},
     utils::{Logical, Rectangle},
     wayland::{compositor::with_states, shell::xdg::XdgToplevelSurfaceData},
     xwayland::X11Surface,
@@ -174,6 +174,34 @@ impl WindowSurface {
                     tracing::debug!("x11 close failed: {e}");
                 }
             }
+        }
+    }
+
+    /// The process behind the window, for the force-close binding.
+    ///
+    /// For X11 this is asked of the X server (XRes' local client PID, which
+    /// the server reads off the client's socket) and deliberately not read
+    /// from `_NET_WM_PID`. That property is whatever the client wrote there,
+    /// and a client inside a PID namespace — every game Steam starts in its
+    /// runtime container — writes the number it has *in there*, which out here
+    /// is some other process or none. The Wayland client of an X11 window is
+    /// no use either: that is XWayland, and killing it takes every X11
+    /// application down with it.
+    pub(crate) fn pid(&self, display: &DisplayHandle) -> Option<u32> {
+        match self {
+            Self::Xdg(t) => {
+                let credentials = t.wl_surface().client()?.get_credentials(display).ok()?;
+                u32::try_from(credentials.pid).ok()
+            }
+            Self::X11(x) => match x.get_client_pid() {
+                // Zero is how smithay reports a server without XRes.
+                Ok(0) => None,
+                Ok(pid) => Some(pid),
+                Err(e) => {
+                    tracing::debug!("x11 client pid lookup failed: {e}");
+                    None
+                }
+            },
         }
     }
 
