@@ -36,6 +36,8 @@ mod frametime;
 #[cfg(target_os = "linux")]
 mod gesture;
 #[cfg(target_os = "linux")]
+mod kill;
+#[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
 mod menu;

@@ -1601,6 +1601,7 @@ mod tests {
             exec: exec.to_owned(),
             categories: Vec::new(),
             keywords: Vec::new(),
+            mime_types: Vec::new(),
             terminal: false,
             startup_wm_class: None,
             path: PathBuf::from(format!("/apps/{name}.desktop")),

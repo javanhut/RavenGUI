@@ -169,7 +169,8 @@ client cannot receive or override them:
 | Chord | Does |
 |---|---|
 | `Super+Ctrl+E` / `T` | open a terminal |
-| `Super+Ctrl+Q` / `X` | close the focused window |
+| `Super+Ctrl+Q` | close the focused window (in the overview: the highlighted one) |
+| `Super+Ctrl+X` | force it closed: close request, `SIGTERM`, then `SIGKILL` after 2 s |
 | `Super+Ctrl+J` / `K` | focus the next / previous window |
 | `Alt+Tab` / `Alt+Shift+Tab` | the window switcher: every window, most recently focused first, across every workspace; letting go of `Alt` goes to the highlighted one |
 | `Super+Ctrl+arrows` | move the focused window between tiles |

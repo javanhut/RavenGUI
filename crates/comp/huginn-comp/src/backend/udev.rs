@@ -1878,11 +1878,8 @@ impl Udev {
                 state.close_dock_menu();
                 return;
             }
-            Action::CloseFocused => {
-                if let Some(surface) = state.space.focused().and_then(|id| state.surface(id)) {
-                    surface.close();
-                }
-            }
+            Action::CloseFocused => state.close_focused(),
+            Action::ForceCloseFocused => state.force_close_focused(),
             Action::Workspace(i) => state.go_to_workspace(i),
             Action::SendToWorkspace(i) => state.send_focused_to_workspace(i),
             Action::FocusNextOutput => state.focus_next_output(),

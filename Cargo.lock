@@ -966,6 +966,7 @@ dependencies = [
  "raven-desktop",
  "raven-protocol",
  "raven-rec",
+ "rustix 1.1.4",
  "serde",
  "smithay",
  "toml",

@@ -3006,6 +3006,57 @@ impl Huginn {
         }
     }
 
+    /// The window a close binding means: the overview's highlighted window
+    /// while the overview is up, and the focused one otherwise.
+    ///
+    /// The overview is where somebody goes to point at a window they cannot
+    /// reach any other way — one that holds the pointer, say — so the highlight
+    /// outranks a focus that was decided before the overview opened.
+    fn close_target(&self) -> Option<WindowId> {
+        self.workspace_carousel
+            .as_ref()
+            .and_then(|carousel| carousel.selected)
+            .or_else(|| self.space.focused())
+    }
+
+    /// Ask the focused — or highlighted — window to close.
+    ///
+    /// Politely. The client unmaps itself, which arrives back as
+    /// `toplevel_destroyed`; it is free to answer with a save dialog instead.
+    pub(crate) fn close_focused(&mut self) {
+        if let Some(window) = self.close_target().and_then(|id| self.windows.get(&id)) {
+            window.close();
+        }
+    }
+
+    /// Close the focused — or highlighted — window whether its client is
+    /// listening or not, by ending the process behind it.
+    ///
+    /// The close request goes first, so a client that is merely slow sees the
+    /// same thing it would have from the polite binding; then the process is
+    /// signalled (see [`crate::kill`]). The window itself is not torn down
+    /// here: the kernel closes a dead client's socket, and that arrives as the
+    /// ordinary `toplevel_destroyed`, close animation and all.
+    pub(crate) fn force_close_focused(&mut self) {
+        let Some(id) = self.close_target() else {
+            return;
+        };
+        let Some(window) = self.windows.get(&id) else {
+            return;
+        };
+        window.close();
+        match window.pid(&self.display) {
+            Some(pid) => {
+                tracing::info!(?id, pid, app = ?window.app_id(), "force close");
+                crate::kill::terminate(pid);
+            }
+            None => tracing::warn!(
+                ?id,
+                "force close: no PID for this window; only the close request was sent"
+            ),
+        }
+    }
+
     /// Where the dock's *panel* goes, which is not where its bar goes: the
     /// canvas keeps room above the bar for an icon magnified under the
     /// pointer and the label over it. The switcher has neither, so there its
