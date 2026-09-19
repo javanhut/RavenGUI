@@ -1864,6 +1864,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "raven-open"
+version = "0.0.1"
+dependencies = [
+ "raven-desktop",
+]
+
+[[package]]
 name = "raven-output"
 version = "0.0.1"
 dependencies = [

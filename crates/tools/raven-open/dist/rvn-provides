@@ -1,0 +1,7 @@
+# Installed as /usr/share/rvn/provides.d/raven-open.
+#
+# raven-open answers as xdg-open, xdg-settings and xdg-mime, so packages that
+# depend on xdg-utils (chromium, among others) are satisfied by it, and rvn
+# never installs xdg-utils over it. The version is the xdg-utils release whose
+# behaviour those three names follow.
+xdg-utils=1.2.1

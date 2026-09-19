@@ -483,6 +483,7 @@ mod tests {
             categories: Vec::new(),
             keywords: keywords.iter().map(|k| (*k).to_owned()).collect(),
             terminal: false,
+            mime_types: Vec::new(),
             startup_wm_class: None,
             path: PathBuf::from(format!("/apps/{name}.desktop")),
             actions: Vec::new(),
