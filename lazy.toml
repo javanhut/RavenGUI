@@ -18,17 +18,26 @@ probe = "-p layer-probe"
 desc = "Make the scripts in scripts/ executable"
 run = ["chmod +x scripts/*.sh"]
 
+# Building links libseat and libinput, and needs their build-time half (the .pc
+# files and unversioned .so symlinks), not just the runtime libraries. Installs
+# them when pkg-config can't see them — the same check install.sh makes — so
+# sudo is only reached when something is actually missing.
+[commands.deps]
+desc = "Install libseat and libinput's build files if missing"
+run = ["pkg-config --exists libseat libinput || sudo rvn -y install seatd libinput"]
+
 [commands.help]
 desc = "Show RavenGUI's commands"
 run = ["imlazy list"]
 
 [commands.build]
 desc = "Build the compositor, optimised"
-run = ["cargo build --release {{comp}}"]
+dep = ["deps"]
+run =["cargo build --release {{comp}}"]
 
 [commands.install]
 desc = "Replace the installed huginn with this tree's"
-dep = ["permission"]
+dep = ["permission", "deps"]
 run = ["./scripts/install.sh install"]
 
 [commands.restore]
@@ -44,6 +53,7 @@ alias = ["status"]
 
 [commands.run]
 desc = "Run the compositor nested in the current session"
+dep = ["deps"]
 run = ["cargo run {{comp}}"]
 alias = ["nested"]
 # Nested, for development: the debug log that production no longer writes.
@@ -51,19 +61,22 @@ env = { RUST_LOG = "huginn=debug,smithay=warn" }
 
 [commands.probe]
 desc = "Run the layer-shell probe against a nested compositor (WAYLAND_DISPLAY=wayland-N)"
+dep = ["deps"]
 run = ["cargo run {{probe}} -- --interactivity exclusive --cycle 2"]
 
 [commands.check]
 desc = "Typecheck the workspace"
+dep = ["deps"]
 run = ["cargo check --workspace --all-targets"]
 
 [commands.test]
 desc = "Run every test"
+dep = ["deps"]
 run = ["cargo test --workspace"]
 
 [commands.lint]
 desc = "Clippy, and prove no crate has escaped the unsafe quarantine"
-dep = ["permission"]
+dep = ["permission", "deps"]
 run = ["cargo clippy --workspace --all-targets -- -D warnings", "./scripts/check-unsafe.sh"]
 
 [commands.fmt]
