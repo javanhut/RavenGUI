@@ -125,7 +125,7 @@ impl Huginn {
             return;
         };
 
-        let output = self.output_area();
+        let output = self.focused_output_area();
         let mut target = Rectangle::new(
             (output.x(), output.y()).into(),
             (output.w(), output.h()).into(),

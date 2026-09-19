@@ -96,6 +96,9 @@ pub struct Saved {
     pub scale: Option<f64>,
     /// Which way up it is.
     pub rotation: Rotation,
+    /// Whether this is the main screen: where the shell's panels stay, new
+    /// windows open, focus starts, and which is numbered 1. At most one.
+    pub primary: bool,
 }
 
 impl Saved {
@@ -106,6 +109,7 @@ impl Saved {
             position: None,
             scale: None,
             rotation: Rotation::Normal,
+            primary: false,
         }
     }
 }
@@ -183,7 +187,8 @@ fn right_of(taken: &[Rect], size: Size, y: i32) -> Rect {
 ///
 /// One screen per line: `name x,y` or `name x,y scale` or `name - scale`,
 /// where `-` is no position, optionally followed by `rotate=90` (or 180,
-/// 270; counter-clockwise). Lines that do not parse are dropped rather than
+/// 270; counter-clockwise) and `primary`. Only the first `primary` in the
+/// file counts. Lines that do not parse are dropped rather than
 /// failing the file: a typo in one entry should cost that entry, not every
 /// screen's place. Comments start with `#`.
 pub fn parse(text: &str) -> Vec<Saved> {
@@ -202,7 +207,12 @@ pub fn parse(text: &str) -> Vec<Saved> {
             };
             let mut scale = None;
             let mut rotation = Rotation::Normal;
+            let mut primary = false;
             for part in parts {
+                if part == "primary" {
+                    primary = true;
+                    continue;
+                }
                 match part.strip_prefix("rotate=") {
                     Some(degrees) => rotation = Rotation::from_degrees(degrees.parse().ok()?)?,
                     None if scale.is_none() => {
@@ -216,7 +226,14 @@ pub fn parse(text: &str) -> Vec<Saved> {
                 position,
                 scale,
                 rotation,
+                primary,
             })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .scan(false, |seen, mut entry| {
+            entry.primary &= !std::mem::replace(seen, *seen || entry.primary);
+            Some(entry)
         })
         .collect()
 }
@@ -224,7 +241,7 @@ pub fn parse(text: &str) -> Vec<Saved> {
 /// Write the saved layout, in the format [`parse`] reads.
 pub fn to_text(saved: &[Saved]) -> String {
     let mut out =
-        String::from("# raven outputs: name x,y [scale] [rotate=90]  -- see huginn docs/outputs.md\n");
+        String::from("# raven outputs: name x,y [scale] [rotate=90] [primary]  -- see huginn docs/outputs.md\n");
     for entry in saved {
         out.push_str(&entry.name);
         out.push(' ');
@@ -237,6 +254,9 @@ pub fn to_text(saved: &[Saved]) -> String {
         }
         if entry.rotation != Rotation::Normal {
             out.push_str(&format!(" rotate={}", entry.rotation.degrees()));
+        }
+        if entry.primary {
+            out.push_str(" primary");
         }
         out.push('\n');
     }
@@ -251,6 +271,21 @@ pub fn set_position(saved: &mut Vec<Saved>, name: &str, at: Point) {
 /// Record a scale for `name`, or clear it with `None`.
 pub fn set_scale(saved: &mut Vec<Saved>, name: &str, scale: Option<f64>) {
     entry(saved, name).scale = scale;
+}
+
+/// Make `name` the main screen, or with `None` have no main screen.
+pub fn set_primary(saved: &mut Vec<Saved>, name: Option<&str>) {
+    for entry in saved.iter_mut() {
+        entry.primary = false;
+    }
+    if let Some(name) = name {
+        entry(saved, name).primary = true;
+    }
+}
+
+/// The main screen's name, if one is set.
+pub fn primary(saved: &[Saved]) -> Option<&str> {
+    saved.iter().find(|s| s.primary).map(|s| s.name.as_str())
 }
 
 /// Record which way up `name` is.
@@ -419,6 +454,28 @@ mod tests {
         assert!(text.contains("DP-2 - rotate=270\n"));
         assert!(text.contains("eDP-1 0,0\n"), "upright writes nothing extra");
         assert_eq!(parse(&text), saved);
+    }
+
+    #[test]
+    fn the_main_screen_round_trips_and_there_is_only_ever_one() {
+        let mut saved = vec![at("eDP-1", 0, 0), at("DP-1", 1920, 0)];
+        set_primary(&mut saved, Some("DP-1"));
+        assert_eq!(primary(&saved), Some("DP-1"));
+        let text = to_text(&saved);
+        assert!(text.contains("DP-1 1920,0 primary\n"));
+        assert_eq!(parse(&text), saved);
+
+        set_primary(&mut saved, Some("eDP-1"));
+        assert_eq!(primary(&saved), Some("eDP-1"));
+        assert!(!saved[1].primary, "the old one gave it up");
+        set_primary(&mut saved, Some("HDMI-A-1"));
+        assert_eq!(saved.len(), 3, "a screen not seen yet can be main");
+        set_primary(&mut saved, None);
+        assert_eq!(primary(&saved), None);
+
+        let two = parse("DP-1 0,0 primary\neDP-1 - 1.5 rotate=90 primary\n");
+        assert!(two[0].primary && !two[1].primary, "a hand-edited second one is ignored");
+        assert_eq!(two[1].rotation, Rotation::Deg90);
     }
 
     #[test]

@@ -65,6 +65,23 @@ back above the laptop.
 A saved scale overrides the one the panel's size implies, through the same
 integer-advertised, fractional-laid-out policy as the automatic one.
 
+## Main display
+
+One screen may be marked main: `primary` at the end of its line in the saved
+layout, set from Settings or `raven-output primary DP-1` through
+`raven_output_layout_v1.set_primary` (since version 7). It is kept by name,
+like the rest of the layout, and found again whenever the screens change.
+
+- The dock, launcher, quick settings, notifications and the other
+  compositor-drawn panels stay on it (`Huginn::panel_output`), as does a
+  layer-shell bar that did not choose a screen. Without a main display they
+  follow the focused screen, as before.
+- New windows open on the workspace it is showing, and focus goes with them
+  (`Space::set_primary`).
+- Focus and the pointer are put on it when the session's first screens
+  arrive and at every unlock.
+- It is numbered 1; the rest follow left to right.
+
 ## Workspaces across screens
 
 Every screen shows one workspace from a shared row, and no workspace is on
@@ -76,8 +93,8 @@ screen never changes another:
 - A swipe, the overview and `Super`+wheel step over workspaces another screen
   is showing. The overview draws them dimmed, and their label carries that
   screen's number in a square badge.
-- Screens are numbered left to right, then top to bottom, from 1
-  (`overview::screen_numbers`). While the overview is up every screen shows
+- Screens are numbered from 1: the main display first, then left to right
+  and top to bottom (`overview::screen_numbers`). While the overview is up every screen shows
   its number in a large badge in its top-left corner, and the Settings
   Display page titles its cards the same way ("Display 2 (HDMI-A-1)").
 - The overview belongs to the screen it opened on, and only that screen draws
@@ -156,8 +173,6 @@ dock on the laptop reserves nothing on the monitor.
 
 ## Not done
 
-- **A chosen primary.** The focused screen follows the pointer; there is no
-  way to say the shell's panels should stay on one screen regardless.
 - **Direct scan-out on a second GPU.** A fullscreen client on a screen of the
   discrete GPU still goes through the bridge; its buffer would have to live on
   that GPU to be scanned out directly.

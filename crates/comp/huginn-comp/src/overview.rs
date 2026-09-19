@@ -243,13 +243,19 @@ pub(crate) fn screen_badge(
     })
 }
 
-/// Number every screen for people: left to right, and top to bottom where
-/// two share a column, starting at 1. Position rather than connector order,
-/// so the number says where to look -- 1 is the leftmost -- and it follows a
+/// Number every screen for people: the main screen is 1, then the rest left
+/// to right, and top to bottom where two share a column. Position rather
+/// than connector order, so the number says where to look, and it follows a
 /// monitor that is moved in Settings.
-pub(crate) fn screen_numbers(outputs: &[Rect]) -> Vec<u32> {
+pub(crate) fn screen_numbers(outputs: &[Rect], primary: Option<usize>) -> Vec<u32> {
     let mut order: Vec<usize> = (0..outputs.len()).collect();
-    order.sort_by_key(|&index| (outputs[index].x(), outputs[index].y()));
+    order.sort_by_key(|&index| {
+        (
+            Some(index) != primary,
+            outputs[index].x(),
+            outputs[index].y(),
+        )
+    });
     let mut numbers = vec![0; outputs.len()];
     for (rank, index) in order.into_iter().enumerate() {
         numbers[index] = rank as u32 + 1;
@@ -387,14 +393,29 @@ mod tests {
 
     #[test]
     fn screens_are_numbered_left_to_right_then_top_to_bottom() {
-        let numbers = screen_numbers(&[
-            Rect::from_xywh(1920, 0, 2560, 1440),
-            Rect::from_xywh(0, 360, 1920, 1080),
-            Rect::from_xywh(4480, 1440, 1920, 1080),
-            Rect::from_xywh(4480, 0, 1920, 1440),
-        ]);
+        let numbers = screen_numbers(
+            &[
+                Rect::from_xywh(1920, 0, 2560, 1440),
+                Rect::from_xywh(0, 360, 1920, 1080),
+                Rect::from_xywh(4480, 1440, 1920, 1080),
+                Rect::from_xywh(4480, 0, 1920, 1440),
+            ],
+            None,
+        );
         assert_eq!(numbers, vec![2, 1, 4, 3]);
-        assert!(screen_numbers(&[]).is_empty());
+        assert!(screen_numbers(&[], None).is_empty());
+    }
+
+    #[test]
+    fn the_main_screen_is_1_and_the_rest_follow_left_to_right() {
+        let rects = [
+            Rect::from_xywh(0, 0, 1920, 1080),
+            Rect::from_xywh(1920, 0, 2560, 1440),
+            Rect::from_xywh(4480, 0, 1080, 1920),
+        ];
+        assert_eq!(screen_numbers(&rects, Some(1)), vec![2, 1, 3]);
+        assert_eq!(screen_numbers(&rects, Some(2)), vec![2, 3, 1]);
+        assert_eq!(screen_numbers(&rects, Some(9)), vec![1, 2, 3], "no such screen");
     }
 
     #[test]

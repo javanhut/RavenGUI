@@ -111,6 +111,9 @@ pub struct Space {
     /// exactly one workspace, no workspace is visible on two outputs, and the
     /// active workspace is the one visible on the focused output.
     visible: Vec<usize>,
+    /// The main screen, if one is set: where new windows open. See
+    /// [`Self::set_primary`].
+    primary: Option<usize>,
     /// Space between tiled windows and around the edge of the pane.
     ///
     /// Held here rather than read from a constant so `huginn-core` keeps
@@ -162,6 +165,7 @@ impl Space {
             active: 0,
             outputs: vec![OutputArea::new(area)],
             visible: vec![0],
+            primary: None,
             gap: DEFAULT_GAP,
             carousel_columns: strip::DEFAULT_COLUMNS,
             carousel_offset: None,
@@ -548,6 +552,19 @@ impl Space {
         debug_assert_eq!(self.visible.len(), self.outputs.len());
     }
 
+    /// Set the main screen, as an output index, or `None` for none. New
+    /// windows open on the workspace it is showing. An index past the end is
+    /// taken as none. The compositor sets it again after every change to the
+    /// outputs, since indices move when a monitor comes or goes.
+    pub fn set_primary(&mut self, index: Option<usize>) {
+        self.primary = index.filter(|&i| i < self.outputs.len());
+    }
+
+    /// The main screen, if one is set.
+    pub const fn primary(&self) -> Option<usize> {
+        self.primary
+    }
+
     /// Move focus to output `index`, onto the workspace it is showing.
     pub fn focus_output(&mut self, index: usize) -> bool {
         let Some(&workspace) = self.visible.get(index) else {
@@ -615,6 +632,11 @@ impl Space {
         let id = WindowId::from_raw(self.next_window);
         self.next_window += 1;
         self.windows.insert(id, Window::new(id));
+        // With a main screen, that is where a new window opens, and focus
+        // goes with it: it is what was just asked for.
+        if let Some(&home) = self.primary.and_then(|screen| self.visible.get(screen)) {
+            self.active = home;
+        }
         if self.workspaces[self.active].is_full()
             && let Some(target) = self.workspace_with_room().or_else(|| self.add_workspace())
         {
@@ -2823,6 +2845,21 @@ mod tests {
         s.pull_workspace(1);
         s.arrange();
         assert_eq!(s.window(id).unwrap().geometry, Rect::from_xywh(100, 200, 640, 480));
+    }
+
+    #[test]
+    fn with_a_main_screen_new_windows_open_there_and_focus_follows() {
+        let mut s = two_screens();
+        s.set_primary(Some(1));
+        let id = s.open_window();
+        assert_eq!(s.workspace_of(id), Some(1));
+        assert_eq!(s.focused_output(), 1);
+        s.set_primary(None);
+        s.focus_output(0);
+        let here = s.open_window();
+        assert_eq!(s.workspace_of(here), Some(0), "without one, where focus is");
+        s.set_primary(Some(7));
+        assert_eq!(s.primary(), None, "no such screen");
     }
 
     #[test]

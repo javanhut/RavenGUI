@@ -22,7 +22,7 @@
     is what makes moving this file to its own repository a mechanical step.
   </description>
 
-  <interface name="raven_shell_manager_v1" version="6">
+  <interface name="raven_shell_manager_v1" version="7">
     <description summary="entry point for the desktop shell">
       Handed to the shell so it can observe compositor state it cannot see as an
       ordinary Wayland client.
@@ -131,7 +131,7 @@
     </request>
   </interface>
 
-  <interface name="raven_output_layout_v1" version="6">
+  <interface name="raven_output_layout_v1" version="7">
     <description summary="where each screen sits, and the means to move it">
       Created through raven_shell_manager_v1.get_output_layout.
 
@@ -190,6 +190,16 @@
       <arg name="rotation" type="uint" summary="a value of the rotation enum"/>
     </request>
 
+    <request name="set_primary" since="7">
+      <description summary="stage the main screen">
+        The screen the desktop's panels stay on, new windows open on and
+        focus starts on, and which is numbered 1. An empty name stages no
+        main screen: panels follow the focused screen. A name that matches no
+        connected screen is kept for when it connects.
+      </description>
+      <arg name="name" type="string" summary="connector name, or empty for none"/>
+    </request>
+
     <request name="identify" since="6">
       <description summary="show each screen's number on it">
         Every screen shows its number in a badge in its corner for a few
@@ -233,6 +243,15 @@
       </description>
       <arg name="name" type="string" summary="connector name"/>
       <arg name="rotation" type="uint" summary="a value of the rotation enum"/>
+    </event>
+
+    <event name="primary" since="7">
+      <description summary="the main screen">
+        Sent after the output events and before done, when a main screen is
+        set, with its name -- which may be a screen not connected now. No
+        event means none is set.
+      </description>
+      <arg name="name" type="string" summary="connector name"/>
     </event>
 
     <event name="done">

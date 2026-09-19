@@ -74,7 +74,7 @@ impl RavenShellState {
         // or a socket only the shell can reach) before anything untrusted runs
         // on this compositor. Until then the recording dot is the only sign a
         // capture is running.
-        dh.create_global::<Huginn, RavenShellManagerV1, ()>(6, ());
+        dh.create_global::<Huginn, RavenShellManagerV1, ()>(7, ());
         Self::default()
     }
 }
@@ -148,6 +148,11 @@ impl Huginn {
             if observer.version() >= 5 {
                 observer.rotation(output.name.clone(), output.rotation().raw());
             }
+        }
+        if observer.version() >= 7
+            && let Some(primary) = huginn_core::layout::primary(self.output_layout())
+        {
+            observer.primary(primary.to_owned());
         }
         observer.done();
     }
@@ -328,6 +333,9 @@ impl Dispatch<RavenOutputLayoutV1, ()> for Huginn {
                     Some(rotation) => state.stage_output_rotation(&name, rotation),
                     None => tracing::warn!(%name, rotation, "ignoring a rotation that is not a quarter turn"),
                 }
+            }
+            raven_output_layout_v1::Request::SetPrimary { name } => {
+                state.stage_output_primary((!name.is_empty()).then_some(name));
             }
             raven_output_layout_v1::Request::Identify => {
                 if !state.is_locked() {

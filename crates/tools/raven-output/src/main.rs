@@ -13,6 +13,7 @@
 //! raven-output scale eDP-1 auto         # back to what its size implies
 //! raven-output rotate DP-1 90           # stand it on its side (0, 90, 180, 270)
 //! raven-output identify                 # show each screen's number on it
+//! raven-output primary DP-1             # make DP-1 the main screen (or `none`)
 //! ```
 //!
 //! Every change is applied at once and saved by the compositor, and the
@@ -60,6 +61,8 @@ mod linux {
     #[derive(Debug, Default)]
     struct App {
         screens: Vec<Screen>,
+        /// The main screen's name, if one is set.
+        primary: Option<String>,
         /// One full set has arrived since the last time this was cleared.
         done: bool,
     }
@@ -114,6 +117,7 @@ mod linux {
                     if app.done {
                         // A new set is starting.
                         app.screens.clear();
+                        app.primary = None;
                         app.done = false;
                     }
                     app.screens.push(Screen {
@@ -129,6 +133,7 @@ mod linux {
                         rotation: 0,
                     });
                 }
+                raven_output_layout_v1::Event::Primary { name } => app.primary = Some(name),
                 raven_output_layout_v1::Event::Rotation { name, rotation } => {
                     if let Some(screen) = app.screens.iter_mut().rev().find(|s| s.name == name) {
                         screen.rotation = rotation;
@@ -147,7 +152,8 @@ mod linux {
              raven-output left-of|right-of|above|below NAME OTHER\n       \
              raven-output scale NAME FACTOR|auto   lay NAME out at FACTOR (e.g. 1.5)\n       \
              raven-output rotate NAME 0|90|180|270 turn NAME counter-clockwise\n       \
-             raven-output identify                 show each screen's number on it"
+             raven-output identify                 show each screen's number on it\n       \
+             raven-output primary NAME|none        make NAME the main screen"
         );
         std::process::exit(2);
     }
@@ -160,7 +166,7 @@ mod linux {
         let (globals, mut queue) = registry_queue_init::<App>(&conn).expect("registry");
         let qh = queue.handle();
         let manager: RavenShellManagerV1 = globals
-            .bind(&qh, 3..=6, ())
+            .bind(&qh, 3..=7, ())
             .expect("raven_shell_manager_v1 version 3: is this huginn, and is it recent?");
         let layout = manager.get_output_layout(&qh, ());
 
@@ -173,7 +179,7 @@ mod linux {
         };
         match command {
             "list" => {
-                print(&app.screens);
+                print(&app.screens, app.primary.as_deref());
                 return;
             }
             "move" => {
@@ -216,6 +222,15 @@ mod linux {
                 };
                 layout.set_scale(name.clone(), scale);
             }
+            "primary" => {
+                let [name] = rest else { usage() };
+                if layout.version() < 7 {
+                    eprintln!("raven-output: this huginn is too old to set a main screen; update RavenGUI and log in again");
+                    std::process::exit(1);
+                }
+                let name = if name == "none" { String::new() } else { name.clone() };
+                layout.set_primary(name);
+            }
             "identify" => {
                 if layout.version() < 6 {
                     eprintln!("raven-output: this huginn is too old to identify screens; update RavenGUI and log in again");
@@ -223,7 +238,7 @@ mod linux {
                 }
                 layout.identify();
                 conn.flush().expect("flush");
-                print(&app.screens);
+                print(&app.screens, app.primary.as_deref());
                 return;
             }
             "rotate" => {
@@ -247,7 +262,7 @@ mod linux {
         // The compositor answers with the layout it actually arrived at.
         app.done = false;
         wait_for_done(&mut queue, &mut app);
-        print(&app.screens);
+        print(&app.screens, app.primary.as_deref());
     }
 
     fn wait_for_done(queue: &mut wayland_client::EventQueue<App>, app: &mut App) {
@@ -256,7 +271,7 @@ mod linux {
         }
     }
 
-    fn print(screens: &[Screen]) {
+    fn print(screens: &[Screen], primary: Option<&str>) {
         if screens.is_empty() {
             println!("no screens");
             return;
@@ -269,7 +284,7 @@ mod linux {
                 "size unknown".to_owned()
             };
             println!(
-                "{:<10} {:>5},{:<5} {:>5}x{:<5} logical  {}x{} panel  {}  scale {:.2}{}{}",
+                "{:<10} {:>5},{:<5} {:>5}x{:<5} logical  {}x{} panel  {}  scale {:.2}{}{}{}",
                 s.name,
                 s.x,
                 s.y,
@@ -283,6 +298,11 @@ mod linux {
                     String::new()
                 } else {
                     format!("  rotated {}", s.rotation * 90)
+                },
+                if primary == Some(s.name.as_str()) {
+                    "  main"
+                } else {
+                    ""
                 },
                 if s.focused { "  focused" } else { "" }
             );

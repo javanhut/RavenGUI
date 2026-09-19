@@ -782,8 +782,13 @@ pub(crate) struct Huginn {
     layout: Vec<huginn_core::layout::Saved>,
     /// Changes a client has staged and not yet applied.
     staged_layout: Vec<huginn_core::layout::Saved>,
+    /// A main screen a client has staged: `Some(None)` is "no main screen".
+    staged_primary: Option<Option<String>>,
     /// `apply` happened; the backend owes a re-arrange.
     layout_changed: bool,
+    /// Focus has been put on the main screen for this session. Done once,
+    /// when the first real screens arrive, and again at every unlock.
+    homed: bool,
 
     /// The keybinding overlay, painted once when summoned. `None` when closed.
     help: Option<crate::overlay::Overlay>,
@@ -1222,7 +1227,9 @@ impl Huginn {
             outputs: vec![OutputInfo::bare(area)],
             layout: load_layout(),
             staged_layout: Vec::new(),
+            staged_primary: None,
             layout_changed: false,
+            homed: false,
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), crate::theme::accent().to_rgba_f32())
             }),
@@ -1801,17 +1808,58 @@ impl Huginn {
         self.queue_redraw();
     }
 
-    /// The focused screen's rectangle, before panels reserve any of it.
+    /// The panel screen's rectangle, before panels reserve any of it.
     ///
-    /// The focused screen is the one the shell's own panels sit on and the
-    /// one keybindings act on; it follows the pointer between screens.
+    /// The panel screen is the one the shell's own panels sit on -- the dock,
+    /// the launcher, quick settings, notifications. With a main screen set it
+    /// is that one, and they stay there; without, it is the focused screen
+    /// and they follow the pointer between screens.
     pub(crate) fn output_area(&self) -> Rect {
+        self.outputs[self.panel_output()].rect
+    }
+
+    /// The panel screen's scale: what the shell composes its panels at.
+    pub(crate) fn scale(&self) -> OutputScale {
+        self.outputs[self.panel_output()].scale
+    }
+
+    /// The screen the panels sit on. See [`Self::output_area`].
+    fn panel_output(&self) -> usize {
+        self.primary_output()
+            .unwrap_or_else(|| self.space.focused_output())
+            .min(self.outputs.len() - 1)
+    }
+
+    /// The focused screen's rectangle, for what belongs where the person is
+    /// working rather than with the panels: a popup kept on screen.
+    pub(crate) fn focused_output_area(&self) -> Rect {
         self.outputs[self.space.focused_output().min(self.outputs.len() - 1)].rect
     }
 
-    /// The focused screen's scale: what the shell composes its panels at.
-    pub(crate) fn scale(&self) -> OutputScale {
+    /// The focused screen's scale.
+    fn focused_scale(&self) -> OutputScale {
         self.outputs[self.space.focused_output().min(self.outputs.len() - 1)].scale
+    }
+
+    /// The main screen, if one is set and connected.
+    pub(crate) fn primary_output(&self) -> Option<usize> {
+        huginn_core::layout::primary(&self.layout).and_then(|name| self.output_index(name))
+    }
+
+    /// Put focus, and the pointer, on the main screen. At the start of the
+    /// session and at every unlock; nowhere else, since in between the
+    /// person moves between screens and the desktop follows.
+    fn home_to_primary(&mut self) {
+        let Some(screen) = self.primary_output() else {
+            return;
+        };
+        self.space.focus_output(screen);
+        let rect = self.outputs[screen].rect;
+        let centre = rect.center();
+        self.pointer_location = (f64::from(centre.x), f64::from(centre.y)).into();
+        self.refresh_output_panels();
+        self.refresh_focus();
+        self.broadcast_workspaces();
     }
 
     /// Every screen, in output order.
@@ -1865,10 +1913,17 @@ impl Huginn {
                 .collect(),
         );
         self.outputs = outputs;
+        // Indices move when a monitor comes or goes; the main screen is kept
+        // by name, so it is found again every time.
+        self.space.set_primary(self.primary_output());
         // Somewhere on a screen, always: a pointer left on a monitor that was
         // just unplugged is invisible and can reach nothing.
         self.pointer_location = self.clamp_pointer(self.pointer_location);
         self.apply_output_geometry();
+        if !self.homed && self.outputs.iter().any(|output| output.output.is_some()) {
+            self.homed = true;
+            self.home_to_primary();
+        }
         self.broadcast_outputs();
         // A screen gone is a capture of it stopped; a new mode is a new
         // buffer size. Both are told now, not at the next frame.
@@ -2363,6 +2418,7 @@ impl Huginn {
     /// idle period, which is the most a broken lock screen should cost.
     fn reveal_unlocked(&mut self) {
         self.lock = None;
+        self.home_to_primary();
         self.last_input = Instant::now();
         self.refresh_focus();
         self.queue_redraw();
@@ -2726,6 +2782,11 @@ impl Huginn {
         huginn_core::layout::set_scale(&mut self.staged_layout, name, scale);
     }
 
+    /// Stage the main screen by name, or `None` for none.
+    pub(crate) fn stage_output_primary(&mut self, name: Option<String>) {
+        self.staged_primary = Some(name);
+    }
+
     /// Stage which way up a named screen is.
     pub(crate) fn stage_output_rotation(
         &mut self,
@@ -2750,6 +2811,13 @@ impl Huginn {
             // for "back to automatic".
             huginn_core::layout::set_scale(&mut self.layout, &entry.name, entry.scale);
             huginn_core::layout::set_rotation(&mut self.layout, &entry.name, entry.rotation);
+        }
+        if let Some(primary) = self.staged_primary.take() {
+            huginn_core::layout::set_primary(&mut self.layout, primary.as_deref());
+            self.space.set_primary(self.primary_output());
+            // The panels move to it now, not at the next pointer crossing.
+            self.refresh_output_panels();
+            self.broadcast_outputs();
         }
         self.save_layout();
         self.layout_changed = true;
@@ -4425,7 +4493,7 @@ impl Huginn {
     /// `crate::overview::screen_numbers`.
     fn screen_numbers(&self) -> Vec<u32> {
         let rects: Vec<Rect> = self.outputs.iter().map(|output| output.rect).collect();
-        crate::overview::screen_numbers(&rects)
+        crate::overview::screen_numbers(&rects, self.primary_output())
     }
 
     /// The overview's whole screen, in desktop coordinates.
@@ -8600,14 +8668,16 @@ impl WlrLayerShellHandler for Huginn {
         layer: Layer,
         namespace: String,
     ) {
-        // The screen the client asked for, or the focused one when it left
+        // The screen the client asked for, or the panel screen when it left
         // the choice to us. Resolved to an index now and re-clamped on every
         // refresh, so a panel outlives the screen it was made for.
         let on = output
             .as_ref()
             .and_then(Output::from_resource)
             .and_then(|o| self.output_index(&o.name()))
-            .unwrap_or_else(|| self.space.focused_output());
+            // A bar that did not choose goes where the desktop's own panels
+            // are: the main screen when there is one.
+            .unwrap_or_else(|| self.panel_output());
         tracing::debug!(%namespace, ?layer, output = %self.outputs[on.min(self.outputs.len() - 1)].name, "layer surface created");
         // Only record it. Do NOT configure yet: the client sets its anchor,
         // size and exclusive zone *after* creating the surface and before its
@@ -8649,7 +8719,7 @@ impl FractionalScaleHandler for Huginn {
     /// binds this and gets no scale back has to guess, and guessing is the
     /// thing this exists to remove.
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let scale = f64::from(self.scale().advertised);
+        let scale = f64::from(self.focused_scale().advertised);
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional| {
                 fractional.set_preferred_scale(scale);
@@ -8727,6 +8797,7 @@ impl SessionLockHandler for Huginn {
     fn unlock(&mut self) {
         tracing::info!("session unlocked");
         self.lock = None;
+        self.home_to_primary();
         // Unlocking is somebody at the machine, and the idle count starts
         // over from here. A password was typed, which already counted; a
         // finger on the sensor is not input this compositor sees, so after a
