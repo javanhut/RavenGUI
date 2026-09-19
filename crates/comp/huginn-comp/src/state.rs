@@ -320,14 +320,23 @@ impl WorkspaceCarousel {
 /// The overview's chrome, composed for what it is showing; see
 /// [`crate::overview`].
 #[derive(Debug)]
+/// Each screen's number badge, and what they were composed for: every
+/// screen's usable area, number and density.
+struct ScreenBadges {
+    key: Vec<(Rect, u32, u32)>,
+    badges: Vec<crate::overview::ScreenBadge>,
+}
+
+#[derive(Debug)]
 struct OverviewChrome {
     /// What the chrome was composed for: each window's stage, settled frame
     /// and title. When the overview would show something else, it is redone.
     key: Vec<(usize, WindowId, Rect, Option<String>)>,
     /// Which stage the space labels mark as the front.
     front: usize,
-    /// For each stage, the screen showing it if that is not the overview's.
-    elsewhere: Vec<Option<String>>,
+    /// For each stage, the number of the screen showing it if that is not
+    /// the overview's.
+    elsewhere: Vec<Option<u32>>,
     bar: Option<crate::overview::SpacesBar>,
     thumbs: Vec<crate::overview::Thumb>,
 }
@@ -408,6 +417,12 @@ const APP_SWITCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// strip. Longer than the run of events a free-spinning wheel reports for one
 /// flick, and shorter than the gap before anyone deliberately turns it again.
 const WHEEL_QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long the screens show their numbers when Settings asks which is which:
+/// long enough to look from one monitor to the next.
+const IDENTIFY_FOR: std::time::Duration = std::time::Duration::from_millis(3500);
+/// The fade at either end of that, in seconds.
+const IDENTIFY_FADE: f32 = 0.2;
 
 /// Applications that drive the `Super` layer themselves.
 ///
@@ -695,6 +710,11 @@ pub(crate) struct Huginn {
     carousel_scroll: crate::anim::Animated,
     /// Workspace-level Cover Flow shown while a three-finger swipe is active.
     workspace_carousel: Option<WorkspaceCarousel>,
+    /// The screens' number badges, composed while something shows them.
+    screen_badges: Option<ScreenBadges>,
+    /// When the screens were last asked to show their numbers on their own,
+    /// through `raven_output_layout_v1.identify`.
+    identify_since: Option<std::time::Duration>,
     /// The touchpad swipe in progress, if any.
     ///
     /// Held on the compositor rather than in the core because a gesture is
@@ -1183,6 +1203,8 @@ impl Huginn {
             layers: Vec::new(),
             carousel_scroll: crate::anim::Animated::settled(0.0),
             workspace_carousel: None,
+            screen_badges: None,
+            identify_since: None,
             swipe: None,
             fullscreen_solo: HashSet::new(),
             drag: false,
@@ -2105,6 +2127,19 @@ impl Huginn {
             let rect = Rect::from_xywh(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
             out.extend(self.popups_of(&surface, rect));
             out.push(SceneItem::Surface(surface, rect));
+        }
+        // Every screen shows its number while the overview is up, so a stage
+        // labelled with one can be matched to the monitor at a glance, and
+        // for a few seconds when Settings asks which screen is which. Each
+        // badge sits on its own screen, so it is drawn only there without
+        // being told to.
+        let badge_alpha = self.badge_alpha();
+        if badge_alpha > 0.0
+            && let Some(badges) = &self.screen_badges
+        {
+            for badge in &badges.badges {
+                out.push(SceneItem::Overlay(badge.panel.buffer(), badge.rect, badge_alpha));
+            }
         }
         if let Some(previews) = self.workspace_previews() {
             // The centre stage is first because scene order is front-to-back.
@@ -4329,6 +4364,70 @@ impl Huginn {
             .map(|(output, _)| output)
     }
 
+    /// Show every screen's number for a few seconds: Settings' "Identify
+    /// displays". Asking again while they are up starts the time over.
+    pub(crate) fn identify_screens(&mut self) {
+        self.identify_since = Some(self.uptime());
+        self.refresh_screen_badges();
+        self.queue_redraw();
+    }
+
+    /// How opaque the badges are now: as far as the overview has opened, or
+    /// where the identify fade has got to, whichever is more.
+    fn badge_alpha(&self) -> f32 {
+        let now = self.uptime();
+        let overview = self
+            .workspace_carousel
+            .map_or(0.0, |carousel| carousel.reveal.value(now).clamp(0.0, 1.0));
+        let identify = self.identify_since.map_or(0.0, |since| {
+            let t = now.saturating_sub(since).as_secs_f32();
+            let total = IDENTIFY_FOR.as_secs_f32();
+            (t / IDENTIFY_FADE).min((total - t) / IDENTIFY_FADE).clamp(0.0, 1.0)
+        });
+        if self.reduced_motion() && identify > 0.0 {
+            return 1.0;
+        }
+        overview.max(identify)
+    }
+
+    /// Compose the badges again if a screen's area, number or density has
+    /// changed since they were last composed.
+    fn refresh_screen_badges(&mut self) {
+        let numbers = self.screen_numbers();
+        // In from the corner of the part of each screen panels leave free,
+        // so a bar along the top does not cover it.
+        let key: Vec<(Rect, u32, u32)> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let usable = self
+                    .space
+                    .outputs()
+                    .get(index)
+                    .map_or(output.rect, |screen| screen.area);
+                (usable, numbers[index], output.scale.advertised)
+            })
+            .collect();
+        if self.screen_badges.as_ref().is_some_and(|badges| badges.key == key) {
+            return;
+        }
+        let badges = key
+            .iter()
+            .filter_map(|&(usable, number, density)| {
+                crate::overview::screen_badge(&mut self.text, number, usable, density)
+            })
+            .collect();
+        self.screen_badges = Some(ScreenBadges { key, badges });
+    }
+
+    /// Each screen's number, in output order. See
+    /// `crate::overview::screen_numbers`.
+    fn screen_numbers(&self) -> Vec<u32> {
+        let rects: Vec<Rect> = self.outputs.iter().map(|output| output.rect).collect();
+        crate::overview::screen_numbers(&rects)
+    }
+
     /// The overview's whole screen, in desktop coordinates.
     fn overview_output(&self) -> Rect {
         self.outputs[self.overview_screen()].rect
@@ -5653,6 +5752,18 @@ impl Huginn {
         }
         if self.workspace_carousel.is_some() {
             self.refresh_overview_chrome();
+        }
+        if let Some(since) = self.identify_since {
+            if now.saturating_sub(since) >= IDENTIFY_FOR {
+                self.identify_since = None;
+            }
+            // Frames for the fade, and one more to take the badges down.
+            self.queue_redraw();
+        }
+        if self.workspace_carousel.is_some() || self.identify_since.is_some() {
+            self.refresh_screen_badges();
+        } else {
+            self.screen_badges = None;
         }
         if finish_workspace_carousel {
             self.workspace_carousel = None;
@@ -7110,9 +7221,11 @@ impl Huginn {
             self.overview_output(),
             self.outputs[self.overview_screen()].scale.advertised,
         );
-        let elsewhere: Vec<Option<String>> = (0..count)
-            .map(|index| self.shown_off_overview(index).map(|screen| self.outputs[screen].name.clone()))
+        let numbers = self.screen_numbers();
+        let elsewhere: Vec<Option<u32>> = (0..count)
+            .map(|index| self.shown_off_overview(index).map(|screen| numbers[screen]))
             .collect();
+
         let stale = self.overview_chrome.as_ref().is_none_or(|chrome| {
             chrome.key != key || chrome.front != front || chrome.elsewhere != elsewhere
         });

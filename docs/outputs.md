@@ -74,7 +74,12 @@ screen never changes another:
 - `Super`+`Ctrl`+a digit for a workspace another screen is showing moves
   focus to that screen; nothing is rearranged.
 - A swipe, the overview and `Super`+wheel step over workspaces another screen
-  is showing. The overview draws them dimmed and labels them `on DP-1`.
+  is showing. The overview draws them dimmed, and their label carries that
+  screen's number in a square badge.
+- Screens are numbered left to right, then top to bottom, from 1
+  (`overview::screen_numbers`). While the overview is up every screen shows
+  its number in a large badge in its top-left corner, and the Settings
+  Display page titles its cards the same way ("Display 2 (HDMI-A-1)").
 - The overview belongs to the screen it opened on, and only that screen draws
   it; the others go on showing their own workspaces.
 

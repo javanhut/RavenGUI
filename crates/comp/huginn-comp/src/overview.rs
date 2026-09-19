@@ -16,7 +16,7 @@
 use huginn_core::geometry::Rect;
 
 use crate::canvas::{Canvas, Panel};
-use crate::text::Text;
+use crate::text::{Text, Weight};
 use crate::theme::Color;
 
 /// Height of the row of space labels, at 1080p.
@@ -31,6 +31,17 @@ const LABEL_PAD: f32 = 14.0;
 const LABEL_GAP: f32 = 6.0;
 /// The pill behind the front space's label: white, mostly see-through.
 const PILL: Color = Color::from_argb(0x3CFF_FFFF);
+
+/// Side of the square number badge inside a space label, at 1080p.
+const TAG_SIDE: f32 = 20.0;
+/// Text size of the number inside it.
+const TAG_SIZE: f32 = 12.0;
+/// Side of the badge in the corner of each screen, at 1080p.
+const BADGE_SIDE: f32 = 88.0;
+/// Text size of its number.
+const BADGE_SIZE: f32 = 52.0;
+/// How far that badge sits in from the screen's corner.
+const BADGE_MARGIN: f32 = 24.0;
 
 /// How far the backing stands proud of the window on every side.
 const BORDER: f32 = 4.0;
@@ -76,7 +87,7 @@ pub(crate) fn spaces_bar(
     text: &mut Text,
     count: usize,
     front: usize,
-    elsewhere: &[Option<String>],
+    elsewhere: &[Option<u32>],
     area: Rect,
     density: u32,
 ) -> Option<SpacesBar> {
@@ -89,17 +100,19 @@ pub(crate) fn spaces_bar(
     let (pad, gap) = (LABEL_PAD * scale, LABEL_GAP * scale);
     let height = (BAR_HEIGHT * scale).ceil();
 
-    // A workspace another screen is showing says which: the overview slides
-    // past it rather than onto it, and the label is why.
-    let names: Vec<String> = (0..count)
-        .map(|index| match elsewhere.get(index).cloned().flatten() {
-            Some(screen) => format!("Desktop {} \u{b7} on {screen}", index + 1),
-            None => format!("Desktop {}", index + 1),
-        })
-        .collect();
+    let names: Vec<String> = (1..=count).map(|n| format!("Desktop {n}")).collect();
+    // A workspace another screen is showing carries that screen's number, in
+    // the same square badge the screen itself shows in its corner, so which
+    // monitor it is on is a glance rather than a connector name to decode.
+    let (tag_side, tag_size) = (TAG_SIDE * scale, TAG_SIZE * scale);
+    let tag = |index: usize| elsewhere.get(index).copied().flatten();
     let widths: Vec<f32> = names
         .iter()
-        .map(|name| text.measure(name, size).0 + pad * 2.0)
+        .enumerate()
+        .map(|(index, name)| {
+            let badge = if tag(index).is_some() { tag_side + gap } else { 0.0 };
+            text.measure(name, size).0 + badge + pad * 2.0
+        })
         .collect();
     let total = widths.iter().sum::<f32>() + gap * (count as f32 - 1.0);
     let (w, h) = (total.ceil() as usize, height as usize);
@@ -123,6 +136,18 @@ pub(crate) fn spaces_bar(
             ((height - text_h) * 0.5) as i32,
             colour,
         );
+        if let Some(number) = tag(index) {
+            let left = x + width - pad - tag_side;
+            draw_number_square(
+                text,
+                &mut canvas,
+                number,
+                left,
+                (height - tag_side) * 0.5,
+                tag_side,
+                tag_size,
+            );
+        }
         labels.push((x, *width));
         x += width + gap;
     }
@@ -151,6 +176,85 @@ pub(crate) fn spaces_bar(
         rect,
         labels,
     })
+}
+
+/// A rounded square in the accent colour with `number` centred in it: the
+/// one mark a screen is known by, drawn the same wherever it appears.
+fn draw_number_square(
+    text: &mut Text,
+    canvas: &mut Canvas,
+    number: u32,
+    x: f32,
+    y: f32,
+    side: f32,
+    size: f32,
+) {
+    let label = number.to_string();
+    canvas.fill_rounded(
+        x.max(0.0) as usize,
+        y.max(0.0) as usize,
+        side.ceil() as usize,
+        side.ceil() as usize,
+        side * 0.22,
+        crate::theme::ACCENT,
+    );
+    let (w, h) = text.measure_weighted(&label, size, Weight::BOLD);
+    text.draw_weighted(
+        canvas,
+        &label,
+        size,
+        (x + (side - w) * 0.5).round() as i32,
+        (y + (side - h) * 0.5).round() as i32,
+        crate::theme::BACKGROUND,
+        Weight::BOLD,
+    );
+}
+
+/// The number badge in the corner of one screen while the overview is up.
+#[derive(Debug)]
+pub(crate) struct ScreenBadge {
+    pub panel: Panel,
+    /// Where it goes, in logical pixels: the screen's top-left corner, in
+    /// from the edge.
+    pub rect: Rect,
+}
+
+/// Compose the badge for screen `number`, whose rectangle is `output`.
+pub(crate) fn screen_badge(
+    text: &mut Text,
+    number: u32,
+    output: Rect,
+    density: u32,
+) -> Option<ScreenBadge> {
+    if !text.is_usable() {
+        return None;
+    }
+    let density = density.max(1);
+    let scale = ui_scale(output) * density as f32;
+    let side = (BADGE_SIDE * scale).ceil();
+    let mut canvas = Canvas::new(side as usize, side as usize);
+    draw_number_square(text, &mut canvas, number, 0.0, 0.0, side, BADGE_SIZE * scale);
+    let panel = Panel::from_canvas(&canvas, density);
+    let (pw, ph) = panel.size();
+    let margin = (BADGE_MARGIN * ui_scale(output)) as i32;
+    Some(ScreenBadge {
+        panel,
+        rect: Rect::from_xywh(output.x() + margin, output.y() + margin, pw, ph),
+    })
+}
+
+/// Number every screen for people: left to right, and top to bottom where
+/// two share a column, starting at 1. Position rather than connector order,
+/// so the number says where to look -- 1 is the leftmost -- and it follows a
+/// monitor that is moved in Settings.
+pub(crate) fn screen_numbers(outputs: &[Rect]) -> Vec<u32> {
+    let mut order: Vec<usize> = (0..outputs.len()).collect();
+    order.sort_by_key(|&index| (outputs[index].x(), outputs[index].y()));
+    let mut numbers = vec![0; outputs.len()];
+    for (rank, index) in order.into_iter().enumerate() {
+        numbers[index] = rank as u32 + 1;
+    }
+    numbers
 }
 
 /// The chrome of one window in the overview.
@@ -282,6 +386,18 @@ mod tests {
     const AREA: Rect = Rect::from_xywh(0, 0, 1920, 1080);
 
     #[test]
+    fn screens_are_numbered_left_to_right_then_top_to_bottom() {
+        let numbers = screen_numbers(&[
+            Rect::from_xywh(1920, 0, 2560, 1440),
+            Rect::from_xywh(0, 360, 1920, 1080),
+            Rect::from_xywh(4480, 1440, 1920, 1080),
+            Rect::from_xywh(4480, 0, 1920, 1440),
+        ]);
+        assert_eq!(numbers, vec![2, 1, 4, 3]);
+        assert!(screen_numbers(&[]).is_empty());
+    }
+
+    #[test]
     fn the_shadow_fades_out_before_the_panel_edge_and_the_backing_is_solid() {
         let frame = Rect::from_xywh(100, 100, 400, 300);
         let canvas = compose_backing(frame, AREA, 1);
@@ -361,7 +477,7 @@ mod tests {
             }
         };
         let area = Rect::from_xywh(0, 34, 1920, 1080 - 34);
-        if let Some(bar) = spaces_bar(&mut text, 3, 1, &[], area, 1) {
+        if let Some(bar) = spaces_bar(&mut text, 3, 1, &[None, None, Some(2)], area, 1) {
             // The panel's canvas is not kept, so compose it again for the dump.
             let (pw, ph) = bar.panel.size();
             let mut tmp = Canvas::new(pw as usize, ph as usize);

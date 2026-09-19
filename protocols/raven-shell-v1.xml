@@ -22,7 +22,7 @@
     is what makes moving this file to its own repository a mechanical step.
   </description>
 
-  <interface name="raven_shell_manager_v1" version="5">
+  <interface name="raven_shell_manager_v1" version="6">
     <description summary="entry point for the desktop shell">
       Handed to the shell so it can observe compositor state it cannot see as an
       ordinary Wayland client.
@@ -131,7 +131,7 @@
     </request>
   </interface>
 
-  <interface name="raven_output_layout_v1" version="5">
+  <interface name="raven_output_layout_v1" version="6">
     <description summary="where each screen sits, and the means to move it">
       Created through raven_shell_manager_v1.get_output_layout.
 
@@ -188,6 +188,16 @@
       </description>
       <arg name="name" type="string" summary="connector name"/>
       <arg name="rotation" type="uint" summary="a value of the rotation enum"/>
+    </request>
+
+    <request name="identify" since="6">
+      <description summary="show each screen's number on it">
+        Every screen shows its number in a badge in its corner for a few
+        seconds -- the numbers the overview uses, left to right and then top
+        to bottom from 1 -- so a person can tell which monitor is which.
+        Asking again while they are up starts the time over. Changes nothing
+        and saves nothing.
+      </description>
     </request>
 
     <request name="apply">
