@@ -612,6 +612,9 @@ impl Nested {
             Action::Move(dir) => {
                 state.space.move_focused(dir);
             }
+            Action::PullFrom(dir) => {
+                state.pull_from_output(dir);
+            }
             Action::Copy => {
                 chord::send_ctrl(&self.keyboard, state, Keysym::c, time);
                 return;

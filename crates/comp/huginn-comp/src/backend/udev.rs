@@ -89,6 +89,7 @@ use smithay::{
 
 use huginn_core::{
     geometry::{Rect, Size},
+    layout::Rotation,
     scale::OutputScale,
     workspace::Direction,
 };
@@ -686,6 +687,10 @@ fn present_primary(
 
 /// Put a frame on a screen of another GPU: render on the primary into the
 /// bridge buffer, draw that buffer on the secondary.
+///
+/// `size` is the turned frame's, so the bridge holds the scene upright and the
+/// secondary's compositor, which follows the output's transform, turns it on
+/// the way to the panel -- turning it here as well would turn it twice.
 #[allow(clippy::too_many_arguments)]
 fn present_gpu(
     primary: &mut GlesRenderer,
@@ -742,6 +747,7 @@ fn present_dumb(
     dumb: &mut DumbSurface,
     elements: &[HuginnElement],
     scale: f64,
+    transform: Transform,
 ) -> Result<bool> {
     let size = dumb.size();
     let mut texture = match dumb.texture.take() {
@@ -754,7 +760,9 @@ fn present_dumb(
         let mut framebuffer = primary
             .bind(&mut texture)
             .map_err(|e| anyhow::anyhow!("binding the read-back texture: {e}"))?;
-        draw(primary, &mut framebuffer, size, scale, elements)?;
+        // No compositor between here and the panel to turn the frame, so
+        // it is turned as it is drawn.
+        draw(primary, &mut framebuffer, size, transform, scale, elements)?;
         let mapping = primary
             .copy_framebuffer(
                 &framebuffer,
@@ -787,19 +795,22 @@ where
     let mut framebuffer = renderer
         .bind(target)
         .map_err(|e| anyhow::anyhow!("binding the bridge: {e}"))?;
-    draw(renderer, &mut framebuffer, size, scale, elements)
+    draw(renderer, &mut framebuffer, size, Transform::Normal, scale, elements)
 }
 
 fn draw(
     renderer: &mut GlesRenderer,
     framebuffer: &mut <GlesRenderer as smithay::backend::renderer::RendererSuper>::Framebuffer<'_>,
     size: smithay::utils::Size<i32, Physical>,
+    transform: Transform,
     scale: f64,
     elements: &[HuginnElement],
 ) -> Result<()> {
-    let damage = [Rectangle::from_size(size)];
+    // `size` is the framebuffer's, before the turn; the elements and the
+    // damage are in the turned frame.
+    let damage = [Rectangle::from_size(transform.transform_size(size))];
     let mut frame = renderer
-        .render(framebuffer, size, Transform::Normal)
+        .render(framebuffer, size, transform)
         .map_err(|e| anyhow::anyhow!("starting the frame: {e}"))?;
     frame
         .clear(CLEAR.into(), &damage)
@@ -821,6 +832,17 @@ fn draw(
 /// is frequently zero on modern kernels. The flag adjustments matter on real
 /// panels: an interlaced mode scans each field separately, and doublescan
 /// repeats every line.
+/// The output transform for a saved rotation. The numbering is the same,
+/// counter-clockwise quarter turns, so this is a relabelling.
+const fn transform_of(rotation: Rotation) -> Transform {
+    match rotation {
+        Rotation::Normal => Transform::Normal,
+        Rotation::Deg90 => Transform::_90,
+        Rotation::Deg180 => Transform::_180,
+        Rotation::Deg270 => Transform::_270,
+    }
+}
+
 fn refresh_mhz(mode: &smithay::reexports::drm::control::Mode) -> i32 {
     use smithay::reexports::drm::control::ModeFlags;
 
@@ -1398,18 +1420,27 @@ impl Udev {
         let mut keys: Vec<ScreenKey> = self.screens.keys().copied().collect();
         keys.sort_by(|a, b| self.screens[a].name.cmp(&self.screens[b].name));
 
-        // A saved scale wins over the one the panel's size implies. Applied
-        // before placing, since it changes how much room the screen takes.
+        // A saved rotation and scale win over the upright panel and the scale
+        // its size implies. Applied before placing, since both change how much
+        // room the screen takes: a turned screen is measured turned.
         for key in &keys {
             let screen = self.screens.get_mut(key).expect("key from the same map");
-            let wanted = saved
-                .iter()
-                .find(|s| s.name == screen.name)
-                .and_then(|s| s.scale)
-                .map_or_else(
-                    || OutputScale::for_output(screen.physical, screen.mm),
-                    |scale| OutputScale::from_effective(screen.physical, scale),
-                );
+            let entry = saved.iter().find(|s| s.name == screen.name);
+            let rotation = entry.map_or(Rotation::Normal, |s| s.rotation);
+            let transform = transform_of(rotation);
+            if screen.output.current_transform() != transform {
+                tracing::info!(name = %screen.name, degrees = rotation.degrees(), "output rotation set");
+                screen
+                    .output
+                    .change_current_state(None, Some(transform), None, None);
+                screen.dirty = true;
+            }
+            let physical = rotation.apply(screen.physical);
+            let mm = rotation.apply(screen.mm);
+            let wanted = entry.and_then(|s| s.scale).map_or_else(
+                || OutputScale::for_output(physical, mm),
+                |scale| OutputScale::from_effective(physical, scale),
+            );
             if wanted != screen.scale {
                 tracing::info!(name = %screen.name, advertised = wanted.advertised, effective = wanted.fractional(), "output scale set");
                 screen.scale = wanted;
@@ -1508,11 +1539,15 @@ impl Udev {
                 screen.rect,
                 screen.scale.fractional(),
                 screen.scale.advertised,
-                screen
-                    .output
-                    .current_mode()
-                    .map(|mode| mode.size)
-                    .unwrap_or_default(),
+                // The scene is composed the way the screen is turned; the
+                // mode is the panel's own, sideways on a portrait monitor.
+                screen.output.current_transform().transform_size(
+                    screen
+                        .output
+                        .current_mode()
+                        .map(|mode| mode.size)
+                        .unwrap_or_default(),
+                ),
             )
         }) else {
             return;
@@ -1602,7 +1637,13 @@ impl Udev {
                     _ => Err(anyhow::anyhow!("its device is gone")),
                 }
             }
-            ScreenScanout::Dumb(dumb) => present_dumb(renderer, dumb, &elements, scale),
+            ScreenScanout::Dumb(dumb) => present_dumb(
+                renderer,
+                dumb,
+                &elements,
+                scale,
+                screen.output.current_transform(),
+            ),
         };
         match presented {
             Ok(true) => {
@@ -1857,6 +1898,9 @@ impl Udev {
             }
             Action::Move(dir) => {
                 state.space.move_focused(dir);
+            }
+            Action::PullFrom(dir) => {
+                state.pull_from_output(dir);
             }
             Action::Copy => {
                 chord::send_ctrl(&self.keyboard, state, Keysym::c, time);

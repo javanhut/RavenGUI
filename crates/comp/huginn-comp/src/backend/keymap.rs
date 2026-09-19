@@ -37,6 +37,9 @@ pub(crate) enum Action {
     CloseFocused,
     /// Move the focused window one tile in a direction.
     Move(Dir),
+    /// Take the focused window of the screen in a direction onto this one,
+    /// without going there.
+    PullFrom(Dir),
     Workspace(usize),
     SendToWorkspace(usize),
     /// Move focus to the next screen, onto whatever workspace it shows.
@@ -264,6 +267,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::Move(Dir::Left),
         chord: "Super+Ctrl+arrows",
         description: "move the focused window between tiles",
+    },
+    Binding {
+        action: Action::PullFrom(Dir::Left),
+        chord: "Super+Ctrl+Shift+arrows",
+        description: "bring the focused window of the screen that way onto this one",
     },
     Binding {
         action: Action::PromoteFocused,
@@ -681,6 +689,11 @@ pub(crate) fn resolve(
         keysyms::KEY_Return => Action::PromoteFocused,
         keysyms::KEY_q | keysyms::KEY_Q | keysyms::KEY_x | keysyms::KEY_X => Action::CloseFocused,
         keysyms::KEY_e | keysyms::KEY_E | keysyms::KEY_t | keysyms::KEY_T => Action::Spawn,
+        // Adding Shift reaches across a bezel instead of across a tile.
+        keysyms::KEY_Left if modifiers.shift => Action::PullFrom(Dir::Left),
+        keysyms::KEY_Right if modifiers.shift => Action::PullFrom(Dir::Right),
+        keysyms::KEY_Up if modifiers.shift => Action::PullFrom(Dir::Up),
+        keysyms::KEY_Down if modifiers.shift => Action::PullFrom(Dir::Down),
         keysyms::KEY_Left => Action::Move(Dir::Left),
         keysyms::KEY_Right => Action::Move(Dir::Right),
         keysyms::KEY_Up => Action::Move(Dir::Up),
@@ -1468,6 +1481,18 @@ mod tests {
                 "Super+Shift+{sym:#x} was eaten"
             );
         }
+    }
+
+    #[test]
+    fn shifted_arrows_pull_from_the_screen_that_way() {
+        assert_eq!(
+            intercepted(super_ctrl_shift(), keysyms::KEY_Right),
+            Some(Action::PullFrom(Dir::Right))
+        );
+        assert_eq!(
+            intercepted(super_ctrl_shift(), keysyms::KEY_Up),
+            Some(Action::PullFrom(Dir::Up))
+        );
     }
 
     #[test]

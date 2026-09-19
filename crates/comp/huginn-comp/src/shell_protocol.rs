@@ -74,7 +74,7 @@ impl RavenShellState {
         // or a socket only the shell can reach) before anything untrusted runs
         // on this compositor. Until then the recording dot is the only sign a
         // capture is running.
-        dh.create_global::<Huginn, RavenShellManagerV1, ()>(4, ());
+        dh.create_global::<Huginn, RavenShellManagerV1, ()>(5, ());
         Self::default()
     }
 }
@@ -145,6 +145,9 @@ impl Huginn {
                 output.mm.h,
                 u32::from(index == focused),
             );
+            if observer.version() >= 5 {
+                observer.rotation(output.name.clone(), output.rotation().raw());
+            }
         }
         observer.done();
     }
@@ -319,6 +322,12 @@ impl Dispatch<RavenOutputLayoutV1, ()> for Huginn {
             }
             raven_output_layout_v1::Request::SetScale { name, scale } => {
                 state.stage_output_scale(&name, (scale > 0.0).then_some(scale));
+            }
+            raven_output_layout_v1::Request::SetRotation { name, rotation } => {
+                match huginn_core::layout::Rotation::from_raw(rotation) {
+                    Some(rotation) => state.stage_output_rotation(&name, rotation),
+                    None => tracing::warn!(%name, rotation, "ignoring a rotation that is not a quarter turn"),
+                }
             }
             raven_output_layout_v1::Request::Apply => {
                 // Saved now; the backend re-arranges on its next turn and

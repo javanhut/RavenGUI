@@ -11,6 +11,7 @@
 //! raven-output right-of DP-1 eDP-1
 //! raven-output scale eDP-1 1.5          # lay it out at 1.5x
 //! raven-output scale eDP-1 auto         # back to what its size implies
+//! raven-output rotate DP-1 90           # stand it on its side (0, 90, 180, 270)
 //! ```
 //!
 //! Every change is applied at once and saved by the compositor, and the
@@ -35,7 +36,7 @@ mod linux {
         raven_shell_manager_v1::RavenShellManagerV1,
     };
     use wayland_client::{
-        Connection, Dispatch, QueueHandle,
+        Connection, Dispatch, Proxy as _, QueueHandle,
         globals::{GlobalListContents, registry_queue_init},
         protocol::wl_registry,
     };
@@ -51,6 +52,8 @@ mod linux {
         physical: (i32, i32),
         mm: (i32, i32),
         focused: bool,
+        /// Quarter turns counter-clockwise, as the protocol numbers them.
+        rotation: u32,
     }
 
     #[derive(Debug, Default)]
@@ -122,7 +125,13 @@ mod linux {
                         physical: (physical_width, physical_height),
                         mm: (mm_width, mm_height),
                         focused: focused == 1,
+                        rotation: 0,
                     });
+                }
+                raven_output_layout_v1::Event::Rotation { name, rotation } => {
+                    if let Some(screen) = app.screens.iter_mut().rev().find(|s| s.name == name) {
+                        screen.rotation = rotation;
+                    }
                 }
                 raven_output_layout_v1::Event::Done => app.done = true,
                 _ => {}
@@ -135,7 +144,8 @@ mod linux {
             "usage: raven-output                         list the screens\n       \
              raven-output move NAME X Y            put NAME's top-left corner at X,Y\n       \
              raven-output left-of|right-of|above|below NAME OTHER\n       \
-             raven-output scale NAME FACTOR|auto   lay NAME out at FACTOR (e.g. 1.5)"
+             raven-output scale NAME FACTOR|auto   lay NAME out at FACTOR (e.g. 1.5)\n       \
+             raven-output rotate NAME 0|90|180|270 turn NAME counter-clockwise"
         );
         std::process::exit(2);
     }
@@ -148,7 +158,7 @@ mod linux {
         let (globals, mut queue) = registry_queue_init::<App>(&conn).expect("registry");
         let qh = queue.handle();
         let manager: RavenShellManagerV1 = globals
-            .bind(&qh, 3..=3, ())
+            .bind(&qh, 3..=5, ())
             .expect("raven_shell_manager_v1 version 3: is this huginn, and is it recent?");
         let layout = manager.get_output_layout(&qh, ());
 
@@ -204,6 +214,21 @@ mod linux {
                 };
                 layout.set_scale(name.clone(), scale);
             }
+            "rotate" => {
+                let [name, degrees] = rest else { usage() };
+                let rotation = match degrees.as_str() {
+                    "0" => 0,
+                    "90" => 1,
+                    "180" => 2,
+                    "270" => 3,
+                    _ => usage(),
+                };
+                if layout.version() < 5 {
+                    eprintln!("raven-output: this huginn is too old to rotate screens; update RavenGUI and log in again");
+                    std::process::exit(1);
+                }
+                layout.set_rotation(name.clone(), rotation);
+            }
             _ => usage(),
         }
         layout.apply();
@@ -232,7 +257,7 @@ mod linux {
                 "size unknown".to_owned()
             };
             println!(
-                "{:<10} {:>5},{:<5} {:>5}x{:<5} logical  {}x{} panel  {}  scale {:.2}{}",
+                "{:<10} {:>5},{:<5} {:>5}x{:<5} logical  {}x{} panel  {}  scale {:.2}{}{}",
                 s.name,
                 s.x,
                 s.y,
@@ -242,6 +267,11 @@ mod linux {
                 s.physical.1,
                 inches,
                 s.scale,
+                if s.rotation == 0 {
+                    String::new()
+                } else {
+                    format!("  rotated {}", s.rotation * 90)
+                },
                 if s.focused { "  focused" } else { "" }
             );
         }

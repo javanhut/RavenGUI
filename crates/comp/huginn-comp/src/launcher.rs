@@ -1605,6 +1605,7 @@ mod tests {
             startup_wm_class: None,
             path: PathBuf::from(format!("/apps/{name}.desktop")),
             actions: Vec::new(),
+            mime_types: Vec::new(),
         }
     }
 

@@ -88,10 +88,7 @@ pub(crate) fn capture(
     let view = info.rect;
     let scale = info.scale.fractional();
     let size = info
-        .output
-        .as_ref()
-        .and_then(|output| output.current_mode())
-        .map(|mode| mode.size)
+        .frame_size()
         .context("the screen has no mode, so nothing to capture")?;
 
     let elements = capture_elements(renderer, state, view, scale);

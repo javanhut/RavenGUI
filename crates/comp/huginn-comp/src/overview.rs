@@ -76,6 +76,7 @@ pub(crate) fn spaces_bar(
     text: &mut Text,
     count: usize,
     front: usize,
+    elsewhere: &[Option<String>],
     area: Rect,
     density: u32,
 ) -> Option<SpacesBar> {
@@ -88,7 +89,14 @@ pub(crate) fn spaces_bar(
     let (pad, gap) = (LABEL_PAD * scale, LABEL_GAP * scale);
     let height = (BAR_HEIGHT * scale).ceil();
 
-    let names: Vec<String> = (1..=count).map(|n| format!("Desktop {n}")).collect();
+    // A workspace another screen is showing says which: the overview slides
+    // past it rather than onto it, and the label is why.
+    let names: Vec<String> = (0..count)
+        .map(|index| match elsewhere.get(index).cloned().flatten() {
+            Some(screen) => format!("Desktop {} \u{b7} on {screen}", index + 1),
+            None => format!("Desktop {}", index + 1),
+        })
+        .collect();
     let widths: Vec<f32> = names
         .iter()
         .map(|name| text.measure(name, size).0 + pad * 2.0)
@@ -353,7 +361,7 @@ mod tests {
             }
         };
         let area = Rect::from_xywh(0, 34, 1920, 1080 - 34);
-        if let Some(bar) = spaces_bar(&mut text, 3, 1, area, 1) {
+        if let Some(bar) = spaces_bar(&mut text, 3, 1, &[], area, 1) {
             // The panel's canvas is not kept, so compose it again for the dump.
             let (pw, ph) = bar.panel.size();
             let mut tmp = Canvas::new(pw as usize, ph as usize);
