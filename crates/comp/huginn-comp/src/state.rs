@@ -1570,13 +1570,10 @@ impl Huginn {
         let area = self.output_area();
         self.workspace_card.resize((area.w(), area.h()));
         self.overview_veil.resize((area.w(), area.h()));
-        // The overlay picks its scale from the output height, so a resize with
-        // it open has to redraw it rather than just re-centre it. The filter
-        // is carried across, which is the whole reason it does not live in the
-        // panel being thrown away here.
-        if self.help.is_some() {
-            self.paint_help();
-        }
+        // The overlay picks its size and its scale from the output, so a
+        // resize with it open has to redraw it rather than just re-centre it.
+        // `refresh_output_panels` below is what does that, for it and for
+        // every other panel composed against a screen.
         self.refresh_output_panels();
         self.refresh_layers();
     }
@@ -1593,6 +1590,14 @@ impl Huginn {
     /// overlay in [`Self::apply_output_geometry`] for exactly this reason;
     /// this does the same for the rest.
     fn refresh_output_panels(&mut self) {
+        // The overlay is sized to the screen it is shown on — how many columns
+        // the table gets, how far the text shrinks, how many rows there is
+        // room for at all — so a panel composed for the last screen is one
+        // that can be wider or taller than this one. First, because it is the
+        // one drawn in front of the rest.
+        if self.help.is_some() {
+            self.paint_help();
+        }
         if self.launcher_panel.is_some() {
             // The opening motion aims at the dock icon it grew from, captured
             // as a global rect when the launcher opened. The dock has moved

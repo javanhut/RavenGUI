@@ -63,12 +63,42 @@ const CAP_SHADOW: Color = Color::from_argb(0x5A00_0000);
 const TITLE: &str = "Huginn keybindings";
 const FOOTER: &str = "Type to filter. Esc clears the filter, then closes this — \
 so does a click outside. Plain Super belongs to the focused application.";
+
 /// Shown in place of the table when the filter matches nothing. Better than an
 /// empty panel, which reads as the overlay having broken rather than as a
 /// query having come up short.
 const NO_MATCH: &str = "No binding matches that.";
 /// Between the title and the filter at the other end of its row.
 const HEAD_GAP: f32 = 32.0;
+
+/// The footer, given how many rows the screen had no room for and how wide
+/// the line may be.
+///
+/// A list that simply stops is one you have no reason to think has stopped —
+/// you read to the bottom and take it for the whole table. Saying how many are
+/// missing is what turns that into a filter you know to reach for.
+///
+/// Two lengths, because the footer is a line of prose and on a small screen it
+/// is the widest thing on the panel: at 640 pixels the long form alone made
+/// the panel wider than the screen it was explaining. It steps down rather
+/// than being clipped — half a sentence is worse than a short one — and what
+/// it gives up first is the note about the `Super` layer, which is the one
+/// part also written down in the startup log and the docs.
+fn footer(hidden: usize, room: f32, size: f32, text: &mut Text) -> String {
+    let long = if hidden == 0 {
+        FOOTER.to_owned()
+    } else {
+        format!("{hidden} more — type to filter. Esc clears the filter, then closes this.")
+    };
+    if text.measure(&long, size).0 <= room {
+        return long;
+    }
+    if hidden == 0 {
+        "Type to filter. Esc closes this.".to_owned()
+    } else {
+        format!("{hidden} more — type to filter.")
+    }
+}
 
 /// A keystroke the overlay takes while it is up.
 ///
@@ -264,6 +294,13 @@ struct Layout {
     shown: Vec<&'static Binding>,
     /// What to print at the other end of the title row. `None` with no filter.
     head: Option<String>,
+    /// The footer line. Not a constant, because it says how many rows the
+    /// screen had no room for. See [`footer`].
+    foot: String,
+    /// How many matching rows did not fit. Only a test reads it; the footer
+    /// it produced is what the panel shows.
+    #[cfg_attr(not(test), allow(dead_code))]
+    hidden: usize,
 }
 
 /// Text measurements, kept across the passes one [`fit`] makes.
@@ -331,15 +368,31 @@ fn fit(output: Rect, text: &mut Text, density: u32, query: &str) -> Layout {
     let px = density.max(1) as f32;
     let room = (output.w() as f32 * px * FILL, output.h() as f32 * px * FILL);
     let wanted = (BASE_SIZE * (output.h() as f32 / 1080.0)).clamp(BASE_SIZE, BASE_SIZE * 2.5) * px;
-    // Best first: fits both ways, then fits across (a list clipped at the
-    // bottom still reads from the top; one clipped at the side loses the end
-    // of every line), then whichever overflows least — and among equals the
-    // larger text.
+    // Best first: fitting, then showing the most of the table, then — for a
+    // screen too small for any of them to fit — overflowing least, and among
+    // equals the larger text.
+    //
+    // Fitting comes first on its own, with nothing above it. The ranking used
+    // to prefer a layout that fitted *across* over one that fitted both ways,
+    // on the grounds that a list clipped at the bottom still reads from the
+    // top. That is true of the first screenful and false of everything after
+    // it: on a 1366x768 panel it chose a single column 1195 pixels tall, and a
+    // third of the bindings were drawn past the bottom of the screen with
+    // nothing able to scroll to them. Now every candidate fits vertically by
+    // construction — `lay_out` leaves out what there is no room for — so the
+    // question is no longer whether the list is clipped but how much of it
+    // each shape can show, which is what the second key asks.
     let rank = |layout: &Layout| {
         let (over_w, over_h) = (layout.w as f32 / room.0, layout.h as f32 / room.1);
+        let fits = over_w <= 1.0 && over_h <= 1.0;
         (
-            over_w <= 1.0 && over_h <= 1.0,
-            over_w <= 1.0,
+            fits,
+            // Only among the shapes that fit. A layout that does not fit shows
+            // whatever the screen can hold of it and no more, so counting its
+            // rows would rate it on rows nobody can see — which is how a 640
+            // wide screen came to prefer a panel twice that wide for the extra
+            // column it would have had.
+            if fits { layout.rows.len() } else { 0 },
             -over_w.max(over_h),
             layout.size,
         )
@@ -426,6 +479,27 @@ fn lay_out(
         LINE_GAP * px,
         px,
     );
+    let top = pad + line + line_gap + rule + line_gap;
+
+    // How many rows there is height for, and so how many of them get drawn.
+    //
+    // The text stops shrinking at `MIN_SIZE`, because a list too small to read
+    // is no better than one that runs off the edge — so on a screen that
+    // cannot hold the table even at the floor, what does not fit is *left out*
+    // rather than pushed past the bottom. A 1366x768 laptop panel is one of
+    // those, which is not an edge case: before this, a third of the bindings
+    // were drawn below the screen, where nothing could scroll to them.
+    //
+    // Everything above and below the rows is fixed — title, rule, footer and
+    // the padding around them — so the room left for rows is what is left of
+    // the panel's height after them.
+    let columns = columns.max(1);
+    let chrome = top + line_gap * 2.0 + line + pad;
+    let for_rows = (request.room.1 - chrome).max(box_h);
+    let fits = (((for_rows + row_gap) / (box_h + row_gap)).floor() as usize).max(1);
+    let per_column = shown.len().div_ceil(columns).max(1).min(fits);
+    let hidden = shown.len().saturating_sub(per_column * columns);
+    let shown = &shown[..shown.len() - hidden];
 
     let mut measured = Vec::with_capacity(shown.len());
     for binding in shown {
@@ -445,8 +519,6 @@ fn lay_out(
         measured.push((chord, widths, description));
     }
 
-    let top = pad + line + line_gap + rule + line_gap;
-    let per_column = shown.len().div_ceil(columns.max(1)).max(1);
     let mut rows = Vec::with_capacity(shown.len());
     let mut longest = 0;
     let mut x = pad;
@@ -506,9 +578,11 @@ fn lay_out(
         + head
             .as_deref()
             .map_or(0.0, |head| HEAD_GAP * px + text.measure(head, size).0);
-    let body_w = columns_w
-        .max(title_w)
-        .max(measure(seen, text, FOOTER, size, false).0);
+    // Measured against the screen's own room rather than against the rest of
+    // the panel: the footer may be as long as the panel is allowed to be, and
+    // a filter that matched one row must not drag the note down to its width.
+    let foot = footer(hidden, (request.room.0 - pad * 2.0).max(0.0), size, text);
+    let body_w = columns_w.max(title_w).max(text.measure(&foot, size).0);
     // The empty state still needs a line's worth of room, or the footer would
     // come up under the rule and the panel would look like it had lost its
     // middle rather than like it had nothing to show.
@@ -541,6 +615,8 @@ fn lay_out(
         rows,
         shown: shown.to_vec(),
         head,
+        foot,
+        hidden,
     }
 }
 
@@ -623,7 +699,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
 
     text.draw(
         &mut canvas,
-        FOOTER,
+        &l.foot,
         l.size,
         l.pad as i32,
         l.footer_y as i32,
@@ -837,6 +913,134 @@ mod tests {
             Key::from_keysym(keysyms::KEY_Return, Some('\r')),
             Key::Ignored
         );
+    }
+
+    /// Every screen the panel has to work on, smallest first. 640x480 is the
+    /// floor this promises to fit; below it there is no readable way to put a
+    /// chord and a sentence side by side, and the panel falls back to showing
+    /// its top-left corner.
+    const SCREENS: &[(i32, i32)] = &[
+        (640, 480),
+        (800, 600),
+        (1024, 768),
+        (1280, 720),
+        (1280, 1024),
+        (1366, 768),
+        (1440, 900),
+        (1600, 900),
+        (1680, 1050),
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    ];
+
+    #[test]
+    fn the_panel_never_outgrows_the_screen_it_is_on() {
+        // The one thing the overlay has to get right: a list drawn past the
+        // bottom of the screen is a list nothing can scroll to. A 1366x768
+        // laptop panel used to get a single column 1195 pixels tall.
+        let mut text = Text::new();
+        for &(w, h) in SCREENS {
+            let output = Rect::from_xywh(0, 0, w, h);
+            for density in [1, 2] {
+                for query in ["", "w", "window", "zzzzz"] {
+                    let at = Overlay::render(output, &mut text, density, query).placement(output);
+                    assert!(
+                        at.w() <= output.w() && at.h() <= output.h(),
+                        "{w}x{h} @{density}x {query:?}: panel is {}x{}",
+                        at.w(),
+                        at.h()
+                    );
+                    assert!(
+                        at.x() >= output.x()
+                            && at.y() >= output.y()
+                            && at.right() <= output.right()
+                            && at.y() + at.h() <= output.y() + output.h(),
+                        "{w}x{h} @{density}x {query:?}: panel sits at {at:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_screen_with_no_room_for_the_table_says_how_much_it_left_out() {
+        // A list that simply stops reads as the whole list. The count is what
+        // sends somebody to the filter for the rest.
+        let mut text = Text::new();
+        if !text.is_usable() {
+            return;
+        }
+        let output = Rect::from_xywh(0, 0, 1366, 768);
+        let layout = fit(output, &mut text, 1, "");
+        assert!(layout.hidden > 0, "1366x768 fitted the whole table");
+        assert_eq!(
+            layout.rows.len() + layout.hidden,
+            BINDINGS.len(),
+            "the rows drawn and the rows left out are not the whole table"
+        );
+        assert!(
+            layout.foot.starts_with(&format!("{} more", layout.hidden)),
+            "the footer does not say what was left out: {:?}",
+            layout.foot
+        );
+    }
+
+    #[test]
+    fn a_screen_with_room_for_the_table_leaves_nothing_out() {
+        let mut text = Text::new();
+        if !text.is_usable() {
+            return;
+        }
+        let output = Rect::from_xywh(0, 0, 1920, 1080);
+        let layout = fit(output, &mut text, 1, "");
+        assert_eq!(layout.hidden, 0);
+        assert_eq!(layout.rows.len(), BINDINGS.len());
+        assert_eq!(layout.foot, FOOTER);
+    }
+
+    #[test]
+    fn a_filter_reaches_the_rows_a_small_screen_left_out() {
+        // The point of the count in the footer: what did not fit is a query
+        // away, not lost.
+        let mut text = Text::new();
+        if !text.is_usable() {
+            return;
+        }
+        let output = Rect::from_xywh(0, 0, 1366, 768);
+        let whole = fit(output, &mut text, 1, "");
+        let dropped = BINDINGS[whole.rows.len()..]
+            .first()
+            .expect("some row fell off");
+        let found = fit(output, &mut text, 1, dropped.description);
+        assert_eq!(found.hidden, 0, "the filtered list did not fit either");
+        assert!(
+            found.shown.iter().any(|b| b.chord == dropped.chord),
+            "{:?} is off the panel and the filter cannot reach it",
+            dropped.chord
+        );
+    }
+
+    #[test]
+    fn the_filter_searches_the_description() {
+        // Looking up "how do I lock the screen" is at least as common as
+        // looking up what a key you can see does, and the words somebody
+        // reaches for are the ones in the description.
+        for (query, chord) in [
+            ("terminal", "Super+Ctrl+E / T"),
+            ("lock", "Super+L"),
+            ("volume", "Volume keys"),
+            ("paste", "Super+V"),
+            // Two words from the description, in neither the chord nor next
+            // to each other in the sentence.
+            ("put away", "Super+Ctrl+M"),
+        ] {
+            let left = chords(query);
+            assert!(
+                left.contains(&chord),
+                "{query:?} did not find {chord:?}; it found {left:?}"
+            );
+        }
     }
 
     #[test]
@@ -1112,8 +1316,18 @@ mod tests {
         // `HUGINN_OVERLAY_FILTER` dumps the panel as the filter leaves it,
         // which is the only way to see the narrowed layout without a session.
         let query = std::env::var("HUGINN_OVERLAY_FILTER").unwrap_or_default();
+        // `HUGINN_OVERLAY_OUTPUT=1366x768` dumps the panel as a screen that
+        // size gets it, which is how the row cap is looked at rather than
+        // reasoned about.
+        let (w, h) = std::env::var("HUGINN_OVERLAY_OUTPUT")
+            .ok()
+            .and_then(|spec| {
+                let (w, h) = spec.split_once('x')?;
+                Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+            })
+            .unwrap_or((1920, 1080));
         let mut text = Text::new();
-        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, &query);
+        let canvas = compose(Rect::from_xywh(0, 0, w, h), &mut text, 1, &query);
         let (w, h) = (canvas.stride, canvas.height);
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         // The canvas is RGBA and PPM is RGB, so the alpha is dropped. Every

@@ -189,7 +189,7 @@ client cannot receive or override them:
 | `Super+Ctrl+Space` | open the application launcher |
 | `Super+Ctrl+A` | open the pinned applications |
 | `Super+Ctrl+S` | open quick settings |
-| `Super+Ctrl+H` | show the keybinding list; type to filter it, `Esc` clears the filter then closes it (so does a click outside) |
+| `Super+Ctrl+H` | show the keybinding list; type to filter it by chord or description, `Esc` clears the filter then closes it (so does a click outside). On a screen with no room for the whole table the footer says how many rows were left out — the filter is how you reach them |
 | `Super+Ctrl+Esc` | quit the compositor |
 | `Print` | screenshot the screen (`Shift`: region, `Ctrl`: window) |
 | `Super+Print` | start or stop recording the screen |
