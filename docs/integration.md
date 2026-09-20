@@ -288,6 +288,14 @@ expected to. A file from an earlier release that names a floating centre, or
 an `orientation` line beside the position, still reads: the centre becomes the
 default edge and the orientation is dropped.
 
+Huginn reads that file once, at startup, and holds it in memory afterwards, so
+a second writer has to say when it has changed it: Raven Settings rewrites the
+file and then sends `raven_shell_manager_v1.reload_pins` (since version 8),
+and the bar moves or gains its new application there and then. Without the
+request the edit would sit unseen until the next login, and Huginn would
+overwrite it the next time anything pinned or unpinned something. On a reload
+the file wins outright — nothing is merged.
+
 The Bluetooth row in the same panel talks to BlueZ over D-Bus (it needs
 `bluetoothd` running; without it the row says "not connected"). `Return` on
 the row toggles the radio. The arrows step through what the row could be

@@ -22,7 +22,7 @@
     is what makes moving this file to its own repository a mechanical step.
   </description>
 
-  <interface name="raven_shell_manager_v1" version="7">
+  <interface name="raven_shell_manager_v1" version="8">
     <description summary="entry point for the desktop shell">
       Handed to the shell so it can observe compositor state it cannot see as an
       ordinary Wayland client.
@@ -129,9 +129,28 @@
       </description>
       <arg name="id" type="new_id" interface="raven_region_selection_v1"/>
     </request>
+
+    <request name="reload_pins" since="8">
+      <description summary="re-read the pinned application bar's state file">
+        The pinned application bar — which applications are on it and which
+        edge it rides — is remembered in $XDG_STATE_HOME/raven/pins, written
+        by the desktop on the user's behalf. The compositor reads that file
+        once, at startup, and from then on holds it in memory; a settings
+        page that rewrites the file therefore changes nothing anyone can see
+        until the next login, and its edit is lost the moment the compositor
+        writes its own copy back.
+
+        This request closes that gap: it asks the compositor to read the file
+        again and apply what it says now — move the bar to the edge named
+        there, and show the applications listed there. Nothing is sent back;
+        the change is visible on screen.
+
+        Ignored while the session is locked, as open_quick_settings is.
+      </description>
+    </request>
   </interface>
 
-  <interface name="raven_output_layout_v1" version="7">
+  <interface name="raven_output_layout_v1" version="8">
     <description summary="where each screen sits, and the means to move it">
       Created through raven_shell_manager_v1.get_output_layout.
 

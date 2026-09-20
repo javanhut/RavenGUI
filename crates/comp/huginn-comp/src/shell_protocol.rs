@@ -74,7 +74,7 @@ impl RavenShellState {
         // or a socket only the shell can reach) before anything untrusted runs
         // on this compositor. Until then the recording dot is the only sign a
         // capture is running.
-        dh.create_global::<Huginn, RavenShellManagerV1, ()>(7, ());
+        dh.create_global::<Huginn, RavenShellManagerV1, ()>(8, ());
         Self::default()
     }
 }
@@ -206,6 +206,23 @@ impl Dispatch<RavenShellManagerV1, ()> for Huginn {
                 } else {
                     tracing::debug!("shell opened quick settings");
                     state.open_settings();
+                }
+            }
+            raven_shell_manager_v1::Request::ReloadPins => {
+                // Raven Settings has just rewritten the pins file. It is the
+                // one thing in the state directory two processes write, so
+                // the file — not this compositor's memory — is what is true
+                // straight after the request, and the reload replaces what
+                // is held here rather than merging into it.
+                //
+                // Locked for the reason quick settings is: a request that
+                // arrived over the wire skipped the keymap, and rearranging
+                // the screen under a lock screen is not something a client
+                // gets to do.
+                if state.is_locked() {
+                    tracing::debug!("shell asked to reload pins while locked; ignored");
+                } else {
+                    state.reload_pins();
                 }
             }
             raven_shell_manager_v1::Request::GetOutputLayout { id } => {

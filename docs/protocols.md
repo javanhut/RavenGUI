@@ -39,7 +39,7 @@ The contract between Huginn and the desktop shell, covering only what no
 standard protocol provides. Panels, the dock and the wallpaper are layer-shell
 surfaces; this file does not duplicate them.
 
-### `raven_shell_manager_v1` — version 7
+### `raven_shell_manager_v1` — version 8
 
 | | |
 |---|---|
@@ -51,6 +51,7 @@ surfaces; this file does not duplicate them.
 | `capture_window(id, identifier, options)` | request, since 4. Creates a `raven_capture_v1` of the window with that `ext_foreign_toplevel_handle_v1` identifier: the window alone, with its compositor-drawn bar, nothing overlapping it, at its screen's density. An unknown identifier gives a capture whose only event is `stopped`. |
 | `capture_region(id, output, x, y, width, height, options)` | request, since 4. Creates a `raven_capture_v1` of a rectangle of a screen, in logical pixels relative to its top-left corner, clipped to the screen. Empty after clipping, or an unknown screen, gives a capture whose only event is `stopped`. |
 | `select_region(id)` | request, since 4. Creates a `raven_region_selection_v1` and puts up the compositor's own region picker — the one `Shift+Print` uses. |
+| `reload_pins` | request, since 8. Re-read `$XDG_STATE_HOME/raven/pins` and apply it: move the pinned application bar to the edge named there and show the applications listed there. No reply; ignored while the session is locked. |
 
 The second version exists for a bar whose battery reading is a natural place
 to click: the panel it should lead to is drawn by the compositor, so the bar
@@ -60,6 +61,16 @@ at version 1 sees no difference.
 Version 4 exists for Raven Camera, a screen recorder with a live preview: see
 below, and the privilege note, which matters more now that this global can read
 the screen.
+
+Version 8 exists for Raven Settings. The pins file is the one thing in the
+state directory two processes write: Huginn reads it at startup and holds it
+in memory from then on, so a settings page that rewrote it changed nothing
+anyone could see until the next login — and lost the edit as soon as Huginn
+wrote its own copy back. `reload_pins` is how the writer says *I have changed
+it, read it again*; Huginn replaces what it holds rather than merging, because
+the page wrote the file from that same file a moment earlier. Note that this
+is the **pinned application bar**, not the dock: the dock is a layer of
+running applications at the bottom edge and has nothing to do with this file.
 
 ### `raven_capture_v1` — version 1
 
@@ -120,7 +131,7 @@ Exactly one of the two events is sent. The result is shaped for
 | `activate(index)` | request. Switch to a workspace. An out-of-range index is ignored, not clamped. |
 | `state(count, active, occupied)` | event. Sent once on creation and again whenever a field changes, never when nothing did. `occupied` is a bitmask; bit N is set if workspace N holds a window. Caps at 32. |
 
-### `raven_output_layout_v1` — version 7
+### `raven_output_layout_v1` — version 8
 
 | | |
 |---|---|

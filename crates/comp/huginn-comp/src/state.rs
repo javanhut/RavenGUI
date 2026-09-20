@@ -5577,12 +5577,60 @@ impl Huginn {
     /// it up to date — the launcher's menu label, the pin bar's items.
     fn pins_changed(&mut self) {
         self.save_pins();
+        self.show_pins();
+    }
+
+    /// Bring every view of the pins up to date, without writing them back.
+    ///
+    /// Split from [`Self::pins_changed`] for [`Self::reload_pins`], where
+    /// the file is where the change came from and saving would only write
+    /// back what was just read.
+    fn show_pins(&mut self) {
         self.launcher.set_pinned(self.pins.paths().to_vec());
         let clock = self.uptime();
         if self.pinned.is_visible(clock) {
             self.pinned.refresh(&self.apps, &self.pins);
             self.refresh_pinned();
         }
+    }
+
+    /// Read the pins file again and show what it says now.
+    ///
+    /// The `reload_pins` request of `raven_shell_v1`: Raven Settings writes
+    /// the file and then asks for this, so that pinning an application or
+    /// moving the bar to another edge is visible at once rather than at the
+    /// next login. Nothing merges — the file wins outright, because the
+    /// settings page wrote it from the same file a moment ago.
+    ///
+    /// The row in quick settings is told too. It owns the edge between
+    /// startup and now ([`Self::refresh_settings`] copies it into the pins
+    /// every time the panel is drawn), so a reload that left it alone would
+    /// be undone the next time quick settings opened.
+    pub(crate) fn reload_pins(&mut self) {
+        let Some(file) = pins_path() else {
+            return;
+        };
+        let pins = match crate::pins::Pins::load(&file) {
+            Ok(pins) => pins,
+            Err(e) => {
+                tracing::warn!("could not reload pins from {}: {e}", file.display());
+                return;
+            }
+        };
+        if pins == self.pins {
+            tracing::debug!("pins reloaded; unchanged");
+            return;
+        }
+        tracing::info!(
+            position = pins.position().value(),
+            count = pins.paths().len(),
+            "pins reloaded from {}",
+            file.display()
+        );
+        self.pins = pins;
+        self.settings.set_pins_position(self.pins.position());
+        self.show_pins();
+        self.queue_redraw();
     }
 
     /// Write the pins beside the launch history. Saved on every change
