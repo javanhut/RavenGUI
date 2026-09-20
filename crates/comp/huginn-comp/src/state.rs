@@ -745,6 +745,13 @@ pub(crate) struct Huginn {
     double_tap: crate::gesture::DoubleTap,
     /// Wheel travel banked towards the next `Super`+wheel workspace step.
     wheel: crate::wheel::Notches,
+    /// The same, for `Super`+`Ctrl`+wheel tile resizing.
+    ///
+    /// A bank of its own rather than a share of [`Self::wheel`]: letting go of
+    /// Ctrl part way through a turn changes what the wheel means, and travel
+    /// banked towards a resize would otherwise pay out as a workspace step —
+    /// the desktop jumping sideways because of a notch aimed at a divider.
+    tile_wheel: crate::wheel::Notches,
     /// Until when the wheel is swallowed after a notch up took the strip's
     /// highlighted window. A free-spinning wheel reports one flick as a run
     /// of events, and the ones after the first would otherwise arrive on a
@@ -790,8 +797,16 @@ pub(crate) struct Huginn {
     /// when the first real screens arrive, and again at every unlock.
     homed: bool,
 
-    /// The keybinding overlay, painted once when summoned. `None` when closed.
+    /// The keybinding overlay, painted when summoned. `None` when closed.
     help: Option<crate::overlay::Overlay>,
+    /// What has been typed into the overlay's filter. Empty is the whole
+    /// table.
+    ///
+    /// Beside the overlay rather than inside it because the panel is thrown
+    /// away and repainted whenever the output it was sized for changes — see
+    /// [`Self::apply_output_geometry`] — and a filter that cleared itself
+    /// because a monitor was plugged in would be a filter nobody trusts.
+    help_query: String,
 
     /// The wallpaper at its own size, read from disk once at startup, and the
     /// copies composed for each output, parallel to `outputs`.
@@ -960,7 +975,8 @@ pub(crate) struct Huginn {
     /// asked for over `raven_region_selection_v1` rather than by
     /// `Shift`+`Print`: the release answers it instead of taking a
     /// screenshot.
-    region_client: Option<raven_protocol::server::raven_region_selection_v1::RavenRegionSelectionV1>,
+    region_client:
+        Option<raven_protocol::server::raven_region_selection_v1::RavenRegionSelectionV1>,
     /// Windows whose drawn rectangle is still on its way to the layout's.
     ///
     /// A relayout moves the layout's rectangles at once; these are what the
@@ -1218,6 +1234,7 @@ impl Huginn {
             pointer_found_until: None,
             double_tap: crate::gesture::DoubleTap::default(),
             wheel: crate::wheel::Notches::default(),
+            tile_wheel: crate::wheel::Notches::default(),
             wheel_quiet_until: None,
             hold_fingers: None,
             app_switcher: None,
@@ -1261,6 +1278,7 @@ impl Huginn {
             render_context: None,
             focus_ring_shown: None,
             help: None,
+            help_query: String::new(),
             // Stamped before decoding, and fields are evaluated in the order
             // written; see `Sources::of`.
             wallpaper_sources: crate::wallpaper::Sources::of(desktop_config.wallpaper().as_deref()),
@@ -1454,24 +1472,70 @@ impl Huginn {
     /// kilobytes that spend the whole session unlooked at, and the table it is
     /// drawn from cannot change while the compositor runs, so there is nothing
     /// to gain by holding it.
+    ///
+    /// It opens unfiltered every time. A filter left over from the last time
+    /// somebody went looking for a chord would meet the next person as a table
+    /// with most of it missing and no obvious reason why.
     pub(crate) fn open_help(&mut self) {
         if self.help.is_some() {
             return;
         }
+        self.help_query.clear();
+        self.paint_help();
+        tracing::debug!(visible = true, "keybinding overlay");
+        self.queue_redraw();
+    }
+
+    /// Repaint the overlay for the current filter, output and scale.
+    fn paint_help(&mut self) {
         let area = self.output_area();
         let advertised = self.scale().advertised;
         self.help = Some(crate::overlay::Overlay::render(
             area,
             &mut self.text,
             advertised,
+            &self.help_query,
         ));
-        tracing::debug!(visible = true, "keybinding overlay");
+    }
+
+    /// A keystroke while the keybinding overlay is up: the filter.
+    ///
+    /// Escape clears the filter before it closes the panel, which is the way
+    /// out of a query that has narrowed the table too far without losing the
+    /// table with it. With nothing typed there is nothing to clear, so the
+    /// first Escape closes — the behaviour the footer has always promised.
+    pub(crate) fn help_key(&mut self, key: crate::overlay::Key) {
+        use crate::overlay::Key;
+        if self.help.is_none() {
+            return;
+        }
+        match key {
+            Key::Insert(c) => self.help_query.push(c),
+            Key::Backspace => {
+                if self.help_query.pop().is_none() {
+                    return;
+                }
+            }
+            Key::Escape => {
+                if self.help_query.is_empty() {
+                    self.close_help();
+                } else {
+                    self.help_query.clear();
+                    self.paint_help();
+                    self.queue_redraw();
+                }
+                return;
+            }
+            Key::Ignored => return,
+        }
+        self.paint_help();
         self.queue_redraw();
     }
 
     /// Put the keybinding overlay away.
     pub(crate) fn close_help(&mut self) {
         if self.help.take().is_some() {
+            self.help_query.clear();
             tracing::debug!(visible = false, "keybinding overlay");
             self.queue_redraw();
         }
@@ -1507,14 +1571,11 @@ impl Huginn {
         self.workspace_card.resize((area.w(), area.h()));
         self.overview_veil.resize((area.w(), area.h()));
         // The overlay picks its scale from the output height, so a resize with
-        // it open has to redraw it rather than just re-centre it.
+        // it open has to redraw it rather than just re-centre it. The filter
+        // is carried across, which is the whole reason it does not live in the
+        // panel being thrown away here.
         if self.help.is_some() {
-            let advertised = self.scale().advertised;
-            self.help = Some(crate::overlay::Overlay::render(
-                area,
-                &mut self.text,
-                advertised,
-            ));
+            self.paint_help();
         }
         self.refresh_output_panels();
         self.refresh_layers();
@@ -2193,7 +2254,11 @@ impl Huginn {
             && let Some(badges) = &self.screen_badges
         {
             for badge in &badges.badges {
-                out.push(SceneItem::Overlay(badge.panel.buffer(), badge.rect, badge_alpha));
+                out.push(SceneItem::Overlay(
+                    badge.panel.buffer(),
+                    badge.rect,
+                    badge_alpha,
+                ));
             }
         }
         if let Some(previews) = self.workspace_previews() {
@@ -2285,18 +2350,20 @@ impl Huginn {
     /// Hit testing and frame callbacks both want a client on the other end, and
     /// the focus ring has none.
     pub(crate) fn scene_surfaces(&self) -> impl Iterator<Item = (WlSurface, Rect, Option<Rect>)> {
-        self.scene().into_iter().map(SceneItem::unwrapped).filter_map(|item| match item {
-            SceneItem::Surface(surface, rect) | SceneItem::WorkspaceSurface(surface, rect, _) => {
-                Some((surface, rect, None))
-            }
-            SceneItem::Clipped(surface, rect, clip, _) => Some((surface, rect, Some(clip))),
-            SceneItem::Preview(..)
-            | SceneItem::Ghost(..)
-            | SceneItem::Ring(..)
-            | SceneItem::Overlay(..)
-            | SceneItem::WorkspaceCard(..)
-            | SceneItem::OnScreen(..) => None,
-        })
+        self.scene()
+            .into_iter()
+            .map(SceneItem::unwrapped)
+            .filter_map(|item| match item {
+                SceneItem::Surface(surface, rect)
+                | SceneItem::WorkspaceSurface(surface, rect, _) => Some((surface, rect, None)),
+                SceneItem::Clipped(surface, rect, clip, _) => Some((surface, rect, Some(clip))),
+                SceneItem::Preview(..)
+                | SceneItem::Ghost(..)
+                | SceneItem::Ring(..)
+                | SceneItem::Overlay(..)
+                | SceneItem::WorkspaceCard(..)
+                | SceneItem::OnScreen(..) => None,
+            })
     }
 
     /// Every surface that should be told it may draw.
@@ -2315,10 +2382,15 @@ impl Huginn {
         // The switcher's thumbnail is a picture, not a surface to click, so
         // it is not in the scene list -- but it is on screen, and a window
         // that is on screen should be allowed to keep painting itself.
-        out.extend(self.scene().into_iter().map(SceneItem::unwrapped).filter_map(|item| match item {
-            SceneItem::Preview(surface, rect, _) => Some((surface, rect)),
-            _ => None,
-        }));
+        out.extend(
+            self.scene()
+                .into_iter()
+                .map(SceneItem::unwrapped)
+                .filter_map(|item| match item {
+                    SceneItem::Preview(surface, rect, _) => Some((surface, rect)),
+                    _ => None,
+                }),
+        );
 
         // While locked that is the entire list. The windows below would
         // otherwise go on receiving frame callbacks and go on painting -- into
@@ -4501,7 +4573,9 @@ impl Huginn {
         let identify = self.identify_since.map_or(0.0, |since| {
             let t = now.saturating_sub(since).as_secs_f32();
             let total = IDENTIFY_FOR.as_secs_f32();
-            (t / IDENTIFY_FADE).min((total - t) / IDENTIFY_FADE).clamp(0.0, 1.0)
+            (t / IDENTIFY_FADE)
+                .min((total - t) / IDENTIFY_FADE)
+                .clamp(0.0, 1.0)
         });
         if self.reduced_motion() && identify > 0.0 {
             return 1.0;
@@ -4528,7 +4602,11 @@ impl Huginn {
                 (usable, numbers[index], output.scale.advertised)
             })
             .collect();
-        if self.screen_badges.as_ref().is_some_and(|badges| badges.key == key) {
+        if self
+            .screen_badges
+            .as_ref()
+            .is_some_and(|badges| badges.key == key)
+        {
             return;
         }
         let badges = key
@@ -4740,6 +4818,78 @@ impl Huginn {
         }
     }
 
+    /// `Super`+`Ctrl`+wheel: grow or shrink the focused tile.
+    ///
+    /// Up is bigger, down is smaller, and *bigger* rather than *wider* on
+    /// purpose. The divider that moves is the one nearest the focused window
+    /// — see [`huginn_core::tiles::Tiles::grow`] — so on a pane of columns a
+    /// notch up widens it and on a pane of rows the same notch makes it
+    /// taller. A wheel has one axis and the tiling has two, and tying the
+    /// gesture to *the screen's* horizontal would make it do nothing at all
+    /// half the time, which is the worse of the two surprises.
+    ///
+    /// Only on the tiling. The carousel gives every pane the same width by
+    /// definition, so there is no divider there to move, and the wheel is
+    /// better left to the client than spent on a tree the strip does not read.
+    ///
+    /// Returns whether the event belongs to this binding, part-detents
+    /// included, for the reason [`Self::wheel_workspace`] gives: banked travel
+    /// that reached the client would scroll the window under the pointer by
+    /// the remainder of every turn.
+    pub(crate) fn wheel_resize(&mut self, axis: ScrollAxis, v120: i32) -> bool {
+        /// How much of a tile one detent moves. Larger than the keyboard's
+        /// step in [`Self::resize_focused`]: a wheel is turned in handfuls of
+        /// notches and aimed by eye, where the arrows are pressed and counted.
+        const STEP: f32 = 0.05;
+        /// A device is free to report nonsense travel; no real turn is
+        /// anywhere near this, and the clamp costs nothing when it is not.
+        const MOST: i32 = 32;
+
+        // A panel or a picker owns input while it is up, exactly as it owns
+        // the keyboard — and exactly as in `wheel_workspace`, which this runs
+        // ahead of.
+        if self.is_locked()
+            || self.launcher.is_open()
+            || self.settings.is_open()
+            || self.pinned.is_open()
+            || self.region_active()
+            || self.app_switcher_open()
+            || self.overview_open()
+        {
+            return false;
+        }
+        let workspace = self.space.active_workspace();
+        if workspace.layout() != huginn_core::workspace::Layout::Tiled {
+            return false;
+        }
+        // Not just "something is focused": a floating window is not in the
+        // tree at all, and a fullscreen one is in it only so that leaving
+        // fullscreen puts it back where it was. Moving either's divider would
+        // swallow the wheel to change something nobody can see.
+        let Some(window) = workspace
+            .focused()
+            .filter(|w| workspace.tiles().contains(*w))
+            .filter(|w| self.space.window(*w).is_some_and(|w| !w.is_fullscreen()))
+        else {
+            return false;
+        };
+        let steps = self.tile_wheel.take(axis, v120).clamp(-MOST, MOST);
+        if steps == 0 {
+            return true;
+        }
+        // Positive is down, and down is smaller.
+        let delta = -STEP * steps as f32;
+        if self
+            .space
+            .active_workspace_mut()
+            .tiles_mut()
+            .grow(window, delta)
+        {
+            self.arrange();
+        }
+        true
+    }
+
     /// Mouse counterpart to the three-finger swipe: `Super`+wheel steps
     /// through the workspaces.
     ///
@@ -4786,7 +4936,10 @@ impl Huginn {
         }
         let switcher = self.app_switcher_open();
         let overview = self.overview_open();
-        if !(switcher || (overview && chord != Chord::Other) || chord == Chord::Super) {
+        if !(switcher
+            || (overview && matches!(chord, Chord::Super | Chord::Bare))
+            || chord == Chord::Super)
+        {
             return false;
         }
         // The tail of the flick that just took a window out of the strip.
@@ -5248,6 +5401,20 @@ impl Huginn {
         {
             self.arrange();
         }
+    }
+
+    /// Turn the active workspace's tiling the other way: two windows side by
+    /// side and the third across the bottom, or two windows stacked and the
+    /// third down the right-hand side.
+    ///
+    /// The relayout is what makes it appear — the tree is rebuilt inside
+    /// [`Space::arrange`] — so the animation carries every window from where
+    /// it was to where the new shape puts it, the same as any other layout
+    /// change.
+    pub(crate) fn toggle_tile_orientation(&mut self) {
+        let orientation = self.space.toggle_tile_orientation();
+        tracing::debug!(?orientation, "tiling turned");
+        self.arrange();
     }
 
     /// Enter or leave keyboard resize mode and mirror it to the focused
@@ -6675,7 +6842,10 @@ impl Huginn {
         if top <= 0 || self.decor.get(&id)?.mode != crate::decor::DecorMode::Server {
             return None;
         }
-        Some(crate::decor::bar_rect(self.space.window(id)?.content(), top))
+        Some(crate::decor::bar_rect(
+            self.space.window(id)?.content(),
+            top,
+        ))
     }
 
     /// Window `id` alone, at rest, as scene items front to back: its popups,
@@ -7462,7 +7632,8 @@ impl Huginn {
                 let surface = self.windows.get(id)?.wl_surface()?;
                 let pane = self.space.window(*id)?.content();
                 let placed = place_in_pane(&surface, pane);
-                let placed = Rect::from_xywh(placed.x() + dx, placed.y() + dy, placed.w(), placed.h());
+                let placed =
+                    Rect::from_xywh(placed.x() + dx, placed.y() + dy, placed.w(), placed.h());
                 Some((*id, surface, placed))
             })
             .collect()

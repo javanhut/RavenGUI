@@ -263,13 +263,12 @@ fn push_cursor(
         // [`crate::pointer::Found`].
         CursorImageStatus::Named(_) => {
             if let Some(cursor) = fallback_cursor {
-                let (buffer, hotspot, rescale): (_, Point<f64, Logical>, _) =
-                    match &cursor.found {
-                        Some(big) if found != 1.0 => {
-                            (&big.buffer, big.hotspot, found / big.magnification)
-                        }
-                        _ => (&cursor.buffer, cursor.hotspot.to_f64(), found),
-                    };
+                let (buffer, hotspot, rescale): (_, Point<f64, Logical>, _) = match &cursor.found {
+                    Some(big) if found != 1.0 => {
+                        (&big.buffer, big.hotspot, found / big.magnification)
+                    }
+                    _ => (&cursor.buffer, cursor.hotspot.to_f64(), found),
+                };
                 let position: Point<f64, Logical> =
                     (pointer.x - hotspot.x, pointer.y - hotspot.y).into();
                 if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
@@ -334,7 +333,8 @@ fn push_items(
     // is the same thing only on the screen at the origin. Everywhere else the
     // difference is the corner's own movement under the scale.
     let shift = |transform: &WorkspacePreview| {
-        Point::<f64, Logical>::from(local_shift(transform, view)).to_physical_precise_round::<f64, i32>(scale)
+        Point::<f64, Logical>::from(local_shift(transform, view))
+            .to_physical_precise_round::<f64, i32>(scale)
     };
 
     let mut boundary = None;
@@ -649,8 +649,14 @@ mod local_shift_tests {
             let drawn = crate::motion::appear_rect(placed, 0.3);
             let transform = crate::motion::fit(placed, drawn, 1.0);
             let (x, y) = drawn_corner(placed, &transform, view);
-            assert!((x - f64::from(drawn.x() - view.x())).abs() < 0.5, "{view:?}: x {x}");
-            assert!((y - f64::from(drawn.y() - view.y())).abs() < 0.5, "{view:?}: y {y}");
+            assert!(
+                (x - f64::from(drawn.x() - view.x())).abs() < 0.5,
+                "{view:?}: x {x}"
+            );
+            assert!(
+                (y - f64::from(drawn.y() - view.y())).abs() < 0.5,
+                "{view:?}: y {y}"
+            );
         }
     }
 
@@ -663,6 +669,9 @@ mod local_shift_tests {
             offset_y: -7.0,
             alpha: 1.0,
         };
-        assert_eq!(local_shift(&transform, Rect::from_xywh(1920, 300, 10, 10)), (12.0, -7.0));
+        assert_eq!(
+            local_shift(&transform, Rect::from_xywh(1920, 300, 10, 10)),
+            (12.0, -7.0)
+        );
     }
 }

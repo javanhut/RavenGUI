@@ -57,12 +57,7 @@ pub(crate) fn handle<B: InputBackend>(state: &mut Huginn, event: InputEvent<B>) 
             // run into the edge of the screen, as fingers keep travelling
             // when the cursor they are not drawing has.
             let delta = event.delta();
-            relative_motion(
-                state,
-                delta,
-                event.delta_unaccel(),
-                event.time(),
-            );
+            relative_motion(state, delta, event.delta_unaccel(), event.time());
             if state.pointer_locked() {
                 state.pointer().frame(state);
                 return;
@@ -607,7 +602,7 @@ fn shell_press(state: &mut Huginn, button: u32, source: Source) -> Taken {
 
 fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
     let source = event.source();
-    if wheel_workspace::<B>(state, event, source) {
+    if wheel::<B>(state, event, source) {
         return;
     }
     let mut frame = AxisFrame::new(event.time_msec()).source(source);
@@ -634,7 +629,10 @@ fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
     pointer.frame(state);
 }
 
-/// `Super`+wheel: step through the workspaces, and do not tell the client.
+/// The compositor's own wheel bindings, taken before the client's.
+///
+/// `Super`+wheel steps through the workspaces; `Super`+`Ctrl`+wheel grows or
+/// shrinks the focused tile.
 ///
 /// This is the mouse's three-finger swipe. A trackpad has the gesture and a
 /// mouse does not, so without this the only way to the workspace next door
@@ -647,14 +645,23 @@ fn axis<B: InputBackend>(state: &mut Huginn, event: &B::PointerAxisEvent) {
 /// already has the swipe — taking it would add a second, worse way to do the
 /// same thing on the one pointer that needs it least.
 ///
-/// Exactly Super, on the desktop: `Super`+`Ctrl` is the compositor's keyboard
-/// prefix, but the wheel is not a key and has no keysym to disambiguate, so
-/// the plainest chord is the right one. What the other chords mean while a
-/// picker is up is [`Huginn::wheel_workspace`]'s to decide, which is why the
-/// classification is passed along rather than settled here.
+/// The two chords are the way round they are because of what they act on.
+/// Stepping the workspaces is about the desktop, and the desktop's gesture is
+/// the plainest chord there is: exactly `Super`, which needs no keysym to
+/// disambiguate it the way `Super`+`Ctrl` disambiguates the keyboard's window
+/// management from the plain `Super` layer the client owns. Resizing a tile
+/// *is* window management, so it takes the modifier the window-management keys
+/// already use.
+///
+/// The resize is offered the event first, and takes it only if it has a
+/// divider to move: a `Super`+`Ctrl` turn that resizes nothing — nothing tiled
+/// focused, a picker up — falls through to whatever the plain classification
+/// would have done with it. What the other chords mean while a picker is up is
+/// [`Huginn::wheel_workspace`]'s to decide, which is why the classification is
+/// passed along rather than settled here.
 ///
 /// Returns whether the event was taken.
-fn wheel_workspace<B: InputBackend>(
+fn wheel<B: InputBackend>(
     state: &mut Huginn,
     event: &B::PointerAxisEvent,
     source: AxisSource,
@@ -681,6 +688,9 @@ fn wheel_workspace<B: InputBackend>(
         // notches, so it goes to the client rather than being swallowed.
         return false;
     };
+    if chord == crate::wheel::Chord::SuperCtrl && state.wheel_resize(axis, v120) {
+        return true;
+    }
     state.wheel_workspace(axis, v120, chord)
 }
 

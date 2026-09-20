@@ -12,7 +12,7 @@
 //! turns a missed update from a wrong layout into nothing at all.
 
 use crate::geometry::Rect;
-use crate::tiles::Tiles;
+use crate::tiles::{Orientation, Tiles};
 use crate::window::WindowId;
 
 /// How many windows a workspace holds before new ones overflow to a
@@ -234,6 +234,24 @@ impl Workspace {
     /// [`Self::reconcile_tiles`].
     pub fn tiles_mut(&mut self) -> &mut Tiles {
         &mut self.tiles
+    }
+
+    /// Which way this workspace's tiling is turned. See [`Orientation`].
+    pub fn tile_orientation(&self) -> Orientation {
+        self.tiles.orientation()
+    }
+
+    /// Turn the tiling the other way, and report the orientation now in force.
+    ///
+    /// Per workspace, as [`Self::layout`] is and for the same reason: the
+    /// point of having a second shape is to use it where it suits the work,
+    /// and a setting that turned every workspace at once would make it a mode
+    /// you switch into rather than a property of the space you are in.
+    ///
+    /// `area` settles [`Orientation::Auto`]; the caller relayouts afterwards,
+    /// which is when [`Self::reconcile_tiles`] rebuilds to the new shape.
+    pub fn toggle_tile_orientation(&mut self, area: Rect) -> Orientation {
+        self.tiles.toggle_orientation(area)
     }
 
     /// Bring the tree into line with `tiled`, the windows that belong in it.

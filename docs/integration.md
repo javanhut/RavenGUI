@@ -181,6 +181,7 @@ client cannot receive or override them:
 | `Super+Ctrl+P` | open the settings application |
 | `Super+Ctrl+I` | open the software store (`raven-store`) |
 | `Super+Ctrl+R` | resize the focused window with the arrows |
+| `Super+Ctrl+O` | turn the tiling: windows side by side, or stacked |
 | `Super+Ctrl+1..9` | go to a workspace |
 | `Super+Ctrl+Shift+1..9` | send the focused window to a workspace |
 | `Super+C` / `Super+V` | copy / paste in the focused client |
@@ -188,7 +189,7 @@ client cannot receive or override them:
 | `Super+Ctrl+Space` | open the application launcher |
 | `Super+Ctrl+A` | open the pinned applications |
 | `Super+Ctrl+S` | open quick settings |
-| `Super+Ctrl+H` | show the keybinding list (`Esc` or a click outside closes it) |
+| `Super+Ctrl+H` | show the keybinding list; type to filter it, `Esc` clears the filter then closes it (so does a click outside) |
 | `Super+Ctrl+Esc` | quit the compositor |
 | `Print` | screenshot the screen (`Shift`: region, `Ctrl`: window) |
 | `Super+Print` | start or stop recording the screen |
@@ -201,6 +202,7 @@ combination.
 | Chord | Does |
 |---|---|
 | `Super`+wheel | go to the workspace either side; slides the overview's row |
+| `Super+Ctrl`+wheel | grow or shrink the focused tile |
 | `Super`+right click | put the window under the pointer away to the dock; closes an open picker |
 | `Super`+click | tap: show the put-away windows, and take a tile; drag: the three-finger swipe, sideways, up or down |
 | `Super`+middle click | open or close the workspace overview |

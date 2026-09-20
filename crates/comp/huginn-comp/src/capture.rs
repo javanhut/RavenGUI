@@ -502,7 +502,12 @@ impl Huginn {
 
     /// A client asked for a capture of `source`. The first event goes out
     /// now: `buffer_size`, or `stopped` for a source that does not exist.
-    pub(crate) fn create_capture(&mut self, resource: RavenCaptureV1, source: Source, options: Options) {
+    pub(crate) fn create_capture(
+        &mut self,
+        resource: RavenCaptureV1,
+        source: Source,
+        options: Options,
+    ) {
         let mut capture = Capture {
             resource,
             source,
@@ -577,7 +582,8 @@ impl Huginn {
             return;
         }
         let expected = capture.size.unwrap_or_default();
-        let checked = with_buffer_contents(&buffer, |_, len, data| check_buffer(&data, len, expected));
+        let checked =
+            with_buffer_contents(&buffer, |_, len, data| check_buffer(&data, len, expected));
         match checked {
             Ok(Ok(())) => self.captures.kick = true,
             Ok(Err(why)) => {
@@ -690,7 +696,12 @@ pub(crate) fn tick<'c>(
             continue;
         }
         let with_rings = capture.options.contains(Options::Clicks) && !rings.is_empty();
-        if !wants_frame(capture.first, capture.damaged, with_rings, capture.rings_drawn) {
+        if !wants_frame(
+            capture.first,
+            capture.damaged,
+            with_rings,
+            capture.rings_drawn,
+        ) {
             continue;
         }
         if let Some(wait) = until_due(capture.last_render, now, view.period) {
@@ -698,7 +709,16 @@ pub(crate) fn tick<'c>(
             continue;
         }
         let drawn: &[(Point<f64, Logical>, f64, f32)] = if with_rings { &rings } else { &[] };
-        render_one(renderer, state, capture, &view, cursor, drawn, ring.as_ref(), now);
+        render_one(
+            renderer,
+            state,
+            capture,
+            &view,
+            cursor,
+            drawn,
+            ring.as_ref(),
+            now,
+        );
         // Collected on the tick after, once the GPU has had its time.
         soonest(view.period / 2);
     }
@@ -729,7 +749,15 @@ fn render_one<'c>(
     ring: Option<&Panel>,
     now: Instant,
 ) {
-    match capture.render(renderer, state, view, cursor(view.density), rings, ring, now) {
+    match capture.render(
+        renderer,
+        state,
+        view,
+        cursor(view.density),
+        rings,
+        ring,
+        now,
+    ) {
         Ok(()) => {
             capture.damaged = false;
             capture.rings_drawn = !rings.is_empty();
@@ -798,7 +826,12 @@ impl Dispatch<RavenRegionSelectionV1, ()> for Huginn {
         let _ = request;
     }
 
-    fn destroyed(state: &mut Self, _client: ClientId, resource: &RavenRegionSelectionV1, _data: &()) {
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        resource: &RavenRegionSelectionV1,
+        _data: &(),
+    ) {
         state.region_client_gone(resource);
     }
 }
@@ -844,7 +877,10 @@ enum Refused {
 /// `xrgb8888`, exactly that size, four bytes a pixel or more, and inside its
 /// pool. `pool` is the pool's length in bytes.
 fn check_buffer(data: &BufferData, pool: usize, size: Size<i32, Physical>) -> Result<(), Refused> {
-    if !matches!(data.format, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888) {
+    if !matches!(
+        data.format,
+        wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
+    ) {
         return Err(Refused::Format);
     }
     if data.width != size.w || data.height != size.h || size.w <= 0 || size.h <= 0 {
@@ -903,7 +939,8 @@ fn frame_period(refresh_mhz: i32) -> Duration {
     } else {
         DEFAULT_REFRESH_MHZ
     };
-    Duration::from_micros(1_000_000_000 / u64::from(mhz.unsigned_abs())).max(Duration::from_micros(1_000_000 / 240))
+    Duration::from_micros(1_000_000_000 / u64::from(mhz.unsigned_abs()))
+        .max(Duration::from_micros(1_000_000 / 240))
 }
 
 /// How long until a capture last drawn at `last` may be drawn again, or
@@ -972,8 +1009,14 @@ mod tests {
     fn a_buffer_must_match_format_size_stride_and_pool() {
         let size = Size::from((100, 50));
         let pool = 100 * 4 * 50;
-        assert_eq!(check_buffer(&shm(wl_shm::Format::Argb8888, 100, 50, 400), pool, size), Ok(()));
-        assert_eq!(check_buffer(&shm(wl_shm::Format::Xrgb8888, 100, 50, 400), pool, size), Ok(()));
+        assert_eq!(
+            check_buffer(&shm(wl_shm::Format::Argb8888, 100, 50, 400), pool, size),
+            Ok(())
+        );
+        assert_eq!(
+            check_buffer(&shm(wl_shm::Format::Xrgb8888, 100, 50, 400), pool, size),
+            Ok(())
+        );
         assert_eq!(
             check_buffer(&shm(wl_shm::Format::Rgb565, 100, 50, 400), pool, size),
             Err(Refused::Format)
@@ -992,12 +1035,20 @@ mod tests {
             Err(Refused::Pool)
         );
         assert_eq!(
-            check_buffer(&shm(wl_shm::Format::Argb8888, 100, 50, 512), 512 * 49 + 400, size),
+            check_buffer(
+                &shm(wl_shm::Format::Argb8888, 100, 50, 512),
+                512 * 49 + 400,
+                size
+            ),
             Ok(())
         );
         // Nothing fits an empty size, whatever the buffer.
         assert_eq!(
-            check_buffer(&shm(wl_shm::Format::Argb8888, 0, 0, 0), 0, Size::from((0, 0))),
+            check_buffer(
+                &shm(wl_shm::Format::Argb8888, 0, 0, 0),
+                0,
+                Size::from((0, 0))
+            ),
             Err(Refused::Size)
         );
     }
@@ -1048,7 +1099,10 @@ mod tests {
         let now = Instant::now();
         assert_eq!(until_due(None, now, period), None, "never drawn: due");
         let just = now - Duration::from_millis(2);
-        assert_eq!(until_due(Some(just), now, period), Some(Duration::from_millis(12)));
+        assert_eq!(
+            until_due(Some(just), now, period),
+            Some(Duration::from_millis(12))
+        );
         // A tick a millisecond early still counts.
         let early = now - Duration::from_millis(15);
         assert_eq!(until_due(Some(early), now, period), None);
@@ -1056,11 +1110,17 @@ mod tests {
 
     #[test]
     fn a_still_source_draws_nothing_after_the_first_frame() {
-        assert!(wants_frame(true, false, false, false), "the first frame is at once");
+        assert!(
+            wants_frame(true, false, false, false),
+            "the first frame is at once"
+        );
         assert!(!wants_frame(false, false, false, false));
         assert!(wants_frame(false, true, false, false));
         assert!(wants_frame(false, false, true, false), "a ring is fading");
-        assert!(wants_frame(false, false, false, true), "a ring must be taken out");
+        assert!(
+            wants_frame(false, false, false, true),
+            "a ring must be taken out"
+        );
     }
 
     #[test]

@@ -413,6 +413,16 @@ impl Space {
         Some(pane)
     }
 
+    /// Turn the active workspace's tiling the other way — two windows side by
+    /// side, or two windows stacked — and report the orientation now in force.
+    ///
+    /// Call [`Self::arrange`] afterwards: the tree is rebuilt there, which is
+    /// where the new shape actually appears.
+    pub fn toggle_tile_orientation(&mut self) -> tiles::Orientation {
+        let area = self.area();
+        self.workspaces[self.active].toggle_tile_orientation(area)
+    }
+
     /// The area available to windows on the focused output.
     pub fn area(&self) -> Rect {
         self.outputs[self.focused_output()].area
@@ -871,7 +881,9 @@ impl Space {
             .iter()
             .enumerate()
             .filter(|&(index, _)| index != self.focused_output())
-            .filter(|(_, screen)| dir.advances(from, screen.output) && dir.aligned(from, screen.output))
+            .filter(|(_, screen)| {
+                dir.advances(from, screen.output) && dir.aligned(from, screen.output)
+            })
             .min_by_key(|(_, screen)| dir.distance(from, screen.output))
             .map(|(index, _)| index)
     }
@@ -2804,7 +2816,10 @@ mod tests {
         assert_eq!(s.visible_on(2), Some(2));
 
         let changed = s.arrange();
-        assert!(changed.iter().all(|&(id, _)| id != third), "the third screen is untouched");
+        assert!(
+            changed.iter().all(|&(id, _)| id != third),
+            "the third screen is untouched"
+        );
         assert_eq!(s.window(third).unwrap().geometry, before);
         for id in [terminal, brave] {
             assert!(LEFT.contains(s.window(id).unwrap().geometry.center()));
@@ -2844,7 +2859,10 @@ mod tests {
 
         s.pull_workspace(1);
         s.arrange();
-        assert_eq!(s.window(id).unwrap().geometry, Rect::from_xywh(100, 200, 640, 480));
+        assert_eq!(
+            s.window(id).unwrap().geometry,
+            Rect::from_xywh(100, 200, 640, 480)
+        );
     }
 
     #[test]
@@ -2865,7 +2883,11 @@ mod tests {
     #[test]
     fn the_output_toward_a_direction_is_the_one_beside_it() {
         let mut s = three_screens();
-        assert_eq!(s.output_toward(Dir::Right), Some(1), "the nearest, not the furthest");
+        assert_eq!(
+            s.output_toward(Dir::Right),
+            Some(1),
+            "the nearest, not the furthest"
+        );
         assert_eq!(s.output_toward(Dir::Left), None);
         assert_eq!(s.output_toward(Dir::Up), None);
         s.focus_output(2);
@@ -2886,7 +2908,11 @@ mod tests {
         assert_eq!(s.focused(), Some(brave));
         assert_eq!(s.active_workspace().windows(), &[terminal, brave]);
         assert_eq!(s.workspaces()[1].windows(), &[editor], "the rest stay");
-        assert_eq!(s.workspaces()[1].focused(), Some(editor), "and something there has focus");
+        assert_eq!(
+            s.workspaces()[1].focused(),
+            Some(editor),
+            "and something there has focus"
+        );
         assert_eq!(s.visible_on(1), Some(1));
     }
 
@@ -2918,7 +2944,11 @@ mod tests {
         let g = s.window(top).unwrap().geometry;
         assert!(PORTRAIT.contains(g.center()));
         assert!(g.w() <= PORTRAIT.w());
-        assert_eq!(s.visible_on(1), Some(1), "the rotated screen keeps its workspace");
+        assert_eq!(
+            s.visible_on(1),
+            Some(1),
+            "the rotated screen keeps its workspace"
+        );
         assert_eq!(s.focused_output(), 1);
     }
 

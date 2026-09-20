@@ -79,10 +79,11 @@ pub(crate) enum Action {
     Lock,
     /// Show the keybinding overlay.
     OpenHelp,
-    /// Close the keybinding overlay. Escape, and only reachable while the
-    /// overlay is up, which is why it has no row in [`BINDINGS`]; a click
-    /// outside it does the same from the pointer side.
-    CloseHelp,
+    /// A key while the keybinding overlay is up: the filter over the table,
+    /// and Escape, which clears it and then closes the panel. Only reachable
+    /// while the overlay is up, which is why it has no row in [`BINDINGS`]; a
+    /// click outside it closes it from the pointer side.
+    Help(crate::overlay::Key),
     /// Put the dock's context menu away.
     ///
     /// Reachable only while that menu is up, which is why it has no row in
@@ -101,6 +102,9 @@ pub(crate) enum Action {
     Resize(Dir),
     /// Leave resize mode.
     LeaveResize,
+    /// Turn the active workspace's tiling the other way: two windows side by
+    /// side, or two windows stacked.
+    ToggleTileOrientation,
     /// Move the overview's highlight one window over.
     OverviewMove(Dir),
     /// Take the overview's highlighted window: it gets the screen to itself
@@ -208,8 +212,10 @@ pub(crate) struct Modes {
     /// A region screenshot is being dragged out. Every key but Escape is
     /// swallowed so a keystroke cannot act on a window under the selection.
     pub selecting_region: bool,
-    /// The keybinding overlay is up, and Escape closes it.
-    pub help_open: bool,
+    /// The keybinding overlay is up, and the character this key produces. It
+    /// takes the unmodified keys as a filter over the table; every chord falls
+    /// through to what it would otherwise have meant.
+    pub help: Option<Option<char>>,
     /// The dock's context menu is up, and Escape closes it.
     pub dock_menu_open: bool,
 }
@@ -309,6 +315,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "resize the focused window with the arrows",
     },
     Binding {
+        action: Action::ToggleTileOrientation,
+        chord: "Super+Ctrl+O",
+        description: "turn the tiling: windows side by side, or stacked",
+    },
+    Binding {
         action: Action::Workspace(0),
         chord: "Super+Ctrl+1..9",
         description: "go to a workspace",
@@ -323,6 +334,14 @@ pub(crate) const BINDINGS: &[Binding] = &[
         action: Action::Workspace(0),
         chord: "Super+wheel",
         description: "go to the workspace either side; slides the overview",
+    },
+    Binding {
+        // Carries `EnterResize` rather than `Resize`, which only resolves with
+        // the mode already on: the row is documentation, and the discriminant
+        // is what keeps `bindings_cover_every_action` able to check it.
+        action: Action::EnterResize,
+        chord: "Super+Ctrl+wheel",
+        description: "grow or shrink the focused tile",
     },
     Binding {
         action: Action::MinimizeFocused,
@@ -486,12 +505,27 @@ pub(crate) fn resolve(
         return FilterResult::Intercept(action.and_then(|action| pressed(key_state, action)));
     }
 
-    // The keybinding overlay closes on Escape, ahead of every panel it is
-    // drawn over. Only Escape: the list is there to be read while the chords
-    // on it are tried, so every other key goes where it would have gone. And
-    // only Escape without Super, so `Super`+`Ctrl`+`Esc` still quits.
-    if mode.help_open && sym == keysyms::KEY_Escape && !modifiers.logo {
-        return FilterResult::Intercept(pressed(key_state, Action::CloseHelp));
+    // The keybinding overlay takes the bare keys as a filter over its table,
+    // and Escape to clear or close, ahead of every panel it is drawn over —
+    // it is drawn over them, so it is the one the keyboard should be talking
+    // to. See [`crate::state::Huginn::scene`] for that order.
+    //
+    // Only the bare keys. The list is there to be read *while* the chords on
+    // it are tried, so anything with a modifier goes where it would have gone:
+    // `Super`+`Ctrl`+`Q` still closes a window, and `Super`+`Ctrl`+`Esc` still
+    // quits, with the overlay open over the lot. A key the filter has no use
+    // for — a function key, Insert — falls through too rather than being
+    // swallowed, which is what leaves `Print` below still able to take a
+    // screenshot of the overlay itself.
+    if let Some(character) = mode.help
+        && !modifiers.logo
+        && !modifiers.ctrl
+        && !modifiers.alt
+    {
+        let key = crate::overlay::Key::from_keysym(sym, character);
+        if key != crate::overlay::Key::Ignored {
+            return FilterResult::Intercept(pressed(key_state, Action::Help(key)));
+        }
     }
 
     // Screenshots resolve here, before the `Super`-layer gate below, so `Print`
@@ -686,6 +720,9 @@ pub(crate) fn resolve(
         keysyms::KEY_n | keysyms::KEY_N if modifiers.shift => Action::DismissNotifications,
         keysyms::KEY_n | keysyms::KEY_N => Action::DismissNotification,
         keysyms::KEY_r | keysyms::KEY_R => Action::EnterResize,
+        // O for orientation. Beside R, which resizes within whichever one is
+        // in force.
+        keysyms::KEY_o | keysyms::KEY_O => Action::ToggleTileOrientation,
         // Ctrl is what separates this from `Super`+`C`, which is copy: the
         // branch above returns before this one whenever Ctrl is not held.
         keysyms::KEY_c | keysyms::KEY_C => Action::ToggleCarousel,
@@ -900,31 +937,70 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn escape_closes_the_help_overlay_and_nothing_else_is_taken() {
-        let help = Modes {
-            help_open: true,
+    /// The overlay up, with `ch` the character the pressed key produces.
+    fn with_help(ch: Option<char>) -> Modes {
+        Modes {
+            help: Some(ch),
             ..Modes::default()
-        };
+        }
+    }
+
+    #[test]
+    fn the_help_overlay_takes_the_bare_keys_as_its_filter() {
+        let plain = ModifiersState::default();
+        assert!(matches!(
+            resolve(
+                KeyState::Pressed,
+                &plain,
+                keysyms::KEY_a,
+                with_help(Some('a'))
+            ),
+            FilterResult::Intercept(Some(Action::Help(crate::overlay::Key::Insert('a'))))
+        ));
+        assert!(matches!(
+            resolve(
+                KeyState::Pressed,
+                &plain,
+                keysyms::KEY_BackSpace,
+                with_help(None)
+            ),
+            FilterResult::Intercept(Some(Action::Help(crate::overlay::Key::Backspace)))
+        ));
+        // A key with no printable form is not typed into the filter, and is
+        // not swallowed either — `Print` below still captures the overlay.
+        assert!(matches!(
+            resolve(
+                KeyState::Pressed,
+                &plain,
+                keysyms::KEY_Print,
+                with_help(None)
+            ),
+            FilterResult::Intercept(Some(Action::Screenshot(_)))
+        ));
+    }
+
+    #[test]
+    fn escape_clears_the_overlay_filter_and_the_chords_still_work_under_it() {
+        let help = with_help(None);
         let plain = ModifiersState::default();
         assert!(matches!(
             resolve(KeyState::Pressed, &plain, keysyms::KEY_Escape, help),
-            FilterResult::Intercept(Some(Action::CloseHelp))
+            FilterResult::Intercept(Some(Action::Help(crate::overlay::Key::Escape)))
         ));
         // Its release is swallowed with it, and acts on nothing.
         assert!(matches!(
             resolve(KeyState::Released, &plain, keysyms::KEY_Escape, help),
             FilterResult::Intercept(None)
         ));
-        // Other keys go where they would have gone: the list is read while
-        // the chords on it are tried.
-        assert!(matches!(
-            resolve(KeyState::Pressed, &plain, keysyms::KEY_a, help),
-            FilterResult::Forward
-        ));
+        // Every chord goes where it would have gone: the list is read while
+        // the chords on it are tried, so a modifier is never the filter's.
         assert!(matches!(
             resolve(KeyState::Pressed, &super_ctrl(), keysyms::KEY_j, help),
             FilterResult::Intercept(Some(Action::FocusNext))
+        ));
+        assert!(matches!(
+            resolve(KeyState::Pressed, &alt_held(), keysyms::KEY_Tab, help),
+            FilterResult::Intercept(Some(Action::AltTab(_)))
         ));
         // Quitting is still Super+Ctrl+Esc, overlay or not.
         assert!(matches!(
@@ -1691,6 +1767,19 @@ mod tests {
             "an action is reachable by a key but missing from BINDINGS, so the \
              overlay and the log line will not mention it"
         );
+    }
+
+    #[test]
+    fn super_ctrl_o_turns_the_tiling() {
+        for sym in [keysyms::KEY_o, keysyms::KEY_O] {
+            assert_eq!(
+                intercepted(super_ctrl(), sym),
+                Some(Action::ToggleTileOrientation)
+            );
+        }
+        // Plain `Super`+`O` is the focused application's, like the rest of
+        // that layer.
+        assert!(forwarded(KeyState::Pressed, super_held(), keysyms::KEY_o));
     }
 
     #[test]

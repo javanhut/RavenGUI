@@ -795,7 +795,14 @@ where
     let mut framebuffer = renderer
         .bind(target)
         .map_err(|e| anyhow::anyhow!("binding the bridge: {e}"))?;
-    draw(renderer, &mut framebuffer, size, Transform::Normal, scale, elements)
+    draw(
+        renderer,
+        &mut framebuffer,
+        size,
+        Transform::Normal,
+        scale,
+        elements,
+    )
 }
 
 fn draw(
@@ -1827,7 +1834,7 @@ impl Udev {
         let locked = self.state.is_locked();
         let switcher_open = self.state.app_switcher_open();
         let selecting_region = self.state.region_active();
-        let help_open = self.state.help_open();
+        let help_up = self.state.help_open();
         let dock_menu_open = self.state.dock_menu_is_open();
         let action = self
             .keyboard
@@ -1845,6 +1852,7 @@ impl Udev {
                         // than what a US keyboard would have.
                         let character = sym.key_char();
                         let launcher = launcher_open.then_some(character);
+                        let help = help_up.then_some(character);
                         resolve(
                             key_state,
                             modifiers,
@@ -1859,7 +1867,7 @@ impl Udev {
                                 locked,
                                 switcher_open,
                                 selecting_region,
-                                help_open,
+                                help,
                                 dock_menu_open,
                             },
                         )
@@ -1914,8 +1922,8 @@ impl Udev {
                 state.open_help();
                 return;
             }
-            Action::CloseHelp => {
-                state.close_help();
+            Action::Help(key) => {
+                state.help_key(key);
                 return;
             }
             Action::CloseDockMenu => {
@@ -1934,6 +1942,7 @@ impl Udev {
             }
             Action::Resize(dir) => state.resize_focused(dir),
             Action::LeaveResize => state.set_resize_mode(false),
+            Action::ToggleTileOrientation => state.toggle_tile_orientation(),
             Action::OverviewMove(dir) => state.overview_move(dir),
             Action::OverviewConfirm => state.overview_confirm(),
             Action::OverviewCancel => state.close_workspace_carousel(),
@@ -2097,15 +2106,15 @@ impl Udev {
             self.handle.remove(token);
         }
         let timer = Timer::immediate();
-        match self.handle.insert_source(timer, |_, _, data: &mut Udev| {
-            match data.tick_captures() {
+        match self
+            .handle
+            .insert_source(timer, |_, _, data: &mut Udev| match data.tick_captures() {
                 Some(wait) => TimeoutAction::ToDuration(wait),
                 None => {
                     data.capture_timer = None;
                     TimeoutAction::Drop
                 }
-            }
-        }) {
+            }) {
             Ok(token) => self.capture_timer = Some(token),
             Err(e) => tracing::error!(error = %e, "cannot arm the capture timer"),
         }

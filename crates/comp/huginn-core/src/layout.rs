@@ -240,8 +240,9 @@ pub fn parse(text: &str) -> Vec<Saved> {
 
 /// Write the saved layout, in the format [`parse`] reads.
 pub fn to_text(saved: &[Saved]) -> String {
-    let mut out =
-        String::from("# raven outputs: name x,y [scale] [rotate=90] [primary]  -- see huginn docs/outputs.md\n");
+    let mut out = String::from(
+        "# raven outputs: name x,y [scale] [rotate=90] [primary]  -- see huginn docs/outputs.md\n",
+    );
     for entry in saved {
         out.push_str(&entry.name);
         out.push(' ');
@@ -474,13 +475,18 @@ mod tests {
         assert_eq!(primary(&saved), None);
 
         let two = parse("DP-1 0,0 primary\neDP-1 - 1.5 rotate=90 primary\n");
-        assert!(two[0].primary && !two[1].primary, "a hand-edited second one is ignored");
+        assert!(
+            two[0].primary && !two[1].primary,
+            "a hand-edited second one is ignored"
+        );
         assert_eq!(two[1].rotation, Rotation::Deg90);
     }
 
     #[test]
     fn a_rotation_that_is_not_a_quarter_turn_costs_its_line() {
-        let parsed = parse("DP-1 0,0 rotate=45\nDP-2 0,0 rotate=sideways\nDP-3 0,0 1 2\neDP-1 - rotate=180\n");
+        let parsed = parse(
+            "DP-1 0,0 rotate=45\nDP-2 0,0 rotate=sideways\nDP-3 0,0 1 2\neDP-1 - rotate=180\n",
+        );
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].rotation, Rotation::Deg180);
     }

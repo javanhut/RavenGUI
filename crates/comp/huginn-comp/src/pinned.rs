@@ -909,9 +909,7 @@ fn compose(
             menu_w as i32,
             menu_h as i32,
         ));
-        layout
-            .menu_hits
-            .extend(hits.into_iter().zip(0..));
+        layout.menu_hits.extend(hits.into_iter().zip(0..));
     }
 
     (canvas, layout)

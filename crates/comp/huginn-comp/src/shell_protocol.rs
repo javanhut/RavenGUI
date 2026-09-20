@@ -331,7 +331,9 @@ impl Dispatch<RavenOutputLayoutV1, ()> for Huginn {
             raven_output_layout_v1::Request::SetRotation { name, rotation } => {
                 match huginn_core::layout::Rotation::from_raw(rotation) {
                     Some(rotation) => state.stage_output_rotation(&name, rotation),
-                    None => tracing::warn!(%name, rotation, "ignoring a rotation that is not a quarter turn"),
+                    None => {
+                        tracing::warn!(%name, rotation, "ignoring a rotation that is not a quarter turn")
+                    }
                 }
             }
             raven_output_layout_v1::Request::SetPrimary { name } => {

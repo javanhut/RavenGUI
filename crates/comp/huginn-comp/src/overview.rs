@@ -110,7 +110,11 @@ pub(crate) fn spaces_bar(
         .iter()
         .enumerate()
         .map(|(index, name)| {
-            let badge = if tag(index).is_some() { tag_side + gap } else { 0.0 };
+            let badge = if tag(index).is_some() {
+                tag_side + gap
+            } else {
+                0.0
+            };
             text.measure(name, size).0 + badge + pad * 2.0
         })
         .collect();
@@ -233,7 +237,15 @@ pub(crate) fn screen_badge(
     let scale = ui_scale(output) * density as f32;
     let side = (BADGE_SIDE * scale).ceil();
     let mut canvas = Canvas::new(side as usize, side as usize);
-    draw_number_square(text, &mut canvas, number, 0.0, 0.0, side, BADGE_SIZE * scale);
+    draw_number_square(
+        text,
+        &mut canvas,
+        number,
+        0.0,
+        0.0,
+        side,
+        BADGE_SIZE * scale,
+    );
     let panel = Panel::from_canvas(&canvas, density);
     let (pw, ph) = panel.size();
     let margin = (BADGE_MARGIN * ui_scale(output)) as i32;
@@ -415,7 +427,11 @@ mod tests {
         ];
         assert_eq!(screen_numbers(&rects, Some(1)), vec![2, 1, 3]);
         assert_eq!(screen_numbers(&rects, Some(2)), vec![2, 3, 1]);
-        assert_eq!(screen_numbers(&rects, Some(9)), vec![1, 2, 3], "no such screen");
+        assert_eq!(
+            screen_numbers(&rects, Some(9)),
+            vec![1, 2, 3],
+            "no such screen"
+        );
     }
 
     #[test]

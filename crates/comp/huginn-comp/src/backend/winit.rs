@@ -521,7 +521,7 @@ impl Nested {
                 let locked = self.state.is_locked();
                 let switcher_open = self.state.app_switcher_open();
                 let selecting_region = self.state.region_active();
-                let help_open = self.state.help_open();
+                let help_up = self.state.help_open();
                 let dock_menu_open = self.state.dock_menu_is_open();
                 let action = self
                     .keyboard
@@ -539,6 +539,7 @@ impl Nested {
                                 // than what a US keyboard would have.
                                 let character = sym.key_char();
                                 let launcher = launcher_open.then_some(character);
+                                let help = help_up.then_some(character);
                                 resolve(
                                     key_state,
                                     modifiers,
@@ -553,7 +554,7 @@ impl Nested {
                                         locked,
                                         switcher_open,
                                         selecting_region,
-                                        help_open,
+                                        help,
                                         dock_menu_open,
                                     },
                                 )
@@ -627,8 +628,8 @@ impl Nested {
                 state.open_help();
                 return;
             }
-            Action::CloseHelp => {
-                state.close_help();
+            Action::Help(key) => {
+                state.help_key(key);
                 return;
             }
             Action::CloseDockMenu => {
@@ -647,6 +648,7 @@ impl Nested {
             }
             Action::Resize(dir) => state.resize_focused(dir),
             Action::LeaveResize => state.set_resize_mode(false),
+            Action::ToggleTileOrientation => state.toggle_tile_orientation(),
             Action::OverviewMove(dir) => state.overview_move(dir),
             Action::OverviewConfirm => state.overview_confirm(),
             Action::OverviewCancel => state.close_workspace_carousel(),

@@ -4,13 +4,19 @@
 //! through [`crate::text`] — real shaping and antialiased rasterization — which
 //! is what lets this be a panel someone reads rather than a debugging aid.
 //!
-//! Keycaps and labels are painted once when the panel opens.
+//! Keycaps and labels are painted when the panel opens, and again on every
+//! keystroke that changes the filter — the table is thirty-odd rows and grew
+//! past the point where "read the whole thing" is how anybody finds a chord,
+//! so typing narrows it to the rows that match.
 
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+use smithay::input::keyboard::keysyms;
+
+use std::collections::HashMap;
 
 use huginn_core::geometry::Rect;
 
-use crate::backend::keymap::BINDINGS;
+use crate::backend::keymap::{BINDINGS, Binding};
 use crate::canvas::{Canvas, Panel};
 use crate::text::{Text, Weight};
 use crate::theme::{self, Color};
@@ -55,8 +61,87 @@ const CAP_SHINE: Color = Color::from_argb(0xFFFF_FFFF);
 const CAP_SHADOW: Color = Color::from_argb(0x5A00_0000);
 
 const TITLE: &str = "Huginn keybindings";
-const FOOTER: &str =
-    "Esc or a click outside closes this. Plain Super belongs to the focused application.";
+const FOOTER: &str = "Type to filter. Esc clears the filter, then closes this — \
+so does a click outside. Plain Super belongs to the focused application.";
+/// Shown in place of the table when the filter matches nothing. Better than an
+/// empty panel, which reads as the overlay having broken rather than as a
+/// query having come up short.
+const NO_MATCH: &str = "No binding matches that.";
+/// Between the title and the filter at the other end of its row.
+const HEAD_GAP: f32 = 32.0;
+
+/// A keystroke the overlay takes while it is up.
+///
+/// Only the keys a filter needs. Everything else falls through to the chord it
+/// would otherwise have been, which is the point of the panel: the list is
+/// there to be read *while* the chords on it are tried, so `Super`+`Ctrl`+`Q`
+/// still closes a window with the overlay open over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Key {
+    /// Add a character to the filter.
+    Insert(char),
+    /// Drop the last one.
+    Backspace,
+    /// Clear the filter, or — with nothing to clear — close the overlay.
+    Escape,
+    /// Not the overlay's. See [`Self::from_keysym`].
+    Ignored,
+}
+
+impl Key {
+    /// What a keysym means to the overlay. `character` is what the layout
+    /// produces, so the filter takes what was pressed rather than what a US
+    /// keyboard would have made of it.
+    ///
+    /// The caller has already established that no modifier is held, so a
+    /// control character here is a key with no printable form — Insert, F5 —
+    /// rather than a chord, and either way not something to type.
+    pub(crate) fn from_keysym(sym: u32, character: Option<char>) -> Self {
+        match sym {
+            keysyms::KEY_Escape => Self::Escape,
+            keysyms::KEY_BackSpace => Self::Backspace,
+            _ => match character {
+                Some(c) if !c.is_control() => Self::Insert(c),
+                _ => Self::Ignored,
+            },
+        }
+    }
+}
+
+/// The bindings a filter leaves, in table order.
+///
+/// Every whitespace-separated word of `query` has to appear somewhere in the
+/// row — in the chord or in the description, case ignored. Words rather than
+/// the whole string so that "super wheel" finds the row written
+/// `Super+Ctrl+wheel`, where a plain substring search would not: nobody types
+/// a chord's punctuation, and the two halves of a row are two different kinds
+/// of thing to be searching.
+///
+/// Substring rather than fuzzy on purpose. A filter that quietly keeps a row
+/// because its letters appear in order somewhere is one you cannot trust to
+/// have excluded anything, and the whole value here is in what is *left*.
+fn matching(query: &str) -> Vec<&'static Binding> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    BINDINGS
+        .iter()
+        .filter(|binding| {
+            if terms.is_empty() {
+                return true;
+            }
+            let haystack = format!("{} {}", binding.chord, binding.description).to_lowercase();
+            terms.iter().all(|term| haystack.contains(term.as_str()))
+        })
+        .collect()
+}
+
+/// The right-hand end of the title row while a filter is on: what was typed,
+/// and how much of the table it has left.
+fn head(query: &str, shown: usize) -> Option<String> {
+    (!query.is_empty()).then(|| format!("{query}   ·   {shown} of {}", BINDINGS.len()))
+}
 
 /// The keybinding overlay.
 #[derive(Debug)]
@@ -66,10 +151,14 @@ pub(crate) struct Overlay {
 
 impl Overlay {
     /// Draw the overlay, sized to sit comfortably on `output`, at `density`
-    /// pixels per logical one.
-    pub(crate) fn render(output: Rect, text: &mut Text, density: u32) -> Self {
+    /// pixels per logical one, showing the rows `query` leaves.
+    ///
+    /// An empty `query` is the whole table, which is what opening it gives
+    /// you: the filter is there for when reading the list is slower than
+    /// describing the thing you want.
+    pub(crate) fn render(output: Rect, text: &mut Text, density: u32, query: &str) -> Self {
         Self {
-            panel: Panel::from_canvas(&compose(output, text, density), density),
+            panel: Panel::from_canvas(&compose(output, text, density, query), density),
         }
     }
 
@@ -169,6 +258,59 @@ struct Layout {
     w: usize,
     h: usize,
     rows: Vec<RowLayout>,
+    /// The bindings these rows are for: the whole table, or what the filter
+    /// left of it. Held here rather than re-derived at paint time, so the
+    /// geometry and the text can never be measured from two different lists.
+    shown: Vec<&'static Binding>,
+    /// What to print at the other end of the title row. `None` with no filter.
+    head: Option<String>,
+}
+
+/// Text measurements, kept across the passes one [`fit`] makes.
+///
+/// `fit` lays the panel out up to ten times — two column counts, each shrunk
+/// until it fits — over the same few dozen strings, and shaping them is most
+/// of what that costs. That was paid once per opening before the panel had a
+/// filter; now it is paid on every keystroke, which is the difference between
+/// measuring each string once per size and dropping a frame per character.
+///
+/// Keyed by the string, the size and the weight, which is everything a
+/// measurement depends on. Every string here is `&'static str` from
+/// [`BINDINGS`] or a constant above, so the key borrows rather than copies.
+type Measures = HashMap<(&'static str, u32, bool), (f32, f32)>;
+
+/// What the panel is being laid out *for*, which is the same for every pass
+/// [`fit`] makes: the rows to show, the filter that chose them, and how much
+/// of the screen there is to fill.
+///
+/// Gathered rather than passed as four more arguments, because only `size` and
+/// `columns` vary between passes and a call that took all six positionally was
+/// one nobody could read or check.
+#[derive(Clone, Copy)]
+struct Request<'a> {
+    shown: &'a [&'static Binding],
+    query: &'a str,
+    /// Canvas pixels per logical pixel. See [`fit`].
+    px: f32,
+    /// The width and height the panel may fill, in canvas pixels.
+    room: (f32, f32),
+}
+
+/// [`Text::measure_weighted`], memoized in `seen`.
+fn measure(
+    seen: &mut Measures,
+    text: &mut Text,
+    s: &'static str,
+    size: f32,
+    bold: bool,
+) -> (f32, f32) {
+    *seen.entry((s, size.to_bits(), bold)).or_insert_with(|| {
+        if bold {
+            text.measure_weighted(s, size, Weight::BOLD)
+        } else {
+            text.measure(s, size)
+        }
+    })
 }
 
 /// Lay the panel out at a size and column count that fits on `output`.
@@ -184,7 +326,8 @@ struct Layout {
 /// as many per logical pixel as a 1× one. `px` is that factor; it goes into
 /// every dimension and `Panel::from_canvas` divides it back out, so the panel
 /// is placed at the same logical size either way.
-fn fit(output: Rect, text: &mut Text, density: u32) -> Layout {
+fn fit(output: Rect, text: &mut Text, density: u32, query: &str) -> Layout {
+    let shown = matching(query);
     let px = density.max(1) as f32;
     let room = (output.w() as f32 * px * FILL, output.h() as f32 * px * FILL);
     let wanted = (BASE_SIZE * (output.h() as f32 / 1080.0)).clamp(BASE_SIZE, BASE_SIZE * 2.5) * px;
@@ -202,8 +345,15 @@ fn fit(output: Rect, text: &mut Text, density: u32) -> Layout {
         )
     };
     let mut best: Option<Layout> = None;
+    let mut seen = Measures::new();
+    let request = Request {
+        shown: &shown,
+        query,
+        px,
+        room,
+    };
     for columns in [1, 2] {
-        let layout = shrink_to_fit(text, wanted, px, room, columns);
+        let layout = shrink_to_fit(&mut seen, text, wanted, columns, request);
         let better = best.as_ref().is_none_or(|best| {
             rank(&layout).partial_cmp(&rank(best)) == Some(std::cmp::Ordering::Greater)
         });
@@ -215,10 +365,17 @@ fn fit(output: Rect, text: &mut Text, density: u32) -> Layout {
 }
 
 /// [`lay_out`] at `size`, shrunk until it fits `room` or reaches the floor.
-fn shrink_to_fit(text: &mut Text, size: f32, px: f32, room: (f32, f32), columns: usize) -> Layout {
+fn shrink_to_fit(
+    seen: &mut Measures,
+    text: &mut Text,
+    size: f32,
+    columns: usize,
+    request: Request<'_>,
+) -> Layout {
+    let (px, room) = (request.px, request.room);
     let floor = MIN_SIZE * px;
     let mut size = size;
-    let mut layout = lay_out(text, size, px, columns);
+    let mut layout = lay_out(seen, text, size, columns, request);
     // Shaped text is not quite linear in its size and the padding does not
     // scale with it at all, so one proportional step can leave the panel a
     // little over. A few more converge.
@@ -228,13 +385,23 @@ fn shrink_to_fit(text: &mut Text, size: f32, px: f32, room: (f32, f32), columns:
             break;
         }
         size = (size / over).max(floor);
-        layout = lay_out(text, size, px, columns);
+        layout = lay_out(seen, text, size, columns, request);
     }
     layout
 }
 
-/// Measure and place the panel at text `size`, in `columns` columns.
-fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
+/// Measure and place the panel at text `size`, in `columns` columns, for the
+/// rows in `shown`.
+fn lay_out(
+    seen: &mut Measures,
+    text: &mut Text,
+    size: f32,
+    columns: usize,
+    request: Request<'_>,
+) -> Layout {
+    let Request {
+        shown, query, px, ..
+    } = request;
     // Key dimensions follow the text, rounded at 1x and then multiplied out,
     // so a 2× panel is exactly twice a 1× one rather than rounding apart.
     let unit = size / px;
@@ -260,30 +427,27 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
         px,
     );
 
-    let mut measured = Vec::with_capacity(BINDINGS.len());
-    for binding in BINDINGS {
+    let mut measured = Vec::with_capacity(shown.len());
+    for binding in shown {
         let chord = parse(binding.chord);
         let mut widths = Vec::with_capacity(chord.items.len());
         for item in &chord.items {
             widths.push(match *item {
                 // Never much narrower than tall: a single letter is a square
                 // key, not a sliver.
-                Item::Cap(key) => (text.measure_weighted(key, label_size, Weight::BOLD).0
-                    + label_pad * 2.0)
+                Item::Cap(key) => (measure(seen, text, key, label_size, true).0 + label_pad * 2.0)
                     .max(cap_h * 1.05)
                     .ceil(),
-                Item::Sep(sep) => {
-                    text.measure_weighted(sep, size, Weight::BOLD).0.ceil() + sep_gap * 2.0
-                }
+                Item::Sep(sep) => measure(seen, text, sep, size, true).0.ceil() + sep_gap * 2.0,
             });
         }
-        let description = text.measure(binding.description, size).0;
+        let description = measure(seen, text, binding.description, size, false).0;
         measured.push((chord, widths, description));
     }
 
     let top = pad + line + line_gap + rule + line_gap;
-    let per_column = BINDINGS.len().div_ceil(columns.max(1));
-    let mut rows = Vec::with_capacity(BINDINGS.len());
+    let per_column = shown.len().div_ceil(columns.max(1)).max(1);
+    let mut rows = Vec::with_capacity(shown.len());
     let mut longest = 0;
     let mut x = pad;
     let mut remaining = measured.into_iter();
@@ -327,11 +491,32 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
         }
         x = (desc_x + description_w + columns_gap).ceil();
     }
-    let columns_w = x - columns_gap - pad;
+    // With nothing matched there are no columns at all, and `x` never moved
+    // off the padding — so the table's width is the message that stands in
+    // for it.
+    let head = head(query, shown.len());
+    let columns_w = if shown.is_empty() {
+        measure(seen, text, NO_MATCH, size, false).0
+    } else {
+        x - columns_gap - pad
+    };
+    // The filter's own text is the one string here that is not `'static`, and
+    // it is one string: measured outright rather than given a key of its own.
+    let title_w = measure(seen, text, TITLE, size, false).0
+        + head
+            .as_deref()
+            .map_or(0.0, |head| HEAD_GAP * px + text.measure(head, size).0);
     let body_w = columns_w
-        .max(text.measure(TITLE, size).0)
-        .max(text.measure(FOOTER, size).0);
-    let rows_h = longest as f32 * box_h + longest.saturating_sub(1) as f32 * row_gap;
+        .max(title_w)
+        .max(measure(seen, text, FOOTER, size, false).0);
+    // The empty state still needs a line's worth of room, or the footer would
+    // come up under the rule and the panel would look like it had lost its
+    // middle rather than like it had nothing to show.
+    let rows_h = if shown.is_empty() {
+        line
+    } else {
+        longest as f32 * box_h + longest.saturating_sub(1) as f32 * row_gap
+    };
     let footer_y = top + rows_h + line_gap * 2.0;
 
     Layout {
@@ -354,6 +539,8 @@ fn lay_out(text: &mut Text, size: f32, px: f32, columns: usize) -> Layout {
         w: (body_w + pad * 2.0).ceil() as usize,
         h: (footer_y + line + pad).ceil() as usize,
         rows,
+        shown: shown.to_vec(),
+        head,
     }
 }
 
@@ -372,6 +559,20 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
         y as i32,
         theme::accent(),
     );
+    // What was typed, at the far end of the title's own row: it belongs with
+    // the heading rather than above the list, where it would read as a row of
+    // the table.
+    if let Some(head) = &l.head {
+        let w = text.measure(head, l.size).0;
+        text.draw(
+            &mut canvas,
+            head,
+            l.size,
+            (l.pad + l.body_w - w).round() as i32,
+            y as i32,
+            theme::TEXT,
+        );
+    }
     canvas.tint(
         l.pad as usize,
         (y + l.line + l.line_gap) as usize,
@@ -381,7 +582,19 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
         0x14,
     );
 
-    for (row, binding) in l.rows.iter().zip(BINDINGS) {
+    if l.shown.is_empty() {
+        let top = l.pad + l.line + l.line_gap + l.rule + l.line_gap;
+        text.draw(
+            &mut canvas,
+            NO_MATCH,
+            l.size,
+            l.pad as i32,
+            top as i32,
+            theme::TEXT_DIM,
+        );
+    }
+
+    for (row, binding) in l.rows.iter().zip(&l.shown) {
         let face = row.y + l.cap_top;
         for (item, &(x, width)) in row.chord.items.iter().zip(&row.placed) {
             if let Item::Sep(sep) = *item {
@@ -488,8 +701,8 @@ fn draw_cap(canvas: &mut Canvas, text: &mut Text, l: &Layout, at: CapBox, key: &
 }
 
 /// Paint the complete static panel.
-fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
-    let layout = fit(output, text, density);
+fn compose(output: Rect, text: &mut Text, density: u32, query: &str) -> Canvas {
+    let layout = fit(output, text, density, query);
     let mut canvas = paint_base(&layout, text);
     draw_caps(&mut canvas, &layout, text);
     canvas
@@ -499,10 +712,137 @@ fn compose(output: Rect, text: &mut Text, density: u32) -> Canvas {
 mod tests {
     use super::*;
 
+    /// The chords a filter leaves, which is what the panel then draws.
+    fn chords(query: &str) -> Vec<&'static str> {
+        matching(query).iter().map(|b| b.chord).collect()
+    }
+
+    #[test]
+    fn an_empty_filter_is_the_whole_table() {
+        assert_eq!(matching("").len(), BINDINGS.len());
+        // Whitespace is no filter either: a stray space must not empty the
+        // panel out.
+        assert_eq!(matching("   ").len(), BINDINGS.len());
+    }
+
+    #[test]
+    fn a_filter_keeps_only_the_rows_that_match() {
+        let left = chords("workspace");
+        assert!(!left.is_empty(), "nothing matched 'workspace'");
+        assert!(left.len() < BINDINGS.len(), "everything matched");
+        for binding in matching("workspace") {
+            let row = format!("{} {}", binding.chord, binding.description).to_lowercase();
+            assert!(row.contains("workspace"), "{row:?} does not match");
+        }
+    }
+
+    #[test]
+    fn the_filter_reads_the_chord_as_well_as_the_description() {
+        // "print" is in no description, only in the key's own name — and
+        // looking up what a key you can see does is at least as common as
+        // looking up the key for a thing you can describe.
+        let left = chords("print");
+        assert!(
+            left.iter().any(|chord| chord.contains("Print")),
+            "the Print rows are missing: {left:?}"
+        );
+    }
+
+    #[test]
+    fn every_word_of_the_filter_has_to_match() {
+        // Words rather than one substring: nobody types a chord's `+`, and
+        // "super wheel" has to find `Super+Ctrl+wheel`.
+        let both = chords("super wheel");
+        assert!(!both.is_empty(), "nothing matched 'super wheel'");
+        for chord in &both {
+            let chord = chord.to_lowercase();
+            assert!(
+                chord.contains("super") && chord.contains("wheel"),
+                "{chord}"
+            );
+        }
+        // And a second word narrows rather than widens.
+        assert!(both.len() <= chords("wheel").len());
+    }
+
+    #[test]
+    fn the_filter_ignores_case() {
+        assert_eq!(chords("WORKSPACE"), chords("workspace"));
+        assert_eq!(chords("Super+Ctrl+Q"), chords("super+ctrl+q"));
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_still_draws_a_readable_panel() {
+        // An empty panel reads as the overlay having broken. It keeps its
+        // title, its footer and a line saying so.
+        let mut text = Text::new();
+        let output = Rect::from_xywh(0, 0, 1920, 1080);
+        let nonsense = "zzzzz";
+        assert!(matching(nonsense).is_empty(), "'{nonsense}' matched a row");
+        let layout = fit(output, &mut text, 1, nonsense);
+        assert!(layout.rows.is_empty());
+        assert!(layout.h > 0 && layout.w > 0, "the panel collapsed");
+        let at = Overlay::render(output, &mut text, 1, nonsense).placement(output);
+        assert!(at.w() <= output.w() && at.h() <= output.h());
+        assert!(at.x() >= output.x() && at.y() >= output.y());
+    }
+
+    #[test]
+    fn a_filtered_panel_is_no_taller_than_the_unfiltered_one() {
+        // The list shrinks as it narrows; a filter that made the panel grow
+        // downwards would be one that pushed rows off the screen.
+        let mut text = Text::new();
+        if !text.is_usable() {
+            return;
+        }
+        let output = Rect::from_xywh(0, 0, 1920, 1080);
+        let whole = fit(output, &mut text, 1, "");
+        for query in ["workspace", "window", "print", "zzzzz"] {
+            let filtered = fit(output, &mut text, 1, query);
+            assert!(
+                filtered.h <= whole.h,
+                "{query:?} made the panel taller: {} vs {}",
+                filtered.h,
+                whole.h
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_takes_typing_and_leaves_the_rest_alone() {
+        use smithay::input::keyboard::keysyms;
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_a, Some('a')),
+            Key::Insert('a')
+        );
+        // What the layout produces, not what a US keyboard would have.
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_a, Some('ä')),
+            Key::Insert('ä')
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_space, Some(' ')),
+            Key::Insert(' ')
+        );
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_BackSpace, None),
+            Key::Backspace
+        );
+        assert_eq!(Key::from_keysym(keysyms::KEY_Escape, None), Key::Escape);
+        // A key with no printable form is nobody's filter. Escape and
+        // Backspace both produce control characters, so they are matched by
+        // keysym above rather than being left to this.
+        assert_eq!(Key::from_keysym(keysyms::KEY_F5, None), Key::Ignored);
+        assert_eq!(
+            Key::from_keysym(keysyms::KEY_Return, Some('\r')),
+            Key::Ignored
+        );
+    }
+
     #[test]
     fn it_is_centred_on_the_output() {
         let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let overlay = Overlay::render(output, &mut Text::new(), 1);
+        let overlay = Overlay::render(output, &mut Text::new(), 1, "");
         let at = overlay.placement(output);
         // Integer division leaves an odd screen a pixel wider on one side.
         assert!(
@@ -526,7 +866,7 @@ mod tests {
         // also has height to spare and none to waste on width, which is what
         // catches a scale picked from one axis.
         let output = Rect::from_xywh(1920, 0, 1280, 1024);
-        let overlay = Overlay::render(output, &mut Text::new(), 1);
+        let overlay = Overlay::render(output, &mut Text::new(), 1, "");
         let at = overlay.placement(output);
         assert!(at.x() >= output.x() && at.right() <= output.right());
     }
@@ -536,7 +876,7 @@ mod tests {
         // Better a clipped list anchored at the corner than one centred so far
         // negative that the beginning of every line is off screen.
         let output = Rect::from_xywh(0, 0, 320, 200);
-        let overlay = Overlay::render(output, &mut Text::new(), 1);
+        let overlay = Overlay::render(output, &mut Text::new(), 1, "");
         let at = overlay.placement(output);
         assert!(at.x() >= output.x() && at.y() >= output.y());
     }
@@ -550,9 +890,9 @@ mod tests {
             return;
         }
         let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let layout = fit(output, &mut text, 1);
+        let layout = fit(output, &mut text, 1, "");
         assert_eq!(layout.columns, 2);
-        let at = Overlay::render(output, &mut text, 1).placement(output);
+        let at = Overlay::render(output, &mut text, 1, "").placement(output);
         assert!(at.h() <= output.h(), "{} tall on a 1080 screen", at.h());
         assert!(at.w() <= output.w(), "{} wide on a 1920 screen", at.w());
     }
@@ -567,7 +907,7 @@ mod tests {
             Rect::from_xywh(0, 0, 3840, 2160),
         ] {
             for density in [1, 2] {
-                let layout = fit(output, &mut text, density);
+                let layout = fit(output, &mut text, density, "");
                 let boxes: Vec<(CapBox, f32)> = layout
                     .rows
                     .iter()
@@ -604,7 +944,7 @@ mod tests {
             return;
         }
         let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let layout = fit(output, &mut text, 1);
+        let layout = fit(output, &mut text, 1, "");
         let footer = text.measure(FOOTER, layout.size).0;
         assert!(
             layout.w as f32 >= footer + PAD * 2.0,
@@ -621,7 +961,7 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
+        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, "");
         // The corners are rounded, and outside the arc is the desktop by
         // design; everything else inside the panel must be painted.
         let reach = RADIUS.ceil() as usize;
@@ -651,7 +991,7 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
+        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, "");
         let accent = theme::accent().to_rgba_bytes();
         let bg = theme::BACKGROUND.to_rgba_bytes();
         let partial = canvas
@@ -678,8 +1018,8 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let small = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
-        let large = compose(Rect::from_xywh(0, 0, 3840, 2160), &mut text, 1);
+        let small = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, "");
+        let large = compose(Rect::from_xywh(0, 0, 3840, 2160), &mut text, 1, "");
         assert!(
             large.height > small.height,
             "panel did not grow with the output"
@@ -696,8 +1036,8 @@ mod tests {
             return;
         }
         let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let one = compose(output, &mut text, 1);
-        let two = compose(output, &mut text, 2);
+        let one = compose(output, &mut text, 1, "");
+        let two = compose(output, &mut text, 2, "");
         // Shaped text does not scale to the pixel, so allow it a little slack.
         let close = |a: usize, b: usize| (a as f32 - b as f32).abs() <= (b as f32 * 0.02).max(2.0);
         assert!(
@@ -713,8 +1053,8 @@ mod tests {
             one.height
         );
 
-        let at_one = Overlay::render(output, &mut text, 1).placement(output);
-        let at_two = Overlay::render(output, &mut text, 2).placement(output);
+        let at_one = Overlay::render(output, &mut text, 1, "").placement(output);
+        let at_two = Overlay::render(output, &mut text, 2, "").placement(output);
         assert!(close(at_two.w() as usize, at_one.w() as usize));
         assert!(close(at_two.h() as usize, at_one.h() as usize));
     }
@@ -769,8 +1109,11 @@ mod tests {
         let Ok(path) = std::env::var("HUGINN_OVERLAY_DUMP") else {
             return;
         };
+        // `HUGINN_OVERLAY_FILTER` dumps the panel as the filter leaves it,
+        // which is the only way to see the narrowed layout without a session.
+        let query = std::env::var("HUGINN_OVERLAY_FILTER").unwrap_or_default();
         let mut text = Text::new();
-        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1);
+        let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, &query);
         let (w, h) = (canvas.stride, canvas.height);
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         // The canvas is RGBA and PPM is RGB, so the alpha is dropped. Every

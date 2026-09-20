@@ -4,8 +4,14 @@
 //! pane. Two sit side by side. Three put two equal tiles on top and give the
 //! third the whole width beneath them, as tall as the two above. Four are the
 //! four quadrants, and past four the later quadrants subdivide in the same
-//! way, so eight windows are the quadrants each split in half. On a portrait
-//! screen the whole family is transposed, or two windows would be two slivers.
+//! way, so eight windows are the quadrants each split in half.
+//!
+//! The whole family has a transpose, where two windows stack instead of
+//! sitting side by side and the third goes down the right-hand side instead of
+//! across the bottom. Which one a pane uses is its [`Orientation`]: the
+//! screen's own shape by default — a portrait screen transposes, or two
+//! windows there would be two slivers — or named outright, because which shape
+//! suits the work is not something the aspect ratio knows.
 //!
 //! The shapes are held as a binary tree of splits rather than as a list of
 //! rectangles, because a divider the user can move is a *shared edge*: the
@@ -39,6 +45,64 @@ impl Axis {
         match self {
             Self::Horizontal => Self::Vertical,
             Self::Vertical => Self::Horizontal,
+        }
+    }
+}
+
+/// Which way round the whole family of shapes is turned.
+///
+/// Every shape in [`grid`] is built from one axis — the one that puts two
+/// windows *next to* each other — so naming that axis turns the family as a
+/// whole: two windows side by side with the third across the bottom, or two
+/// windows stacked with the third down the right-hand side. There is no third
+/// possibility, because there is no third way to cut a rectangle in two.
+///
+/// Held per pane rather than derived from the screen alone, because which one
+/// suits the work is not something the aspect ratio knows: an editor over a
+/// terminal is the right shape on the same wide monitor where two browsers
+/// side by side are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Orientation {
+    /// Follow the screen: side by side on a landscape one, stacked on a
+    /// portrait one, where side by side would be two slivers.
+    #[default]
+    Auto,
+    /// Two windows side by side; the third across the bottom.
+    Columns,
+    /// Two windows stacked; the third down the right-hand side.
+    Rows,
+}
+
+impl Orientation {
+    /// The axis that puts two tiles next to each other, in a pane of `area`.
+    const fn beside(self, area: Rect) -> Axis {
+        match self {
+            Self::Columns => Axis::Horizontal,
+            Self::Rows => Axis::Vertical,
+            Self::Auto if area.h() > area.w() => Axis::Vertical,
+            Self::Auto => Axis::Horizontal,
+        }
+    }
+
+    /// Which of the two named orientations this one is, in a pane of `area`.
+    /// [`Self::Auto`] is whichever the screen's shape asks for.
+    pub const fn settled(self, area: Rect) -> Self {
+        match self.beside(area) {
+            Axis::Horizontal => Self::Columns,
+            Axis::Vertical => Self::Rows,
+        }
+    }
+
+    /// The other one.
+    ///
+    /// [`Self::Auto`] is settled against `area` first, so the first flip goes
+    /// *away* from the shape that is on screen. Flipping to an explicit value
+    /// that happened to match what `Auto` was already doing would look like
+    /// the key had failed.
+    const fn flipped(self, area: Rect) -> Self {
+        match self.settled(area) {
+            Self::Columns => Self::Rows,
+            _ => Self::Columns,
         }
     }
 }
@@ -140,6 +204,54 @@ impl Node {
         }
         *ratio = clamped;
         true
+    }
+
+    /// Adjust the innermost split containing `target`, whichever way it cuts.
+    ///
+    /// The one-dimensional counterpart to [`Self::resize`], for a wheel: there
+    /// is no axis to name, so the divider that moves is simply the one nearest
+    /// the window — the edge of its own tile. In the two-window shapes that is
+    /// the only divider there is; in the quadrants it is the one between the
+    /// window and the tile it was split from, so a notch grows the tile the
+    /// window is actually sitting in.
+    ///
+    /// Returns `Some(moved)` once that divider has been found, `None` when
+    /// `target` is not under this node. `Some(false)` — found but already at
+    /// its limit — deliberately does *not* fall through to the next divider
+    /// out: a tile pinned at [`MAX_RATIO`] would otherwise start growing along
+    /// the other axis instead, and a wheel that changes what it means halfway
+    /// through a turn is a wheel nobody can aim.
+    fn grow(&mut self, target: WindowId, delta: f32) -> Option<bool> {
+        let Self::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let in_first = first.contains(target);
+        if !in_first && !second.contains(target) {
+            return None;
+        }
+        // Deeper first: the innermost split is the one whose edge the window
+        // touches, and it is the parent of every other candidate.
+        let child = if in_first { first } else { second };
+        if let Some(moved) = child.grow(target, delta) {
+            return Some(moved);
+        }
+        // As in `resize`: growing a window in the second half means shrinking
+        // the first half's share.
+        let wanted = if in_first {
+            *ratio + delta
+        } else {
+            *ratio - delta
+        };
+        let clamped = wanted.clamp(MIN_RATIO, MAX_RATIO);
+        let moved = (clamped - *ratio).abs() >= f32::EPSILON;
+        *ratio = clamped;
+        Some(moved)
     }
 
     /// Whether `target` is somewhere under this node.
@@ -307,6 +419,9 @@ fn divide(rect: Rect, axis: Axis, ratio: f32, gap: i32) -> (Rect, Rect) {
 #[derive(Debug, Clone, Default)]
 pub struct Tiles {
     root: Option<Node>,
+    /// Which way the shapes are turned. See [`Orientation`]; applied by
+    /// [`Self::reconcile`], which is the only thing that builds the tree.
+    orientation: Orientation,
 }
 
 impl Tiles {
@@ -343,8 +458,9 @@ impl Tiles {
     /// [`adopt_ratios`], so with nothing added or removed this is exactly a
     /// no-op and a moved divider survives the windows around it changing.
     ///
-    /// `area` is the pane's area — not to size anything here, but to decide
-    /// whether the shapes should be transposed for a portrait screen.
+    /// `area` is the pane's area — not to size anything here, but to settle
+    /// the [`Orientation`]: which way the family is turned, and for
+    /// [`Orientation::Auto`] that is the screen's shape.
     pub fn reconcile(&mut self, tiled: &[WindowId], area: Rect) {
         let mut order: Vec<WindowId> = self
             .windows()
@@ -361,12 +477,7 @@ impl Tiles {
             self.root = None;
             return;
         }
-        let beside = if area.h() > area.w() {
-            Axis::Vertical
-        } else {
-            Axis::Horizontal
-        };
-        let mut fresh = grid(&order, beside);
+        let mut fresh = grid(&order, self.orientation.beside(area));
         if let Some(old) = &self.root {
             adopt_ratios(&mut fresh, old);
         }
@@ -424,6 +535,50 @@ impl Tiles {
             return false;
         };
         root.resize(window, axis, delta)
+    }
+
+    /// Which way this pane's shapes are turned.
+    pub const fn orientation(&self) -> Orientation {
+        self.orientation
+    }
+
+    /// Turn the shapes. Takes effect at the next [`Self::reconcile`], which is
+    /// the only place the tree is built — so the caller relayouts afterwards
+    /// and nothing here has to know the pane's size.
+    pub fn set_orientation(&mut self, orientation: Orientation) {
+        self.orientation = orientation;
+    }
+
+    /// Flip between the two orientations, and report the one now in force.
+    ///
+    /// `area` settles [`Orientation::Auto`] — see [`Orientation::flipped`].
+    ///
+    /// Moved dividers do not survive the flip, and should not: a ratio names
+    /// an edge, [`adopt_ratios`] carries one only where the old and new trees
+    /// split the same way, and after a turn they agree nowhere. The 70/30 you
+    /// set between two columns is not a wish about the two rows they become.
+    pub fn toggle_orientation(&mut self, area: Rect) -> Orientation {
+        self.orientation = self.orientation.flipped(area);
+        self.orientation
+    }
+
+    /// Grow or shrink `window` against the divider nearest it.
+    ///
+    /// `delta` is a fraction of the tile that divider splits: positive grows
+    /// the window, negative shrinks it. Returns whether anything moved.
+    ///
+    /// The axis-free form of [`Self::resize`], for a wheel or any other
+    /// one-dimensional input. Which edge moves is decided by where the window
+    /// sits rather than by a direction the caller names, so one gesture means
+    /// "more room" whichever way the pane happens to be turned — which is the
+    /// whole point of it when [`Self::toggle_orientation`] can turn the pane
+    /// under it. See [`Node::grow`] for why a divider already at its limit
+    /// stops there rather than handing the gesture to the next one out.
+    pub fn grow(&mut self, window: WindowId, delta: f32) -> bool {
+        self.root
+            .as_mut()
+            .and_then(|root| root.grow(window, delta))
+            .unwrap_or(false)
     }
 
     /// Where every window goes, given the pane's area.
@@ -890,6 +1045,187 @@ mod tests {
     fn a_lone_window_has_nothing_to_resize_against() {
         let mut tiles = tiled(1);
         assert!(!tiles.resize(id(1), Axis::Horizontal, 0.1));
+    }
+
+    /// Windows 1..=n reconciled into `orientation` on the landscape screen.
+    fn turned(n: u64, orientation: Orientation) -> Tiles {
+        let mut tiles = Tiles::new();
+        tiles.set_orientation(orientation);
+        tiles.reconcile(&ids(n), SCREEN);
+        tiles
+    }
+
+    #[test]
+    fn the_stacked_orientation_puts_two_windows_one_above_the_other() {
+        // The same screen the default lays out side by side: the orientation
+        // decides the shape, not the aspect ratio, once it has been named.
+        let laid = turned(2, Orientation::Rows).arrange(SCREEN, GAP);
+        let (a, b) = (laid[0].1, laid[1].1);
+        assert_eq!(a.x(), b.x(), "a stacked split should not change x");
+        assert_eq!(a.w(), b.w());
+        assert!(a.y() < b.y());
+        assert!(a.h().abs_diff(b.h()) <= 1, "halves are equal");
+        assert_eq!(b.y() - (a.y() + a.h()), GAP);
+    }
+
+    #[test]
+    fn the_third_window_goes_down_the_side_when_stacked() {
+        // The transpose of the A/B/C shape: two tiles in a column on the
+        // left, the third down the whole right-hand side.
+        let laid = turned(3, Orientation::Rows).arrange(SCREEN, GAP);
+        let (a, b, c) = (laid[0].1, laid[1].1, laid[2].1);
+        assert_eq!(a.x(), b.x(), "a and b share a column");
+        assert!(a.y() < b.y());
+        assert!(a.h().abs_diff(b.h()) <= 1);
+        assert!(c.x() > a.x() + a.w(), "c sits to the right of the pair");
+        assert_eq!(c.h(), a.h() + GAP + b.h(), "c spans both rows");
+        assert!(a.w().abs_diff(c.w()) <= 1, "the two columns are equal");
+    }
+
+    #[test]
+    fn toggling_turns_the_tiling_the_other_way_and_back() {
+        let mut tiles = tiled(2);
+        assert_eq!(tiles.orientation(), Orientation::Auto);
+        assert_eq!(tiles.toggle_orientation(SCREEN), Orientation::Rows);
+        tiles.reconcile(&ids(2), SCREEN);
+        let stacked = tiles.arrange(SCREEN, GAP);
+        assert_eq!(stacked[0].1.x(), stacked[1].1.x(), "stacked now");
+
+        assert_eq!(tiles.toggle_orientation(SCREEN), Orientation::Columns);
+        tiles.reconcile(&ids(2), SCREEN);
+        let side_by_side = tiles.arrange(SCREEN, GAP);
+        assert_eq!(
+            side_by_side,
+            tiled(2).arrange(SCREEN, GAP),
+            "back as it was"
+        );
+    }
+
+    #[test]
+    fn the_first_toggle_flips_away_from_what_is_on_screen() {
+        // `Auto` on a portrait screen is already stacked, so flipping it to
+        // `Rows` would look like the key had done nothing at all.
+        let tall = Rect::from_xywh(0, 0, 400, 1200);
+        let mut tiles = Tiles::new();
+        tiles.reconcile(&ids(2), tall);
+        assert_eq!(tiles.toggle_orientation(tall), Orientation::Columns);
+        tiles.reconcile(&ids(2), tall);
+        let laid = tiles.arrange(tall, GAP);
+        assert!(
+            laid[0].1.x() < laid[1].1.x(),
+            "side by side on the tall one"
+        );
+    }
+
+    #[test]
+    fn the_orientation_outlives_the_windows_it_was_set_for() {
+        // It is a property of the pane, not of the shape that happened to be
+        // on screen when it was chosen: closing down to one window and opening
+        // back up to three must not quietly put the default back.
+        let mut tiles = turned(3, Orientation::Rows);
+        tiles.reconcile(&[id(1)], SCREEN);
+        tiles.reconcile(&ids(3), SCREEN);
+        assert_eq!(tiles.orientation(), Orientation::Rows);
+        let laid = tiles.arrange(SCREEN, GAP);
+        assert!(
+            laid[2].1.x() > laid[0].1.x() + laid[0].1.w(),
+            "still stacked"
+        );
+    }
+
+    #[test]
+    fn turning_the_pane_gives_up_the_dividers_that_were_moved() {
+        // A ratio names an edge, and after a turn the old edges are gone: a
+        // 70/30 between two columns is not a wish about the rows they become.
+        let mut tiles = tiled(2);
+        assert!(tiles.resize(id(1), Axis::Horizontal, 0.2));
+        tiles.toggle_orientation(SCREEN);
+        tiles.reconcile(&ids(2), SCREEN);
+        let laid = tiles.arrange(SCREEN, GAP);
+        assert!(
+            laid[0].1.h().abs_diff(laid[1].1.h()) <= 1,
+            "the rows started lopsided: {laid:?}"
+        );
+    }
+
+    #[test]
+    fn growing_widens_a_column_and_shrinking_narrows_it() {
+        let mut tiles = tiled(2);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.grow(id(1), 0.1));
+        let wider = tiles.arrange(SCREEN, GAP);
+        assert!(wider[0].1.w() > before[0].1.w(), "it did not grow");
+        assert!(wider[1].1.w() < before[1].1.w(), "its neighbour kept its w");
+        assert!(tiles.grow(id(1), -0.1));
+        assert_eq!(tiles.arrange(SCREEN, GAP), before, "and back again");
+    }
+
+    #[test]
+    fn growing_a_row_makes_it_taller_rather_than_wider() {
+        // The whole point of the axis-free form: one gesture means "more
+        // room" whichever way the pane is turned.
+        let mut tiles = turned(2, Orientation::Rows);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.grow(id(1), 0.1));
+        let after = tiles.arrange(SCREEN, GAP);
+        assert!(after[0].1.h() > before[0].1.h(), "it did not grow");
+        assert_eq!(after[0].1.w(), before[0].1.w(), "it grew sideways instead");
+    }
+
+    #[test]
+    fn growing_the_second_window_grows_it_too() {
+        // As in `resize`, the sign flips for the window on the far side of
+        // the divider.
+        let mut tiles = tiled(2);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.grow(id(2), 0.1));
+        let after = tiles.arrange(SCREEN, GAP);
+        assert!(after[1].1.w() > before[1].1.w(), "the right window shrank");
+    }
+
+    #[test]
+    fn growing_moves_the_divider_nearest_the_window() {
+        // Five windows: the last quadrant is split in half, and that inner
+        // divider is the edge of window four's own tile.
+        let mut tiles = tiled(5);
+        let before = tiles.arrange(SCREEN, GAP);
+        assert!(tiles.grow(id(4), 0.1));
+        let after = tiles.arrange(SCREEN, GAP);
+        assert!(after[3].1.w() > before[3].1.w(), "four did not grow");
+        assert!(after[4].1.w() < before[4].1.w(), "five did not give way");
+        for i in 0..3 {
+            assert_eq!(after[i], before[i], "window {i} moved with it");
+        }
+    }
+
+    #[test]
+    fn a_tile_at_its_limit_stops_rather_than_growing_the_other_way() {
+        // A wheel that quietly changed which divider it was moving — and so
+        // which way the tile grew — halfway through a turn would be a wheel
+        // nobody can aim.
+        let mut tiles = tiled(5);
+        while tiles.grow(id(4), 0.1) {}
+        let pinned = tiles.arrange(SCREEN, GAP);
+        assert!(!tiles.grow(id(4), 0.1), "it kept reporting movement");
+        assert_eq!(tiles.arrange(SCREEN, GAP), pinned, "an outer divider moved");
+    }
+
+    #[test]
+    fn growing_can_never_take_a_window_out_of_existence() {
+        let mut tiles = tiled(5);
+        for _ in 0..50 {
+            tiles.grow(id(4), -0.5);
+        }
+        for (_, rect) in tiles.arrange(SCREEN, GAP) {
+            assert!(rect.w() > 0 && rect.h() > 0, "grown to nothing: {rect:?}");
+        }
+    }
+
+    #[test]
+    fn a_lone_window_has_nothing_to_grow_against() {
+        assert!(!tiled(1).grow(id(1), 0.1));
+        assert!(!tiled(2).grow(id(99), 0.1));
+        assert!(!Tiles::new().grow(id(1), 0.1));
     }
 
     #[test]
