@@ -61,6 +61,8 @@ mod record;
 #[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]
+mod screenoff;
+#[cfg(target_os = "linux")]
 mod screenshot;
 #[cfg(target_os = "linux")]
 mod settings;

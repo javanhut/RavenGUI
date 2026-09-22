@@ -610,6 +610,12 @@ pub(crate) struct Huginn {
     /// and counting the sleep as idle time would mean the idle lock also fired
     /// on every wake, racing it for no reason.
     last_input: Instant,
+    /// When the current lock began, for [`crate::screenoff`]. Meaningless
+    /// while unlocked.
+    lock_began: Instant,
+    /// Somebody has been at the lock screen since it went up. See
+    /// [`crate::screenoff::wait`].
+    lock_woken: bool,
     /// Whether this compositor is hosting the login screen rather than a
     /// session -- started by `ravend` for the greeter, as the greeter
     /// account, with nothing behind its one layer surface.
@@ -1203,6 +1209,8 @@ impl Huginn {
             contacts: crate::touch::Contacts::default(),
             touch_devices: HashMap::new(),
             last_input: Instant::now(),
+            lock_began: Instant::now(),
+            lock_woken: false,
             greeter: hosting_greeter(),
             // Default until a client sets its own on pointer enter.
             cursor_status: CursorImageStatus::default_named(),
@@ -2507,7 +2515,24 @@ impl Huginn {
     /// interpreted — a keystroke that resolves to no binding at all is still
     /// somebody at the keyboard.
     pub(crate) fn note_activity(&mut self) {
+        let now = Instant::now();
+        // Input in the first moment of a lock is the hand that locked it
+        // leaving the keys, not somebody at the lock screen.
+        if self.lock.is_some()
+            && now.saturating_duration_since(self.lock_began) > crate::screenoff::SETTLE
+        {
+            self.lock_woken = true;
+        }
+        self.last_input = now;
+    }
+
+    /// Somebody is at the machine without having touched it: the lid opened
+    /// on a resume.
+    pub(crate) fn note_presence(&mut self) {
         self.last_input = Instant::now();
+        if self.lock.is_some() {
+            self.lock_woken = true;
+        }
     }
 
     /// Whether this session can be locked at all.
@@ -2622,6 +2647,37 @@ impl Huginn {
         self.lock.is_some()
     }
 
+    /// Whether the lock screen has drawn: a client holds the lock and has a
+    /// surface with a buffer on every screen. Until then there is nothing
+    /// worth leaving on a panel that is about to go dark, or about to be
+    /// frozen by a suspend.
+    pub(crate) fn lock_ready(&self) -> bool {
+        let Some(lock) = self.lock.as_ref() else {
+            return false;
+        };
+        let surfaces = lock.surfaces();
+        lock.client.is_some()
+            && !surfaces.is_empty()
+            && surfaces.len() >= self.outputs.len()
+            && surfaces
+                .iter()
+                .all(|(_, surface)| has_buffer(surface.wl_surface()))
+    }
+
+    /// How long until the screens should go off, while locked; `None` when
+    /// they should stay on. See [`crate::screenoff`].
+    pub(crate) fn screen_off_wait(&self, now: Instant) -> Option<std::time::Duration> {
+        if !self.is_locked() {
+            return None;
+        }
+        crate::screenoff::wait(
+            self.desktop_config.screen_off(),
+            now.saturating_duration_since(self.lock_began),
+            now.saturating_duration_since(self.last_input),
+            self.lock_woken,
+        )
+    }
+
     /// Stop drawing the session, before any client has asked.
     ///
     /// This is the compositor's own half of the lock; see [`Lock`] for why it
@@ -2668,6 +2724,8 @@ impl Huginn {
         // which is told `cancelled`. Left up, it would own the pointer under
         // the lock screen and take its answer from a drag across it.
         self.cancel_region();
+        self.lock_began = Instant::now();
+        self.lock_woken = false;
         self.lock = Some(Lock::default());
         self.refresh_focus();
         self.queue_redraw();

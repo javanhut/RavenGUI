@@ -29,6 +29,8 @@
 //!   dock hides itself.
 //! - `general.terminal` — what the spawn binding launches.
 //! - `general.lock_after_minutes` — [`crate::settings::IdleAfter`].
+//! - `general.lock_screen_off_seconds` — [`crate::screenoff::ScreenOff`]:
+//!   whether and when the screens go off while the session is locked.
 //! - `notifications.do_not_disturb` — only critical notifications are shown;
 //!   also switched from quick settings. See [`crate::notifications`].
 //! - `notifications.timeout_seconds` — how long a card stays when its
@@ -85,6 +87,9 @@ pub(crate) struct General {
     pub terminal: String,
     /// 0 is never.
     pub lock_after_minutes: u32,
+    /// While locked: 0 turns the screens off immediately, a negative number
+    /// never, anything else after that many seconds.
+    pub lock_screen_off_seconds: i64,
 }
 
 impl Default for General {
@@ -92,6 +97,7 @@ impl Default for General {
         Self {
             terminal: crate::theme::TERMINAL.to_owned(),
             lock_after_minutes: 10,
+            lock_screen_off_seconds: 0,
         }
     }
 }
@@ -281,6 +287,10 @@ impl DesktopConfig {
         IdleAfter::from_minutes(self.general.lock_after_minutes)
     }
 
+    pub(crate) fn screen_off(&self) -> crate::screenoff::ScreenOff {
+        crate::screenoff::ScreenOff::from_seconds(self.general.lock_screen_off_seconds)
+    }
+
     /// The terminal to spawn; the compiled-in one when the file is blank.
     pub(crate) fn terminal(&self) -> &str {
         let t = self.general.terminal.trim();
@@ -385,6 +395,20 @@ mod tests {
         for text in ["[touch]\noutput = \"\"\n", "[touch]\noutput = \"   \"\n"] {
             assert_eq!(DesktopConfig::parse(text).unwrap().touch_output(), None);
         }
+    }
+
+    #[test]
+    fn the_screens_go_off_when_locked_unless_told_otherwise() {
+        use crate::screenoff::ScreenOff;
+        let absent = DesktopConfig::parse("[general]\nlock_after_minutes = 5\n").unwrap();
+        assert_eq!(absent.screen_off(), ScreenOff::Immediately);
+        let never = DesktopConfig::parse("[general]\nlock_screen_off_seconds = -1\n").unwrap();
+        assert_eq!(never.screen_off(), ScreenOff::Never);
+        let later = DesktopConfig::parse("[general]\nlock_screen_off_seconds = 30\n").unwrap();
+        assert_eq!(
+            later.screen_off(),
+            ScreenOff::After(std::time::Duration::from_secs(30))
+        );
     }
 
     #[test]

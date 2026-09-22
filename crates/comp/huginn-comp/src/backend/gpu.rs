@@ -390,6 +390,13 @@ impl DumbSurface {
         }
     }
 
+    /// Turn the CRTC off. The next [`Self::present`] is a modeset, which
+    /// turns it back on.
+    pub(super) fn power_off(&mut self) -> Result<()> {
+        self.modeset_done = false;
+        self.surface.clear().context("turning the screen off")
+    }
+
     fn release(&self, fb: DumbFb) {
         let _ = self.fd.destroy_framebuffer(fb.fb);
         let _ = self.fd.destroy_dumb_buffer(fb.buffer);

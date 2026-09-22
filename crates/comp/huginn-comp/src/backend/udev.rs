@@ -221,6 +221,19 @@ struct Udev {
     /// The timer that serves clients' captures, while it has anything to
     /// do. See `crate::capture`.
     capture_timer: Option<RegistrationToken>,
+    /// Every CRTC is off: the session is locked and nobody is looking, or the
+    /// machine is about to sleep. Nothing is drawn until input or an unlock
+    /// turns them back on. See `crate::screenoff`.
+    screens_off: bool,
+    /// The countdown to turning the screens off while locked, while one is
+    /// running.
+    screen_off_timer: Option<RegistrationToken>,
+    /// A sleep init is waiting on us for, until the lock screen has drawn or
+    /// [`SLEEP_LOCK_WAIT`] runs out. See `crate::sleep`.
+    sleep_token: Option<String>,
+    /// Init has been told we are ready and the machine is going down. The
+    /// screens stay off whatever happens until the resume.
+    asleep: bool,
 }
 
 /// How long a withdrawn `wl_output` global stays bindable before it is
@@ -501,16 +514,30 @@ pub(crate) fn run() -> Result<()> {
     // why the recovery has to be the heavier one: we still hold DRM master over
     // a device whose state the firmware has been through, and only a full
     // modeset can be trusted to put a picture back on the panel.
-    crate::sleep::watch::<Udev, _>(&handle, move |data: &mut Udev| {
-        // Locked *before* the display comes back, and that ordering is the
-        // whole security of it. `reclaim_display` is what puts the next frame
-        // on the panel; blanking the session first means the first thing drawn
-        // after a resume is the lock screen and never the desktop. There is no
-        // window in which the machine shows what it was doing, because the
-        // compositor simply never composites it.
-        data.lock_session();
-        data.reclaim_display(true);
-    });
+    //
+    // The lock happens *before* the sleep: see `prepare_for_sleep`. Locking
+    // only after the resume is too late, because the display driver relights
+    // the panel with its last frame before this process has even thawed.
+    crate::sleep::watch::<Udev, _, _>(
+        &handle,
+        |data: &mut Udev, token: String| data.prepare_for_sleep(token),
+        |data: &mut Udev| {
+            // Normally a no-op -- the session was locked before the sleep.
+            // It is not when init stopped waiting for us, or when an init
+            // from before the handshake put the machine to sleep; locking
+            // before `reclaim_display` still keeps the desktop out of every
+            // frame this process draws.
+            data.lock_session();
+            data.sleep_token = None;
+            data.asleep = false;
+            // Opening the lid is somebody at the machine: the lock screen it
+            // comes back to stays lit for them rather than going straight
+            // back off.
+            data.state.note_presence();
+            data.reclaim_display(true);
+        },
+    );
+    crate::sleep::announce();
 
     // For the density the state starts with; `relayout` loads more as screens
     // of other densities appear.
@@ -549,6 +576,10 @@ pub(crate) fn run() -> Result<()> {
         recording: None,
         recording_timer: None,
         capture_timer: None,
+        screens_off: false,
+        screen_off_timer: None,
+        sleep_token: None,
+        asleep: false,
     };
 
     // Every other DRM device on the seat: the discrete GPU on a hybrid
@@ -606,6 +637,7 @@ pub(crate) fn run() -> Result<()> {
             }
             data.reap_retired_globals();
             data.state.refresh();
+            data.settle_screen_power();
             data.render_dirty();
             data.schedule_captures();
             if let Err(e) = data.display.flush_clients() {
@@ -883,6 +915,17 @@ const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often frame-time percentiles are reported. See `crate::frametime`.
 const FRAMETIME_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long a sleep waits for the lock screen to draw before the screens go
+/// off with only the compositor's blank behind them. The lock screen takes a
+/// few dozen milliseconds; init's own ceiling is two seconds.
+const SLEEP_LOCK_WAIT: Duration = Duration::from_millis(500);
+
+/// How often the screen-off countdown looks again when it has nothing to
+/// count down to: the lock screen has not drawn yet, or the setting says
+/// never and might be changed.
+const SCREEN_OFF_RECHECK: Duration = Duration::from_millis(100);
+const SCREEN_OFF_IDLE_RECHECK: Duration = Duration::from_secs(5);
+
 impl Udev {
     /// Withdraw a screen's `wl_output` global without destroying it.
     ///
@@ -927,6 +970,139 @@ impl Udev {
             return;
         }
         self.arm_claim_timeout();
+        self.arm_screen_off();
+    }
+
+    /// The machine is about to sleep: lock, wait for the lock screen to draw,
+    /// turn the screens off, and tell init. See `crate::sleep`.
+    ///
+    /// The screens are what matters. A CRTC that is off when the machine
+    /// sleeps is still off when the display driver resumes it, so the panel
+    /// stays dark until `reclaim_display` lights it -- with the lock screen,
+    /// already drawn, as the first frame.
+    fn prepare_for_sleep(&mut self, token: String) {
+        if self.state.lockable() {
+            self.lock_session();
+        }
+        self.sleep_token = Some(token.clone());
+        let timer = Timer::from_duration(SLEEP_LOCK_WAIT);
+        let armed = self.handle.insert_source(timer, move |_, _, data: &mut Udev| {
+            if data.sleep_token.as_deref() == Some(token.as_str()) {
+                tracing::warn!("the lock screen did not draw in time; sleeping behind the blank");
+                data.finish_sleep_prep(true);
+            }
+            TimeoutAction::Drop
+        });
+        if let Err(e) = armed {
+            tracing::warn!(error = %e, "no timer for the sleep; not waiting for the lock screen");
+            self.finish_sleep_prep(true);
+            return;
+        }
+        self.finish_sleep_prep(false);
+    }
+
+    /// Answer init, if the session is ready to sleep -- or `force`d, once the
+    /// wait is over. Called again from the main loop until it answers.
+    fn finish_sleep_prep(&mut self, force: bool) {
+        if self.sleep_token.is_none() {
+            return;
+        }
+        let ready = force || !self.state.lockable() || self.state.lock_ready();
+        if !ready {
+            return;
+        }
+        let Some(token) = self.sleep_token.take() else {
+            return;
+        };
+        self.set_screens_powered(false);
+        self.asleep = true;
+        crate::sleep::ready(&token);
+    }
+
+    /// Turn every screen off, or back on.
+    ///
+    /// Off is a DPMS-off commit on each CRTC; the panel and its backlight
+    /// power down. On marks every screen dirty, and the next frame queued on
+    /// each is the modeset that lights it again.
+    fn set_screens_powered(&mut self, on: bool) {
+        if on != self.screens_off || !self.session.is_active() {
+            return;
+        }
+        self.screens_off = !on;
+        for screen in self.screens.values_mut() {
+            screen.awaiting_flip = false;
+            screen.submitted_at = None;
+            if on {
+                screen.dirty = true;
+                continue;
+            }
+            let cleared = match &mut screen.scanout {
+                ScreenScanout::Primary(drm) | ScreenScanout::Gpu { drm, .. } => {
+                    drm.with_compositor(|c| c.clear()).map_err(anyhow::Error::from)
+                }
+                ScreenScanout::Dumb(dumb) => dumb.power_off(),
+            };
+            if let Err(e) = cleared {
+                tracing::warn!(name = %screen.name, error = %e, "could not turn the screen off");
+            }
+        }
+        if on {
+            tracing::info!("screens on");
+            self.state.queue_redraw();
+        } else {
+            tracing::info!("screens off");
+        }
+    }
+
+    /// Start the countdown to turning the screens off while locked, if one
+    /// is not already running.
+    fn arm_screen_off(&mut self) {
+        if self.screen_off_timer.is_some() {
+            return;
+        }
+        let timer = Timer::from_duration(SCREEN_OFF_RECHECK);
+        match self.handle.insert_source(timer, |_, _, data: &mut Udev| data.screen_off_tick()) {
+            Ok(token) => self.screen_off_timer = Some(token),
+            Err(e) => tracing::warn!(error = %e, "no screen-off timer; screens stay on while locked"),
+        }
+    }
+
+    fn screen_off_tick(&mut self) -> TimeoutAction {
+        if !self.state.is_locked() || self.screens_off {
+            self.screen_off_timer = None;
+            return TimeoutAction::Drop;
+        }
+        if !self.state.lock_ready() {
+            return TimeoutAction::ToDuration(SCREEN_OFF_RECHECK);
+        }
+        match self.state.screen_off_wait(Instant::now()) {
+            None => TimeoutAction::ToDuration(SCREEN_OFF_IDLE_RECHECK),
+            Some(wait) if !wait.is_zero() => TimeoutAction::ToDuration(wait),
+            Some(_) => {
+                self.set_screens_powered(false);
+                self.screen_off_timer = None;
+                TimeoutAction::Drop
+            }
+        }
+    }
+
+    /// Keep the screens' power in step with the lock, once per loop: on after
+    /// any unlock (a fingerprint or a face needs no input to get there), and
+    /// a countdown running whenever a lit session is locked -- however the
+    /// lock arrived.
+    fn settle_screen_power(&mut self) {
+        if self.sleep_token.is_some() {
+            self.finish_sleep_prep(false);
+            return;
+        }
+        if self.asleep {
+            return;
+        }
+        if !self.state.is_locked() {
+            self.set_screens_powered(true);
+        } else if !self.screens_off {
+            self.arm_screen_off();
+        }
     }
 
     /// Give the lock screen just started `CLAIM_TIMEOUT` to claim the blank.
@@ -949,6 +1125,9 @@ impl Udev {
     }
 
     fn reclaim_display(&mut self, disable_connectors: bool) {
+        // Reactivating is a modeset on every screen, which lights any that
+        // were off.
+        self.screens_off = false;
         if let Err(e) = self.manager.activate(disable_connectors) {
             tracing::error!(error = %e, "could not reactivate DRM");
         }
@@ -1534,7 +1713,7 @@ impl Udev {
         // Advance animations before assembling the scene, so this frame shows
         // where they are now rather than where they were last frame.
         self.state.tick_animations();
-        if !self.session.is_active() {
+        if !self.session.is_active() || self.screens_off {
             return;
         }
 
@@ -1806,6 +1985,15 @@ impl Udev {
         // presence, not commands. Device add and remove are excluded above:
         // hardware appearing is not somebody using it.
         self.state.note_activity();
+        // Any input lights screens turned off under the lock. The event is
+        // still delivered: a key typed at a dark lock screen is the start of
+        // a password.
+        // Not a switch: the lid closing is not somebody wanting to see the
+        // screen, and it lands right as the machine goes to sleep.
+        let switch = matches!(event, InputEvent::SwitchToggle { .. });
+        if self.screens_off && !self.asleep && self.sleep_token.is_none() && !switch {
+            self.set_screens_powered(true);
+        }
 
         let InputEvent::Keyboard { event } = event else {
             // Motion, buttons and scroll all go to the shared handler, so the
