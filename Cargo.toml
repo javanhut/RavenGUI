@@ -104,6 +104,48 @@ opt-level = 1          # a compositor at opt-level 0 drops frames while you test
 [profile.dev.package."*"]
 opt-level = 3          # deps are rebuilt rarely; always optimize them
 
+[profile.release]
+# Until this table existed there was no release profile here at all, which
+# meant `imlazy build` and stage-gui.sh shipped huginn at cargo's defaults —
+# LTO off, sixteen codegen units — and nothing in the compositor was ever
+# inlined into anything else in the compositor. That matters more here than
+# anywhere else in the tree, because this workspace root governs huginn
+# together with raven-desktop and with raven-rec, raven-h264, raven-aac and
+# raven-mp4, and the boundaries between them are crossed per frame: the render
+# loop goes through huginn-comp into huginn-core and raven-desktop on the way
+# to every damage rectangle, and a screen recording crosses into the codecs
+# sixty times a second for as long as it runs.
+#
+# `fat` rather than `thin` because of where the two costs land. Link time is
+# paid once, on a build host, by the stage that makes an ISO. Frame time is
+# paid on every machine that boots the result, for the whole length of every
+# session. That trade is close in most of this tree and is not close here, so
+# the slow link is deliberate: whole-program LTO over fourteen members plus
+# the vendored smithay below is minutes, not seconds, and stage-gui.sh will
+# feel it.
+#
+# This is the opposite choice from RavenLinux/init for the opposite reason.
+# raven-init is read off disk once during the busiest part of boot and then
+# sleeps for the life of the machine, so it optimizes for size; huginn is
+# never not working. Copying a boot-path profile into a compositor is the
+# specific mistake this comment exists to prevent, and RavenCanvas/Cargo.toml
+# has the measurement — 119 ms against 81 ms for one 1080p frame — that
+# settles the general case in the graphics path.
+#
+# Note that this does not reach the codec crates everywhere they are built.
+# RavenCamera patches raven-h264/raven-aac/raven-mp4/raven-rec to ../RavenGUI
+# in its own .cargo/config.toml, so inside that build they compile under
+# RavenCamera's profile, not this one.
+#
+# Deliberately no `panic = "abort"`, on CrowTextEditor's precedent: anything
+# with work left to do on the way out keeps unwinding. Nothing here installs a
+# panic hook today, so abort would have to be argued on binary size alone —
+# and against it stands the seat and the DRM master, which LibSeatSession
+# releases from Drop, and which an abort leaves the tty still holding.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
 # Patched smithay: upstream 0.7.0 creates the drag-and-drop `wl_data_offer` at
 # the client's own `wl_data_device` version and then sends `source_actions` on
 # it unconditionally. That event is new in version 3, so a client that binds
