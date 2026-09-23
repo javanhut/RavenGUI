@@ -70,10 +70,10 @@ pub(super) fn make_audible() {
     if let Some((id, mut value)) = control(&ctl, VOLUME, ElemType::Integer)
         && value.get_integer(0) == Some(0)
     {
-        // Cap recovery at -12 dB, even if the card supports positive gain.
+        // Cap recovery at -20 dB, even if the card supports positive gain.
         // PipeWire still controls the ordinary 0–100% slider above this.
         let target = ctl.get_db_range(&id).and_then(|(min, max)| {
-            let db = MilliBel((-1200).clamp(min.0, max.0));
+            let db = MilliBel((-2000).clamp(min.0, max.0));
             ctl.convert_from_db(&id, db, Round::Floor)
         });
         match target {
