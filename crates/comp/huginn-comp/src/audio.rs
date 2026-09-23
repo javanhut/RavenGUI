@@ -44,6 +44,9 @@ use std::time::Duration;
 use crate::osd::{Flash, Slider};
 use crate::settings::Motion;
 
+#[cfg(target_os = "linux")]
+mod alsa_master;
+
 /// One media key's worth of change, as a percentage.
 pub(crate) const STEP: u32 = 5;
 
@@ -149,10 +152,22 @@ impl Mixer for Wpctl {
         if !output.status.success() {
             return None;
         }
-        Self::parse(&String::from_utf8_lossy(&output.stdout))
+        let mut level = Self::parse(&String::from_utf8_lossy(&output.stdout))?;
+        #[cfg(target_os = "linux")]
+        if alsa_master::silent() == Some(true) {
+            level.muted = true;
+        }
+        Some(level)
     }
 
     fn apply(&self, level: Level) {
+        // Some cards expose a separate ALSA Master control which PipeWire's
+        // sink volume does not move. A zeroed or muted Master makes a healthy
+        // PipeWire sink silent; recover it when the user asks for sound.
+        #[cfg(target_os = "linux")]
+        if !level.muted && level.percent > 0 {
+            alsa_master::make_audible();
+        }
         // Two commands, because `wpctl` sets volume and mute separately and
         // there is no reason to be clever about skipping one: each is a
         // process that lives for a frame.

@@ -25,6 +25,7 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 huginn-egl.workspace = true
+alsa = "0.11"
 # For dev_t in the dmabuf main-device hint. No unsafe involved: the type is a
 # plain integer alias.
 libc = "0.2"
