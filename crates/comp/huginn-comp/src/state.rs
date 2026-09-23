@@ -683,6 +683,13 @@ pub(crate) struct Huginn {
     /// injected in `backend::spawn`. `std::env::set_var` would be a
     /// process-global write, and unsafe in edition 2024.
     pub(crate) x11_display: Option<u32>,
+    /// Whether this compositor owns the session bus's activation environment.
+    ///
+    /// True only on the udev backend. A nested compositor shares the bus of the
+    /// desktop it runs inside; publishing its socket there would send that
+    /// desktop's portal dialogs into a development window, or into nothing once
+    /// it closes. See `backend::publish_activation_environment`.
+    pub(crate) publishes_activation_env: bool,
 
     /// Windows that have committed a buffer, and may therefore be drawn.
     ///
@@ -1227,6 +1234,7 @@ impl Huginn {
             xwayland_shell_state: XWaylandShellState::new::<Self>(dh),
             x11_unmanaged: Vec::new(),
             x11_display: None,
+            publishes_activation_env: false,
             mapped: HashSet::new(),
             popups: PopupManager::default(),
             layers: Vec::new(),
@@ -5409,6 +5417,11 @@ impl Huginn {
     /// Tell the compositor which socket to hand to children.
     pub(crate) fn set_socket(&mut self, socket: String) {
         self.socket = socket;
+    }
+
+    /// The Wayland socket name clients connect with, e.g. `wayland-1`.
+    pub(crate) fn socket(&self) -> &str {
+        &self.socket
     }
 
     /// Run an application, and remember that it was run.

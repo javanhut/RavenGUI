@@ -145,6 +145,12 @@ where
             // now, never at spawn time — a client that connects before the
             // window manager exists maps windows nobody will manage.
             huginn.x11_display = Some(display_number);
+            if huginn.publishes_activation_env {
+                crate::backend::publish_activation_environment(
+                    huginn.socket(),
+                    Some(display_number),
+                );
+            }
             tracing::info!(display = display_number, "XWayland ready");
         }
         XWaylandEvent::Error => {

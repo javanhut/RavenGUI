@@ -139,6 +139,73 @@ pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) -> 
     }
 }
 
+/// Tell the session bus which display D-Bus-activated services should use.
+///
+/// `spawn` covers what huginn starts itself; this covers what the bus starts on
+/// demand. The session bus is up before huginn is, so its activation
+/// environment has no WAYLAND_DISPLAY -- and every service it activates
+/// inherits that. The one that bites is the portal backend: a browser's
+/// Open/Upload dialog goes through xdg-desktop-portal to
+/// `ravenfilemanager --portal`, which, started without a display, cannot open a
+/// window and never answers. The picker simply never appears. The GTK backend
+/// crashes outright for the same reason.
+///
+/// This is the call `dbus-update-activation-environment` makes. It only affects
+/// services activated from now on, which is why it runs as soon as the socket
+/// exists, before anything could have asked for a portal. It runs again once
+/// XWayland is up, to add DISPLAY.
+///
+/// On a thread: it is a blocking round-trip to the bus, and the compositor must
+/// not stall on a bus that is slow or missing. Failure is logged, not fatal --
+/// the desktop works without it, only activated services go without a display.
+pub(crate) fn publish_activation_environment(socket: &str, x11_display: Option<u32>) {
+    let mut vars = vec![
+        ("WAYLAND_DISPLAY".to_string(), socket.to_string()),
+        ("XDG_SESSION_TYPE".to_string(), "wayland".to_string()),
+    ];
+    // Passed through rather than invented: the session script decides these.
+    // Portals choose their backend by XDG_CURRENT_DESKTOP, and GTK_USE_PORTAL
+    // makes a GTK3 program the bus starts use the portal dialogs, like one
+    // started from the launcher.
+    for name in ["XDG_CURRENT_DESKTOP", "GTK_USE_PORTAL"] {
+        if let Ok(value) = std::env::var(name) {
+            vars.push((name.to_string(), value));
+        }
+    }
+    if let Some(display) = x11_display {
+        vars.push(("DISPLAY".to_string(), format!(":{display}")));
+    }
+
+    let started = std::thread::Builder::new()
+        .name("huginn-dbus-env".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let result = zbus::blocking::Connection::session().and_then(|bus| {
+                let env: std::collections::HashMap<&str, &str> =
+                    vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                bus.call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "UpdateActivationEnvironment",
+                    &(env,),
+                )
+                .map(drop)
+            });
+            match result {
+                Ok(()) => tracing::info!(?vars, "published activation environment"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "cannot update the D-Bus activation environment; \
+                     bus-activated services such as portals will have no display"
+                ),
+            }
+        });
+    if let Err(e) = started {
+        tracing::warn!(error = %e, "no thread to publish the activation environment");
+    }
+}
+
 /// Wait for `child` on a thread of its own, so it does not become a zombie.
 ///
 /// Nothing used to wait for these at all. `Child`'s `Drop` deliberately does

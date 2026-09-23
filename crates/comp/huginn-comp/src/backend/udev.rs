@@ -367,6 +367,10 @@ pub(crate) fn run() -> Result<()> {
     let socket_source = ListeningSocketSource::new_auto().context("binding wayland socket")?;
     let socket = socket_source.socket_name().to_string_lossy().into_owned();
     state.set_socket(socket.clone());
+    // This is the session, so the session bus should launch its services onto
+    // this display. Before anything else runs, so no portal starts without it.
+    state.publishes_activation_env = true;
+    super::publish_activation_environment(&socket, None);
 
     // Every client rings this on its way out, and the loop then asks whether
     // the one that left was the lock screen. See `Huginn::recover_lost_lock`.
