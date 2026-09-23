@@ -624,6 +624,10 @@ impl Nested {
                 chord::send_ctrl(&self.keyboard, state, Keysym::v, time);
                 return;
             }
+            Action::SelectAll => {
+                chord::send_ctrl(&self.keyboard, state, Keysym::a, time);
+                return;
+            }
             Action::OpenHelp => {
                 state.open_help();
                 return;

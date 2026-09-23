@@ -222,8 +222,8 @@ pub(crate) fn ready(token: &str) {
         return;
     };
     let tmp = dir.join(format!("{READY_FILE}.new"));
-    let written = fs::write(&tmp, format!("{token}\n"))
-        .and_then(|()| fs::rename(&tmp, dir.join(READY_FILE)));
+    let written =
+        fs::write(&tmp, format!("{token}\n")).and_then(|()| fs::rename(&tmp, dir.join(READY_FILE)));
     if let Err(e) = written {
         tracing::warn!(error = %e, "could not tell init the session is ready to sleep");
     }
@@ -246,7 +246,9 @@ fn parse(text: &str) -> Option<Phase> {
     let mut words = text.split_whitespace();
     match words.next()? {
         AWAKE => Some(Phase::Awake),
-        SLEEPING => Some(Phase::Sleeping(words.next().unwrap_or_default().to_string())),
+        SLEEPING => Some(Phase::Sleeping(
+            words.next().unwrap_or_default().to_string(),
+        )),
         _ => None,
     }
 }

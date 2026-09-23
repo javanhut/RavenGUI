@@ -12,7 +12,7 @@
 //! macOS. A compositor that takes the whole `Super` layer leaves those chords
 //! unreachable, since a key it intercepts never arrives at the client at all.
 //!
-//! There are two exceptions. Copy and paste, which the compositor translates
+//! There are two exceptions. Copy, paste and select-all, which the compositor translates
 //! rather than performs — see [`Action::Copy`] — and which it hands back to any
 //! client that has its own use for the chord. And [`Action::Lock`], which it
 //! does *not* hand back to anybody, for the reason given there.
@@ -63,6 +63,9 @@ pub(crate) enum Action {
     Copy,
     /// Paste in the focused client. As [`Action::Copy`], with `Ctrl`+`V`.
     Paste,
+    /// Select everything in the focused client. As [`Action::Copy`], with
+    /// `Ctrl`+`A`.
+    SelectAll,
     /// Lock the session.
     ///
     /// On plain `Super` rather than `Super`+`Ctrl`, breaking this module's own
@@ -391,6 +394,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         description: "paste in the focused client",
     },
     Binding {
+        action: Action::SelectAll,
+        chord: "Super+A",
+        description: "select all in the focused client",
+    },
+    Binding {
         action: Action::OpenLauncher,
         chord: "Super+Ctrl+Space",
         description: "open the application launcher",
@@ -708,7 +716,7 @@ pub(crate) fn resolve(
         if matches!(sym, keysyms::KEY_l | keysyms::KEY_L) {
             return FilterResult::Intercept(pressed(key_state, Action::Lock));
         }
-        // Copy and paste are borrowed back, and only from clients that have no
+        // Copy, paste and select-all are borrowed back, and only from clients that have no
         // use of their own for the chord.
         if mode.focus_owns_super {
             return FilterResult::Forward;
@@ -716,6 +724,7 @@ pub(crate) fn resolve(
         let action = match sym {
             keysyms::KEY_c | keysyms::KEY_C => Action::Copy,
             keysyms::KEY_v | keysyms::KEY_V => Action::Paste,
+            keysyms::KEY_a | keysyms::KEY_A => Action::SelectAll,
             _ => return FilterResult::Forward,
         };
         return FilterResult::Intercept(pressed(key_state, action));
@@ -1322,8 +1331,11 @@ mod tests {
             intercepted(super_ctrl(), keysyms::KEY_a),
             Some(Action::OpenPinned)
         );
-        // Plain Super+A stays the application's.
-        assert!(forwarded(KeyState::Pressed, super_held(), keysyms::KEY_a));
+        // Plain Super+A is select-all, not the pin bar.
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_a),
+            Some(Action::SelectAll)
+        );
         let mode = Modes {
             pinned_open: true,
             ..Modes::default()
@@ -1690,13 +1702,17 @@ mod tests {
             intercepted(super_held(), keysyms::KEY_v),
             Some(Action::Paste)
         );
+        assert_eq!(
+            intercepted(super_held(), keysyms::KEY_a),
+            Some(Action::SelectAll)
+        );
     }
 
     #[test]
     fn a_client_with_its_own_super_layer_keeps_copy_and_paste() {
         // Translating for a terminal would replace a working copy with Ctrl+C,
         // which it reads as SIGINT and sends to whatever is running.
-        for sym in [keysyms::KEY_c, keysyms::KEY_v] {
+        for sym in [keysyms::KEY_c, keysyms::KEY_v, keysyms::KEY_a] {
             assert!(matches!(
                 resolve(
                     KeyState::Pressed,

@@ -13,9 +13,9 @@ mod anim;
 #[cfg(target_os = "linux")]
 mod appwatch;
 mod audio;
-mod backlight;
 #[cfg(target_os = "linux")]
 mod backend;
+mod backlight;
 #[cfg(target_os = "linux")]
 mod bluetooth;
 mod blur;

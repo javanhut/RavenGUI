@@ -103,7 +103,12 @@ mod tests {
     fn immediately_is_immediate_for_a_session_walked_away_from() {
         // Locked a moment ago; the last input was the lock chord itself.
         assert_eq!(
-            wait(ScreenOff::Immediately, Duration::from_millis(300), S(5), false),
+            wait(
+                ScreenOff::Immediately,
+                Duration::from_millis(300),
+                S(5),
+                false
+            ),
             Some(Duration::ZERO)
         );
     }
@@ -133,8 +138,16 @@ mod tests {
     #[test]
     fn a_delay_counts_from_the_later_of_lock_and_input() {
         let thirty = ScreenOff::After(S(30));
-        assert_eq!(wait(thirty, S(10), S(600), false), Some(S(20)), "from the lock");
-        assert_eq!(wait(thirty, S(600), S(10), true), Some(S(20)), "from the input");
+        assert_eq!(
+            wait(thirty, S(10), S(600), false),
+            Some(S(20)),
+            "from the lock"
+        );
+        assert_eq!(
+            wait(thirty, S(600), S(10), true),
+            Some(S(20)),
+            "from the input"
+        );
         assert_eq!(wait(thirty, S(600), S(45), true), Some(Duration::ZERO));
     }
 }

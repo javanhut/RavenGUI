@@ -990,13 +990,17 @@ impl Udev {
         }
         self.sleep_token = Some(token.clone());
         let timer = Timer::from_duration(SLEEP_LOCK_WAIT);
-        let armed = self.handle.insert_source(timer, move |_, _, data: &mut Udev| {
-            if data.sleep_token.as_deref() == Some(token.as_str()) {
-                tracing::warn!("the lock screen did not draw in time; sleeping behind the blank");
-                data.finish_sleep_prep(true);
-            }
-            TimeoutAction::Drop
-        });
+        let armed = self
+            .handle
+            .insert_source(timer, move |_, _, data: &mut Udev| {
+                if data.sleep_token.as_deref() == Some(token.as_str()) {
+                    tracing::warn!(
+                        "the lock screen did not draw in time; sleeping behind the blank"
+                    );
+                    data.finish_sleep_prep(true);
+                }
+                TimeoutAction::Drop
+            });
         if let Err(e) = armed {
             tracing::warn!(error = %e, "no timer for the sleep; not waiting for the lock screen");
             self.finish_sleep_prep(true);
@@ -1041,9 +1045,9 @@ impl Udev {
                 continue;
             }
             let cleared = match &mut screen.scanout {
-                ScreenScanout::Primary(drm) | ScreenScanout::Gpu { drm, .. } => {
-                    drm.with_compositor(|c| c.clear()).map_err(anyhow::Error::from)
-                }
+                ScreenScanout::Primary(drm) | ScreenScanout::Gpu { drm, .. } => drm
+                    .with_compositor(|c| c.clear())
+                    .map_err(anyhow::Error::from),
                 ScreenScanout::Dumb(dumb) => dumb.power_off(),
             };
             if let Err(e) = cleared {
@@ -1065,9 +1069,14 @@ impl Udev {
             return;
         }
         let timer = Timer::from_duration(SCREEN_OFF_RECHECK);
-        match self.handle.insert_source(timer, |_, _, data: &mut Udev| data.screen_off_tick()) {
+        match self
+            .handle
+            .insert_source(timer, |_, _, data: &mut Udev| data.screen_off_tick())
+        {
             Ok(token) => self.screen_off_timer = Some(token),
-            Err(e) => tracing::warn!(error = %e, "no screen-off timer; screens stay on while locked"),
+            Err(e) => {
+                tracing::warn!(error = %e, "no screen-off timer; screens stay on while locked")
+            }
         }
     }
 
@@ -2108,6 +2117,10 @@ impl Udev {
             }
             Action::Paste => {
                 chord::send_ctrl(&self.keyboard, state, Keysym::v, time);
+                return;
+            }
+            Action::SelectAll => {
+                chord::send_ctrl(&self.keyboard, state, Keysym::a, time);
                 return;
             }
             Action::OpenHelp => {

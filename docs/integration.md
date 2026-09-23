@@ -185,6 +185,7 @@ client cannot receive or override them:
 | `Super+Ctrl+1..9` | go to a workspace |
 | `Super+Ctrl+Shift+1..9` | send the focused window to a workspace |
 | `Super+C` / `Super+V` | copy / paste in the focused client |
+| `Super+A` | select all in the focused client |
 | `Super+L` | lock the session |
 | `Super+Ctrl+Space` | open the application launcher |
 | `Super+Ctrl+A` | open the pinned applications |
@@ -252,7 +253,7 @@ menu down — but after the lock, which owns every key ahead of it, so a locked
 screen cannot be photographed through the binding. See "Screenshots" below.
 
 `Super+L` is the one chord on the plain `Super` layer that is never handed back.
-`Super+C` and `Super+V` are given to a client that drives `Super` itself, since
+`Super+C`, `Super+V` and `Super+A` are given to a client that drives `Super` itself, since
 a terminal has its own use for them; `Super+L` is not, because a lock chord that
 does nothing whenever a terminal happens to be focused fails at exactly the
 moment somebody walks away from a machine believing they locked it.
@@ -535,8 +536,9 @@ the workspace carousel partway across the screen.
 
 ### The `Super` rule
 
-**Plain `Super` belongs to the focused application.** `Super+C` and `Super+V`
-above are translated: the compositor synthesises `Ctrl+C` / `Ctrl+V` for the
+**Plain `Super` belongs to the focused application.** `Super+C`, `Super+V` and
+`Super+A` above are translated: the compositor synthesises `Ctrl+C` / `Ctrl+V` /
+`Ctrl+A` for the
 focused client, because copy is not a compositor operation — the clipboard
 belongs to the client, and there is no protocol for asking one to copy.
 
