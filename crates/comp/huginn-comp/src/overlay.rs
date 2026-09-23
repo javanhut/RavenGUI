@@ -971,9 +971,9 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let output = Rect::from_xywh(0, 0, 1366, 768);
+        let output = Rect::from_xywh(0, 0, 1280, 720);
         let layout = fit(output, &mut text, 1, "");
-        assert!(layout.hidden > 0, "1366x768 fitted the whole table");
+        assert!(layout.hidden > 0, "1280x720 fitted the whole table");
         assert_eq!(
             layout.rows.len() + layout.hidden,
             BINDINGS.len(),
@@ -1007,7 +1007,7 @@ mod tests {
         if !text.is_usable() {
             return;
         }
-        let output = Rect::from_xywh(0, 0, 1366, 768);
+        let output = Rect::from_xywh(0, 0, 1280, 720);
         let whole = fit(output, &mut text, 1, "");
         let dropped = BINDINGS[whole.rows.len()..]
             .first()

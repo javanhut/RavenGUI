@@ -13,6 +13,7 @@ mod anim;
 #[cfg(target_os = "linux")]
 mod appwatch;
 mod audio;
+mod backlight;
 #[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
@@ -47,6 +48,8 @@ mod motion;
 mod mouse;
 #[cfg(target_os = "linux")]
 mod notifications;
+#[cfg(target_os = "linux")]
+mod osd;
 #[cfg(target_os = "linux")]
 mod overlay;
 mod overview;

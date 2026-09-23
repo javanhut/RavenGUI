@@ -1,0 +1,6 @@
+# Let the session (group video, which the Raven session already holds for DRM)
+# set the screen's backlight brightness without root. huginn writes
+# /sys/class/backlight/*/brightness when the brightness keys are pressed; see
+# crates/comp/huginn-comp/src/backlight.rs. Install with:
+#   sudo cp data/90-backlight.rules /etc/udev/rules.d/ && sudo udevadm trigger -s backlight
+ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"

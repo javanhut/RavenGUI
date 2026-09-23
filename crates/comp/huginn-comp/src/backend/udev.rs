@@ -2161,6 +2161,10 @@ impl Udev {
                 state.volume_key(key);
                 return;
             }
+            Action::Brightness(key) => {
+                state.brightness_key(key);
+                return;
+            }
             Action::Screenshot(shot) => {
                 self.screenshot(shot);
                 return;

@@ -194,6 +194,7 @@ client cannot receive or override them:
 | `Print` | screenshot the screen (`Shift`: region, `Ctrl`: window) |
 | `Super+Print` | start or stop recording the screen |
 | volume keys | raise, lower or mute the output volume |
+| brightness keys | brighten or dim the screen |
 
 And these pointer chords, which never reach the client under the pointer.
 Plain buttons and a plain wheel are yours; so is every other modifier
@@ -244,7 +245,7 @@ compositor's drawing of it changes. A pointer a client has hidden is not
 enlarged, since that client is drawing its own. The rule is
 `huginn-comp/src/shake.rs`, pure and tested.
 
-`Print` is the one binding besides the volume keys that resolves without the
+`Print` is the one binding besides the volume and brightness keys that resolves without the
 `Super` layer, because that is where every other desktop puts it. It is settled
 before the panels, so it captures whatever is on screen — the launcher open, a
 menu down — but after the lock, which owns every key ahead of it, so a locked
@@ -257,13 +258,28 @@ does nothing whenever a terminal happens to be focused fails at exactly the
 moment somebody walks away from a machine believing they locked it.
 
 While the session is locked no chord in this table resolves at all — every key
-goes to the lock screen, including `Super+Ctrl+Esc`. The volume keys are the
-one exception: they act on the speakers rather than on the session, and they
-work whatever is open — the launcher, quick settings, or the lock screen. Each
-press shows a slider at the bottom of the screen for a moment; the level is set
-through `wpctl`, so it needs PipeWire, and the slider says "not connected" when
-there is none. The same level is a row in quick settings (`Super+Ctrl+S`),
+goes to the lock screen, including `Super+Ctrl+Esc`. The volume and brightness
+keys are the exceptions: they act on the speakers and the panel rather than on
+the session, and they work whatever is open — the launcher, quick settings, or
+the lock screen. Each press shows a slider at the bottom of the screen for a
+moment; the volume is set through `wpctl`, so it needs PipeWire, and the slider
+says "not connected" when there is none. The same level is a row in quick settings (`Super+Ctrl+S`),
 where the left and right arrows step it and `Return` mutes.
+
+The brightness keys (`XF86MonBrightnessUp` / `Down`) follow the same rules:
+they work over every panel and on the lock screen, and show the same slider in
+the same place — pressing one kind of key replaces the other's slider rather
+than stacking on it. They step 5% at a time on a grid (23% goes to 25%, not
+28%) and stop at 1% rather than zero, because on most laptop panels zero is the
+light off. The level is written straight to `/sys/class/backlight/*/brightness`
+— `firmware` before `platform` before `raw` when there is more than one — which
+is root's unless `data/90-backlight.rules` is installed:
+
+    sudo cp data/90-backlight.rules /etc/udev/rules.d/
+    sudo udevadm trigger -s backlight
+
+Without it the slider says "not connected" and the log says why. The same level
+is the Brightness row in quick settings, stepped with the arrows.
 
 The pin bar (`Super+Ctrl+A`) shows the applications the user has pinned, as a
 rail of icons riding one edge of the screen: one slot wide, as long as it has

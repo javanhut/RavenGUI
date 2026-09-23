@@ -291,35 +291,48 @@ impl Control for VolumeRow {
     }
 }
 
-/// Brightness, as a percentage.
+/// The screen brightness. Real, through whatever
+/// [`crate::backlight::Brightness`] found.
 ///
-/// A stub: the real implementation writes `/sys/class/backlight/*/brightness`
-/// or asks logind, and needs the session to own the device.
+/// Shares the compositor's brightness for the reason [`VolumeRow`] shares
+/// its volume: the keys and this row are two ways of moving one number.
 #[derive(Debug)]
-struct Brightness {
-    percent: u32,
+struct BrightnessRow {
+    brightness: crate::backlight::Shared,
+    /// The clock, for the slider's reveal. See [`VolumeRow::now`].
+    now: Duration,
+    motion: Motion,
 }
 
-impl Control for Brightness {
+impl Control for BrightnessRow {
     fn label(&self) -> &str {
         "Brightness"
     }
     fn read(&self) -> Reading {
+        let brightness = self.brightness.borrow();
         Reading {
-            value: format!("{}%", self.percent),
-            real: false,
+            value: brightness.level().caption(),
+            real: brightness.is_real(),
         }
     }
     fn activate(&mut self) -> bool {
-        // Steps rather than a slider until there is pointer input to drag one.
-        self.percent = match self.percent {
-            0..=24 => 25,
-            25..=49 => 50,
-            50..=74 => 75,
-            75..=99 => 100,
-            _ => 0,
-        };
-        true
+        // Nothing to toggle: there is no "off" worth a key, and the floor
+        // exists so there is not one by accident. The arrows are the row.
+        false
+    }
+    fn adjust(&mut self, delta: i32) -> bool {
+        let before = self.brightness.borrow().level();
+        self.brightness
+            .borrow_mut()
+            .adjust(delta, self.now, self.motion);
+        self.brightness.borrow().level() != before
+    }
+    fn slider(&self) -> Option<f32> {
+        Some(self.brightness.borrow().level().fraction())
+    }
+    fn set_clock(&mut self, now: Duration, motion: Motion) {
+        self.now = now;
+        self.motion = motion;
     }
 }
 
@@ -989,26 +1002,32 @@ pub(crate) struct Settings {
 }
 
 impl Default for Settings {
-    /// A panel with a volume of its own, connected to nothing. For tests;
-    /// the compositor builds one with [`Settings::new`] around its volume.
+    /// A panel with a volume and brightness of its own, connected to
+    /// nothing. For tests; the compositor builds one with [`Settings::new`]
+    /// around its own.
     fn default() -> Self {
         Self::with_power(
             crate::audio::Volume::default().shared(),
+            crate::backlight::Brightness::default().shared(),
             Box::new(FakePower::default()),
         )
     }
 }
 
 impl Settings {
-    /// The panel, with its volume row driving `volume` and its Power row
-    /// talking to raven-powerd.
-    pub(crate) fn new(volume: crate::audio::Shared) -> Self {
-        Self::with_power(volume, Box::new(PowerSocket))
+    /// The panel, with its volume and brightness rows driving `volume` and
+    /// `brightness`, and its Power row talking to raven-powerd.
+    pub(crate) fn new(volume: crate::audio::Shared, brightness: crate::backlight::Shared) -> Self {
+        Self::with_power(volume, brightness, Box::new(PowerSocket))
     }
 
     /// The panel with a Power row that sends through `power`, so a test can
     /// press Return on it without leaving the machine off.
-    fn with_power(volume: crate::audio::Shared, power: Box<dyn PowerSender>) -> Self {
+    fn with_power(
+        volume: crate::audio::Shared,
+        brightness: crate::backlight::Shared,
+        power: Box<dyn PowerSender>,
+    ) -> Self {
         Self {
             open: false,
             selected: 0,
@@ -1030,7 +1049,11 @@ impl Settings {
                 Box::new(PinsPosition {
                     position: crate::pins::Position::default(),
                 }),
-                Box::new(Brightness { percent: 75 }),
+                Box::new(BrightnessRow {
+                    brightness,
+                    now: Duration::ZERO,
+                    motion: Motion::default(),
+                }),
                 Box::new(WiFi { on: true }),
                 Box::new(BluetoothRow::new(Box::new(crate::bluetooth::Unavailable))),
                 Box::new(DoNotDisturb { on: false }),
@@ -1687,9 +1710,10 @@ mod tests {
             .filter(|c| !c.read().real)
             .map(|c| c.label())
             .collect();
-        // Volume and Bluetooth are on the list only because a default panel
-        // has a silent mixer and no BlueZ thread behind it; on a machine
-        // with PipeWire and bluetoothd those rows are real.
+        // Volume, Brightness and Bluetooth are on the list only because a
+        // default panel has a silent mixer, no backlight and no BlueZ thread
+        // behind it; on a laptop with PipeWire and bluetoothd those rows are
+        // real.
         assert_eq!(stubs, ["Volume", "Brightness", "Wi-Fi", "Bluetooth"]);
     }
 
@@ -1744,31 +1768,41 @@ mod tests {
     #[test]
     fn activating_changes_only_the_highlighted_control() {
         let mut settings = opened();
-        select(&mut settings, "Brightness");
-        let brightness = index_of(&settings, "Brightness");
+        select(&mut settings, DO_NOT_DISTURB);
+        let row = index_of(&settings, DO_NOT_DISTURB);
         let before: Vec<String> = settings.controls.iter().map(|c| c.read().value).collect();
         settings.press(Key::Activate, T0);
         let after: Vec<String> = settings.controls.iter().map(|c| c.read().value).collect();
         let changed: Vec<usize> = (0..before.len())
             .filter(|i| before[*i] != after[*i])
             .collect();
-        assert_eq!(changed, [brightness], "activation touched {changed:?}");
+        assert_eq!(changed, [row], "activation touched {changed:?}");
     }
 
+    /// The row and the brightness keys move one number, not two.
     #[test]
-    fn brightness_wraps_rather_than_sticking_at_full() {
-        let mut settings = opened();
+    fn the_brightness_row_shares_the_compositors_brightness() {
+        let brightness = crate::backlight::Brightness::default().shared();
+        let mut settings =
+            Settings::new(crate::audio::Volume::default().shared(), brightness.clone());
+        settings.open(T0);
         select(&mut settings, "Brightness");
-        let brightness = index_of(&settings, "Brightness");
-        let mut seen = Vec::new();
-        for _ in 0..6 {
-            settings.press(Key::Activate, T0);
-            seen.push(settings.controls[brightness].read().value.clone());
-        }
-        assert!(seen.contains(&"100%".to_owned()));
+        let row = index_of(&settings, "Brightness");
+        brightness
+            .borrow_mut()
+            .press(crate::backlight::Key::Lower, T0, Motion::Full);
+        let level = brightness.borrow().level();
+        assert_eq!(settings.controls[row].read().value, level.caption());
+        settings.press(Key::Right, T0);
+        assert_eq!(
+            brightness.borrow().level().percent(),
+            level.percent() + crate::backlight::STEP
+        );
+        settings.press(Key::Left, T0);
+        assert_eq!(brightness.borrow().level(), level);
         assert!(
-            seen.contains(&"0%".to_owned()),
-            "it stuck at full: {seen:?}"
+            settings.controls[row].slider().is_some(),
+            "brightness has no slider"
         );
     }
 
@@ -1803,7 +1837,10 @@ mod tests {
     #[test]
     fn the_volume_row_shares_the_compositors_volume() {
         let volume = crate::audio::Volume::default().shared();
-        let mut settings = Settings::new(volume.clone());
+        let mut settings = Settings::new(
+            volume.clone(),
+            crate::backlight::Brightness::default().shared(),
+        );
         settings.open(T0);
         select(&mut settings, "Volume");
         let row = index_of(&settings, "Volume");
@@ -1824,6 +1861,7 @@ mod tests {
         let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut settings = Settings::with_power(
             crate::audio::Volume::default().shared(),
+            crate::backlight::Brightness::default().shared(),
             Box::new(FakePower { sent: sent.clone() }),
         );
         settings.open(T0);
@@ -1963,8 +2001,11 @@ mod tests {
                 Ok("error: init unreachable".to_owned())
             }
         }
-        let mut settings =
-            Settings::with_power(crate::audio::Volume::default().shared(), Box::new(Refusing));
+        let mut settings = Settings::with_power(
+            crate::audio::Volume::default().shared(),
+            crate::backlight::Brightness::default().shared(),
+            Box::new(Refusing),
+        );
         settings.open(T0);
         select(&mut settings, "Power");
         let row = index_of(&settings, "Power");

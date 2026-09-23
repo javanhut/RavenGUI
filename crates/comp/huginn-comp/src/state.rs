@@ -900,6 +900,10 @@ pub(crate) struct Huginn {
     /// the slider drawn while it is being changed.
     volume: crate::audio::Shared,
     volume_panel: Option<crate::canvas::Panel>,
+    /// The screen brightness, shared the same way with its settings row, and
+    /// its slider — drawn in the volume slider's place, never beside it.
+    brightness: crate::backlight::Shared,
+    brightness_panel: Option<crate::canvas::Panel>,
     /// When the compositor started, so animations have a monotonic origin.
     started: std::time::Instant,
 
@@ -1157,6 +1161,7 @@ impl Huginn {
         let desktop_config = crate::desktop_config::DesktopConfig::load();
         crate::theme::set_accent(desktop_config.accent());
         let volume = crate::audio::Volume::detect().shared();
+        let brightness = crate::backlight::Brightness::detect().shared();
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(dh, "huginn");
         // Advertised for every backend. A seat with no pointer capability makes
@@ -1311,10 +1316,12 @@ impl Huginn {
             dock_hover: None,
             dock_hover_since: None,
             dock_items: Vec::new(),
-            settings: crate::settings::Settings::new(volume.clone()),
+            settings: crate::settings::Settings::new(volume.clone(), brightness.clone()),
             settings_panel: None,
             volume,
             volume_panel: None,
+            brightness,
+            brightness_panel: None,
             started: std::time::Instant::now(),
             notifications: crate::notifications::Notifications::default(),
             launcher: crate::launcher::Launcher::default(),
@@ -1633,6 +1640,9 @@ impl Huginn {
         }
         if self.volume_panel.is_some() {
             self.refresh_volume();
+        }
+        if self.brightness_panel.is_some() {
+            self.refresh_brightness();
         }
         if self.notifications.drawn_count() > 0 {
             self.notifications.invalidate();
@@ -2177,8 +2187,15 @@ impl Huginn {
         if let Some(panel) = &self.volume_panel {
             out.push(SceneItem::Overlay(
                 panel.buffer(),
-                crate::audio::placement(self.output_area(), panel.size()),
+                crate::osd::placement(self.output_area(), panel.size()),
                 self.volume.borrow().reveal(self.uptime()),
+            ));
+        }
+        if let Some(panel) = &self.brightness_panel {
+            out.push(SceneItem::Overlay(
+                panel.buffer(),
+                crate::osd::placement(self.output_area(), panel.size()),
+                self.brightness.borrow().reveal(self.uptime()),
             ));
         }
         if let Some(panel) = &self.launcher_panel {
@@ -5960,6 +5977,7 @@ impl Huginn {
             + self.region_ring_len()
             + usize::from(self.help.is_some())
             + usize::from(self.volume_panel.is_some())
+            + usize::from(self.brightness_panel.is_some())
             + usize::from(self.launcher_panel.is_some())
             + usize::from(self.pinned_panel.is_some())
             + usize::from(self.settings_panel.is_some())
@@ -6193,6 +6211,7 @@ impl Huginn {
         }
         self.tick_found_pointer(now);
         self.tick_volume(now);
+        self.tick_brightness(now);
         self.tick_notifications(now);
         if let Some(since) = self.dock_hover_since {
             if now.saturating_sub(since) >= crate::dock::PREVIEW_DELAY {
@@ -6286,6 +6305,9 @@ impl Huginn {
     /// A media key. Moves the level and shows the slider.
     pub(crate) fn volume_key(&mut self, key: crate::audio::Key) {
         let (now, motion) = (self.uptime(), self.settings.motion());
+        // One slider at a time: the two sit in the same place.
+        self.brightness.borrow_mut().dismiss();
+        self.brightness_panel = None;
         self.volume.borrow_mut().press(key, now, motion);
         self.refresh_volume();
         // The settings row shows the same number, so if the panel is up it
@@ -6336,8 +6358,49 @@ impl Huginn {
         let volume = self.volume.borrow();
         self.volume_panel = volume
             .is_visible(now)
-            .then(|| crate::audio::render(&volume, &mut self.text, area, advertised));
+            .then(|| crate::osd::render(&volume.slider(), &mut self.text, area, advertised));
         drop(volume);
+        self.queue_redraw();
+    }
+
+    /// A brightness key. Moves the backlight and shows the slider, in place
+    /// of the volume one if that is up.
+    pub(crate) fn brightness_key(&mut self, key: crate::backlight::Key) {
+        let (now, motion) = (self.uptime(), self.settings.motion());
+        self.volume.borrow_mut().dismiss();
+        self.volume_panel = None;
+        self.brightness.borrow_mut().press(key, now, motion);
+        self.refresh_brightness();
+        if self.settings_panel.is_some() {
+            self.refresh_settings();
+        }
+    }
+
+    /// The brightness slider's hold and fade. See [`Huginn::tick_volume`].
+    fn tick_brightness(&mut self, now: std::time::Duration) {
+        let motion = self.settings.motion();
+        let mut brightness = self.brightness.borrow_mut();
+        brightness.tick(now, motion);
+        let animating = brightness.is_animating(now);
+        drop(brightness);
+        if animating {
+            self.queue_redraw();
+        } else if self.brightness_panel.is_some() {
+            self.brightness_panel = None;
+            self.queue_redraw();
+        }
+    }
+
+    /// Recompose the brightness slider for the level it now shows. See
+    /// [`Huginn::refresh_volume`].
+    pub(crate) fn refresh_brightness(&mut self) {
+        let now = self.uptime();
+        let (area, advertised) = (self.output_area(), self.scale().advertised);
+        let brightness = self.brightness.borrow();
+        self.brightness_panel = brightness
+            .is_visible(now)
+            .then(|| crate::osd::render(&brightness.slider(), &mut self.text, area, advertised));
+        drop(brightness);
         self.queue_redraw();
     }
 
@@ -6367,8 +6430,26 @@ impl Huginn {
         });
         // The volume row may just have moved the level, and the slider that
         // shows it is drawn whether the change came from a key or a row.
+        // Both rows pop a slider in the same place. Stepping one while the
+        // other's is still held up leaves the newer, as the keys do.
+        let held = (
+            self.volume.borrow().held_until(),
+            self.brightness.borrow().held_until(),
+        );
+        if let (Some(volume), Some(brightness)) = held {
+            if volume > brightness {
+                self.brightness.borrow_mut().dismiss();
+                self.brightness_panel = None;
+            } else {
+                self.volume.borrow_mut().dismiss();
+                self.volume_panel = None;
+            }
+        }
         if self.volume.borrow().is_visible(now) {
             self.refresh_volume();
+        }
+        if self.brightness.borrow().is_visible(now) {
+            self.refresh_brightness();
         }
         // The pin bar's row may just have been stepped. The row owns the
         // value; the pins take a copy, and the file and the bar follow.

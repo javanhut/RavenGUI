@@ -159,6 +159,13 @@ pub(crate) enum Action {
     /// has started playing something is for it to stop, and a mute key that
     /// works only after the password is a mute key that arrives late.
     Volume(crate::audio::Key),
+    /// A brightness key: raise or lower the screen's backlight.
+    ///
+    /// Resolved where [`Action::Volume`] is, and for the same reason works
+    /// while locked: it acts on the panel, not the session, and a lock screen
+    /// too bright to look at in the dark is not one anybody should have to
+    /// unlock to dim.
+    Brightness(crate::backlight::Key),
     /// Take a screenshot: the whole screen, the focused window, or — for
     /// [`Shot::Region`](crate::screenshot::Shot::Region) — arm the interactive
     /// selection the pointer finishes. On `Print`, before the `Super` layer, so
@@ -443,6 +450,11 @@ pub(crate) const BINDINGS: &[Binding] = &[
         chord: "Volume keys",
         description: "raise, lower or mute the volume",
     },
+    Binding {
+        action: Action::Brightness(crate::backlight::Key::Raise),
+        chord: "Brightness keys",
+        description: "brighten or dim the screen",
+    },
 ];
 
 /// The startup log line, built from [`BINDINGS`] rather than written out again.
@@ -489,6 +501,9 @@ pub(crate) fn resolve(
     // silence the machine through.
     if let Some(key) = volume_key(sym) {
         return FilterResult::Intercept(pressed(key_state, Action::Volume(key)));
+    }
+    if let Some(key) = brightness_key(sym) {
+        return FilterResult::Intercept(pressed(key_state, Action::Brightness(key)));
     }
 
     if mode.locked {
@@ -776,6 +791,18 @@ fn volume_key(sym: u32) -> Option<crate::audio::Key> {
         keysyms::KEY_XF86AudioRaiseVolume => Some(Key::Raise),
         keysyms::KEY_XF86AudioLowerVolume => Some(Key::Lower),
         keysyms::KEY_XF86AudioMute => Some(Key::ToggleMute),
+        _ => None,
+    }
+}
+
+/// The brightness key a keysym names, if it is one. Modifier-free for the
+/// reason [`volume_key`] is: on a laptop they are `Fn` chords the firmware
+/// has already resolved.
+fn brightness_key(sym: u32) -> Option<crate::backlight::Key> {
+    use crate::backlight::Key;
+    match sym {
+        keysyms::KEY_XF86MonBrightnessUp => Some(Key::Raise),
+        keysyms::KEY_XF86MonBrightnessDown => Some(Key::Lower),
         _ => None,
     }
 }
@@ -1909,6 +1936,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_brightness_keys_need_no_modifier() {
+        use crate::backlight::Key;
+        let none = ModifiersState::default();
+        assert_eq!(
+            intercepted(none, keysyms::KEY_XF86MonBrightnessUp),
+            Some(Action::Brightness(Key::Raise))
+        );
+        assert_eq!(
+            intercepted(none, keysyms::KEY_XF86MonBrightnessDown),
+            Some(Action::Brightness(Key::Lower))
+        );
+    }
+
     /// Every panel swallows every key while it is open, and the lock forwards
     /// every key to the lock screen. The mute key is the one thing that has
     /// to get through all of them.
@@ -1949,6 +1990,18 @@ mod tests {
                     FilterResult::Intercept(Some(Action::Volume(Key::ToggleMute)))
                 ),
                 "mute did not resolve under {mode:?}"
+            );
+            assert!(
+                matches!(
+                    resolve(
+                        KeyState::Pressed,
+                        &ModifiersState::default(),
+                        keysyms::KEY_XF86MonBrightnessDown,
+                        mode
+                    ),
+                    FilterResult::Intercept(Some(Action::Brightness(crate::backlight::Key::Lower)))
+                ),
+                "dimming did not resolve under {mode:?}"
             );
         }
         // And the release is swallowed with its press, like every binding.
