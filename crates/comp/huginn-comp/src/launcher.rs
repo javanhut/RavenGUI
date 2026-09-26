@@ -379,6 +379,22 @@ pub(crate) enum Button {
     Category(usize),
     /// The list's link to the pin bar.
     PinnedPanel,
+    /// The list's "All apps" pill in the search field: opens the bare search
+    /// bar into the full grid, or folds it back.
+    Expand,
+}
+
+/// How long the highlight takes to slide from one target to the next.
+const GLIDE: std::time::Duration = std::time::Duration::from_millis(140);
+
+/// The highlight on its way from where it was drawn to where it now belongs.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    /// Where the last redraw put the highlight, in canvas pixels.
+    from: Rect,
+    /// Stamped by the first redraw after the move, see [`Launcher::frame`]:
+    /// the keystroke or the hover that moved it has no clock of its own.
+    started: Option<std::time::Duration>,
 }
 
 /// The launcher.
@@ -453,6 +469,14 @@ pub(crate) struct Launcher {
     /// How many applications and files the search found before [`Filter`]
     /// took any away, so the tabs can say.
     found: (usize, usize),
+    /// Whether the list shows its grid with nothing typed. It opens as the
+    /// bare search bar — most openings are two letters and Return — and the
+    /// grid is one click or one `Down` away.
+    expanded: bool,
+    /// The highlight sliding to a new target, while it is.
+    glide: Option<Glide>,
+    /// The clock the next redraw draws at. See [`Self::frame`].
+    clock: std::time::Duration,
 }
 
 impl Default for Launcher {
@@ -483,6 +507,9 @@ impl Default for Launcher {
             pins_shown: Vec::new(),
             last_used: Vec::new(),
             found: (0, 0),
+            expanded: false,
+            glide: None,
+            clock: std::time::Duration::ZERO,
         }
     }
 }
@@ -638,6 +665,7 @@ impl Launcher {
         self.selected = 0;
         self.first = 0;
         self.menu = None;
+        self.glide = None;
         true
     }
 
@@ -775,6 +803,76 @@ impl Launcher {
         self.query.is_empty()
     }
 
+    /// Whether the list is only its search bar: nothing typed, and the grid
+    /// not asked for. The arc has no bare state; its ring is the launcher.
+    pub(crate) fn is_compact(&self) -> bool {
+        self.style == Style::List && self.query.is_empty() && !self.expanded
+    }
+
+    /// Open the bare search bar into the grid, or fold it back.
+    fn set_expanded(&mut self, expanded: bool) -> Outcome {
+        if self.expanded == expanded {
+            return Outcome::Unchanged;
+        }
+        self.expanded = expanded;
+        self.selected = 0;
+        self.first = 0;
+        self.menu = None;
+        self.glide = None;
+        Outcome::Redraw
+    }
+
+    /// Set the clock the next redraw draws at, and start a slide that has
+    /// been waiting for one. Called by the compositor before every redraw.
+    pub(crate) fn frame(&mut self, clock: std::time::Duration, reduced: bool) {
+        self.clock = clock;
+        if reduced {
+            self.glide = None;
+        } else if let Some(glide) = &mut self.glide {
+            glide.started.get_or_insert(clock);
+        }
+    }
+
+    /// Whether the highlight is still sliding, so the compositor keeps
+    /// recomposing the panel: the slide is in the pixels, not the placement.
+    pub(crate) fn is_gliding(&self, clock: std::time::Duration) -> bool {
+        self.glide
+            .is_some_and(|g| g.started.is_none_or(|s| clock.saturating_sub(s) < GLIDE))
+    }
+
+    /// Where to draw a highlight that belongs at `target`, part way along its
+    /// slide from wherever it was.
+    pub(crate) fn highlight_rect(&self, target: Rect) -> Rect {
+        let Some(Glide {
+            from,
+            started: Some(started),
+        }) = self.glide
+        else {
+            return target;
+        };
+        let t = self.clock.saturating_sub(started).as_secs_f32() / GLIDE.as_secs_f32();
+        if t >= 1.0 {
+            return target;
+        }
+        // Cubic ease-out: most of the way there before the eye has followed.
+        let t = 1.0 - (1.0 - t).powi(3);
+        let lerp = |a: i32, b: i32| a + ((b - a) as f32 * t).round() as i32;
+        Rect::from_xywh(
+            lerp(from.x(), target.x()),
+            lerp(from.y(), target.y()),
+            lerp(from.w(), target.w()),
+            lerp(from.h(), target.h()),
+        )
+    }
+
+    /// The highlight is about to move: slide it from where it was drawn.
+    fn begin_glide(&mut self) {
+        self.glide = self.layout.highlight.map(|from| Glide {
+            from,
+            started: None,
+        });
+    }
+
     /// Open with an empty query, showing the most-used applications.
     ///
     /// `origin` is the dock's launcher icon, or `None` to grow in place from
@@ -801,6 +899,8 @@ impl Launcher {
         self.filter = Filter::All;
         self.sort = Sort::Relevance;
         self.category = 0;
+        self.expanded = false;
+        self.glide = None;
         self.origin = origin;
         self.refresh(entries, frecency, now, Keep::Top);
         self.reveal.open(clock, motion.is_reduced());
@@ -897,6 +997,22 @@ impl Launcher {
                 Key::Insert(_) | Key::Backspace | Key::DeleteWord | Key::Clear => {
                     self.menu = None;
                 }
+            }
+        }
+        // The bare search bar has nothing to highlight or launch until
+        // something is typed; `Down` is how the keyboard opens the grid.
+        if self.is_compact() {
+            match key {
+                Key::Down | Key::PageDown => return self.set_expanded(true),
+                Key::Up
+                | Key::Left
+                | Key::Right
+                | Key::PageUp
+                | Key::PrevGroup
+                | Key::NextGroup
+                | Key::Launch
+                | Key::Actions => return Outcome::Unchanged,
+                _ => {}
             }
         }
         match key {
@@ -1064,6 +1180,7 @@ impl Launcher {
         }
         match self.layout.hit(point) {
             Some(index) if index < self.visible.len() && index != self.selected => {
+                self.begin_glide();
                 self.selected = index;
                 Outcome::Redraw
             }
@@ -1131,6 +1248,7 @@ impl Launcher {
     fn after_edit(&mut self, entries: &[Entry], frecency: &Frecency, now: u64) -> Outcome {
         self.selected = 0;
         self.first = 0;
+        self.glide = None;
         // A filter is a way of looking at a search; with the search gone,
         // the next one starts from everything again.
         if self.query.is_empty() {
@@ -1159,10 +1277,12 @@ impl Launcher {
             }
             Button::Category(index) => self.category = index,
             Button::PinnedPanel => return Outcome::OpenPinned,
+            Button::Expand => return self.set_expanded(!self.expanded),
         }
         self.selected = 0;
         self.first = 0;
         self.menu = None;
+        self.glide = None;
         self.refresh(entries, frecency, now, Keep::Top);
         Outcome::Redraw
     }
@@ -1187,6 +1307,7 @@ impl Launcher {
         self.selected = 0;
         self.first = 0;
         self.menu = None;
+        self.glide = None;
         self.refresh(entries, frecency, now, Keep::Top);
         Outcome::Redraw
     }
@@ -1384,9 +1505,12 @@ impl Launcher {
         if tiles.contains(&selected) {
             let next = selected as isize + direction * COLUMNS as isize;
             if next < tiles.start as isize {
-                // Off the top row: onto the result row, if there is one.
+                // Off the top row: onto the result row, if there is one;
+                // with nothing typed, back to the bare search bar.
                 return if tiles.start > 0 {
                     self.select(tiles.start - 1)
+                } else if self.is_grid() && self.style == Style::List {
+                    self.set_expanded(false)
                 } else {
                     Outcome::Unchanged
                 };
@@ -1510,6 +1634,7 @@ impl Launcher {
         if next == self.selected {
             return Outcome::Unchanged;
         }
+        self.begin_glide();
         self.selected = next;
         self.scroll_to_selection();
         Outcome::Redraw
@@ -1569,10 +1694,11 @@ mod tests {
         launcher.selection().map(|i| apps[i].name.clone())
     }
 
-    /// Open over `apps`: the list opens straight into its grid.
+    /// Open over `apps` and open the bare search bar into its grid.
     fn expanded(apps: &[Entry], frecency: &Frecency) -> Launcher {
         let mut launcher = Launcher::default();
         launcher.open(apps, frecency, NOW, None, CLOCK, STILL);
+        launcher.press(Key::Down, apps, frecency, NOW, CLOCK, STILL);
         launcher
     }
 
@@ -1677,8 +1803,9 @@ mod tests {
 
     #[test]
     fn before_typing_the_arrows_walk_a_grid() {
-        // Four suggestions on one row of six: Right steps one, and with no
-        // row and no foot below, Down and Up have nowhere to go.
+        // Four suggestions on one row of six: Right steps one, with no row
+        // and no foot below Down has nowhere to go, and Up off the top row
+        // folds the grid back into the bare search bar.
         let apps = apps();
         let frecency = Frecency::new();
         let mut launcher = expanded(&apps, &frecency);
@@ -1695,8 +1822,85 @@ mod tests {
         );
         assert_eq!(
             launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL),
-            Outcome::Unchanged
+            Outcome::Redraw
         );
+        assert!(launcher.is_compact());
+    }
+
+    #[test]
+    fn it_opens_as_the_bare_search_bar_and_down_opens_the_grid() {
+        let apps = apps();
+        let frecency = Frecency::new();
+        let mut launcher = Launcher::default();
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        assert!(launcher.is_compact());
+        // Nothing drawn to launch or step through until the grid is open.
+        for key in [Key::Launch, Key::Right, Key::Up, Key::Actions] {
+            assert_eq!(
+                launcher.press(key, &apps, &frecency, NOW, CLOCK, STILL),
+                Outcome::Unchanged,
+                "{key:?} acted on the bare bar"
+            );
+        }
+        assert_eq!(
+            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
+        assert!(!launcher.is_compact());
+        assert_eq!(launcher.selection(), launcher.suggested().first().copied());
+        // The next opening starts bare again.
+        launcher.close(CLOCK, STILL);
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        assert!(launcher.is_compact());
+    }
+
+    #[test]
+    fn typing_into_the_bare_bar_shows_results() {
+        let (launcher, _) = typed("fi");
+        assert!(!launcher.is_compact());
+        assert!(!launcher.results().is_empty());
+        assert_eq!(launcher.selection(), launcher.results().first().copied());
+    }
+
+    #[test]
+    fn the_expand_pill_opens_and_folds_the_grid() {
+        let apps = apps();
+        let frecency = Frecency::new();
+        let mut launcher = Launcher::default();
+        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        assert_eq!(
+            launcher.press_button(Button::Expand, &apps, &frecency, NOW),
+            Outcome::Redraw
+        );
+        assert!(!launcher.is_compact());
+        launcher.press_button(Button::Expand, &apps, &frecency, NOW);
+        assert!(launcher.is_compact());
+    }
+
+    #[test]
+    fn the_highlight_slides_from_where_it_was_drawn() {
+        let apps = apps();
+        let frecency = Frecency::new();
+        let mut launcher = expanded(&apps, &frecency);
+        let from = Rect::from_xywh(0, 0, 100, 100);
+        let to = Rect::from_xywh(200, 0, 100, 100);
+        launcher.layout.highlight = Some(from);
+        launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
+        let start = std::time::Duration::from_secs(1);
+        launcher.frame(start, false);
+        assert_eq!(launcher.highlight_rect(to), from);
+        assert!(launcher.is_gliding(start));
+        launcher.frame(start + GLIDE / 2, false);
+        let mid = launcher.highlight_rect(to);
+        assert!(mid.x() > from.x() && mid.x() < to.x(), "{mid:?}");
+        launcher.frame(start + GLIDE, false);
+        assert_eq!(launcher.highlight_rect(to), to);
+        assert!(!launcher.is_gliding(start + GLIDE));
+        // Reduced motion: no slide at all.
+        launcher.layout.highlight = Some(from);
+        launcher.press(Key::Left, &apps, &frecency, NOW, CLOCK, STILL);
+        launcher.frame(start, true);
+        assert_eq!(launcher.highlight_rect(to), to);
     }
 
     #[test]
@@ -1822,8 +2026,7 @@ mod tests {
     fn tab_offers_open_and_the_entrys_actions() {
         let apps = browser();
         let frecency = Frecency::new();
-        let mut launcher = Launcher::default();
-        launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
+        let mut launcher = expanded(&apps, &frecency);
         assert_eq!(launcher.menu(), None);
         assert_eq!(
             launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL),
@@ -3222,6 +3425,9 @@ pub(crate) struct Layout {
     /// glass, for a panel that is not a rounded rectangle. `None` blurs the
     /// panel inset by its corners. See [`Launcher::blur_region`].
     pub(crate) blur: Option<Rect>,
+    /// Where the highlight was drawn, in canvas pixels, so the next move can
+    /// slide it from there. `None` when it is on nothing that slides.
+    pub(crate) highlight: Option<Rect>,
 }
 
 impl Layout {

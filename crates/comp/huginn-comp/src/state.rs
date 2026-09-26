@@ -733,6 +733,10 @@ pub(crate) struct Huginn {
     /// What is under the pointer may have changed without the pointer
     /// moving; see [`crate::backend::input::rehover`].
     pointer_stale: bool,
+    /// Where the pointer was when the launcher last heard of it, so motion
+    /// that did not move it is not mistaken for a hover. See
+    /// [`Self::launcher_pointer_moved`].
+    launcher_pointer_at: Option<Point<f64, Logical>>,
     /// The touchpad swipe in progress, if any.
     ///
     /// Held on the compositor rather than in the core because a gesture is
@@ -1258,6 +1262,7 @@ impl Huginn {
             identify_since: None,
             swallowed_keys: Default::default(),
             pointer_stale: false,
+            launcher_pointer_at: None,
             swipe: None,
             fullscreen_solo: HashSet::new(),
             drag: false,
@@ -5597,6 +5602,9 @@ impl Huginn {
         self.launcher.set_style(self.settings.launcher_style());
         self.launcher
             .open(&self.apps, &self.frecency, now, origin, clock, motion);
+        // A pointer that happens to rest where the panel opens is not a
+        // choice; the highlight starts on the best match all the same.
+        self.launcher_pointer_at = Some(self.pointer_location);
         self.refresh_launcher();
     }
 
@@ -5645,7 +5653,16 @@ impl Huginn {
     }
 
     /// Tell the launcher where the pointer went: the highlight follows it.
+    ///
+    /// Only when it actually went somewhere. The input backend re-runs
+    /// motion at the pointer's standing position after every relayout (see
+    /// `rehover`), and a pointer resting over the panel would otherwise drag
+    /// the highlight back under itself after each arrow key.
     pub(crate) fn launcher_pointer_moved(&mut self) {
+        let at = self.pointer_location;
+        if self.launcher_pointer_at.replace(at) == Some(at) {
+            return;
+        }
         let Some(point) = self.launcher_canvas_point() else {
             return;
         };
@@ -6289,6 +6306,11 @@ impl Huginn {
             self.dock_pointer_moved();
             self.refresh_dock();
         }
+        if self.launcher.is_gliding(now) {
+            // The highlight's slide is in the pixels, so unlike the reveal
+            // it does need the panel recomposed, a frame at a time.
+            self.refresh_launcher();
+        }
         if self.launcher.is_animating(now) {
             // Position and alpha come from the reveal at draw time, so the
             // panel itself does not need recomposing — but a frame still has
@@ -6872,6 +6894,8 @@ impl Huginn {
         let (area, advertised) = (self.output_area(), self.scale().advertised);
         // A no-op when the size is unchanged.
         self.launcher_backdrop.resize((area.w(), area.h()));
+        self.launcher
+            .frame(self.uptime(), self.settings.motion().is_reduced());
         self.launcher_panel = self.launcher.is_visible(self.uptime()).then(|| {
             let (panel, layout) = crate::launcher::render(
                 &self.launcher,

@@ -114,14 +114,26 @@ pub(super) fn compose(
     let rect =
         |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
     let accent = crate::theme::accent();
+    // Bare, only the bar is glass. The canvas keeps the full sheet's size so
+    // the bar sits exactly where the sheet's field will be once it opens, and
+    // [`placement`] needs no second idea of where the launcher goes.
+    let compact = launcher.is_compact();
+    let glass_h = if compact {
+        (pad * 2.0 + field_h).ceil() as usize
+    } else {
+        height
+    };
     canvas.material(
         0,
         0,
         width_px,
-        height,
+        glass_h,
         px(RADIUS + 6.0),
         crate::theme::panel_alpha(),
     );
+    if compact {
+        layout.surfaces.push(rect(0.0, 0.0, width, glass_h as f32));
+    }
 
     // The field: a pill of lighter glass, ringed faintly. The caret is the
     // accent, since the field always has the keyboard.
@@ -178,10 +190,47 @@ pub(super) fn compose(
         text_dim,
         Weight::NORMAL,
     );
+    // With nothing typed, a pill beside it opens the grid, or folds it back.
+    let mut field_end = cap_x;
+    if launcher.is_grid() {
+        let pill_size = px(12.5);
+        let pill_label = if compact { "All apps" } else { "Less" };
+        let pill_w = text.measure(pill_label, pill_size).0 + px(38.0);
+        let pill_x = cap_x - px(8.0) - pill_w;
+        canvas.fill_rounded(
+            pill_x as usize,
+            cap_y as usize,
+            pill_w as usize,
+            cap_h as usize,
+            cap_h / 2.0,
+            crate::theme::well_raised(),
+        );
+        text.draw(
+            &mut canvas,
+            pill_label,
+            pill_size,
+            (pill_x + px(12.0)) as i32,
+            (cap_y + (cap_h - pill_size * 1.35) / 2.0) as i32,
+            text_color,
+        );
+        draw_chevron(
+            &mut canvas,
+            pill_x + pill_w - px(14.0),
+            cap_y + cap_h / 2.0,
+            px(3.5),
+            px(1.5),
+            !compact,
+            text_dim,
+        );
+        layout
+            .buttons
+            .push((rect(pill_x, cap_y, pill_w, cap_h), Button::Expand));
+        field_end = pill_x;
+    }
     let query_size = px(18.0);
     let text_x = glyph_x + px(22.0);
     let text_y = fy + (field_h - query_size * 1.35) / 2.0;
-    let text_room = cap_x - px(12.0) - text_x;
+    let text_room = field_end - px(12.0) - text_x;
     let caret_w = px(2.0).max(1.0);
     if launcher.query().is_empty() {
         // The caret before the hint, not through its first letter.
@@ -219,6 +268,10 @@ pub(super) fn compose(
             (query_size * 1.2) as usize,
             accent.to_rgba_bytes(),
         );
+    }
+
+    if compact {
+        return (canvas, layout);
     }
 
     // The chips: categories before anything is typed, kinds of result
@@ -384,6 +437,28 @@ pub(super) fn compose(
         y += tile_h + gap;
     }
 
+    // The highlight under the tiles, drawn once, where its slide has got to,
+    // rather than by the tile it belongs to — mid-slide it is between two.
+    let selected_tile = launcher
+        .selected()
+        .checked_sub(tile_start)
+        .filter(|n| *n < tiles.len())
+        .map(|n| (n % COLUMNS, n / COLUMNS))
+        .filter(|(_, row)| (first_row..first_row + drawn_rows).contains(row))
+        .map(|(column, row)| {
+            rect(
+                pad + (tile_w + gap) * column as f32,
+                y + (tile_h + gap) * (row - first_row) as f32,
+                tile_w,
+                tile_h,
+            )
+        });
+    if let Some(target) = selected_tile {
+        let at = launcher.highlight_rect(target);
+        draw_wash(&mut canvas, at, px(20.0), scale);
+        layout.highlight = Some(at);
+    }
+
     let icon_size = px(64.0) as u32;
     for (n, tile) in tiles
         .iter()
@@ -396,7 +471,6 @@ pub(super) fn compose(
         let ty = y + (tile_h + gap) * row as f32;
         let position = tile_start + n;
         layout.hits.push((rect(x, ty, tile_w, tile_h), position));
-        let selected = launcher.selected() == position;
         match *tile {
             Target::App(index) => {
                 let Some(entry) = apps.get(index) else {
@@ -412,7 +486,6 @@ pub(super) fn compose(
                     icon.as_ref(),
                     &entry.name,
                     sub.as_deref(),
-                    selected,
                     launcher.is_pinned(entry),
                 );
             }
@@ -430,7 +503,6 @@ pub(super) fn compose(
                     icon.as_ref(),
                     &file.name,
                     Some(&location),
-                    selected,
                     false,
                 );
             }
@@ -627,39 +699,41 @@ fn draw_chevron_sideways(
     );
 }
 
+/// The highlight: a well of lighter glass edged with the accent.
+fn draw_wash(canvas: &mut Canvas, at: Rect, radius: f32, scale: f32) {
+    let (x, y) = (at.x().max(0) as usize, at.y().max(0) as usize);
+    let (w, h) = (at.w().max(0) as usize, at.h().max(0) as usize);
+    canvas.fill_rounded(x, y, w, h, radius, crate::theme::well_raised());
+    canvas.stroke_rounded(
+        x,
+        y,
+        w,
+        h,
+        radius,
+        1.0_f32.max(scale),
+        faded(crate::theme::accent(), 0.55),
+    );
+}
+
 /// A tile of the grid: a large icon with its name under it, and in a search
 /// a quieter line under that — what it is, or where a file lives. No box
 /// around it until it is highlighted: a grid of boxes reads as a form to be
-/// filled in, a grid of icons as a place to pick from. Highlighted, it sits
-/// in a well of lighter glass edged with the accent, with a dot on the icon
-/// when the application is pinned.
+/// filled in, a grid of icons as a place to pick from. The highlight is drawn
+/// under it separately (see [`draw_wash`]), and a dot sits on the icon when
+/// the application is pinned.
 #[allow(clippy::too_many_arguments)]
 fn draw_tile(
     canvas: &mut Canvas,
     text: &mut Text,
-    (x, y, w, h): (f32, f32, f32, f32),
+    (x, y, w, _): (f32, f32, f32, f32),
     scale: f32,
     icon: Option<&raven_desktop::Pixmap>,
     title: &str,
     sub: Option<&str>,
-    selected: bool,
     pinned: bool,
 ) {
     let px = |v: f32| v * scale;
     let accent = crate::theme::accent();
-    if selected {
-        let (xu, yu, wu, hu) = (x as usize, y as usize, w as usize, h as usize);
-        canvas.fill_rounded(xu, yu, wu, hu, px(20.0), crate::theme::well_raised());
-        canvas.stroke_rounded(
-            xu,
-            yu,
-            wu,
-            hu,
-            px(20.0),
-            1.0_f32.max(scale),
-            faded(accent, 0.55),
-        );
-    }
     let cx = x + w / 2.0;
     let icon_box = px(64.0);
     let top = y + px(if sub.is_some() { 10.0 } else { 16.0 });
@@ -725,7 +799,6 @@ fn draw_strip(
     let px = |v: f32| v * scale;
     let rect =
         |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
-    let accent = crate::theme::accent();
     let start = launcher.suggested().len();
     let (pins, recent) = (launcher.pins_shown(), launcher.recent());
     let selected = launcher.selected();
@@ -780,24 +853,19 @@ fn draw_strip(
     let row_y = y + px(28.0);
     let box_size = px(56.0);
     let gap = px(4.0);
-    let wash = |canvas: &mut Canvas, (bx, by, bw, bh): (f32, f32, f32, f32), radius: f32| {
-        let (xu, yu, wu, hu) = (bx as usize, by as usize, bw as usize, bh as usize);
-        canvas.fill_rounded(xu, yu, wu, hu, radius, crate::theme::well_raised());
-        canvas.stroke_rounded(
-            xu,
-            yu,
-            wu,
-            hu,
-            radius,
-            1.0_f32.max(scale),
-            faded(accent, 0.55),
-        );
+    let wash = |canvas: &mut Canvas,
+                layout: &mut Layout,
+                (bx, by, bw, bh): (f32, f32, f32, f32),
+                radius: f32| {
+        let at = launcher.highlight_rect(rect(bx, by, bw, bh));
+        draw_wash(canvas, at, radius, scale);
+        layout.highlight = Some(at);
     };
     let mut sx = x + px(2.0);
     for (n, index) in pins.iter().enumerate() {
         let position = start + n;
         if position == selected {
-            wash(canvas, (sx, row_y, box_size, box_size), px(14.0));
+            wash(canvas, layout, (sx, row_y, box_size, box_size), px(14.0));
         }
         if let Some(icon) = apps
             .get(*index)
@@ -836,7 +904,7 @@ fn draw_strip(
             continue;
         };
         if position == selected {
-            wash(canvas, (sx, row_y, card_w, box_size), px(12.0));
+            wash(canvas, layout, (sx, row_y, card_w, box_size), px(12.0));
         }
         let icon_x = sx + px(10.0);
         if let Some(icon) = app_icon(icons, pixmaps, entry, px(30.0) as u32, density) {
