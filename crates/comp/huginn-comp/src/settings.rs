@@ -750,6 +750,37 @@ impl Control for LauncherLayout {
 /// The launcher layout row's label, which is also how the row is found.
 const LAUNCHER_LAYOUT: &str = "Launcher";
 
+/// Which glass the panels are made of. Wired up like [`LauncherLayout`]:
+/// the compositor reads it back through [`Settings::glass_theme`] and
+/// redraws everything in the new tint.
+#[derive(Debug)]
+struct GlassTheme {
+    theme: crate::theme::Theme,
+}
+
+impl Control for GlassTheme {
+    fn label(&self) -> &str {
+        GLASS_THEME
+    }
+    fn read(&self) -> Reading {
+        Reading {
+            value: self.theme.label().to_owned(),
+            real: true,
+        }
+    }
+    fn activate(&mut self) -> bool {
+        self.theme = self.theme.stepped(1);
+        true
+    }
+    fn adjust(&mut self, delta: i32) -> bool {
+        self.theme = self.theme.stepped(delta);
+        true
+    }
+}
+
+/// The theme row's label, which is also how the row is found.
+const GLASS_THEME: &str = "Theme";
+
 /// What the Power row can ask the machine to do.
 ///
 /// A closed set stepped with one key, like [`IdleAfter`]. Suspend comes
@@ -1046,6 +1077,9 @@ impl Settings {
                 Box::new(LauncherLayout {
                     style: crate::launcher::Style::default(),
                 }),
+                Box::new(GlassTheme {
+                    theme: crate::theme::Theme::default(),
+                }),
                 Box::new(PinsPosition {
                     position: crate::pins::Position::default(),
                 }),
@@ -1143,6 +1177,15 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    /// Which glass the panels are made of, read from the control that owns it.
+    pub(crate) fn glass_theme(&self) -> crate::theme::Theme {
+        self.controls
+            .iter()
+            .find(|c| c.label() == GLASS_THEME)
+            .and_then(|c| crate::theme::Theme::from_value(&c.read().value))
+            .unwrap_or_default()
+    }
+
     /// Give the Animations, Lock, Launcher and Do not disturb rows what
     /// `desktop.toml` said. Called at startup and whenever the file changes;
     /// between those the rows are the source, as with
@@ -1152,6 +1195,7 @@ impl Settings {
         motion: Motion,
         after: IdleAfter,
         style: crate::launcher::Style,
+        theme: crate::theme::Theme,
         do_not_disturb: bool,
     ) {
         for control in &mut self.controls {
@@ -1161,6 +1205,8 @@ impl Settings {
                 *control = Box::new(IdleLock { after });
             } else if control.label() == LAUNCHER_LAYOUT {
                 *control = Box::new(LauncherLayout { style });
+            } else if control.label() == GLASS_THEME {
+                *control = Box::new(GlassTheme { theme });
             } else if control.label() == DO_NOT_DISTURB {
                 *control = Box::new(DoNotDisturb { on: do_not_disturb });
             }
@@ -1373,7 +1419,7 @@ fn compose(
         (pad + header - size * 0.6) as usize,
         width - (pad * 2.0) as usize,
         1,
-        crate::theme::RULE,
+        crate::theme::rule(),
         0x14,
     );
 
@@ -1421,7 +1467,7 @@ fn compose(
                     track_w as usize,
                     track_h as usize,
                     track_h / 2.0,
-                    crate::theme::WELL_RAISED,
+                    crate::theme::well_raised(),
                 );
                 let filled = (track_w * fraction.clamp(0.0, 1.0)).round();
                 if filled >= 1.0 {
@@ -1443,9 +1489,9 @@ fn compose(
                     knob as usize,
                     knob / 2.0,
                     if highlighted {
-                        crate::theme::TEXT
+                        crate::theme::text()
                     } else {
-                        crate::theme::TEXT_DIM
+                        crate::theme::text_dim()
                     },
                 );
             }
@@ -1457,9 +1503,9 @@ fn compose(
             (pad + 6.0 * scale) as i32,
             text_y,
             if highlighted {
-                crate::theme::TEXT
+                crate::theme::text()
             } else {
-                crate::theme::TEXT_DIM
+                crate::theme::text_dim()
             },
         );
 
@@ -1472,7 +1518,7 @@ fn compose(
             if reading.real {
                 crate::theme::accent()
             } else {
-                crate::theme::TEXT_DIM
+                crate::theme::text_dim()
             },
         );
         y += row;
@@ -1542,8 +1588,32 @@ mod tests {
         settings.press(Key::Activate, T0);
         assert_eq!(settings.launcher_style(), Style::List);
         // What the file says replaces what the row showed.
-        settings.apply_desktop_config(Motion::Full, IdleAfter::default(), Style::Arc, false);
+        settings.apply_desktop_config(
+            Motion::Full,
+            IdleAfter::default(),
+            Style::Arc,
+            crate::theme::Theme::default(),
+            false,
+        );
         assert_eq!(settings.launcher_style(), Style::Arc);
+    }
+
+    #[test]
+    fn the_theme_row_steps_through_every_glass_and_the_file_sets_it() {
+        use crate::theme::Theme;
+        let mut settings = opened();
+        assert_eq!(settings.glass_theme(), Theme::Black);
+        select(&mut settings, GLASS_THEME);
+        assert_eq!(settings.press(Key::Activate, T0), Outcome::Redraw);
+        assert_eq!(settings.glass_theme(), Theme::Fog);
+        settings.apply_desktop_config(
+            Motion::Full,
+            IdleAfter::default(),
+            crate::launcher::Style::List,
+            Theme::Arctic,
+            false,
+        );
+        assert_eq!(settings.glass_theme(), Theme::Arctic);
     }
 
     #[test]
@@ -1557,6 +1627,7 @@ mod tests {
             Motion::Full,
             IdleAfter::default(),
             crate::launcher::Style::List,
+            crate::theme::Theme::default(),
             false,
         );
         assert!(

@@ -523,14 +523,13 @@ impl Nested {
                 let selecting_region = self.state.region_active();
                 let help_up = self.state.help_open();
                 let dock_menu_open = self.state.dock_menu_is_open();
-                let action = self
+                let code = event.key_code();
+                let (resolved, mods_changed) = self
                     .keyboard
-                    .input::<Option<Action>, _>(
+                    .input_intercept::<_, _>(
                         &mut self.state,
-                        event.key_code(),
+                        code,
                         key_state,
-                        serial,
-                        time,
                         |_state, modifiers, handle| {
                             {
                                 let sym = handle.modified_sym();
@@ -560,8 +559,15 @@ impl Nested {
                                 )
                             }
                         },
-                    )
-                    .flatten();
+                    );
+                let (forward, action) = self
+                    .state
+                    .swallowed_keys
+                    .settle(code.raw(), key_state, resolved);
+                if forward {
+                    self.keyboard
+                        .input_forward(&mut self.state, code, key_state, serial, time, mods_changed);
+                }
                 // Any press that is not an arrow leaves resize mode — the
                 // keymap forwarded it, so this is the only place that knows it
                 // happened. Presses only: an arrow's *release* also resolves to

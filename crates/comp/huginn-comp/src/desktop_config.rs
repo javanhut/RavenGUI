@@ -22,6 +22,9 @@
 //!   `ravencanvasd` draws when it is running.
 //! - `appearance.launcher_layout` — `"list"` or `"arc"`,
 //!   [`crate::launcher::Style`]; also stepped from quick settings.
+//! - `appearance.glass_theme` — `"black"`, `"fog"`, `"arctic"`,
+//!   `"midnight"` or `"rose"`, [`crate::theme::Theme`]: the tint of every
+//!   panel the compositor draws; also stepped from quick settings.
 //! - `dock.icon_size`, `dock.magnification`, `dock.labels`,
 //!   `dock.running_dots`, `dock.auto_hide` — [`crate::dock::Prefs`]: how big
 //!   the dock's icons are, how far the one under the pointer lifts, whether
@@ -67,6 +70,9 @@ pub(crate) struct Appearance {
     /// `"list"` or `"arc"`; see [`crate::launcher::Style`]. Empty, or a
     /// value this build does not know, is the list.
     pub launcher_layout: String,
+    /// `"black"`, `"fog"`, `"arctic"`, `"midnight"` or `"rose"`; see
+    /// [`crate::theme::Theme`]. Empty, or unknown, is Black Glass.
+    pub glass_theme: String,
 }
 
 impl Default for Appearance {
@@ -77,6 +83,7 @@ impl Default for Appearance {
             blur: None,
             wallpaper: String::new(),
             launcher_layout: String::new(),
+            glass_theme: String::new(),
         }
     }
 }
@@ -306,6 +313,12 @@ impl DesktopConfig {
         crate::launcher::Style::from_value(&self.appearance.launcher_layout).unwrap_or_default()
     }
 
+    /// Which glass the panels are made of: Black Glass unless the file
+    /// names another.
+    pub(crate) fn glass_theme(&self) -> crate::theme::Theme {
+        crate::theme::Theme::from_value(&self.appearance.glass_theme).unwrap_or_default()
+    }
+
     pub(crate) fn wallpaper(&self) -> Option<PathBuf> {
         let w = self.appearance.wallpaper.trim();
         (!w.is_empty()).then(|| PathBuf::from(w))
@@ -443,6 +456,16 @@ mod tests {
         // A layout a later build added falls back rather than failing the file.
         let unknown = DesktopConfig::parse("[appearance]\nlauncher_layout = \"orbit\"\n").unwrap();
         assert_eq!(unknown.launcher_style(), Style::List);
+    }
+
+    #[test]
+    fn the_glass_is_black_unless_the_file_names_another() {
+        use crate::theme::Theme;
+        assert_eq!(DesktopConfig::parse("").unwrap().glass_theme(), Theme::Black);
+        let fog = DesktopConfig::parse("[appearance]\nglass_theme = \"fog\"\n").unwrap();
+        assert_eq!(fog.glass_theme(), Theme::Fog);
+        let odd = DesktopConfig::parse("[appearance]\nglass_theme = \"sepia\"\n").unwrap();
+        assert_eq!(odd.glass_theme(), Theme::Black);
     }
 
     #[test]

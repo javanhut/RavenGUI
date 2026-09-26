@@ -207,6 +207,21 @@ fn constrained_location(state: &Huginn, proposed: Point<f64, Logical>) -> Point<
     Point::from((start.x + delta.x * inside, start.y + delta.y * inside))
 }
 
+/// Tell whatever is under the pointer that it is there, though the pointer
+/// has not moved.
+///
+/// A window that opens under a resting pointer, a tile that reflows beneath
+/// it, a launcher that closes off it: the pointer is now over a different
+/// surface, and until it moves nobody has said so. The client gets no
+/// `enter`, draws no hover, sets no cursor, and the first scroll goes to the
+/// surface that used to be there. A motion to where the pointer already is
+/// settles all of it.
+pub(crate) fn rehover(state: &mut Huginn) {
+    let location = state.pointer_location;
+    let time = state.uptime().as_millis() as u32;
+    motion(state, location, time);
+}
+
 fn motion(state: &mut Huginn, location: Point<f64, Logical>, time: u32) {
     state.pointer_location = location;
     // A region screenshot is being framed: the pointer draws the rectangle and

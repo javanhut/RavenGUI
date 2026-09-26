@@ -214,7 +214,7 @@ fn compose(
 
     let (w, h) = (width.round() as usize, height.round() as usize);
     let mut canvas = Canvas::new(w, h);
-    canvas.material(0, 0, w, h, theme::CARD_RADIUS * scale, theme::PANEL_ALPHA);
+    canvas.material(0, 0, w, h, theme::CARD_RADIUS * scale, theme::panel_alpha());
 
     if notification.urgency == Urgency::Critical {
         let edge = (EDGE * scale).max(2.0);
@@ -245,7 +245,7 @@ fn compose(
             y,
             first_w,
             1,
-            theme::TEXT_DIM,
+            theme::text_dim(),
         );
         y += Text::line_height(app_size);
     }
@@ -262,7 +262,7 @@ fn compose(
             y,
             summary_w,
             1,
-            theme::TEXT,
+            theme::text(),
         );
         y += Text::line_height(summary_size);
     }
@@ -275,7 +275,7 @@ fn compose(
             y,
             text_w,
             BODY_LINES,
-            theme::TEXT_DIM,
+            theme::text_dim(),
         );
     }
 
@@ -298,9 +298,9 @@ fn compose(
                 button_h as usize,
                 BUTTON_RADIUS * scale,
                 if raised {
-                    theme::WELL_RAISED
+                    theme::well_raised()
                 } else {
-                    theme::WELL
+                    theme::well()
                 },
             );
             let label = one_line(&action.label);
@@ -314,7 +314,7 @@ fn compose(
                 row_y + (button_h - Text::line_height(label_size)) / 2.0,
                 room,
                 1,
-                theme::TEXT,
+                theme::text(),
             );
             button_rects.push(pixel_rect(x, row_y, each, button_h));
         }
@@ -329,7 +329,7 @@ fn compose(
             close as usize,
             close as usize,
             close / 2.0,
-            if on { theme::WELL_RAISED } else { theme::WELL },
+            if on { theme::well_raised() } else { theme::well() },
         );
         let glyph_size = CLOSE_GLYPH * scale;
         let (glyph_w, glyph_h) = text.measure("×", glyph_size);
@@ -339,7 +339,7 @@ fn compose(
             glyph_size,
             (close_x + (close - glyph_w) / 2.0).round() as i32,
             (close_y + (close - glyph_h) / 2.0).round() as i32,
-            if on { theme::TEXT } else { theme::TEXT_DIM },
+            if on { theme::text() } else { theme::text_dim() },
         );
     }
 

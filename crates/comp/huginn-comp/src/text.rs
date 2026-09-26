@@ -399,7 +399,7 @@ mod tests {
             return;
         };
         let mut surface = Recorder::new(400, 60);
-        text.draw(&mut surface, "Raven", 24.0, 4, 4, crate::theme::TEXT);
+        text.draw(&mut surface, "Raven", 24.0, 4, 4, crate::theme::text());
         assert!(
             surface.covered() > 50,
             "only {} pixels drawn",
@@ -420,7 +420,7 @@ mod tests {
             40.0,
             -30,
             -10,
-            crate::theme::TEXT,
+            crate::theme::text(),
         );
         text.draw(
             &mut surface,
@@ -428,7 +428,7 @@ mod tests {
             40.0,
             15,
             15,
-            crate::theme::TEXT,
+            crate::theme::text(),
         );
     }
 
@@ -440,8 +440,8 @@ mod tests {
         };
         let mut short = Recorder::new(600, 60);
         let mut long = Recorder::new(600, 60);
-        text.draw(&mut short, "i", 24.0, 4, 4, crate::theme::TEXT);
-        text.draw(&mut long, "iiiiiiiiii", 24.0, 4, 4, crate::theme::TEXT);
+        text.draw(&mut short, "i", 24.0, 4, 4, crate::theme::text());
+        text.draw(&mut long, "iiiiiiiiii", 24.0, 4, 4, crate::theme::text());
         assert!(
             long.rightmost() > short.rightmost(),
             "text did not advance: {:?} vs {:?}",
@@ -458,7 +458,7 @@ mod tests {
             return;
         };
         let mut surface = Recorder::new(400, 80);
-        text.draw(&mut surface, "Oso", 48.0, 4, 4, crate::theme::TEXT);
+        text.draw(&mut surface, "Oso", 48.0, 4, 4, crate::theme::text());
         let partial = surface
             .pixels
             .iter()
@@ -482,7 +482,7 @@ mod tests {
             24.0,
             0,
             0,
-            crate::theme::TEXT,
+            crate::theme::text(),
         );
         let drawn = surface.rightmost().unwrap_or(0);
         // Within a few pixels: the measure is the advance, the drawing is ink,
@@ -527,7 +527,7 @@ mod tests {
         };
         for sample in ["Größe", "Ελληνικά", "العربية", "Ćirilica Ђ"] {
             let mut surface = Recorder::new(400, 80);
-            text.draw(&mut surface, sample, 32.0, 4, 4, crate::theme::TEXT);
+            text.draw(&mut surface, sample, 32.0, 4, 4, crate::theme::text());
             assert!(surface.covered() > 0, "{sample:?} drew nothing");
         }
     }
@@ -545,7 +545,7 @@ mod tests {
             return;
         };
         let mut surface = Recorder::new(400, 80);
-        text.draw(&mut surface, "日本語", 32.0, 4, 4, crate::theme::TEXT);
+        text.draw(&mut surface, "日本語", 32.0, 4, 4, crate::theme::text());
         if surface.covered() == 0 {
             eprintln!("note: no CJK font installed; CJK application names will be blank");
         }
@@ -557,7 +557,7 @@ mod tests {
             return;
         };
         let mut surface = Recorder::new(100, 40);
-        text.draw(&mut surface, "", 24.0, 4, 4, crate::theme::TEXT);
+        text.draw(&mut surface, "", 24.0, 4, 4, crate::theme::text());
         assert_eq!(surface.covered(), 0);
     }
 }

@@ -610,7 +610,10 @@ const DOT: f32 = 4.0;
 /// How far the hover glow reaches past a slot's ring.
 const GLOW: f32 = 3.0;
 /// The ground's opacity: the desktop's one material, at the one alpha.
-const ALPHA: u8 = crate::theme::PANEL_ALPHA;
+/// The panel ground's opacity, in the theme in use.
+fn alpha() -> u8 {
+    crate::theme::panel_alpha()
+}
 
 /// Where the rail sits, and how big, at the current reveal.
 ///
@@ -796,7 +799,7 @@ fn compose(
         rw as usize,
         rh as usize,
         RAIL_RADIUS * scale,
-        ALPHA,
+        alpha(),
     );
     let rail = rect((rx, ry, rw, rh));
     layout.surfaces.push(rail);
@@ -824,9 +827,9 @@ fn compose(
             sh as usize,
             radius,
             if chosen {
-                crate::theme::WELL_RAISED
+                crate::theme::well_raised()
             } else {
-                crate::theme::WELL
+                crate::theme::well()
             },
         );
         // Ringed in the accent when it is the one, and at half strength
@@ -839,7 +842,7 @@ fn compose(
         } else if chosen {
             ((1.5 * scale).max(1.5), crate::theme::accent())
         } else {
-            (1.0, crate::theme::HAIRLINE)
+            (1.0, crate::theme::hairline())
         };
         canvas.stroke_rounded(
             sx as usize,

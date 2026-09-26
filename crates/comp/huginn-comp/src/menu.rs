@@ -130,7 +130,7 @@ pub(crate) fn draw(
         w as usize,
         h as usize,
         crate::theme::CARD_RADIUS * scale,
-        crate::theme::PANEL_ALPHA,
+        crate::theme::panel_alpha(),
     );
 
     let glyph = GLYPH * scale;
@@ -160,7 +160,7 @@ pub(crate) fn draw(
         text_size,
         text_left as i32,
         (at + (row - text_size * 1.35) / 2.0) as i32,
-        crate::theme::TEXT,
+        crate::theme::text(),
         Weight::SEMIBOLD,
     );
     at += row;
@@ -211,7 +211,7 @@ pub(crate) fn draw(
             let ink = if item.removes() {
                 crate::theme::CRITICAL
             } else {
-                crate::theme::TEXT
+                crate::theme::text()
             };
             let label = launcher::fit(text, item.label, text_size, text_room);
             text.draw(
@@ -240,7 +240,7 @@ fn draw_rule(canvas: &mut Canvas, x: f32, y: f32, w: f32, height: f32) {
         w as usize,
         height.max(1.0) as usize,
         0.0,
-        crate::theme::RULE,
+        crate::theme::rule(),
     );
 }
 
@@ -279,7 +279,7 @@ fn draw_cross(canvas: &mut Canvas, x: f32, y: f32, size: f32, scale: f32) {
 /// leave the row with a blank beside it.
 fn draw_window_mark(canvas: &mut Canvas, x: f32, y: f32, size: f32, scale: f32) {
     let line = (1.5 * scale).max(1.5);
-    let ink = crate::theme::TEXT_DIM;
+    let ink = crate::theme::text_dim();
     let radius = (2.0 * scale).max(1.5);
     canvas.stroke_rounded(
         x as usize,

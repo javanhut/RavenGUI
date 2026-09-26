@@ -173,16 +173,16 @@ fn compose(slider: &Slider, text: &mut Text, output: Rect, density: u32) -> Canv
         width,
         height,
         12.0 * scale,
-        crate::theme::BACKGROUND.with_alpha(ALPHA),
+        crate::theme::background().with_alpha(ALPHA),
     );
 
     // The label on the left, the reading on the right, and the track between
     // the two on the line below.
     let text_y = pad * 0.55;
     let label_color = if slider.real {
-        crate::theme::TEXT
+        crate::theme::text()
     } else {
-        crate::theme::TEXT_DIM
+        crate::theme::text_dim()
     };
     text.draw(
         &mut canvas,
@@ -205,7 +205,7 @@ fn compose(slider: &Slider, text: &mut Text, output: Rect, density: u32) -> Canv
         (width as f32 - pad - caption_w) as i32,
         text_y as i32,
         if slider.dim {
-            crate::theme::TEXT_DIM
+            crate::theme::text_dim()
         } else {
             crate::theme::accent()
         },
@@ -222,7 +222,7 @@ fn compose(slider: &Slider, text: &mut Text, output: Rect, density: u32) -> Canv
         track_w as usize,
         track_h as usize,
         track_h / 2.0,
-        crate::theme::BORDER,
+        crate::theme::border(),
     );
     let filled = (track_w * slider.fraction.clamp(0.0, 1.0)).round();
     if filled >= 1.0 {
@@ -248,9 +248,9 @@ fn compose(slider: &Slider, text: &mut Text, output: Rect, density: u32) -> Canv
         knob as usize,
         knob / 2.0,
         if slider.dim {
-            crate::theme::TEXT_DIM
+            crate::theme::text_dim()
         } else {
-            crate::theme::TEXT
+            crate::theme::text()
         },
     );
 

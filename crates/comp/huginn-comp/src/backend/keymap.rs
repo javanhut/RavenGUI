@@ -840,6 +840,49 @@ fn pressed(key_state: KeyState, action: Action) -> Option<Action> {
     (key_state == KeyState::Pressed).then_some(action)
 }
 
+/// The keys whose press the compositor kept from the focused client, so that
+/// their release is kept too — and nobody else's is.
+///
+/// [`resolve`] decides each event on its own, and a panel that opens between a
+/// key's press and its release would otherwise swallow a release whose press
+/// the client already saw. The launcher does exactly that to the `Super` of
+/// the chord that opened it: the terminal behind it is left believing `Super`
+/// is still held, and every key typed into it afterwards arrives as a
+/// `Super` chord — the keyboard looks dead in that window until something
+/// sends it a fresh `enter`. A release follows its press, whatever is open
+/// by the time it comes.
+#[derive(Debug, Default)]
+pub(crate) struct Swallowed(std::collections::HashSet<u32>);
+
+impl Swallowed {
+    /// Settle a resolved key event: whether it reaches the focused client,
+    /// and the action it asks for. An action can come with a forwarded
+    /// release — `Alt` coming up still accepts the switcher.
+    pub(crate) fn settle(
+        &mut self,
+        code: u32,
+        key_state: KeyState,
+        resolved: FilterResult<Option<Action>>,
+    ) -> (bool, Option<Action>) {
+        let (intercepted, action) = match resolved {
+            FilterResult::Intercept(action) => (true, action),
+            FilterResult::Forward => (false, None),
+        };
+        let forward = match key_state {
+            KeyState::Pressed if intercepted => {
+                self.0.insert(code);
+                false
+            }
+            KeyState::Pressed => {
+                self.0.remove(&code);
+                true
+            }
+            KeyState::Released => !self.0.remove(&code),
+        };
+        (forward, action)
+    }
+}
+
 /// The zero-based workspace a digit key names, however the layout shifts it.
 ///
 /// Shift is held to send a window to a workspace, so on a US layout the digit
@@ -866,6 +909,40 @@ fn workspace_index(sym: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_goes_where_its_press_went() {
+        let mut swallowed = Swallowed::default();
+        // Super goes down to the terminal; the launcher opens before it comes
+        // up and resolves the release as its own. The terminal still gets it.
+        assert_eq!(
+            swallowed.settle(125, KeyState::Pressed, FilterResult::Forward),
+            (true, None)
+        );
+        assert_eq!(
+            swallowed.settle(125, KeyState::Released, FilterResult::Intercept(None)),
+            (true, None)
+        );
+        // A key the launcher took going down, it keeps coming up, even once
+        // the launcher has closed and the filter would forward it.
+        assert_eq!(
+            swallowed.settle(57, KeyState::Pressed, FilterResult::Intercept(None)),
+            (false, None)
+        );
+        assert_eq!(
+            swallowed.settle(57, KeyState::Released, FilterResult::Forward),
+            (false, None)
+        );
+        // And the action on a forwarded release is not lost.
+        assert_eq!(
+            swallowed.settle(
+                56,
+                KeyState::Released,
+                FilterResult::Intercept(Some(Action::AcceptSwitcher))
+            ),
+            (true, Some(Action::AcceptSwitcher))
+        );
+    }
 
     /// The action a press produces, if any.
     fn intercepted(mods: ModifiersState, sym: u32) -> Option<Action> {

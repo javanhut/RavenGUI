@@ -206,6 +206,30 @@ impl Motion {
         )
     }
 
+    /// The transform that draws a buffer sitting at `placed` into this
+    /// motion's rectangle at `now`, at its opacity.
+    ///
+    /// Straight from the springs rather than through [`Self::rect_at`]:
+    /// rounding each side to a whole pixel every frame rounds the width and
+    /// the height separately, so a pane shrinking into the dock wobbles
+    /// between two aspect ratios and its slow last stretch moves in visible
+    /// steps. Kept fractional, both ends share an aspect — the springs are
+    /// identical, so every rectangle between does too — and the tail glides.
+    pub(crate) fn fit_at(&self, placed: Rect, now: Duration) -> WorkspacePreview {
+        let (x, y) = (f64::from(self.x.value(now)), f64::from(self.y.value(now)));
+        let w = f64::from(self.w.value(now)).max(1.0);
+        let h = f64::from(self.h.value(now)).max(1.0);
+        let scale_x = w / f64::from(placed.w().max(1));
+        let scale_y = h / f64::from(placed.h().max(1));
+        WorkspacePreview {
+            scale_x,
+            scale_y,
+            offset_x: x - f64::from(placed.x()) * scale_x,
+            offset_y: y - f64::from(placed.y()) * scale_y,
+            alpha: self.alpha_at(now),
+        }
+    }
+
     /// How opaque to draw it at `now`.
     pub(crate) fn alpha_at(&self, now: Duration) -> f32 {
         self.alpha.value(now).clamp(0.0, 1.0)

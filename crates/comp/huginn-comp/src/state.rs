@@ -728,6 +728,11 @@ pub(crate) struct Huginn {
     /// When the screens were last asked to show their numbers on their own,
     /// through `raven_output_layout_v1.identify`.
     identify_since: Option<std::time::Duration>,
+    /// Keys whose press was kept from clients: their release is kept too.
+    pub(crate) swallowed_keys: crate::backend::keymap::Swallowed,
+    /// What is under the pointer may have changed without the pointer
+    /// moving; see [`crate::backend::input::rehover`].
+    pointer_stale: bool,
     /// The touchpad swipe in progress, if any.
     ///
     /// Held on the compositor rather than in the core because a gesture is
@@ -980,6 +985,9 @@ pub(crate) struct Huginn {
     /// began. It fades over [`FLASH`](Self::FLASH) and then clears itself.
     flash: Option<(usize, Instant)>,
     flash_buffer: SolidColorBuffer,
+    /// The shade laid over the desktop behind the open launcher, so the
+    /// panel is front and centre and the windows behind step back.
+    launcher_backdrop: SolidColorBuffer,
     /// The dot on a screen being recorded: the screen's connector name, and
     /// the dot drawn at its density. See [`crate::record`].
     recording_dot: Option<(String, crate::canvas::Panel)>,
@@ -1160,6 +1168,7 @@ impl Huginn {
     pub(crate) fn new(dh: &DisplayHandle, area: Rect) -> Self {
         let desktop_config = crate::desktop_config::DesktopConfig::load();
         crate::theme::set_accent(desktop_config.accent());
+        crate::theme::set_theme(desktop_config.glass_theme());
         let volume = crate::audio::Volume::detect().shared();
         let brightness = crate::backlight::Brightness::detect().shared();
         let mut seat_state = SeatState::new();
@@ -1247,6 +1256,8 @@ impl Huginn {
             workspace_carousel: None,
             screen_badges: None,
             identify_since: None,
+            swallowed_keys: Default::default(),
+            pointer_stale: false,
             swipe: None,
             fullscreen_solo: HashSet::new(),
             drag: false,
@@ -1273,7 +1284,7 @@ impl Huginn {
             }),
             workspace_card: SolidColorBuffer::new(
                 (area.w(), area.h()),
-                crate::theme::BACKGROUND
+                crate::theme::background()
                     .with_alpha(WORKSPACE_CARD_ALPHA)
                     .to_rgba_f32(),
             ),
@@ -1288,6 +1299,7 @@ impl Huginn {
             pending_capture: None,
             flash: None,
             flash_buffer: SolidColorBuffer::new((area.w(), area.h()), [1.0, 1.0, 1.0, 1.0]),
+            launcher_backdrop: SolidColorBuffer::new((area.w(), area.h()), [0.0, 0.0, 0.0, 1.0]),
             recording_dot: None,
             capture_dots: Vec::new(),
             captures: crate::capture::Captures::default(),
@@ -1346,6 +1358,7 @@ impl Huginn {
             huginn.desktop_config.motion(),
             huginn.desktop_config.idle_after(),
             huginn.desktop_config.launcher_style(),
+            huginn.desktop_config.glass_theme(),
             huginn.desktop_config.do_not_disturb(),
         );
         huginn
@@ -1373,8 +1386,10 @@ impl Huginn {
             cfg.motion(),
             cfg.idle_after(),
             cfg.launcher_style(),
+            cfg.glass_theme(),
             cfg.do_not_disturb(),
         );
+        self.apply_glass_theme();
         self.notifications.set_timeouts(cfg.notification_timeouts());
         // The dock's icons may just have changed size, which changes where
         // every one of them is: it has to be laid out and painted again, and
@@ -2211,6 +2226,15 @@ impl Huginn {
                     self.launcher.style(),
                 ),
                 reveal.clamp(0.0, 1.0),
+            ));
+            // Behind the panel and over the blurred desktop: the shade that
+            // makes the search the one thing on screen. It fades with the
+            // panel, so opening reads as the desktop stepping back.
+            let shade = f32::from(crate::theme::backdrop()) / 255.0;
+            out.push(SceneItem::Ring(
+                &self.launcher_backdrop,
+                self.output_area(),
+                reveal.clamp(0.0, 1.0) * shade,
             ));
         }
         if let Some(panel) = &self.pinned_panel {
@@ -3680,7 +3704,7 @@ impl Huginn {
             let Some(placed) = self.placed_rect(*id) else {
                 continue;
             };
-            let transform = crate::motion::fit(placed, motion.rect_at(now), motion.alpha_at(now));
+            let transform = motion.fit_at(placed, now);
             out.extend(self.bar_item(*id, now));
             out.push(SceneItem::Preview(surface, placed, transform));
         }
@@ -3737,6 +3761,32 @@ impl Huginn {
                 // A resize: the buffer at its natural size, its frame's
                 // corner pinned to the moving rectangle's corner, cropped
                 // to it. The content never stretches; the edge slides.
+                // Unless the client has not caught up with a rectangle that
+                // grew — a maximize, a neighbour closing — and its buffer is
+                // still the old, smaller one: cropped, that is a gap the edge
+                // slides away from and the content snaps into a few frames
+                // later. The old buffer is stretched to fill until the new
+                // one arrives, which the eye reads as the window growing.
+                Some(motion)
+                    if motion.kind() == crate::motion::Kind::Resize && {
+                        let drawn = motion.rect_at(now);
+                        let frame = crate::popup::window_geometry(&surface);
+                        frame.size.w > 0
+                            && frame.size.h > 0
+                            && (drawn.w() > frame.size.w + 1 || drawn.h() > frame.size.h + 1)
+                    } =>
+                {
+                    let frame = crate::popup::window_geometry(&surface);
+                    let content = Rect::from_xywh(
+                        placed.x() + frame.loc.x,
+                        placed.y() + frame.loc.y,
+                        frame.size.w,
+                        frame.size.h,
+                    );
+                    let mut transform = motion.fit_at(content, now);
+                    transform.alpha *= fade;
+                    out.push(SceneItem::WorkspaceSurface(surface, placed, transform));
+                }
                 Some(motion) if motion.kind() == crate::motion::Kind::Resize => {
                     let drawn = motion.rect_at(now);
                     let frame = crate::popup::window_geometry(&surface);
@@ -3757,8 +3807,7 @@ impl Huginn {
                 // and hit-tested at its real rectangle, which is where it
                 // is about to be.
                 Some(motion) => {
-                    let transform =
-                        crate::motion::fit(placed, motion.rect_at(now), motion.alpha_at(now));
+                    let transform = motion.fit_at(placed, now);
                     out.push(SceneItem::WorkspaceSurface(surface, placed, transform));
                 }
                 // Keep ordinary tiled panes cropped too. The resize spring can
@@ -4655,8 +4704,11 @@ impl Huginn {
     /// where the identify fade has got to, whichever is more.
     fn badge_alpha(&self) -> f32 {
         let now = self.uptime();
+        // A lone screen has nothing to tell apart: the overview shows no
+        // number on it. Asking to identify still does.
         let overview = self
             .workspace_carousel
+            .filter(|_| self.outputs.len() > 1)
             .map_or(0.0, |carousel| carousel.reveal.value(now).clamp(0.0, 1.0));
         let identify = self.identify_since.map_or(0.0, |since| {
             let t = now.saturating_sub(since).as_secs_f32();
@@ -5635,9 +5687,16 @@ impl Huginn {
         match outcome {
             crate::launcher::Outcome::Launch { entry, argv } => {
                 self.launch(entry, &argv);
+                self.pointer_stale = true;
                 self.refresh_launcher();
             }
-            crate::launcher::Outcome::Dismissed | crate::launcher::Outcome::Redraw => {
+            crate::launcher::Outcome::Dismissed => {
+                // The window behind was kept from the pointer while the
+                // panel covered it; now it is uncovered, tell it.
+                self.pointer_stale = true;
+                self.refresh_launcher();
+            }
+            crate::launcher::Outcome::Redraw => {
                 self.refresh_launcher();
             }
             crate::launcher::Outcome::TogglePin { entry } => {
@@ -5978,7 +6037,8 @@ impl Huginn {
             + usize::from(self.help.is_some())
             + usize::from(self.volume_panel.is_some())
             + usize::from(self.brightness_panel.is_some())
-            + usize::from(self.launcher_panel.is_some())
+            // The launcher's panel and the shade behind it.
+            + 2 * usize::from(self.launcher_panel.is_some())
             + usize::from(self.pinned_panel.is_some())
             + usize::from(self.settings_panel.is_some())
     }
@@ -6112,16 +6172,13 @@ impl Huginn {
             return None;
         }
         let clock = self.uptime();
-        if let Some(panel) = self.launcher_panel.as_ref() {
-            // The arc is not a rectangle, so it names its own region; see
-            // `Launcher::blur_region`.
-            return self.launcher.blur_region(crate::launcher::placement(
-                self.output_area(),
-                panel.size(),
-                self.launcher.origin(),
-                self.launcher.reveal(clock),
-                self.launcher.style(),
-            ));
+        // The launcher defocuses the whole desktop, not only the patch
+        // behind its panel: the search is front and centre, and everything
+        // else is out of focus behind it. The blur's strength follows the
+        // reveal (see [`Self::blur_radius`]), so it eases in and out with
+        // the panel.
+        if self.launcher_panel.is_some() {
+            return Some(self.output_area());
         }
         // The pin bar blurs its rail rather than its canvas: the canvas is
         // rail, menu and the transparent air between them. See
@@ -6456,6 +6513,8 @@ impl Huginn {
         if self.pins.set_position(self.settings.pins_position()) {
             self.pins_changed();
         }
+        // The theme row: every panel is redrawn in the new glass.
+        self.apply_glass_theme();
         // The launcher row, likewise: the row owns the value and the
         // launcher takes a copy, redrawing if it is on screen.
         if self.launcher.set_style(self.settings.launcher_style()) && self.launcher.is_visible(now)
@@ -6466,6 +6525,25 @@ impl Huginn {
             self.launcher.reindex(&self.apps, &self.frecency, epoch);
             self.refresh_launcher();
         }
+        self.queue_redraw();
+    }
+
+    /// Switch to the glass the Theme row says, and redraw everything the
+    /// compositor painted in the old one: every panel, the overview's
+    /// chrome, the screen badges, the title bars.
+    fn apply_glass_theme(&mut self) {
+        if !crate::theme::set_theme(self.settings.glass_theme()) {
+            return;
+        }
+        tracing::info!(theme = crate::theme::theme().label(), "glass theme changed");
+        self.overview_chrome = None;
+        self.refresh_overview_chrome();
+        self.screen_badges = None;
+        for entry in self.decor.values_mut() {
+            entry.bar = None;
+        }
+        self.refresh_decor();
+        self.refresh_output_panels();
         self.queue_redraw();
     }
 
@@ -6792,6 +6870,8 @@ impl Huginn {
     /// which is cheap once per keystroke and wasteful sixty times a second.
     pub(crate) fn refresh_launcher(&mut self) {
         let (area, advertised) = (self.output_area(), self.scale().advertised);
+        // A no-op when the size is unchanged.
+        self.launcher_backdrop.resize((area.w(), area.h()));
         self.launcher_panel = self.launcher.is_visible(self.uptime()).then(|| {
             let (panel, layout) = crate::launcher::render(
                 &self.launcher,
@@ -7384,6 +7464,9 @@ impl Huginn {
     pub(crate) fn refresh(&mut self) {
         self.popups.cleanup();
         self.tick_flash();
+        if std::mem::take(&mut self.pointer_stale) {
+            crate::backend::input::rehover(self);
+        }
     }
 
     /// Keep the post-capture flash animating, and clear it when it is spent.
@@ -7977,6 +8060,7 @@ impl Huginn {
                 mapped = self.mapped.contains(&id),
                 "toplevel map state"
             );
+            self.pointer_stale = true;
         }
         // The first frame a window has ever shown: fade and grow it into its
         // pane, from now. Only a window somebody can see — one on a workspace
@@ -8184,6 +8268,7 @@ impl Huginn {
         // index runs through arrange, so this is the one place the shell needs
         // to be told. broadcast_workspaces suppresses no-op events itself.
         self.broadcast_workspaces();
+        self.pointer_stale = true;
         self.queue_redraw();
     }
 

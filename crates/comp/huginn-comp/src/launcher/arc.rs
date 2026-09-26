@@ -15,7 +15,7 @@
 use super::paint::*;
 use super::*;
 use crate::text::Weight;
-use crate::theme::{Color, TEXT, TEXT_DIM};
+use crate::theme::Color;
 
 /// The glass's outer radius.
 const OUTER: f32 = 232.0;
@@ -151,7 +151,7 @@ pub(super) fn compose(
             label_size,
             sx + nudge,
             sy + px(SLOT) + px(2.0),
-            if chosen { WHITE } else { TEXT },
+            if chosen { WHITE } else { crate::theme::text() },
             Weight::NORMAL,
         );
         layout.hits.push((
@@ -495,7 +495,7 @@ fn draw_search(
     let stack =
         px(22.0) + px(6.0) + input_size * 1.35 + px(6.0) + hint_size * 1.35 + px(14.0) + 1.0;
     let mut y = cy - stack / 2.0 - px(15.0);
-    draw_search_glyph(canvas, cx - px(1.5), y + px(9.0), px(7.5), px(1.6), TEXT);
+    draw_search_glyph(canvas, cx - px(1.5), y + px(9.0), px(7.5), px(1.6), crate::theme::text());
     y += px(22.0) + px(6.0);
     if typing {
         let shown = fit_tail(text, launcher.query(), input_size, px(170.0));
@@ -529,7 +529,7 @@ fn draw_search(
         hint_size,
         cx,
         y,
-        TEXT_DIM,
+        crate::theme::text_dim(),
         Weight::NORMAL,
     );
     y += hint_size * 1.35 + px(14.0);
@@ -664,7 +664,7 @@ fn draw_sidebar(
             );
         }
         let glyph = px(17.0);
-        let icon_color = if on { accent } else { TEXT_DIM };
+        let icon_color = if on { accent } else { crate::theme::text_dim() };
         if let Some(icon) = symbol(icons, pixmaps, symbols, glyph as u32, density, icon_color) {
             blit_centred(
                 canvas,
@@ -680,7 +680,7 @@ fn draw_sidebar(
             label_size,
             label_x as i32,
             (y + (row_h - label_size * 1.35) / 2.0) as i32,
-            if on { WHITE } else { TEXT },
+            if on { WHITE } else { crate::theme::text() },
         );
         if let Some(count) = count {
             let count = count.to_string();
@@ -692,7 +692,7 @@ fn draw_sidebar(
                 count_size,
                 (row_x + row_w - px(16.0) - count_w) as i32,
                 (y + (row_h - count_size * 1.35) / 2.0) as i32,
-                TEXT_DIM,
+                crate::theme::text_dim(),
             );
         }
         layout.buttons.push((rect(row_x, y, row_w, row_h), button));
@@ -878,7 +878,7 @@ fn draw_card(
         kind_size,
         text_x as i32,
         (heading_y + title_size * 1.3) as i32,
-        TEXT_DIM,
+        crate::theme::text_dim(),
     );
     y += icon_size + px(16.0);
     canvas.fill_rounded(
@@ -891,7 +891,7 @@ fn draw_card(
     );
     y += 1.0 + px(14.0);
     for line in &about {
-        text.draw(canvas, line, about_size, x as i32, y as i32, TEXT);
+        text.draw(canvas, line, about_size, x as i32, y as i32, crate::theme::text());
         y += about_size * 1.5;
     }
     if !about.is_empty() {
@@ -918,7 +918,7 @@ fn draw_card(
             fact_size,
             (x + glyph + px(12.0)) as i32,
             (y + (fact_h - fact_size * 1.35) / 2.0) as i32,
-            TEXT_DIM,
+            crate::theme::text_dim(),
         );
         y += fact_h;
     }
@@ -976,7 +976,7 @@ fn draw_card(
             &["window-new-symbolic", "list-add-symbolic"]
         };
         let glyph = px(16.0);
-        if let Some(icon) = symbol(icons, pixmaps, symbols, glyph as u32, density, TEXT) {
+        if let Some(icon) = symbol(icons, pixmaps, symbols, glyph as u32, density, crate::theme::text()) {
             blit_centred(canvas, &icon, x + glyph / 2.0, y + action_h / 2.0);
         }
         let size = px(12.5);
@@ -987,7 +987,7 @@ fn draw_card(
             size,
             (x + glyph + px(14.0)) as i32,
             (y + (action_h - size * 1.35) / 2.0) as i32,
-            TEXT,
+            crate::theme::text(),
         );
         layout
             .menu_hits
@@ -1001,7 +1001,7 @@ fn draw_card(
             px(11.0),
             x as i32,
             (y + px(8.0)) as i32,
-            TEXT_DIM,
+            crate::theme::text_dim(),
         );
     }
     rect(left, top, width, height)

@@ -106,7 +106,9 @@ pub(crate) struct Bar {
 /// Padding either side of the title, in logical pixels.
 const PAD: f32 = 10.0;
 /// The bar's background: the panel colour, the same as the dock and launcher.
-const BG: [u8; 4] = theme::TITLE_BAR_BG.to_rgba_bytes();
+fn bg() -> [u8; 4] {
+    theme::title_bar_bg().to_rgba_bytes()
+}
 /// The close glyph. A multiplication sign rather than an `x`: it is
 /// symmetric, and every sans-serif font has one.
 const CLOSE: &str = "\u{00D7}";
@@ -148,19 +150,19 @@ pub(crate) fn compose(text: &mut Text, key: &BarKey) -> Canvas {
     let w = (key.width.max(1) as f32 * px) as usize;
     let h = (theme::TITLE_BAR_HEIGHT as f32 * px) as usize;
     let mut canvas = Canvas::new(w.max(1), h.max(1));
-    canvas.fill(0, 0, w, h, BG);
+    canvas.fill(0, 0, w, h, bg());
     // A hairline along the bottom, where the bar meets the content.
     let rule = (px as usize).max(1);
     // The hairline every panel has, where the bar meets the window.
-    canvas.tint(0, h.saturating_sub(rule), w, rule, theme::RULE, 0x14);
+    canvas.tint(0, h.saturating_sub(rule), w, rule, theme::rule(), 0x14);
 
     if !text.is_usable() {
         return canvas;
     }
     let colour = if key.focused {
-        theme::TEXT
+        theme::text()
     } else {
-        theme::TEXT_DIM
+        theme::text_dim()
     };
     let size = theme::TITLE_TEXT_SIZE * ui_scale(key.output) * px;
     let pad = PAD * px;
@@ -291,11 +293,11 @@ mod tests {
         let last = (canvas.height - 1) * canvas.stride * 4;
         let rule = &canvas.pixels[last..last + 4];
         assert!(
-            rule[0] > BG[0] && rule[3] == 0xFF,
+            rule[0] > bg()[0] && rule[3] == 0xFF,
             "rule pixel was {rule:?}"
         );
         // The top-left corner is background: no text starts flush with the edge.
-        assert_eq!(&canvas.pixels[0..4], &BG);
+        assert_eq!(&canvas.pixels[0..4], &bg());
         let panel = render(&mut text, key(Some("hello"), true, 2)).panel;
         assert_eq!(panel.size(), (600, theme::TITLE_BAR_HEIGHT));
     }

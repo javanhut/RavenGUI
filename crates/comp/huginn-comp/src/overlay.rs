@@ -646,7 +646,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
             l.size,
             (l.pad + l.body_w - w).round() as i32,
             y as i32,
-            theme::TEXT,
+            theme::text(),
         );
     }
     canvas.tint(
@@ -654,7 +654,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
         (y + l.line + l.line_gap) as usize,
         l.body_w as usize,
         l.rule as usize,
-        theme::RULE,
+        theme::rule(),
         0x14,
     );
 
@@ -666,7 +666,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
             l.size,
             l.pad as i32,
             top as i32,
-            theme::TEXT_DIM,
+            theme::text_dim(),
         );
     }
 
@@ -681,7 +681,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
                     l.size,
                     (x + (width - w) / 2.0).round() as i32,
                     (face + (l.cap_h - h) / 2.0).round() as i32,
-                    theme::TEXT,
+                    theme::text(),
                     Weight::BOLD,
                 );
             }
@@ -693,7 +693,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
             l.size,
             row.desc_x as i32,
             (face + (l.cap_h - h) / 2.0).round() as i32,
-            theme::TEXT,
+            theme::text(),
         );
     }
 
@@ -703,7 +703,7 @@ fn paint_base(l: &Layout, text: &mut Text) -> Canvas {
         l.size,
         l.pad as i32,
         l.footer_y as i32,
-        theme::TEXT_DIM,
+        theme::text_dim(),
     );
     canvas
 }
@@ -1197,7 +1197,7 @@ mod tests {
         }
         let canvas = compose(Rect::from_xywh(0, 0, 1920, 1080), &mut text, 1, "");
         let accent = theme::accent().to_rgba_bytes();
-        let bg = theme::BACKGROUND.to_rgba_bytes();
+        let bg = theme::background().to_rgba_bytes();
         let partial = canvas
             .pixels
             .as_chunks::<4>()

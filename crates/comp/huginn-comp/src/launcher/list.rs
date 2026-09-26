@@ -1,20 +1,19 @@
-//! The list layout: a search bar that opens into a grid.
+//! The list layout: one sheet of glass, front and centre.
 //!
-//! Closed, the launcher is only its field — a bar hanging from near the top
-//! of the screen (see [`super::placement`]), with a chevron that says there
-//! is more. Opened, a grid hangs below the field. Before anything is typed
-//! that is one row of suggestions and a foot of the pinned and recently used
-//! applications; once something is, tabs that narrow the search by kind, the
-//! sort, and the results as tiles, applications before files, with the
-//! arithmetic result above them and the offer to run the query below.
+//! The search field across the top, a row of chips under it, and the grid
+//! below that — every application before anything is typed, narrowed by the
+//! chips to a category; the results as tiles, applications before files,
+//! once something is. Under a hairline at the foot, the pinned and recently
+//! used applications. The panel is the same size whatever it shows: a sheet
+//! that grew and shrank with every keystroke would jump about under the eye,
+//! and the grid keeps its three rows of room even when a search fills one.
 
 use super::paint::*;
 use super::*;
 use crate::text::Weight;
-use crate::theme::{TEXT, TEXT_DIM};
 
 /// The panel's width at a 1080p output, in logical pixels.
-const WIDTH: f32 = 760.0;
+const WIDTH: f32 = 900.0;
 
 /// Lay out and paint the list. See [`super::compose`].
 pub(super) fn compose(
@@ -27,32 +26,38 @@ pub(super) fn compose(
     density: u32,
 ) -> (Canvas, Layout) {
     let m = Metrics::for_output(output, density);
-    let scale = m.scale;
+    let text_color = crate::theme::text();
+    let text_dim = crate::theme::text_dim();
+
+    // The design's measurements, in logical pixels at 1080p. On a screen too
+    // short for them the whole sheet is drawn smaller rather than cut off.
+    let natural = 26.0 * 2.0 + 56.0 + 20.0 + 34.0 + 20.0 + 3.0 * 124.0 + 2.0 * 6.0
+        + 30.0 + 16.0 + 1.0 + 16.0 + 28.0 + 58.0;
+    let room = output.h() as f32 * m.density as f32 * 0.92;
+    let squeeze = (room / (natural * m.scale)).min(1.0);
+    let scale = m.scale * squeeze;
     let px = |v: f32| v * scale;
+
     let width = px(WIDTH)
         .min(output.w() as f32 * m.density as f32 - px(32.0))
-        .max(px(360.0))
+        .max(px(420.0))
         .floor();
-    let pad = px(9.0);
-    let field_h = px(50.0);
-    // The grid sits a little further in than the field, as the field's own
-    // rounding does, so the tiles line up with the text in it.
-    let inset = pad + px(6.0);
-    let inner = width - inset * 2.0;
-    let gap = px(4.0);
+    let pad = px(26.0);
+    let field_h = px(56.0);
+    let chips_h = px(34.0);
+    let inner = width - pad * 2.0;
+    let gap = px(6.0);
     let tile_w = (inner - gap * (COLUMNS - 1) as f32) / COLUMNS as f32;
-    let tile_h = px(108.0);
-    let tools_h = px(34.0);
-    let heading_h = px(18.0);
-    let section = px(12.0);
-    let row_h = m.row;
-    let strip_h = px(54.0);
+    let tile_h = px(124.0);
+    let grid_h = GRID_ROWS as f32 * tile_h + (GRID_ROWS - 1) as f32 * gap;
+    let pager_h = px(30.0);
+    let section = px(16.0);
     let strip_head = px(28.0);
+    let strip_h = px(58.0);
+    let row_h = m.row * squeeze;
     let hint_size = px(11.5);
-    let keys_h = hint_size * 1.75;
 
     let grid = launcher.is_grid();
-    let collapsed = launcher.is_collapsed();
     let target = launcher.target();
     let visible = launcher.visible();
     let has_result = visible.first() == Some(&Target::Result);
@@ -74,16 +79,10 @@ pub(super) fn compose(
     let tile_start = usize::from(has_result);
     let total_rows = tiles.len().div_ceil(COLUMNS);
     let first_row = launcher.first_row();
-    let drawn_rows = if grid && !launcher.all_apps {
-        total_rows.min(1)
-    } else {
-        total_rows.saturating_sub(first_row).min(GRID_ROWS)
-    };
-    let strip = if grid {
-        launcher.pins_shown().len() + launcher.recent().len()
-    } else {
-        0
-    };
+    // The result and run rows share the grid's room rather than adding to
+    // the sheet: each takes the place of a row of tiles.
+    let row_room = GRID_ROWS - usize::from(has_result) - usize::from(has_command);
+    let drawn_rows = total_rows.saturating_sub(first_row).min(row_room.max(1));
     let nothing = tiles.is_empty() && !has_result && !has_command;
     let menu = launcher
         .menu()
@@ -92,33 +91,19 @@ pub(super) fn compose(
         .map(|entry| launcher.menu_items(entry));
     let menu_metrics = m.with_width(width as usize);
 
-    // How tall it is, from what it will show.
-    let mut body = 0.0;
-    if !collapsed {
-        body += section;
-        body += if grid { heading_h } else { tools_h };
-        body += section;
-        if has_result {
-            body += row_h + section / 2.0;
-        }
-        if drawn_rows > 0 {
-            body += drawn_rows as f32 * tile_h + (drawn_rows - 1) as f32 * gap;
-        }
-        if nothing {
-            body += row_h;
-        }
-        if has_command {
-            body += section / 2.0 + row_h;
-        }
-        if strip > 0 {
-            body += section * 2.0 + 1.0 + strip_head + strip_h;
-        }
-        if let Some(items) = &menu {
-            body = body.max(menu_metrics.menu_height(items.len()) + section);
-        }
-        body += section + keys_h + px(4.0);
-    }
-    let height = (pad * 2.0 + field_h + body).ceil().max(1.0) as usize;
+    let height = (pad * 2.0
+        + field_h
+        + px(20.0)
+        + chips_h
+        + px(20.0)
+        + grid_h
+        + pager_h
+        + section
+        + 1.0
+        + section
+        + strip_head
+        + strip_h)
+        .ceil() as usize;
     let width_px = width as usize;
 
     let mut canvas = Canvas::new(width_px, height);
@@ -129,55 +114,74 @@ pub(super) fn compose(
     let rect =
         |x: f32, y: f32, w: f32, h: f32| Rect::from_xywh(x as i32, y as i32, w as i32, h as i32);
     let accent = crate::theme::accent();
-    canvas.material(0, 0, width_px, height, px(22.0), 0xEE);
+    canvas.material(
+        0,
+        0,
+        width_px,
+        height,
+        px(RADIUS + 6.0),
+        crate::theme::panel_alpha(),
+    );
 
-    // The field: a well with the accent's edge, since it always has focus.
-    let (fx, fy, fw) = (pad, pad, width - pad * 2.0);
+    // The field: a pill of lighter glass, ringed faintly. The caret is the
+    // accent, since the field always has the keyboard.
+    let (fx, fy, fw) = (pad, pad, inner);
+    let field_radius = px(18.0);
     canvas.fill_rounded(
         fx as usize,
         fy as usize,
         fw as usize,
         field_h as usize,
-        px(14.0),
-        rgba(255, 255, 255, 0.05),
+        field_radius,
+        crate::theme::well(),
     );
     canvas.stroke_rounded(
         fx as usize,
         fy as usize,
         fw as usize,
         field_h as usize,
-        px(14.0),
+        field_radius,
         1.0_f32.max(scale * 0.75),
-        faded(accent, 0.5),
+        crate::theme::hairline(),
     );
-    let glyph_x = fx + px(24.0);
+    let glyph_x = fx + px(26.0);
     draw_search_glyph(
         &mut canvas,
         glyph_x,
         fy + field_h / 2.0 - px(1.5),
-        px(6.0),
-        px(1.6),
-        TEXT_DIM,
-    );
-    // The chevron: down on the bar, up once it has opened.
-    let chevron = px(34.0);
-    let (chevron_x, chevron_y) = (fx + fw - px(8.0) - chevron, fy + (field_h - chevron) / 2.0);
-    draw_chevron(
-        &mut canvas,
-        chevron_x + chevron / 2.0,
-        chevron_y + chevron / 2.0,
-        px(5.0),
+        px(7.0),
         px(1.8),
-        !collapsed,
-        TEXT_DIM,
+        text_dim,
     );
-    layout
-        .buttons
-        .push((rect(chevron_x, chevron_y, chevron, chevron), Button::Expand));
-    let query_size = px(16.5);
-    let text_x = glyph_x + px(20.0);
+    // A keycap at the far end says how to leave.
+    let cap_size = px(12.0);
+    let cap = "Esc";
+    let cap_w = text.measure(cap, cap_size).0 + px(18.0);
+    let cap_h = px(26.0);
+    let cap_x = fx + fw - px(14.0) - cap_w;
+    let cap_y = fy + (field_h - cap_h) / 2.0;
+    canvas.fill_rounded(
+        cap_x as usize,
+        cap_y as usize,
+        cap_w as usize,
+        cap_h as usize,
+        px(8.0),
+        crate::theme::well_raised(),
+    );
+    draw_centred(
+        text,
+        &mut canvas,
+        cap,
+        cap_size,
+        cap_x + cap_w / 2.0,
+        cap_y + (cap_h - cap_size * 1.35) / 2.0,
+        text_dim,
+        Weight::NORMAL,
+    );
+    let query_size = px(18.0);
+    let text_x = glyph_x + px(22.0);
     let text_y = fy + (field_h - query_size * 1.35) / 2.0;
-    let room = chevron_x - px(10.0) - text_x;
+    let text_room = cap_x - px(12.0) - text_x;
     let caret_w = px(2.0).max(1.0);
     if launcher.query().is_empty() {
         // The caret before the hint, not through its first letter.
@@ -188,24 +192,24 @@ pub(super) fn compose(
             (query_size * 1.2) as usize,
             accent.to_rgba_bytes(),
         );
-        let hint = fit(text, PLACEHOLDER, query_size, room - px(8.0));
+        let hint = fit(text, PLACEHOLDER, query_size, text_room - px(8.0));
         text.draw(
             &mut canvas,
             &hint,
             query_size,
             (text_x + caret_w + px(6.0)) as i32,
             text_y as i32,
-            TEXT_DIM,
+            text_dim,
         );
     } else {
-        let shown = fit_tail(text, launcher.query(), query_size, room - px(6.0));
+        let shown = fit_tail(text, launcher.query(), query_size, text_room - px(6.0));
         text.draw(
             &mut canvas,
             &shown,
             query_size,
             text_x as i32,
             text_y as i32,
-            TEXT,
+            text_color,
         );
         let caret_x = text_x + text.measure(&shown, query_size).0 + px(2.0);
         canvas.fill(
@@ -217,191 +221,170 @@ pub(super) fn compose(
         );
     }
 
-    if collapsed {
-        return (canvas, layout);
-    }
-
-    let mut y = pad + field_h + section;
-    if grid {
-        text.draw_weighted(
-            &mut canvas,
-            if launcher.all_apps {
-                "All Apps"
-            } else {
-                "Suggested"
-            },
-            px(12.5),
-            (inset + px(4.0)) as i32,
-            y as i32,
-            TEXT,
-            EMPHASIS,
-        );
-        let note = if launcher.all_apps {
-            "Suggested →"
-        } else {
-            "All Apps →"
-        };
-        let note_w = text.measure(note, px(11.5)).0;
-        text.draw(
-            &mut canvas,
-            note,
-            px(11.5),
-            (inset + inner - px(4.0) - note_w) as i32,
-            (y + px(1.0)) as i32,
-            TEXT_DIM,
-        );
-        layout.buttons.push((
-            rect(
-                inset + inner - note_w - px(12.0),
-                y - px(4.0),
-                note_w + px(16.0),
-                heading_h + px(8.0),
-            ),
-            Button::AllApps,
-        ));
-        if launcher.all_apps {
-            let label = format!("Sort: {}", launcher.sort().label());
-            let label_w = text.measure(&label, px(11.5)).0;
-            let sx = inset + inner - note_w - label_w - px(36.0);
-            text.draw(
-                &mut canvas,
-                &label,
-                px(11.5),
-                sx as i32,
-                (y + px(1.0)) as i32,
-                TEXT_DIM,
-            );
-            layout.buttons.push((
-                rect(
-                    sx - px(6.0),
-                    y - px(4.0),
-                    label_w + px(12.0),
-                    heading_h + px(8.0),
-                ),
-                Button::Sort,
-            ));
-        }
-        y += heading_h + section;
+    // The chips: categories before anything is typed, kinds of result
+    // after, each with how many the search found. The sort at the far end.
+    let mut y = pad + field_h + px(20.0);
+    let chip_size = px(13.5);
+    let count_size = px(11.0);
+    let mut cx = pad;
+    let chips: Vec<(String, Option<String>, bool, Button)> = if grid {
+        launcher
+            .categories()
+            .iter()
+            .enumerate()
+            .map(|(i, category)| {
+                let label = match category {
+                    Category::All => "All",
+                    other => other.label(),
+                };
+                (
+                    label.to_owned(),
+                    None,
+                    i == launcher.category(),
+                    Button::Category(i),
+                )
+            })
+            .collect()
     } else {
-        // Tabs by kind, with how many of each the search found; the sort at
-        // the far end. A hairline under both.
         let (apps_found, files_found) = launcher.found();
-        let tab_size = px(13.0);
-        let count_size = px(10.5);
-        let mut tx = inset;
-        for filter in Filter::ALL {
-            let count = match filter {
-                Filter::All => apps_found + files_found,
-                Filter::Apps => apps_found,
-                Filter::Files => files_found,
-            }
-            .to_string();
-            let label_w = text.measure(filter.label(), tab_size).0;
-            let count_w = text.measure(&count, count_size).0;
-            let tab_w = px(12.0) + label_w + px(7.0) + count_w + px(12.0);
-            let on = launcher.filter() == filter;
-            let label_y = y + px(6.0);
-            text.draw(
-                &mut canvas,
-                filter.label(),
-                tab_size,
-                (tx + px(12.0)) as i32,
-                label_y as i32,
-                if on { TEXT } else { TEXT_DIM },
-            );
-            text.draw(
-                &mut canvas,
-                &count,
-                count_size,
-                (tx + px(12.0) + label_w + px(7.0)) as i32,
-                (label_y + (tab_size - count_size) * 1.1) as i32,
-                TEXT_DIM,
-            );
-            if on {
-                canvas.fill_rounded(
-                    (tx + px(12.0)) as usize,
-                    (y + tools_h - px(2.0)) as usize,
-                    (label_w + px(7.0) + count_w) as usize,
-                    px(2.0).max(1.0) as usize,
-                    px(1.0),
-                    accent,
-                );
-            }
-            layout
-                .buttons
-                .push((rect(tx, y, tab_w, tools_h), Button::Filter(filter)));
-            tx += tab_w + px(2.0);
+        Filter::ALL
+            .into_iter()
+            .map(|filter| {
+                let count = match filter {
+                    Filter::All => apps_found + files_found,
+                    Filter::Apps => apps_found,
+                    Filter::Files => files_found,
+                };
+                (
+                    filter.label().to_owned(),
+                    Some(count.to_string()),
+                    launcher.filter() == filter,
+                    Button::Filter(filter),
+                )
+            })
+            .collect()
+    };
+    let sort_size = px(13.0);
+    let sort_label = launcher.sort().label();
+    let lead_w = text.measure("Sort", sort_size).0;
+    let label_w = text.measure_weighted(sort_label, sort_size, EMPHASIS).0;
+    let sort_w = lead_w + px(6.0) + label_w + px(18.0);
+    let sort_x = pad + inner - sort_w - px(4.0);
+    for (label, count, on, button) in &chips {
+        let label_w = text.measure(label, chip_size).0;
+        let count_w = count
+            .as_deref()
+            .map_or(0.0, |c| text.measure(c, count_size).0 + px(7.0));
+        let chip_w = px(18.0) + label_w + count_w + px(18.0);
+        if cx + chip_w > sort_x - px(12.0) {
+            break;
         }
-        let sort_size = px(12.5);
-        let lead_w = text.measure("Sort", sort_size).0;
-        let label = launcher.sort().label();
-        let label_w = text.measure_weighted(label, sort_size, EMPHASIS).0;
-        let sort_w = lead_w + px(5.0) + label_w + px(16.0);
-        let sort_x = inset + inner - sort_w - px(6.0);
-        let sort_y = y + px(6.0);
-        text.draw(
-            &mut canvas,
-            "Sort",
-            sort_size,
-            sort_x as i32,
-            sort_y as i32,
-            TEXT_DIM,
+        let (fill, edge) = if *on {
+            (faded(WHITE, 0.26), Some(faded(WHITE, 0.34)))
+        } else {
+            (crate::theme::well(), None)
+        };
+        canvas.fill_rounded(
+            cx as usize,
+            y as usize,
+            chip_w as usize,
+            chips_h as usize,
+            chips_h / 2.0,
+            fill,
         );
-        text.draw_weighted(
+        if let Some(edge) = edge {
+            canvas.stroke_rounded(
+                cx as usize,
+                y as usize,
+                chip_w as usize,
+                chips_h as usize,
+                chips_h / 2.0,
+                1.0_f32.max(scale * 0.75),
+                edge,
+            );
+        }
+        let label_y = y + (chips_h - chip_size * 1.35) / 2.0;
+        text.draw(
             &mut canvas,
             label,
-            sort_size,
-            (sort_x + lead_w + px(5.0)) as i32,
-            sort_y as i32,
-            TEXT,
-            EMPHASIS,
+            chip_size,
+            (cx + px(18.0)) as i32,
+            label_y as i32,
+            if *on { text_color } else { text_dim },
         );
-        draw_chevron(
-            &mut canvas,
-            sort_x + sort_w - px(5.0),
-            sort_y + sort_size * 0.7,
-            px(3.5),
-            px(1.5),
-            false,
-            TEXT_DIM,
-        );
-        layout.buttons.push((
-            rect(sort_x - px(6.0), y, sort_w + px(12.0), tools_h),
-            Button::Sort,
-        ));
-        canvas.tint(
-            inset as usize,
-            (y + tools_h) as usize,
-            inner as usize,
-            1,
-            WHITE,
-            0x12,
-        );
-        y += tools_h + section;
+        if let Some(count) = count {
+            text.draw(
+                &mut canvas,
+                count,
+                count_size,
+                (cx + px(18.0) + label_w + px(7.0)) as i32,
+                (label_y + (chip_size - count_size) * 1.1) as i32,
+                text_dim,
+            );
+        }
+        layout
+            .buttons
+            .push((rect(cx, y, chip_w, chips_h), *button));
+        cx += chip_w + px(8.0);
     }
+    let sort_y = y + (chips_h - sort_size * 1.35) / 2.0;
+    text.draw(
+        &mut canvas,
+        "Sort",
+        sort_size,
+        sort_x as i32,
+        sort_y as i32,
+        text_dim,
+    );
+    text.draw_weighted(
+        &mut canvas,
+        sort_label,
+        sort_size,
+        (sort_x + lead_w + px(6.0)) as i32,
+        sort_y as i32,
+        text_color,
+        EMPHASIS,
+    );
+    draw_chevron(
+        &mut canvas,
+        sort_x + sort_w - px(5.0),
+        sort_y + sort_size * 0.72,
+        px(3.5),
+        px(1.5),
+        false,
+        text_dim,
+    );
+    layout.buttons.push((
+        rect(sort_x - px(6.0), y, sort_w + px(12.0), chips_h),
+        Button::Sort,
+    ));
+    y += chips_h + px(20.0);
 
+    // The grid's room, whatever fills it.
+    let grid_top = y;
     let style = RowStyle {
-        pad: inset,
+        pad,
         inner,
         row: row_h,
-        size: m.size,
+        size: m.size * squeeze,
         scale,
     };
     if has_result && let Some(value) = launcher.result() {
-        layout.hits.push((rect(inset, y, inner, row_h), 0));
+        let ry = y + (tile_h - row_h) / 2.0;
+        layout.hits.push((rect(pad, ry, inner, row_h), 0));
         glyph_row(
             &mut canvas,
             text,
             &style,
-            y,
+            ry,
             RESULT_GLYPH,
             value,
             target == Some(Target::Result),
         );
-        y += row_h + section / 2.0;
+        y += tile_h + gap;
     }
 
-    let icon_size = px(44.0) as u32;
+    let icon_size = px(64.0) as u32;
     for (n, tile) in tiles
         .iter()
         .enumerate()
@@ -409,7 +392,7 @@ pub(super) fn compose(
         .take(drawn_rows * COLUMNS)
     {
         let (column, row) = (n % COLUMNS, n / COLUMNS - first_row);
-        let x = inset + (tile_w + gap) * column as f32;
+        let x = pad + (tile_w + gap) * column as f32;
         let ty = y + (tile_h + gap) * row as f32;
         let position = tile_start + n;
         layout.hits.push((rect(x, ty, tile_w, tile_h), position));
@@ -420,15 +403,7 @@ pub(super) fn compose(
                     continue;
                 };
                 let icon = app_icon(icons, pixmaps, entry, icon_size, density);
-                let sub = if grid && launcher.all_apps {
-                    None
-                } else if grid {
-                    launcher
-                        .last_used(index)
-                        .map(|at| ago(launcher.now().saturating_sub(at)))
-                } else {
-                    kind_of(entry).map(str::to_owned)
-                };
+                let sub = (!grid).then(|| kind_of(entry).map(str::to_owned)).flatten();
                 draw_tile(
                     &mut canvas,
                     text,
@@ -462,58 +437,119 @@ pub(super) fn compose(
             Target::Command | Target::Result => {}
         }
     }
-    if drawn_rows > 0 {
-        y += drawn_rows as f32 * tile_h + (drawn_rows - 1) as f32 * gap;
+    if drawn_rows > 0 && !tiles.is_empty() {
+        y += drawn_rows as f32 * (tile_h + gap);
     }
     if nothing {
         let note = if grid {
-            if launcher.all_apps {
-                "No installed applications found."
-            } else {
-                "Open something and it will be suggested here."
-            }
+            "Nothing installed in this category."
         } else if launcher.filter() != Filter::All {
             "Nothing of this kind. Ctrl ← shows everything."
         } else {
             "No matches. Try a shorter word."
         };
-        text.draw(
+        draw_centred(
+            text,
             &mut canvas,
             note,
-            m.size * 0.95,
-            (inset + px(10.0)) as i32,
-            (y + (row_h - m.size * 1.3) / 2.0) as i32,
-            TEXT_DIM,
+            px(14.0),
+            width / 2.0,
+            grid_top + grid_h / 2.0 - px(10.0),
+            text_dim,
+            Weight::NORMAL,
         );
-        y += row_h;
     }
     if has_command {
-        y += section / 2.0;
         let label = fit(
             text,
             &format!("Run \"{}\"", launcher.query()),
-            m.size,
+            style.size,
             inner - px(60.0),
         );
+        let ry = y + (tile_h - row_h) / 2.0;
         layout
             .hits
-            .push((rect(inset, y, inner, row_h), visible.len() - 1));
+            .push((rect(pad, ry, inner, row_h), visible.len() - 1));
         glyph_row(
             &mut canvas,
             text,
             &style,
-            y,
+            ry,
             COMMAND_GLYPH,
             &label,
             target == Some(Target::Command),
         );
-        y += row_h;
     }
 
-    if strip > 0 {
-        y += section;
-        canvas.tint(inset as usize, y as usize, inner as usize, 1, WHITE, 0x12);
-        y += 1.0 + section;
+    // The pager, centred under the grid, when there is more than fits.
+    let pager_top = grid_top + grid_h;
+    if total_rows > row_room && launcher.menu().is_none() {
+        let label = format!(
+            "{}–{} of {}",
+            first_row * COLUMNS + 1,
+            ((first_row + drawn_rows) * COLUMNS).min(tiles.len()),
+            tiles.len()
+        );
+        let label_w = text.measure(&label, hint_size).0;
+        let label_y = pager_top + (pager_h - hint_size * 1.35) / 2.0;
+        draw_centred(
+            text,
+            &mut canvas,
+            &label,
+            hint_size,
+            width / 2.0,
+            label_y,
+            text_dim,
+            Weight::NORMAL,
+        );
+        let arrow = px(26.0);
+        for (direction, ax) in [
+            (-1, width / 2.0 - label_w / 2.0 - px(14.0) - arrow),
+            (1, width / 2.0 + label_w / 2.0 + px(14.0)),
+        ] {
+            let can = if direction < 0 {
+                first_row > 0
+            } else {
+                first_row + drawn_rows < total_rows
+            };
+            let cy = pager_top + pager_h / 2.0;
+            canvas.fill_rounded(
+                ax as usize,
+                (cy - arrow / 2.0) as usize,
+                arrow as usize,
+                arrow as usize,
+                arrow / 2.0,
+                crate::theme::well(),
+            );
+            draw_chevron_sideways(
+                &mut canvas,
+                ax + arrow / 2.0,
+                cy,
+                px(4.0),
+                px(1.6),
+                direction < 0,
+                if can { text_color } else { faded(text_dim, 0.4) },
+            );
+            layout.buttons.push((
+                rect(ax, cy - arrow / 2.0, arrow, arrow),
+                Button::Page(direction as isize),
+            ));
+        }
+    }
+
+    // The foot, under a hairline.
+    let foot = pager_top + pager_h + section;
+    let rule = crate::theme::rule();
+    canvas.tint(
+        pad as usize,
+        foot as usize,
+        inner as usize,
+        1,
+        rule,
+        rule.to_rgba_bytes()[3].saturating_mul(2),
+    );
+    let foot = foot + 1.0 + section;
+    if grid {
         draw_strip(
             &mut canvas,
             text,
@@ -522,26 +558,31 @@ pub(super) fn compose(
             &mut layout,
             launcher,
             apps,
-            (inset, y, inner),
+            (pad, foot, inner),
             scale,
             density,
         );
-        y += strip_head + strip_h;
+    } else {
+        let hints = hints_for(target, launcher.menu().is_some(), grid);
+        draw_hints(
+            &mut canvas,
+            text,
+            hints,
+            Align::Right(pad + inner - px(4.0)),
+            foot + (strip_head + strip_h - hint_size * 1.75) / 2.0,
+            hint_size,
+            scale,
+            crate::theme::well_raised(),
+            None,
+        );
     }
 
-    // The actions menu, over the bottom of the body against the right edge.
-    let body_bottom = y;
-    let mut keys_top = body_bottom;
+    // The actions menu, over the bottom of the grid against the right edge.
     if let (Some(item), Some(entry), Some(items)) = (
         launcher.menu(),
         launcher.selection().and_then(|i| apps.get(i)),
         &menu,
     ) {
-        // A menu taller than the body is pushed down past it, and the hints
-        // go under the menu rather than through it.
-        let menu_h = menu_metrics.menu_height(items.len());
-        let menu_top = (body_bottom - menu_h).max(pad + field_h + section);
-        keys_top = keys_top.max(menu_top + menu_h);
         draw_menu(
             &mut canvas,
             text,
@@ -550,54 +591,48 @@ pub(super) fn compose(
             &entry.name,
             items,
             item,
-            body_bottom,
+            pager_top + pager_h,
             pad + field_h + section,
         );
     }
 
-    if grid && launcher.all_apps && total_rows > GRID_ROWS && launcher.menu().is_none() {
-        let label = format!(
-            "←   {}–{} of {}   →",
-            first_row * COLUMNS + 1,
-            ((first_row + drawn_rows) * COLUMNS).min(tiles.len()),
-            tiles.len()
-        );
-        let label_w = text.measure(&label, hint_size).0;
-        text.draw(
-            &mut canvas,
-            &label,
-            hint_size,
-            inset as i32,
-            (keys_top + section) as i32,
-            TEXT_DIM,
-        );
-        for (x, direction) in [(inset, -1), (inset + label_w - px(18.0), 1)] {
-            layout.buttons.push((
-                rect(x, keys_top + section - px(3.0), px(20.0), keys_h),
-                Button::Page(direction),
-            ));
-        }
-    }
-
-    let hints = hints_for(target, launcher.menu().is_some(), grid);
-    draw_hints(
-        &mut canvas,
-        text,
-        hints,
-        Align::Right(inset + inner - px(4.0)),
-        keys_top + section,
-        hint_size,
-        scale,
-        crate::theme::WELL_RAISED,
-        None,
-    );
-
     (canvas, layout)
 }
 
-/// A tile of the grid: icon, name, and a line under it — when it was used,
-/// what it is, or where a file lives — washed and ringed in the accent when
-/// highlighted, with a dot on the icon when the application is pinned.
+/// A chevron pointing left or right, centred on (`cx`, `cy`): the pager's.
+fn draw_chevron_sideways(
+    canvas: &mut Canvas,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    thickness: f32,
+    left: bool,
+    color: crate::theme::Color,
+) {
+    let tip = if left { -size * 0.5 } else { size * 0.5 };
+    let a = (cx - tip, cy - size);
+    let b = (cx + tip, cy);
+    let c = (cx - tip, cy + size);
+    let reach = size + thickness * 2.0;
+    canvas.paint(
+        (cx - reach) as i32,
+        (cy - reach) as i32,
+        (reach * 2.0) as i32 + 1,
+        (reach * 2.0) as i32 + 1,
+        |x, y| {
+            let d = segment_distance(x, y, a, b).min(segment_distance(x, y, b, c));
+            let coverage = edge(d - thickness / 2.0);
+            (coverage > 0.0).then_some((color, coverage))
+        },
+    );
+}
+
+/// A tile of the grid: a large icon with its name under it, and in a search
+/// a quieter line under that — what it is, or where a file lives. No box
+/// around it until it is highlighted: a grid of boxes reads as a form to be
+/// filled in, a grid of icons as a place to pick from. Highlighted, it sits
+/// in a well of lighter glass edged with the accent, with a dot on the icon
+/// when the application is pinned.
 #[allow(clippy::too_many_arguments)]
 fn draw_tile(
     canvas: &mut Canvas,
@@ -614,37 +649,37 @@ fn draw_tile(
     let accent = crate::theme::accent();
     if selected {
         let (xu, yu, wu, hu) = (x as usize, y as usize, w as usize, h as usize);
-        canvas.fill_rounded(xu, yu, wu, hu, px(16.0), faded(accent, 0.13));
+        canvas.fill_rounded(xu, yu, wu, hu, px(20.0), crate::theme::well_raised());
         canvas.stroke_rounded(
             xu,
             yu,
             wu,
             hu,
-            px(16.0),
+            px(20.0),
             1.0_f32.max(scale),
-            faded(accent, 0.6),
+            faded(accent, 0.55),
         );
     }
     let cx = x + w / 2.0;
-    let icon_box = px(52.0);
-    let top = y + px(12.0);
+    let icon_box = px(64.0);
+    let top = y + px(if sub.is_some() { 10.0 } else { 16.0 });
     if let Some(icon) = icon {
         blit_centred(canvas, icon, cx, top + icon_box / 2.0);
     }
     if pinned {
         glow_dot(
             canvas,
-            cx + icon_box / 2.0 - px(4.0),
-            top + px(4.0),
+            cx + icon_box / 2.0 - px(3.0),
+            top + px(3.0),
             px(3.5),
             px(4.5),
             accent,
             rgba(16, 16, 24, 0.9),
         );
     }
-    let title_size = px(12.5);
-    let title = fit(text, title, title_size, w - px(12.0));
-    let title_y = top + icon_box + px(4.0);
+    let title_size = px(13.5);
+    let title = fit(text, title, title_size, w - px(14.0));
+    let title_y = top + icon_box + px(8.0);
     draw_centred(
         text,
         canvas,
@@ -652,12 +687,12 @@ fn draw_tile(
         title_size,
         cx,
         title_y,
-        TEXT,
+        crate::theme::text(),
         Weight::NORMAL,
     );
     if let Some(sub) = sub {
         let sub_size = px(11.0);
-        let sub = fit(text, sub, sub_size, w - px(12.0));
+        let sub = fit(text, sub, sub_size, w - px(14.0));
         draw_centred(
             text,
             canvas,
@@ -665,7 +700,7 @@ fn draw_tile(
             sub_size,
             cx,
             title_y + title_size * 1.35,
-            TEXT_DIM,
+            crate::theme::text_dim(),
             Weight::NORMAL,
         );
     }
@@ -698,7 +733,7 @@ fn draw_strip(
 
     // The heading names what the highlight is on, since the icons have no
     // labels of their own.
-    let head_size = px(12.5);
+    let head_size = px(13.5);
     let head = "Pinned & Recent";
     text.draw_weighted(
         canvas,
@@ -706,7 +741,7 @@ fn draw_strip(
         head_size,
         (x + px(4.0)) as i32,
         y as i32,
-        TEXT,
+        crate::theme::text(),
         EMPHASIS,
     );
     // A shortcut to the pin bar — drawn only when something is pinned,
@@ -732,10 +767,10 @@ fn draw_strip(
             head_size,
             link_x - px(12.0) - name_x,
         );
-        text.draw(canvas, &name, head_size, name_x as i32, y as i32, TEXT_DIM);
+        text.draw(canvas, &name, head_size, name_x as i32, y as i32, crate::theme::text_dim());
     }
     if !pins.is_empty() {
-        text.draw(canvas, link, link_size, link_x as i32, y as i32, TEXT_DIM);
+        text.draw(canvas, link, link_size, link_x as i32, y as i32, crate::theme::text_dim());
         layout.buttons.push((
             rect(link_x - px(6.0), y - px(4.0), link_w + px(12.0), px(22.0)),
             Button::PinnedPanel,
@@ -743,11 +778,11 @@ fn draw_strip(
     }
 
     let row_y = y + px(28.0);
-    let box_size = px(54.0);
+    let box_size = px(56.0);
     let gap = px(4.0);
     let wash = |canvas: &mut Canvas, (bx, by, bw, bh): (f32, f32, f32, f32), radius: f32| {
         let (xu, yu, wu, hu) = (bx as usize, by as usize, bw as usize, bh as usize);
-        canvas.fill_rounded(xu, yu, wu, hu, radius, faded(accent, 0.13));
+        canvas.fill_rounded(xu, yu, wu, hu, radius, crate::theme::well_raised());
         canvas.stroke_rounded(
             xu,
             yu,
@@ -755,7 +790,7 @@ fn draw_strip(
             hu,
             radius,
             1.0_f32.max(scale),
-            faded(accent, 0.6),
+            faded(accent, 0.55),
         );
     };
     let mut sx = x + px(2.0);
@@ -766,7 +801,7 @@ fn draw_strip(
         }
         if let Some(icon) = apps
             .get(*index)
-            .and_then(|entry| app_icon(icons, pixmaps, entry, px(34.0) as u32, density))
+            .and_then(|entry| app_icon(icons, pixmaps, entry, px(40.0) as u32, density))
         {
             blit_centred(canvas, &icon, sx + box_size / 2.0, row_y + box_size / 2.0);
         }
@@ -781,8 +816,8 @@ fn draw_strip(
             (row_y + px(10.0)) as usize,
             1,
             px(34.0) as usize,
-            WHITE,
-            0x1F,
+            crate::theme::rule(),
+            crate::theme::rule().to_rgba_bytes()[3].saturating_mul(2),
         );
         sx += px(20.0);
     }
@@ -817,7 +852,7 @@ fn draw_strip(
             name_size,
             sx + card_w - px(8.0) - label_x,
         );
-        text.draw(canvas, &name, name_size, label_x as i32, top as i32, TEXT);
+        text.draw(canvas, &name, name_size, label_x as i32, top as i32, crate::theme::text());
         let when = ago(launcher.now().saturating_sub(*at));
         text.draw(
             canvas,
@@ -825,7 +860,7 @@ fn draw_strip(
             when_size,
             label_x as i32,
             (top + name_size * 1.35) as i32,
-            TEXT_DIM,
+            crate::theme::text_dim(),
         );
         layout
             .hits

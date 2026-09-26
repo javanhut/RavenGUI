@@ -8,7 +8,7 @@ use raven_desktop::Pixmap;
 
 use super::*;
 use crate::text::Weight;
-use crate::theme::{Color, TEXT, TEXT_DIM};
+use crate::theme::Color;
 
 /// The weight headings and names are set in: size and colour carry the
 /// emphasis, not the weight.
@@ -342,7 +342,7 @@ pub(super) fn draw_glass(
             y as i32 + 1,
             (w - inset * 2.0) as i32,
             1,
-            |_, _| Some((crate::theme::CATCH_LIGHT, 1.0)),
+            |_, _| Some((crate::theme::catch_light(), 1.0)),
         );
     }
 }
@@ -403,9 +403,9 @@ pub(super) fn draw_hints(
                 rim,
             );
         }
-        text.draw(canvas, key, size, (x + pad) as i32, text_y, TEXT);
+        text.draw(canvas, key, size, (x + pad) as i32, text_y, crate::theme::text());
         x += key_w + pad;
-        text.draw(canvas, verb, size, x as i32, text_y, TEXT_DIM);
+        text.draw(canvas, verb, size, x as i32, text_y, crate::theme::text_dim());
         x += verb_w + between;
     }
     Rect::from_xywh(left as i32, y as i32, total as i32, chip_h as i32)

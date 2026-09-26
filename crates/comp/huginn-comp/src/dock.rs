@@ -411,7 +411,10 @@ const GAP: f32 = 10.0;
 const RADIUS: f32 = 0.28;
 /// Distance from the bottom of the screen when fully up.
 const MARGIN: f32 = 12.0;
-const ALPHA: u8 = crate::theme::PANEL_ALPHA;
+/// The panel ground's opacity, in the theme in use.
+fn alpha() -> u8 {
+    crate::theme::panel_alpha()
+}
 /// Text size of the switcher's title caption at a 1080p output.
 pub(crate) const CAPTION_SIZE: f32 = 14.0;
 /// The most of the screen, each way, the switcher's thumbnail may take.
@@ -700,7 +703,7 @@ fn compose(
         bar_w as usize,
         bar_h as usize,
         bar_h * RADIUS,
-        ALPHA,
+        alpha(),
     );
 
     // Where the pointer is along the strip, as a fractional slot: slot `n`
@@ -857,7 +860,7 @@ fn draw_label(
         w as usize,
         h as usize,
         h / 2.0,
-        ALPHA,
+        alpha(),
     );
     text.draw(
         canvas,
@@ -865,7 +868,7 @@ fn draw_label(
         size,
         (x + pad) as i32,
         (y + (h - size * 1.35) / 2.0) as i32,
-        crate::theme::TEXT,
+        crate::theme::text(),
     );
 }
 
@@ -964,14 +967,14 @@ pub(crate) fn caption(
     }
     let (pw, ph) = ((w + pad * 2.0) as usize, (h + pad) as usize);
     let mut canvas = Canvas::new(pw.max(1), ph.max(1));
-    canvas.material(0, 0, pw, ph, ph as f32 * 0.5, ALPHA);
+    canvas.material(0, 0, pw, ph, ph as f32 * 0.5, alpha());
     text.draw(
         &mut canvas,
         &title,
         size,
         pad as i32,
         (pad / 2.0) as i32,
-        crate::theme::TEXT,
+        crate::theme::text(),
     );
     Some(Panel::from_canvas(&canvas, density))
 }
@@ -1088,7 +1091,7 @@ pub(crate) fn preview_frame(frame: Rect, output: Rect, density: u32) -> Panel {
     );
     let scale = (output.h() as f32 / 1080.0).clamp(1.0, 2.5) * density as f32;
     let mut canvas = Canvas::new(w.max(1), h.max(1));
-    canvas.material(0, 0, w, h, PREVIEW_BORDER * scale * 1.5, ALPHA);
+    canvas.material(0, 0, w, h, PREVIEW_BORDER * scale * 1.5, alpha());
     Panel::from_canvas(&canvas, density)
 }
 
@@ -1118,7 +1121,7 @@ fn draw_window_glyph(canvas: &mut Canvas, x: f32, y: f32, size: f32, scale: f32)
     let inset = size * 0.18;
     let (w, h) = (size - inset * 2.0, size - inset * 2.0);
     let line = (2.0 * scale).max(1.5);
-    let colour = crate::theme::TEXT.with_alpha(0x80);
+    let colour = crate::theme::text().with_alpha(0x80);
     let radius = (3.0 * scale).max(2.0);
     let (left, top) = (x + inset, y + inset);
     // Four edges rather than a filled shape, so it reads as a frame.

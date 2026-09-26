@@ -326,7 +326,7 @@ fn compose_indicator(density: u32) -> Canvas {
         side,
         side,
         side as f32 / 2.0,
-        crate::theme::BACKGROUND.with_alpha(0xB0),
+        crate::theme::background().with_alpha(0xB0),
     );
     canvas.fill_rounded(
         HALO * d,

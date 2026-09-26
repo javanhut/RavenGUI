@@ -128,9 +128,9 @@ pub(crate) fn spaces_bar(
         let (_, text_h) = text.measure(name, size);
         let colour = if index == front {
             canvas.fill_rounded(x as usize, 0, width.ceil() as usize, h, height * 0.5, PILL);
-            crate::theme::TEXT
+            crate::theme::text()
         } else {
-            crate::theme::TEXT_DIM
+            crate::theme::text_dim()
         };
         text.draw(
             &mut canvas,
@@ -209,7 +209,7 @@ fn draw_number_square(
         size,
         (x + (side - w) * 0.5).round() as i32,
         (y + (side - h) * 0.5).round() as i32,
-        crate::theme::BACKGROUND,
+        crate::theme::background(),
         Weight::BOLD,
     );
 }
@@ -332,7 +332,7 @@ fn compose_backing(frame: Rect, output: Rect, density: u32) -> Canvas {
     // with the corner radius already taken off — the signed-distance form.
     let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
     let (hx, hy) = (cx - shadow - radius, cy - shadow - radius);
-    let [br, bg, bb, _] = crate::theme::BACKGROUND.to_rgba_bytes();
+    let [br, bg, bb, _] = crate::theme::background().to_rgba_bytes();
     let backing_alpha = f32::from(BACKING_ALPHA) / 255.0;
 
     let mut canvas = Canvas::new(w, h);
@@ -525,9 +525,9 @@ mod tests {
                 let name = format!("Desktop {}", index + 1);
                 let (_, th) = text.measure(&name, LABEL_SIZE);
                 let colour = if index == 1 {
-                    crate::theme::TEXT
+                    crate::theme::text()
                 } else {
-                    crate::theme::TEXT_DIM
+                    crate::theme::text_dim()
                 };
                 text.draw(
                     &mut t,
@@ -575,7 +575,7 @@ mod tests {
                         at.w() as usize,
                         at.h() as usize,
                         at.h() as f32 * 0.5,
-                        crate::theme::BACKGROUND.with_alpha(0xE6),
+                        crate::theme::background().with_alpha(0xE6),
                     );
                     let (tw, th) = text.measure("New Tab — Brave", crate::dock::CAPTION_SIZE);
                     text.draw(
@@ -584,7 +584,7 @@ mod tests {
                         crate::dock::CAPTION_SIZE,
                         ((at.w() as f32 - tw) * 0.5) as i32,
                         ((at.h() as f32 - th) * 0.5) as i32,
-                        crate::theme::TEXT,
+                        crate::theme::text(),
                     );
                     over(&mut scene, &t, at);
                 }

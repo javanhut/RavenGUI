@@ -370,10 +370,6 @@ impl Category {
 /// order: a tab, the sort, the list's chevron, a category, a link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Button {
-    /// The list's chevron: open the bar into the grid, or close it again.
-    Expand,
-    /// Toggle between suggestions and every installed application.
-    AllApps,
     /// Move through the app grid with the pointer.
     Page(isize),
     Filter(Filter),
@@ -438,12 +434,6 @@ pub(crate) struct Launcher {
     pinned: Vec<std::path::PathBuf>,
     /// Which layout draws it; see [`Style`].
     style: Style,
-    /// Whether the list's grid is showing. The list opens as a bar — only
-    /// the search field — and grows into the grid on Down, Tab or Return,
-    /// or as soon as anything is typed. Meaningless on the arc.
-    expanded: bool,
-    /// Browse every installed app in the list grid.
-    all_apps: bool,
     /// Which kinds of result a search shows.
     filter: Filter,
     /// How a search's results are ordered.
@@ -485,8 +475,6 @@ impl Default for Launcher {
             layout: Layout::default(),
             pinned: Vec::new(),
             style: Style::default(),
-            expanded: false,
-            all_apps: false,
             filter: Filter::default(),
             sort: Sort::default(),
             categories: vec![Category::All],
@@ -590,12 +578,22 @@ impl Launcher {
     /// change; deliberately not after a hover, see [`Self::first_row`].
     fn scroll_to_selection(&mut self) {
         let tiles = self.tile_range();
-        let last_first = tiles.len().div_ceil(COLUMNS).saturating_sub(GRID_ROWS);
+        let rows = self.tile_rows();
+        let last_first = tiles.len().div_ceil(COLUMNS).saturating_sub(rows);
         if self.style == Style::List && tiles.contains(&self.selected) {
             let row = (self.selected - tiles.start) / COLUMNS;
-            self.first = self.first.clamp(row.saturating_sub(GRID_ROWS - 1), row);
+            self.first = self.first.clamp(row.saturating_sub(rows - 1), row);
         }
         self.first = self.first.min(last_first);
+    }
+
+    /// How many rows of tiles the list's grid draws at once: its
+    /// [`GRID_ROWS`] of room, less a row each for the result and the run
+    /// rows, which take a tile row's place rather than growing the sheet.
+    pub(crate) fn tile_rows(&self) -> usize {
+        let taken = usize::from(self.visible.first() == Some(&Target::Result))
+            + usize::from(self.visible.last() == Some(&Target::Command));
+        GRID_ROWS.saturating_sub(taken).max(1)
     }
 
     /// The tiles of the list's grid, as positions in the navigation order:
@@ -641,12 +639,6 @@ impl Launcher {
         self.first = 0;
         self.menu = None;
         true
-    }
-
-    /// Whether the list is only its search bar: nothing typed, and not
-    /// opened into the grid.
-    pub(crate) fn is_collapsed(&self) -> bool {
-        self.style == Style::List && !self.expanded && self.query.is_empty()
     }
 
     pub(crate) fn filter(&self) -> Filter {
@@ -697,22 +689,6 @@ impl Launcher {
     /// The highlight's position in [`Self::visible`].
     pub(crate) fn selected(&self) -> usize {
         self.selected
-    }
-
-    /// Where the blurred desktop shows through the launcher at `placement`.
-    ///
-    /// The list is a rounded rectangle and blurs as every panel does
-    /// ([`blur_rect`]). The arc is not a rectangle, and the blur path can only
-    /// crop to one: the arc's composition names a rectangle that lies wholly
-    /// inside its glass ([`Layout::blur`]), mapped here onto the output.
-    pub(crate) fn blur_region(&self, placement: Rect) -> Option<Rect> {
-        match self.layout.blur {
-            Some(inner) => {
-                let region = self.layout.to_output(placement, inner);
-                (!region.is_empty()).then_some(region)
-            }
-            None => blur_rect(placement),
-        }
     }
 
     /// Files matching the query, best first. Empty in the grid.
@@ -819,10 +795,9 @@ impl Launcher {
         self.selected = 0;
         self.first = 0;
         self.menu = None;
-        // Every opening starts from the same place: the bar, every result
-        // kind, best match first, and all the applications on the arc.
-        self.expanded = false;
-        self.all_apps = false;
+        // Every opening starts from the same place: the whole sheet, every
+        // application in the grid, every result kind, best match first, and
+        // every category.
         self.filter = Filter::All;
         self.sort = Sort::Relevance;
         self.category = 0;
@@ -924,36 +899,7 @@ impl Launcher {
                 }
             }
         }
-        // The list's bar is only a field: the keys that would walk a grid
-        // open it instead, and the rest have nothing to walk.
-        if self.is_collapsed() {
-            match key {
-                Key::Down | Key::Actions | Key::Launch => {
-                    self.expanded = true;
-                    self.selected = 0;
-                    self.first = 0;
-                    return Outcome::Redraw;
-                }
-                Key::Up
-                | Key::Left
-                | Key::Right
-                | Key::PageUp
-                | Key::PageDown
-                | Key::PrevGroup
-                | Key::NextGroup => return Outcome::Unchanged,
-                _ => {}
-            }
-        }
         match key {
-            // Escape folds an opened list back into its bar before it closes
-            // anything: the grid was asked for with a key, and one key puts
-            // it away again. Anything typed, or the arc, closes at once.
-            Key::Dismiss if self.style == Style::List && self.expanded && self.query.is_empty() => {
-                self.expanded = false;
-                self.selected = 0;
-                self.first = 0;
-                Outcome::Redraw
-            }
             Key::Dismiss => {
                 self.close(clock, motion);
                 Outcome::Dismissed
@@ -978,7 +924,6 @@ impl Launcher {
             Key::NextGroup => self.change_group(1, entries, frecency, now),
             Key::Insert(c) => {
                 self.query.push(c);
-                self.expanded = true;
                 self.after_edit(entries, frecency, now)
             }
             Key::Backspace => {
@@ -1205,23 +1150,9 @@ impl Launcher {
         now: u64,
     ) -> Outcome {
         match button {
-            Button::Expand if self.is_collapsed() => {
-                self.expanded = true;
-            }
-            // The chevron on an open list folds it back to the bar, taking
-            // any query with it: a bar with a query in it is not a bar.
-            Button::Expand => {
-                self.query.clear();
-                self.expanded = false;
-                self.filter = Filter::All;
-            }
             Button::Filter(filter) if filter == self.filter => return Outcome::Unchanged,
             Button::Filter(filter) => self.filter = filter,
             Button::Page(direction) => return self.page(direction),
-            Button::AllApps => {
-                self.all_apps = !self.all_apps;
-                self.expanded = true;
-            }
             Button::Sort => self.sort = self.sort.toggled(),
             Button::Category(index) if index == self.category || index >= self.categories.len() => {
                 return Outcome::Unchanged;
@@ -1247,9 +1178,7 @@ impl Launcher {
     ) -> Outcome {
         if !self.query.is_empty() {
             self.filter = self.filter.stepped(delta);
-        } else if self.style == Style::List {
-            self.all_apps = !self.all_apps;
-        } else if self.style == Style::Arc && self.categories.len() > 1 {
+        } else if self.categories.len() > 1 {
             let n = self.categories.len() as i32;
             self.category = (self.category as i32 + delta).rem_euclid(n) as usize;
         } else {
@@ -1313,26 +1242,25 @@ impl Launcher {
                         .filter_map(|p| entries.iter().position(|e| e.path == *p))
                         .take(PINS_SHOWN)
                         .collect();
-                    if self.all_apps && self.sort == Sort::Name {
+                    // The chips narrow the grid to a category, as the
+                    // arc's sidebar does.
+                    let category = self.categories[self.category];
+                    self.results
+                        .retain(|i| entries.get(*i).is_some_and(|e| category.contains(e)));
+                    if self.sort == Sort::Name {
                         self.results
                             .sort_by_cached_key(|i| entries[*i].name.to_lowercase());
                     }
+                    // Every application is in the grid, the pinned ones
+                    // included: the grid is where an application is found,
+                    // the foot is a shortcut to it.
                     let pins = &self.pins_shown;
-                    self.suggested = self
-                        .results
-                        .iter()
-                        .copied()
-                        .filter(|i| self.all_apps || !pins.contains(i))
-                        .take(if self.all_apps { usize::MAX } else { SUGGESTED })
-                        .collect();
-                    let suggested = &self.suggested;
+                    self.suggested = self.results.clone();
                     self.recent = self
                         .last_used
                         .iter()
                         .copied()
-                        .filter(|(i, _)| {
-                            (self.all_apps || !suggested.contains(i)) && !pins.contains(i)
-                        })
+                        .filter(|(i, _)| !pins.contains(i))
                         .collect();
                     self.recent
                         .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -1560,7 +1488,8 @@ impl Launcher {
                 if !tiles.contains(&self.selected) {
                     return Outcome::Unchanged;
                 }
-                let next = (self.selected as isize + direction * (COLUMNS * GRID_ROWS) as isize)
+                let next = (self.selected as isize
+                    + direction * (COLUMNS * self.tile_rows()) as isize)
                     .clamp(tiles.start as isize, tiles.end as isize - 1);
                 self.select(next as usize)
             }
@@ -1640,14 +1569,10 @@ mod tests {
         launcher.selection().map(|i| apps[i].name.clone())
     }
 
-    /// Open over `apps` and open the list's bar into its grid, as Down does.
+    /// Open over `apps`: the list opens straight into its grid.
     fn expanded(apps: &[Entry], frecency: &Frecency) -> Launcher {
         let mut launcher = Launcher::default();
         launcher.open(apps, frecency, NOW, None, CLOCK, STILL);
-        assert_eq!(
-            launcher.press(Key::Down, apps, frecency, NOW, CLOCK, STILL),
-            Outcome::Redraw
-        );
         launcher
     }
 
@@ -1777,7 +1702,7 @@ mod tests {
     #[test]
     fn typing_turns_the_suggestions_into_a_grid_of_results() {
         let (mut launcher, apps) = typed("f");
-        assert!(!launcher.is_grid() && !launcher.is_collapsed());
+        assert!(!launcher.is_grid());
         let frecency = Frecency::new();
         let first = launcher.selection();
         assert_eq!(
@@ -1794,28 +1719,27 @@ mod tests {
 
     #[test]
     fn the_grid_never_selects_past_what_it_shows() {
-        // More applications than tiles: the highlight stops at the last
-        // tile rather than wandering onto a suggestion that is not drawn.
+        // The highlight stops at the last tile rather than wandering off
+        // the end of the grid.
         let apps = tools(10);
         let frecency = Frecency::new();
         let mut launcher = expanded(&apps, &frecency);
         for _ in 0..20 {
             launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL);
         }
-        assert_eq!(launcher.suggested().len(), SUGGESTED);
+        assert_eq!(launcher.suggested().len(), apps.len());
         assert_eq!(launcher.selection(), launcher.suggested().last().copied());
     }
 
     #[test]
     fn recently_launched_applications_are_listed_under_the_grid() {
-        // Six applications used often fill the grid. A seventh, launched once
-        // two minutes ago, scores nowhere near them — and is exactly what the
-        // user most likely wants back.
+        // Six applications used often, and a seventh launched once two
+        // minutes ago: the foot leads with the one most likely wanted back.
         let apps: Vec<Entry> = (0..10)
             .map(|i| entry(&format!("App {i}"), "/bin/app"))
             .collect();
         let mut frecency = Frecency::new();
-        for app in apps.iter().take(SUGGESTED) {
+        for app in apps.iter().take(6) {
             for _ in 0..5 {
                 frecency.record(&app.path, NOW - 3_600);
             }
@@ -1824,40 +1748,29 @@ mod tests {
         let mut launcher = Launcher::default();
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
 
-        let mut tiles: Vec<usize> = launcher.suggested().to_vec();
-        tiles.sort_unstable();
-        assert_eq!(tiles, (0..SUGGESTED).collect::<Vec<_>>());
-        let recent: Vec<usize> = launcher.recent().iter().map(|(i, _)| *i).collect();
-        assert_eq!(
-            recent,
-            vec![9],
-            "a tile was repeated, or the recent one lost"
-        );
-        assert_eq!(launcher.recent()[0].1, NOW - 120);
+        assert_eq!(launcher.suggested().len(), apps.len());
+        assert_eq!(launcher.recent()[0], (9, NOW - 120));
+        assert!(launcher.recent().len() <= RECENT);
     }
 
     #[test]
     fn down_from_the_tiles_lands_on_the_foot_and_up_goes_back() {
         let apps = tools(10);
-        // Seven launched, six tiles: one overflows onto the foot.
         let mut frecency = Frecency::new();
         for (i, app) in apps.iter().take(7).enumerate() {
             frecency.record(&app.path, NOW - 1_000 + i as u64);
         }
         let mut launcher = expanded(&apps, &frecency);
-        assert!(!launcher.recent().is_empty(), "nothing overflowed the grid");
+        assert!(!launcher.recent().is_empty(), "nothing on the foot");
         let first_recent = launcher.recent()[0].0;
 
+        // Ten tiles are two rows; down twice is off the grid onto the foot.
+        launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.selection(), Some(first_recent));
-        // One card on the foot: sideways has nowhere to go.
-        assert_eq!(
-            launcher.press(Key::Right, &apps, &frecency, NOW, CLOCK, STILL),
-            Outcome::Unchanged
-        );
-        // Up goes back into the tiles, in the same column.
+        // Up goes back into the last row of tiles, in the same column.
         launcher.press(Key::Up, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(launcher.selection(), Some(launcher.suggested()[0]));
+        assert_eq!(launcher.selection(), Some(launcher.suggested()[COLUMNS]));
     }
 
     #[test]
@@ -1912,11 +1825,6 @@ mod tests {
         let mut launcher = Launcher::default();
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
         assert_eq!(launcher.menu(), None);
-        assert_eq!(
-            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
-            Outcome::Redraw,
-            "on the bar, Tab would open the grid rather than a menu"
-        );
         assert_eq!(
             launcher.press(Key::Actions, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Redraw
@@ -2014,13 +1922,7 @@ mod tests {
         );
         assert!(launcher.is_open());
         assert_eq!(launcher.menu(), None);
-        // A second Escape folds the grid back into the bar, and a third is
-        // the usual one.
-        assert_eq!(
-            launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
-            Outcome::Redraw
-        );
-        assert!(launcher.is_collapsed());
+        // A second Escape is the usual one.
         assert_eq!(
             launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Dismissed
@@ -2174,12 +2076,12 @@ mod tests {
     }
 
     #[test]
-    fn all_apps_includes_pins_and_pages_then_returns_to_suggestions() {
+    fn the_grid_holds_every_application_pins_included_and_pages() {
         let apps = tools(30);
         let frecency = Frecency::new();
         let mut launcher = expanded(&apps, &frecency);
         launcher.set_pinned(vec![apps[29].path.clone()]);
-        launcher.press_button(Button::AllApps, &apps, &frecency, NOW);
+        launcher.reindex(&apps, &frecency, NOW);
         assert_eq!(launcher.suggested().len(), apps.len());
         assert!(launcher.suggested().contains(&29));
         assert_eq!(launcher.pins_shown(), &[29]);
@@ -2190,9 +2092,22 @@ mod tests {
         launcher.press(Key::Insert('t'), &apps, &frecency, NOW, CLOCK, STILL);
         launcher.press(Key::Clear, &apps, &frecency, NOW, CLOCK, STILL);
         assert_eq!(launcher.suggested().len(), apps.len());
-        launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL);
-        assert_eq!(launcher.suggested().len(), SUGGESTED);
-        assert!(!launcher.suggested().contains(&29));
+    }
+
+    #[test]
+    fn the_chips_narrow_the_grid_to_a_category() {
+        let mut apps = tools(4);
+        apps[1].categories = vec!["Development".to_owned()];
+        let frecency = Frecency::new();
+        let mut launcher = expanded(&apps, &frecency);
+        assert_eq!(launcher.categories(), &[Category::All, Category::Development]);
+        assert_eq!(
+            launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL),
+            Outcome::Redraw
+        );
+        assert_eq!(launcher.suggested(), &[1]);
+        launcher.press_button(Button::Category(0), &apps, &frecency, NOW);
+        assert_eq!(launcher.suggested().len(), apps.len());
     }
 
     #[test]
@@ -2797,55 +2712,22 @@ mod tests {
     // -- The two layouts ---------------------------------------------------
 
     #[test]
-    fn the_list_opens_as_a_bar_and_asks_for_more_before_showing_it() {
+    fn the_list_opens_straight_into_its_grid_and_one_escape_closes_it() {
         let apps = apps();
         let frecency = Frecency::new();
         let mut launcher = Launcher::default();
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
-        assert!(launcher.is_collapsed());
-        for key in [
-            Key::Up,
-            Key::Left,
-            Key::Right,
-            Key::PageDown,
-            Key::NextGroup,
-        ] {
-            assert_eq!(
-                launcher.press(key, &apps, &frecency, NOW, CLOCK, STILL),
-                Outcome::Unchanged,
-                "{key:?} did something to a bar"
-            );
-        }
-        assert_eq!(
-            launcher.press(Key::Down, &apps, &frecency, NOW, CLOCK, STILL),
-            Outcome::Redraw
-        );
-        assert!(!launcher.is_collapsed());
-        // Escape folds it back before it closes anything.
-        assert_eq!(
-            launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
-            Outcome::Redraw
-        );
-        assert!(launcher.is_open() && launcher.is_collapsed());
+        assert!(launcher.is_grid());
+        assert_eq!(launcher.suggested().len(), apps.len());
         assert_eq!(
             launcher.press(Key::Dismiss, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Dismissed
         );
     }
 
-    #[test]
-    fn typing_opens_the_bar_and_emptying_the_query_leaves_it_open() {
-        let (mut launcher, apps) = typed("fi");
-        assert!(!launcher.is_collapsed());
-        launcher.press(Key::Clear, &apps, &Frecency::new(), NOW, CLOCK, STILL);
-        assert!(
-            !launcher.is_collapsed(),
-            "the grid folded away under the user's hands"
-        );
-    }
 
     #[test]
-    fn pinned_applications_are_on_the_foot_and_not_suggested_again() {
+    fn pinned_applications_are_on_the_foot() {
         let apps = apps();
         let frecency = Frecency::new();
         let mut launcher = Launcher::default();
@@ -2855,7 +2737,6 @@ mod tests {
         ]);
         launcher.open(&apps, &frecency, NOW, None, CLOCK, STILL);
         assert_eq!(launcher.pins_shown(), &[2], "an uninstalled pin was shown");
-        assert!(!launcher.suggested().contains(&2));
         assert_eq!(
             launcher.visible()[launcher.suggested().len()],
             Target::App(2),
@@ -2937,7 +2818,6 @@ mod tests {
         let apps = tools(7);
         let frecency = Frecency::new();
         let mut launcher = on_arc(&apps, "");
-        assert!(!launcher.is_collapsed(), "the arc has no bar");
         assert_eq!(launcher.selected(), 0, "the best match is highlighted");
         // From the top, Left is the slot to its left — the second rank —
         // and so on to the left end; Up goes the same way along the curve.
@@ -3427,8 +3307,6 @@ pub(crate) const BASE_SIZE: f32 = 16.0;
 /// Rows of the list's result grid drawn at once. Beyond this the answer was
 /// not near the top, and another keystroke is faster than another screenful.
 pub(crate) const GRID_ROWS: usize = 3;
-/// How many suggestions the list shows before anything is typed: one row.
-const SUGGESTED: usize = 6;
 /// Tiles per row of the list's grid.
 pub(crate) const COLUMNS: usize = 6;
 /// How many recently launched applications the list's foot shows.
@@ -3475,7 +3353,7 @@ const GRID_HINTS: &[(&str, &str)] = &[
     ("←↑↓→", "Move"),
     ("Enter", "Open"),
     ("Tab", "Actions"),
-    ("Esc", "Collapse"),
+    ("Esc", "Close"),
 ];
 const LIST_HINTS: &[(&str, &str)] = &[
     ("←↑↓→", "Move"),
@@ -3529,7 +3407,7 @@ const COMMAND_GLYPH: &str = ">";
 const RESULT_GLYPH: &str = "=";
 
 /// What is shown before anything has been typed.
-const PLACEHOLDER: &str = "Search applications and files";
+const PLACEHOLDER: &str = "Search for apps, files, and more…";
 /// The actions menu's last item, which puts the entry on the pin bar
 /// — or takes it off. See [`crate::pinned`].
 pub(crate) const PIN: &str = "Pin";
@@ -3556,17 +3434,15 @@ pub(crate) fn placement(
 ) -> Rect {
     /// How small the panel gets at the start of the motion.
     const MIN_SCALE: f32 = 0.86;
-    /// Where the list's top edge hangs, as a fraction of the output's height.
-    const LIST_TOP: f32 = 0.15;
+    /// How much of the room left over by the list goes above it.
+    const LIST_TOP: f32 = 0.44;
 
     let (w, h) = panel;
-    // The list hangs from a fixed height rather than being centred: it
-    // opens from a bar into a grid, and a centred panel would jump upwards
-    // by half of whatever it grew. The arc is a fixed size and sits centred.
+    // Both sit in the middle of the screen. The list a little above true
+    // centre, where the eye puts the middle of a screen; it is the same
+    // size whatever it shows, so nothing jumps when a search fills it.
     let y = match style {
-        Style::List => (output.y() + (output.h() as f32 * LIST_TOP) as i32)
-            .min(output.bottom() - h)
-            .max(output.y()),
+        Style::List => output.y() + ((output.h() - h).max(0) as f32 * LIST_TOP) as i32,
         Style::Arc => output.y() + (output.h() - h).max(0) / 2,
     };
     let full = Rect::from_xywh(output.x() + (output.w() - w).max(0) / 2, y, w, h);
@@ -3587,26 +3463,6 @@ pub(crate) fn placement(
     let cy = fy + ((ty - fy) as f32 * t) as i32;
 
     Rect::from_xywh(cx - sw / 2, cy - sh / 2, sw, sh)
-}
-
-/// The region of the desktop the panel at `placement` blurs.
-///
-/// The blur is cut out of the desktop with a rectangle, and the panel's
-/// corners are rounded: a blur the full size of the panel would show as four
-/// square, blurred corners peeking out past the rounding, since the panel's
-/// corner pixels are transparent and hide nothing. The blur path cannot mask
-/// a corner, so the rectangle is inset by the corner radius instead. What
-/// that costs is a strip along each edge, one radius wide, where the panel
-/// tints the desktop without softening it — at [`ALPHA`] the difference is
-/// barely there, and it beats the alternative.
-///
-/// `None` when the panel is too small for a blur to fit inside the inset —
-/// the first frames of the reveal from a dock icon, or a panel that has been
-/// shrunk to nothing — so the renderer takes the ordinary path rather than
-/// cropping to an inverted rectangle.
-pub(crate) fn blur_rect(placement: Rect) -> Option<Rect> {
-    let inner = placement.inset(RADIUS as i32);
-    (!inner.is_empty()).then_some(inner)
 }
 
 /// Draw the launcher for `output` at `density` pixels per logical one.
@@ -3749,7 +3605,7 @@ pub(crate) fn draw_menu(
         menu_w as usize,
         menu_h as usize,
         corner,
-        crate::theme::BACKGROUND.with_alpha(0xF6),
+        crate::theme::background().with_alpha(0xF6),
     );
     canvas.stroke_rounded(
         mx as usize,
@@ -3758,7 +3614,7 @@ pub(crate) fn draw_menu(
         menu_h as usize,
         corner,
         edge,
-        crate::theme::HAIRLINE.with_alpha(0x44),
+        crate::theme::hairline().with_alpha(0x44),
     );
     let title = fit(text, title, size * 0.85, menu_w - gap * 2.0);
     text.draw(
@@ -3767,7 +3623,7 @@ pub(crate) fn draw_menu(
         size * 0.85,
         (mx + gap) as i32,
         (my + (heading - size * 1.15) / 2.0) as i32,
-        crate::theme::TEXT_DIM,
+        crate::theme::text_dim(),
     );
     let mut iy = my + heading;
     for (n, label) in labels.iter().enumerate() {
@@ -3792,9 +3648,9 @@ pub(crate) fn draw_menu(
             (mx + gap) as i32,
             (iy + (row - size * 1.35) / 2.0) as i32,
             if n == item {
-                crate::theme::TEXT
+                crate::theme::text()
             } else {
-                crate::theme::TEXT_DIM
+                crate::theme::text_dim()
             },
         );
         iy += row;
@@ -3866,9 +3722,9 @@ fn glyph_row(
         name_x as i32,
         (y + (row - size * 1.35) / 2.0) as i32,
         if highlighted {
-            crate::theme::TEXT
+            crate::theme::text()
         } else {
-            crate::theme::TEXT_DIM
+            crate::theme::text_dim()
         },
     );
 }
@@ -4192,19 +4048,18 @@ mod render_tests {
     }
 
     #[test]
-    fn the_panel_grows_and_shrinks_with_what_it_shows() {
-        let (bar, _) = drawn("", 0);
-        let (grid, _) = drawn("", 1);
-        assert!(
-            bar.height < grid.height,
-            "the bar did not open into the grid"
-        );
+    fn the_panel_keeps_its_size_whatever_it_shows() {
+        // A sheet that grew and shrank with each keystroke would jump about
+        // under the eye; the grid keeps its room whether a search fills it
+        // or not.
+        let (everything, _) = drawn("", 0);
         let two_rows = composed(&tools(12), "tool");
         let one_row = composed(&apps(), "raven");
-        assert!(
-            one_row.height < two_rows.height,
-            "the grid did not grow with its results"
-        );
+        let nothing = composed(&apps(), "zzzz");
+        for other in [&two_rows, &one_row, &nothing] {
+            assert_eq!(other.height, everything.height, "the sheet changed size");
+            assert_eq!(other.stride, everything.stride, "the sheet changed width");
+        }
     }
 
     #[test]
@@ -4363,17 +4218,13 @@ mod render_tests {
 
     #[test]
     fn the_run_row_and_the_result_row_are_drawn() {
-        // Each adds a row to the panel, and each puts ink on it: a row
-        // that changed the height but drew nothing would be a blank strip.
         // "1/0" has no value, so it draws exactly what "2+2" does minus the
         // result row — same run row, and with the highlight moved down onto
-        // it, the same footer.
+        // it, the same footer. The result row takes a row of the grid's room
+        // rather than growing the sheet, and puts ink there.
         let (undefined, _) = drawn("1/0", 0);
         let (summed, _) = drawn("2+2", 1);
-        assert!(
-            summed.height > undefined.height,
-            "the result row did not add to the panel"
-        );
+        assert_eq!(summed.height, undefined.height);
         assert!(ink(&summed) > ink(&undefined), "the result was not drawn");
     }
 
@@ -4488,34 +4339,34 @@ mod render_tests {
 
     #[test]
     fn tiles_and_recent_rows_are_numbered_in_navigation_order() {
-        // Eight used applications: six fill the grid, and the two the grid
-        // has no room for are recent rows under it — and the pointer must
-        // number them the way Down does, or hovering the first recent row
-        // highlights a tile.
+        // Eight used applications: all eight are tiles, and the most recent
+        // are cards on the foot under them — and the pointer must number
+        // them the way Down does, or hovering the first card highlights a
+        // tile.
         let mut eight = apps();
         for name in ["Gimp", "Inkscape", "Kitty", "Vim"] {
             eight.push(entry(name, &format!("/bin/{}", name.to_lowercase())));
         }
         let used: Vec<usize> = (0..eight.len()).collect();
         let (launcher, layout) = laid_out(&eight, "", &used, false);
-        assert_eq!(launcher.recent().len(), 2);
-        assert_eq!(layout.hits.len(), SUGGESTED + 2);
+        let tiles = launcher.suggested().len();
+        let recent = launcher.recent().len();
+        assert_eq!(tiles, eight.len());
+        assert_eq!(recent, RECENT);
+        assert_eq!(layout.hits.len(), tiles + recent);
         let mut slots: Vec<usize> = layout.hits.iter().map(|(_, s)| *s).collect();
         slots.sort_unstable();
-        assert_eq!(slots, (0..SUGGESTED + 2).collect::<Vec<_>>());
-        // The recent rows are below every tile, and in order.
-        let tile_bottom = layout.hits[..SUGGESTED]
+        assert_eq!(slots, (0..tiles + recent).collect::<Vec<_>>());
+        // The cards are below every tile, and in order.
+        let tile_bottom = layout.hits[..tiles]
             .iter()
             .map(|(r, _)| r.bottom())
             .max()
             .unwrap();
-        let (first, second) = (layout.hits[SUGGESTED], layout.hits[SUGGESTED + 1]);
-        assert!(
-            first.0.y() >= tile_bottom,
-            "a recent row overlapped the tiles"
-        );
+        let (first, second) = (layout.hits[tiles], layout.hits[tiles + 1]);
+        assert!(first.0.y() >= tile_bottom, "a card overlapped the tiles");
         assert!(second.0.x() > first.0.x(), "the foot is out of order");
-        assert_eq!((first.1, second.1), (SUGGESTED, SUGGESTED + 1));
+        assert_eq!((first.1, second.1), (tiles, tiles + 1));
     }
 
     #[test]
@@ -4756,6 +4607,10 @@ mod render_tests {
                 frecency.record(&app.path, now - 90 * n as u64);
             }
         }
+        // `LAUNCHER_THEME=fog`: draw it in another glass.
+        if let Ok(theme) = std::env::var("LAUNCHER_THEME") {
+            crate::theme::set_theme(crate::theme::Theme::from_value(&theme).unwrap_or_default());
+        }
         let mut launcher = Launcher::default();
         // `LAUNCHER_STYLE=arc`: the arc rather than the list.
         if std::env::var("LAUNCHER_STYLE").is_ok_and(|s| s.eq_ignore_ascii_case("arc")) {
@@ -4790,9 +4645,6 @@ mod render_tests {
             .unwrap_or(0)
         {
             launcher.press(Key::Down, &apps, &frecency, now, CLOCK, STILL);
-        }
-        if std::env::var_os("LAUNCHER_ALL_APPS").is_some() {
-            launcher.press_button(Button::AllApps, &apps, &frecency, now);
         }
         // `LAUNCHER_TAB=2`: open the actions menu and move down twice.
         if let Some(steps) = std::env::var("LAUNCHER_TAB")
@@ -4902,7 +4754,7 @@ mod render_tests {
                 m.size,
                 10,
                 10,
-                crate::theme::TEXT,
+                crate::theme::text(),
             );
             println!("text.draw: {:?}", t.elapsed());
             let t = std::time::Instant::now();
@@ -4923,7 +4775,7 @@ mod render_tests {
                 panel_w,
                 600,
                 RADIUS * m.scale,
-                crate::theme::BACKGROUND.with_alpha(ALPHA),
+                crate::theme::background().with_alpha(ALPHA),
             );
             println!("fill_rounded {panel_w}x600: {:?}", t.elapsed());
         }
@@ -4976,53 +4828,3 @@ mod render_tests {
     }
 }
 
-#[cfg(test)]
-mod blur_tests {
-    use super::*;
-
-    #[test]
-    fn the_blur_sits_inside_the_panel_by_the_corner_radius() {
-        // The panel's corners are transparent, so a blur that reached them
-        // would show as four square corners around a rounded panel. Inset by
-        // exactly the radius, the blur stays under the opaque part.
-        let panel = Rect::from_xywh(100, 200, 640, 480);
-        let blur = blur_rect(panel).expect("a full-size panel blurs");
-        let radius = RADIUS as i32;
-        assert_eq!(blur.x(), panel.x() + radius);
-        assert_eq!(blur.y(), panel.y() + radius);
-        assert_eq!(blur.right(), panel.right() - radius);
-        assert_eq!(blur.bottom(), panel.bottom() - radius);
-    }
-
-    #[test]
-    fn a_panel_too_small_for_the_inset_does_not_blur() {
-        // At the start of the reveal the panel is scaled down; a rectangle
-        // inset past its own edges is inverted, and the renderer must be told
-        // "no blur" rather than handed a negative crop.
-        let radius = RADIUS as i32;
-        assert_eq!(blur_rect(Rect::from_xywh(0, 0, radius * 2, 300)), None);
-        assert_eq!(blur_rect(Rect::from_xywh(0, 0, 300, radius * 2)), None);
-        assert_eq!(blur_rect(Rect::ZERO), None);
-        assert!(blur_rect(Rect::from_xywh(0, 0, radius * 2 + 1, radius * 2 + 1)).is_some());
-    }
-
-    #[test]
-    fn the_blur_follows_the_panel_through_the_reveal() {
-        // The placement moves and grows as the panel arrives from the dock,
-        // and the blur is cut from the placement, so it moves and grows with
-        // it: a blur parked at the panel's final rectangle while the panel was
-        // still arriving would blur a patch of desktop with nothing over it.
-        let output = Rect::from_xywh(0, 0, 1920, 1080);
-        let origin = Some(Rect::from_xywh(20, 1030, 44, 44));
-        let half = placement(output, (700, 500), origin, 0.5, Style::Arc);
-        let full = placement(output, (700, 500), origin, 1.0, Style::Arc);
-        let (half_blur, full_blur) = (blur_rect(half).unwrap(), blur_rect(full).unwrap());
-        assert!(half_blur.w() < full_blur.w());
-        assert_ne!(half_blur.center(), full_blur.center());
-        // And is always strictly within the panel it belongs to.
-        for (panel, blur) in [(half, half_blur), (full, full_blur)] {
-            assert!(blur.x() > panel.x() && blur.right() < panel.right());
-            assert!(blur.y() > panel.y() && blur.bottom() < panel.bottom());
-        }
-    }
-}

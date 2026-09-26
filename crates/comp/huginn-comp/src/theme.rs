@@ -85,6 +85,265 @@ pub(crate) fn set_accent(color: Option<Color>) {
     ACCENT_IN_USE.store(color.0, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// The glass themes
+// ---------------------------------------------------------------------------
+// One material, tinted several ways. Every theme is the same construction —
+// a translucent ground over the blurred desktop, a hairline, a catch-light,
+// wells a shade lighter than the ground — so switching one changes the
+// colour of the glass and never the shape of anything. The constants above
+// are Black Glass, the look Raven has always had; drawing code reads the
+// functions below, which answer for whichever theme is in use.
+//
+// Every theme keeps light text. The shell's drawing is full of white washes
+// and dark shadows chosen for light-on-glass, and a theme with dark text
+// would need each of those revisited; until then a light glass is a pale,
+// cool tint that white text still reads on, which is what frosted glass
+// over a landscape looks like anyway.
+
+/// The glass the panels are made of. Chosen in `desktop.toml` as
+/// `appearance.glass_theme`, and stepped from quick settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Theme {
+    /// Near-black smoked glass. The original look.
+    #[default]
+    Black,
+    /// Soft blue-grey frosted glass: a misty morning.
+    Fog,
+    /// Pale, icy blue glass with a cold edge.
+    Arctic,
+    /// Deep navy glass, bluer and cooler than black.
+    Midnight,
+    /// Dusky rose-tinted glass.
+    Rose,
+}
+
+impl Theme {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Black,
+        Self::Fog,
+        Self::Arctic,
+        Self::Midnight,
+        Self::Rose,
+    ];
+
+    /// What quick settings shows.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Black => "Black Glass",
+            Self::Fog => "Fog Glass",
+            Self::Arctic => "Arctic Glass",
+            Self::Midnight => "Midnight Glass",
+            Self::Rose => "Rose Glass",
+        }
+    }
+
+    /// What `desktop.toml` says.
+    pub(crate) fn value(self) -> &'static str {
+        match self {
+            Self::Black => "black",
+            Self::Fog => "fog",
+            Self::Arctic => "arctic",
+            Self::Midnight => "midnight",
+            Self::Rose => "rose",
+        }
+    }
+
+    /// Read either spelling, with or without "glass": `"fog"`, `"Fog Glass"`,
+    /// `"fog-glass"`.
+    pub(crate) fn from_value(value: &str) -> Option<Self> {
+        let squash = |s: &str| {
+            s.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase()
+        };
+        let want = squash(value);
+        let want = want.strip_suffix("glass").unwrap_or(&want).to_owned();
+        Self::ALL.into_iter().find(|t| squash(t.value()) == want)
+    }
+
+    /// The next theme, `delta` steps along [`Self::ALL`], wrapping.
+    pub(crate) fn stepped(self, delta: i32) -> Self {
+        let n = Self::ALL.len() as i32;
+        let at = Self::ALL.iter().position(|t| *t == self).unwrap_or(0) as i32;
+        Self::ALL[(at + delta).rem_euclid(n) as usize]
+    }
+
+    /// The colours this glass is made of.
+    pub(crate) const fn palette(self) -> &'static Palette {
+        match self {
+            Self::Black => &BLACK_GLASS,
+            Self::Fog => &FOG_GLASS,
+            Self::Arctic => &ARCTIC_GLASS,
+            Self::Midnight => &MIDNIGHT_GLASS,
+            Self::Rose => &ROSE_GLASS,
+        }
+    }
+}
+
+/// One theme's colours. See the constants of the same names for what each
+/// is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Palette {
+    pub background: Color,
+    pub text: Color,
+    pub text_dim: Color,
+    pub border: Color,
+    pub hairline: Color,
+    pub catch_light: Color,
+    pub well: Color,
+    pub well_raised: Color,
+    pub rule: Color,
+    pub panel_alpha: u8,
+    /// How far the desktop behind the launcher is dimmed, 0..=255 of black:
+    /// enough that the panel is front and centre, not so much that the
+    /// desktop disappears.
+    pub backdrop: u8,
+}
+
+const BLACK_GLASS: Palette = Palette {
+    background: BACKGROUND,
+    text: TEXT,
+    text_dim: TEXT_DIM,
+    border: BORDER,
+    hairline: HAIRLINE,
+    catch_light: CATCH_LIGHT,
+    well: WELL,
+    well_raised: WELL_RAISED,
+    rule: RULE,
+    panel_alpha: PANEL_ALPHA,
+    backdrop: 0x66,
+};
+
+const FOG_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF6E_7D94),
+    text: Color::from_argb(0xFFFF_FFFF),
+    text_dim: Color::from_argb(0xFFE1_E7F0),
+    border: Color::from_argb(0xFF8E_9BB0),
+    hairline: Color::from_argb(0x4DFF_FFFF),
+    catch_light: Color::from_argb(0x80FF_FFFF),
+    well: Color::from_argb(0x26FF_FFFF),
+    well_raised: Color::from_argb(0x40FF_FFFF),
+    rule: Color::from_argb(0x33FF_FFFF),
+    panel_alpha: 0xA8,
+    backdrop: 0x40,
+};
+
+const ARCTIC_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF4F_7F9F),
+    text: Color::from_argb(0xFFFF_FFFF),
+    text_dim: Color::from_argb(0xFFDD_EEF8),
+    border: Color::from_argb(0xFF86_B2CC),
+    hairline: Color::from_argb(0x66E8_F8FF),
+    catch_light: Color::from_argb(0xA0F0_FCFF),
+    well: Color::from_argb(0x29E8_F8FF),
+    well_raised: Color::from_argb(0x45E8_F8FF),
+    rule: Color::from_argb(0x38E8_F8FF),
+    panel_alpha: 0xA0,
+    backdrop: 0x38,
+};
+
+const MIDNIGHT_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF0E_1630),
+    text: Color::from_argb(0xFFE8_EEFF),
+    text_dim: Color::from_argb(0xFFA6_B2D4),
+    border: Color::from_argb(0xFF24_3160),
+    hairline: Color::from_argb(0x2699_B4FF),
+    catch_light: Color::from_argb(0x40B4_C8FF),
+    well: Color::from_argb(0x1A99_B4FF),
+    well_raised: Color::from_argb(0x2B99_B4FF),
+    rule: Color::from_argb(0x1A99_B4FF),
+    panel_alpha: 0xD0,
+    backdrop: 0x60,
+};
+
+const ROSE_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF5A_3A4E),
+    text: Color::from_argb(0xFFFF_F4F8),
+    text_dim: Color::from_argb(0xFFE8_CBD8),
+    border: Color::from_argb(0xFF7E_5670),
+    hairline: Color::from_argb(0x40FF_E0EC),
+    catch_light: Color::from_argb(0x70FF_E6F0),
+    well: Color::from_argb(0x22FF_E0EC),
+    well_raised: Color::from_argb(0x38FF_E0EC),
+    rule: Color::from_argb(0x2CFF_E0EC),
+    panel_alpha: 0xB4,
+    backdrop: 0x48,
+};
+
+/// The theme in use, as its index in [`Theme::ALL`]. An atomic for the
+/// reason [`ACCENT_IN_USE`] is one: every drawing site reads it, and none of
+/// them has the compositor state in hand.
+static THEME_IN_USE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn theme() -> Theme {
+    let at = THEME_IN_USE.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    Theme::ALL.get(at).copied().unwrap_or_default()
+}
+
+/// Switch themes. Returns whether that was a change, so the caller knows
+/// whether everything drawn in the old colours has to be drawn again.
+pub(crate) fn set_theme(theme: Theme) -> bool {
+    let at = Theme::ALL.iter().position(|t| *t == theme).unwrap_or(0) as u8;
+    THEME_IN_USE.swap(at, std::sync::atomic::Ordering::Relaxed) != at
+}
+
+fn palette() -> &'static Palette {
+    theme().palette()
+}
+
+/// Panel, dock and overlay background, in the theme in use.
+pub(crate) fn background() -> Color {
+    palette().background
+}
+/// Body text, in the theme in use.
+pub(crate) fn text() -> Color {
+    palette().text
+}
+/// Secondary text, in the theme in use.
+pub(crate) fn text_dim() -> Color {
+    palette().text_dim
+}
+/// Hairline borders, in the theme in use.
+pub(crate) fn border() -> Color {
+    palette().border
+}
+/// A panel's edge, in the theme in use.
+pub(crate) fn hairline() -> Color {
+    palette().hairline
+}
+/// A panel's top-edge light, in the theme in use.
+pub(crate) fn catch_light() -> Color {
+    palette().catch_light
+}
+/// A well, in the theme in use.
+pub(crate) fn well() -> Color {
+    palette().well
+}
+/// A raised well, in the theme in use.
+pub(crate) fn well_raised() -> Color {
+    palette().well_raised
+}
+/// A rule inside a panel, in the theme in use.
+pub(crate) fn rule() -> Color {
+    palette().rule
+}
+/// Opacity of a panel's ground, in the theme in use.
+pub(crate) fn panel_alpha() -> u8 {
+    palette().panel_alpha
+}
+/// How far the desktop is dimmed behind the launcher, in the theme in use.
+pub(crate) fn backdrop() -> u8 {
+    palette().backdrop
+}
+/// The title bar's background, in the theme in use: the same glass as the
+/// dock and the launcher, so a decorated window reads as part of one
+/// desktop rather than as a window wearing somebody else's frame.
+pub(crate) fn title_bar_bg() -> Color {
+    background()
+}
+
 /// The settings application, opened from quick settings and its own chord.
 pub(crate) const SETTINGS_APP: &str = "raven-settings";
 /// The software store, opened from its own chord.
@@ -170,10 +429,6 @@ pub(crate) const FOCUS_RING_WIDTH: i32 = 2;
 /// screen the way every other panel's does.
 pub(crate) const TITLE_BAR_HEIGHT: i32 = 30;
 
-/// The title bar's background: the same panel colour as the dock and the
-/// launcher, so a decorated window reads as part of one desktop rather than
-/// as a window wearing somebody else's frame.
-pub(crate) const TITLE_BAR_BG: Color = BACKGROUND;
 
 /// The title's size at 1080p, in logical pixels; scaled with the screen.
 pub(crate) const TITLE_TEXT_SIZE: f32 = 13.0;
@@ -253,6 +508,40 @@ mod tests {
     }
 
     #[test]
+    fn every_theme_reads_back_from_what_the_file_says() {
+        for theme in Theme::ALL {
+            assert_eq!(Theme::from_value(theme.value()), Some(theme));
+            assert_eq!(Theme::from_value(theme.label()), Some(theme));
+        }
+        assert_eq!(Theme::from_value("fog-glass"), Some(Theme::Fog));
+        assert_eq!(Theme::from_value("sepia"), None);
+        assert_eq!(Theme::Black.palette().background, BACKGROUND);
+        assert_eq!(Theme::Rose.stepped(1), Theme::Black);
+    }
+
+    #[test]
+    fn every_theme_keeps_its_text_readable_on_its_ground() {
+        // Relative luminance, WCAG's way: text against a ground this far
+        // apart stays legible over whatever the blur lets through.
+        fn luminance(c: Color) -> f32 {
+            let [r, g, b, _] = c.to_rgba_f32().map(|v| {
+                if v <= 0.039_28 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        }
+        for theme in Theme::ALL {
+            let p = theme.palette();
+            let (hi, lo) = (luminance(p.text), luminance(p.background));
+            let ratio = (hi.max(lo) + 0.05) / (hi.min(lo) + 0.05);
+            assert!(ratio >= 4.0, "{} text contrast {ratio}", theme.label());
+        }
+    }
+
+    #[test]
     fn with_alpha_changes_only_the_alpha() {
         let translucent = BACKGROUND.with_alpha(0xF2);
         assert_eq!(translucent.to_rgba_bytes(), [0x16, 0x16, 0x1F, 0xF2]);
@@ -269,7 +558,6 @@ mod tests {
             ("BORDER", BORDER),
             ("TEXT", TEXT),
             ("TEXT_DIM", TEXT_DIM),
-            ("TITLE_BAR_BG", TITLE_BAR_BG),
         ] {
             assert_eq!(color.to_rgba_bytes()[3], 0xFF, "{name} is not opaque");
         }

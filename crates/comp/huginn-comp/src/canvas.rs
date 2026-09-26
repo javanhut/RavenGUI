@@ -231,13 +231,13 @@ impl Canvas {
         alpha: u8,
     ) {
         use crate::theme;
-        self.fill_rounded(x, y, w, h, radius, theme::BACKGROUND.with_alpha(alpha));
-        self.stroke_rounded(x, y, w, h, radius, 1.0, theme::HAIRLINE);
+        self.fill_rounded(x, y, w, h, radius, theme::background().with_alpha(alpha));
+        self.stroke_rounded(x, y, w, h, radius, 1.0, theme::hairline());
         // The catch-light sits just inside the hairline, clear of the arcs,
         // so it reads as light on the top edge and not as a second border.
         let inset = radius.ceil() as usize;
         if h > 2 && w > inset * 2 {
-            self.blend_span(x + inset, x + w - inset, y + 1, theme::CATCH_LIGHT, 255);
+            self.blend_span(x + inset, x + w - inset, y + 1, theme::catch_light(), 255);
         }
     }
 
