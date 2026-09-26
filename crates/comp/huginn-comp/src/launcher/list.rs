@@ -333,7 +333,8 @@ pub(super) fn compose(
             break;
         }
         let (fill, edge) = if *on {
-            (faded(WHITE, 0.26), Some(faded(WHITE, 0.34)))
+            let ink = crate::theme::ink();
+            (faded(ink, 0.26), Some(faded(ink, 0.34)))
         } else {
             (crate::theme::well(), None)
         };
@@ -748,7 +749,7 @@ fn draw_tile(
             px(3.5),
             px(4.5),
             accent,
-            rgba(16, 16, 24, 0.9),
+            faded(crate::theme::background(), 0.9),
         );
     }
     let title_size = px(13.5);

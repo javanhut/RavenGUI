@@ -29,8 +29,11 @@ const LABEL_SIZE: f32 = 13.0;
 const LABEL_PAD: f32 = 14.0;
 /// Space between one label and the next.
 const LABEL_GAP: f32 = 6.0;
-/// The pill behind the front space's label: white, mostly see-through.
-const PILL: Color = Color::from_argb(0x3CFF_FFFF);
+/// The pill behind the front space's label: the theme's wash, mostly
+/// see-through — white on dark glass, the text colour on light.
+fn pill() -> Color {
+    crate::theme::ink().with_alpha(if crate::theme::is_light() { 0x26 } else { 0x3C })
+}
 
 /// Side of the square number badge inside a space label, at 1080p.
 const TAG_SIDE: f32 = 20.0;
@@ -127,7 +130,7 @@ pub(crate) fn spaces_bar(
     for (index, (name, width)) in names.iter().zip(&widths).enumerate() {
         let (_, text_h) = text.measure(name, size);
         let colour = if index == front {
-            canvas.fill_rounded(x as usize, 0, width.ceil() as usize, h, height * 0.5, PILL);
+            canvas.fill_rounded(x as usize, 0, width.ceil() as usize, h, height * 0.5, pill());
             crate::theme::text()
         } else {
             crate::theme::text_dim()
@@ -200,7 +203,7 @@ fn draw_number_square(
         side.ceil() as usize,
         side.ceil() as usize,
         side * 0.22,
-        crate::theme::ACCENT,
+        crate::theme::accent(),
     );
     let (w, h) = text.measure_weighted(&label, size, Weight::BOLD);
     text.draw_weighted(
@@ -209,7 +212,7 @@ fn draw_number_square(
         size,
         (x + (side - w) * 0.5).round() as i32,
         (y + (side - h) * 0.5).round() as i32,
-        crate::theme::background(),
+        crate::theme::on_accent(),
         Weight::BOLD,
     );
 }
@@ -518,7 +521,7 @@ mod tests {
             // The panel's canvas is not kept, so compose it again for the dump.
             let (pw, ph) = bar.panel.size();
             let mut tmp = Canvas::new(pw as usize, ph as usize);
-            tmp.fill_rounded(0, 0, pw as usize, ph as usize, ph as f32 * 0.5, PILL);
+            tmp.fill_rounded(0, 0, pw as usize, ph as usize, ph as f32 * 0.5, pill());
             over(&mut scene, &tmp, bar.labels[1]);
             for (index, label) in bar.labels.iter().enumerate() {
                 let mut t = Canvas::new(label.w() as usize, label.h() as usize);

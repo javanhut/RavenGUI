@@ -1075,8 +1075,9 @@ pub(crate) fn place_in_pane(surface: &WlSurface, pane: Rect) -> Rect {
 /// it would hide the desktop the overview is meant to stand in front of.
 const WORKSPACE_CARD_ALPHA: u8 = 0x40;
 
-/// The veil over the wallpaper while the overview is up: black, half.
-const OVERVIEW_VEIL: [f32; 4] = [0.0, 0.0, 0.0, 0.5];
+// The veil over the wallpaper while the overview is up is
+// [`crate::theme::veil`]: black, half, on dark glass; the pale ground, half,
+// on light.
 
 /// The patches of screen the overview spreads one workspace's windows over:
 /// `count` boxes in as square a grid as holds them, inset from the screen's
@@ -1173,6 +1174,7 @@ impl Huginn {
         let desktop_config = crate::desktop_config::DesktopConfig::load();
         crate::theme::set_accent(desktop_config.accent());
         crate::theme::set_theme(desktop_config.glass_theme());
+        crate::theme::set_mode(desktop_config.theme_mode());
         let volume = crate::audio::Volume::detect().shared();
         let brightness = crate::backlight::Brightness::detect().shared();
         let mut seat_state = SeatState::new();
@@ -1293,7 +1295,10 @@ impl Huginn {
                     .with_alpha(WORKSPACE_CARD_ALPHA)
                     .to_rgba_f32(),
             ),
-            overview_veil: SolidColorBuffer::new((area.w(), area.h()), OVERVIEW_VEIL),
+            overview_veil: SolidColorBuffer::new(
+                (area.w(), area.h()),
+                crate::theme::veil().to_rgba_f32(),
+            ),
             overview_chrome: None,
             focus_ring_at: None,
             region: None,
@@ -1350,7 +1355,7 @@ impl Huginn {
             pinned_panel: None,
             apps: crate::launcher::scan_applications(),
             frecency: load_frecency(),
-            icons: raven_desktop::Icons::discover(crate::theme::ICON_THEME),
+            icons: raven_desktop::Icons::discover(crate::theme::icon_theme()),
             pixmaps: raven_desktop::Pixmaps::new(),
             text: crate::text::Text::new(),
             display: dh.clone(),
@@ -1378,11 +1383,19 @@ impl Huginn {
         let cfg = crate::desktop_config::DesktopConfig::load();
         tracing::info!("desktop settings changed");
 
+        let old_accent = crate::theme::accent();
         crate::theme::set_accent(cfg.accent());
-        let accent = crate::theme::accent().to_rgba_f32();
-        for ring in &mut self.focus_ring {
-            ring.set_color(accent);
+        let accent_changed = crate::theme::accent() != old_accent;
+        // Light or dark: the palette every panel reads, and the icon theme
+        // they draw from — `breeze` on light glass, `breeze-dark` on dark.
+        // Re-indexing the icon themes is a hundred milliseconds or so, which
+        // is paid only when the mode really changed.
+        let mode_changed = crate::theme::set_mode(cfg.theme_mode());
+        if mode_changed {
+            tracing::info!(mode = ?crate::theme::mode(), "theme mode changed");
+            self.icons = raven_desktop::Icons::discover(crate::theme::icon_theme());
         }
+        self.recolor_buffers();
         // The ring is composed from the accent, so it is redone.
         self.overview_chrome = None;
         self.refresh_overview_chrome();
@@ -1394,7 +1407,10 @@ impl Huginn {
             cfg.glass_theme(),
             cfg.do_not_disturb(),
         );
-        self.apply_glass_theme();
+        // Everything drawn in the old palette is drawn again when the glass,
+        // the mode or the accent moved: the badges and title bars carry the
+        // accent and the ground, and are otherwise kept until they resize.
+        self.apply_glass_theme(mode_changed || accent_changed);
         self.notifications.set_timeouts(cfg.notification_timeouts());
         // The dock's icons may just have changed size, which changes where
         // every one of them is: it has to be laid out and painted again, and
@@ -6535,8 +6551,16 @@ impl Huginn {
         if self.pins.set_position(self.settings.pins_position()) {
             self.pins_changed();
         }
-        // The theme row: every panel is redrawn in the new glass.
-        self.apply_glass_theme();
+        // The theme row: every panel is redrawn in the new glass, and the
+        // choice is written to `desktop.toml` so it outlasts the session and
+        // raven-settings shows it. Only when the row moved it: a glass that
+        // arrived from the file is already there, and writing it back would
+        // only wake the watcher for nothing.
+        let glass = crate::theme::theme();
+        self.apply_glass_theme(false);
+        if crate::theme::theme() != glass {
+            crate::desktop_config::save_glass_theme(crate::theme::theme());
+        }
         // The launcher row, likewise: the row owns the value and the
         // launcher takes a copy, redrawing if it is on screen.
         if self.launcher.set_style(self.settings.launcher_style()) && self.launcher.is_visible(now)
@@ -6553,11 +6577,16 @@ impl Huginn {
     /// Switch to the glass the Theme row says, and redraw everything the
     /// compositor painted in the old one: every panel, the overview's
     /// chrome, the screen badges, the title bars.
-    fn apply_glass_theme(&mut self) {
-        if !crate::theme::set_theme(self.settings.glass_theme()) {
+    ///
+    /// `force` redraws even when the glass itself did not change: the mode
+    /// or the accent did, which the glass's own comparison cannot see.
+    fn apply_glass_theme(&mut self, force: bool) {
+        if crate::theme::set_theme(self.settings.glass_theme()) {
+            tracing::info!(theme = crate::theme::theme().label(), "glass theme changed");
+        } else if !force {
             return;
         }
-        tracing::info!(theme = crate::theme::theme().label(), "glass theme changed");
+        self.recolor_buffers();
         self.overview_chrome = None;
         self.refresh_overview_chrome();
         self.screen_badges = None;
@@ -6567,6 +6596,22 @@ impl Huginn {
         self.refresh_decor();
         self.refresh_output_panels();
         self.queue_redraw();
+    }
+
+    /// Recolour the flat buffers the scene draws straight from the theme —
+    /// the focus ring, the region edges, the overview's veil and workspace
+    /// cards — which, unlike the panels, are not recomposed on a redraw.
+    fn recolor_buffers(&mut self) {
+        let accent = crate::theme::accent().to_rgba_f32();
+        for buffer in self.focus_ring.iter_mut().chain(&mut self.region_edges) {
+            buffer.set_color(accent);
+        }
+        self.workspace_card.set_color(
+            crate::theme::background()
+                .with_alpha(WORKSPACE_CARD_ALPHA)
+                .to_rgba_f32(),
+        );
+        self.overview_veil.set_color(crate::theme::veil().to_rgba_f32());
     }
 
     /// Re-read the installed applications and rebuild what shows them.

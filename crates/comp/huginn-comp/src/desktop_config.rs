@@ -24,7 +24,12 @@
 //!   [`crate::launcher::Style`]; also stepped from quick settings.
 //! - `appearance.glass_theme` — `"black"`, `"fog"`, `"arctic"`,
 //!   `"midnight"` or `"rose"`, [`crate::theme::Theme`]: the tint of every
-//!   panel the compositor draws; also stepped from quick settings.
+//!   panel the compositor draws; also stepped from quick settings, which
+//!   writes it back ([`save_glass_theme`]).
+//! - `appearance.theme_mode` — `"light"`, `"dark"` or `"auto"`,
+//!   [`crate::theme::Mode`]: whether that glass is frosted pale with dark
+//!   text or tinted dark with light text, and which icon theme the panels
+//!   draw from. Auto is dark, as it is in every Raven application.
 //! - `dock.icon_size`, `dock.magnification`, `dock.labels`,
 //!   `dock.running_dots`, `dock.auto_hide` — [`crate::dock::Prefs`]: how big
 //!   the dock's icons are, how far the one under the pointer lifts, whether
@@ -43,7 +48,7 @@
 //! - `touch.enabled` — whether it is listened to at all. See
 //!   [`Huginn::touch_output`] and the note on [`Touch`].
 //!
-//! The rest of the file (theme mode, shadows, scale, …) is for the
+//! The rest of the file (transparency, shadows, scale, …) is for the
 //! applications and the bar, which read it themselves.
 
 use std::path::PathBuf;
@@ -73,6 +78,9 @@ pub(crate) struct Appearance {
     /// `"black"`, `"fog"`, `"arctic"`, `"midnight"` or `"rose"`; see
     /// [`crate::theme::Theme`]. Empty, or unknown, is Black Glass.
     pub glass_theme: String,
+    /// `"light"`, `"dark"` or `"auto"`; see [`crate::theme::Mode`]. Empty,
+    /// auto, or unknown, is dark.
+    pub theme_mode: String,
 }
 
 impl Default for Appearance {
@@ -84,6 +92,7 @@ impl Default for Appearance {
             wallpaper: String::new(),
             launcher_layout: String::new(),
             glass_theme: String::new(),
+            theme_mode: String::new(),
         }
     }
 }
@@ -319,6 +328,11 @@ impl DesktopConfig {
         crate::theme::Theme::from_value(&self.appearance.glass_theme).unwrap_or_default()
     }
 
+    /// Light or dark glass: dark unless the file says light.
+    pub(crate) fn theme_mode(&self) -> crate::theme::Mode {
+        crate::theme::Mode::from_value(&self.appearance.theme_mode)
+    }
+
     pub(crate) fn wallpaper(&self) -> Option<PathBuf> {
         let w = self.appearance.wallpaper.trim();
         (!w.is_empty()).then(|| PathBuf::from(w))
@@ -354,6 +368,63 @@ impl DesktopConfig {
             low: defaults.low.min(normal),
             normal,
         }
+    }
+}
+
+/// `text` with `[appearance] key = value` set and everything else as it was
+/// written: comments, order, and keys the compositor does not read.
+///
+/// For the one setting quick settings changes that belongs to the file —
+/// the glass. `None` when `text` does not parse or `appearance` is not a
+/// table: a file the compositor cannot read is one it must not rewrite.
+pub(crate) fn with_appearance_key(text: &str, key: &str, value: &str) -> Option<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().ok()?;
+    let appearance = doc
+        .entry("appearance")
+        .or_insert_with(toml_edit::table)
+        .as_table_like_mut()?;
+    appearance.insert(key, toml_edit::value(value));
+    Some(doc.to_string())
+}
+
+/// Write `[appearance] glass_theme` back to `desktop.toml`, keeping the rest
+/// of the file. Atomically, as `raven-settings` writes it, so the watcher
+/// sees one rename and never half a file. A file that will not parse is
+/// left alone and the choice lasts for the session.
+pub(crate) fn save_glass_theme(theme: crate::theme::Theme) {
+    let Some(path) = path() else {
+        return;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "could not read desktop.toml: {e}");
+            return;
+        }
+    };
+    let Some(updated) = with_appearance_key(&text, "glass_theme", theme.value()) else {
+        tracing::warn!(path = %path.display(), "not saving the glass: desktop.toml does not parse");
+        return;
+    };
+    if updated == text {
+        return;
+    }
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("desktop.toml");
+            let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+            let result =
+                std::fs::write(&temp, &updated).and_then(|()| std::fs::rename(&temp, &path));
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
+            result
+        });
+    if let Err(e) = written {
+        tracing::warn!(path = %path.display(), "could not save the glass to desktop.toml: {e}");
     }
 }
 
@@ -469,6 +540,23 @@ mod tests {
     }
 
     #[test]
+    fn the_glass_is_dark_unless_the_file_says_light() {
+        use crate::theme::Mode;
+        assert_eq!(DesktopConfig::parse("").unwrap().theme_mode(), Mode::Dark);
+        let light = DesktopConfig::parse("[appearance]\ntheme_mode = \"light\"\n").unwrap();
+        assert_eq!(light.theme_mode(), Mode::Light);
+        let auto = DesktopConfig::parse("[appearance]\ntheme_mode = \"auto\"\n").unwrap();
+        assert_eq!(auto.theme_mode(), Mode::Dark, "auto is dark in every Raven app");
+        // The mode sits beside the glass rather than replacing it.
+        let both = DesktopConfig::parse(
+            "[appearance]\ntheme_mode = \"light\"\nglass_theme = \"rose\"\n",
+        )
+        .unwrap();
+        assert_eq!(both.theme_mode(), Mode::Light);
+        assert_eq!(both.glass_theme(), crate::theme::Theme::Rose);
+    }
+
+    #[test]
     fn blur_follows_the_hardware_only_when_unset() {
         let silent = DesktopConfig::parse("[appearance]\naccent = \"#F7768E\"\n").unwrap();
         assert!(silent.blur(true));
@@ -531,6 +619,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.motion(), Motion::Full);
+    }
+
+    #[test]
+    fn saving_the_glass_keeps_the_rest_of_the_file() {
+        let text = "# chosen in raven-settings\n[appearance]\naccent = \"#F7768E\"\n\
+                    glass_theme = \"black\"\ntheme_mode = \"light\"\n\n[privacy]\nx = 1\n";
+        let saved = with_appearance_key(text, "glass_theme", "fog").unwrap();
+        assert!(saved.starts_with("# chosen in raven-settings\n"), "{saved}");
+        assert!(saved.contains("[privacy]\nx = 1"), "{saved}");
+        let cfg = DesktopConfig::parse(&saved).unwrap();
+        assert_eq!(cfg.glass_theme(), crate::theme::Theme::Fog);
+        assert_eq!(cfg.accent(), Some(Color::from_argb(0xFFF7_768E)));
+        assert_eq!(cfg.theme_mode(), crate::theme::Mode::Light);
+
+        // No file, or no section, is a section with the one key in it.
+        let fresh = with_appearance_key("", "glass_theme", "rose").unwrap();
+        assert_eq!(
+            DesktopConfig::parse(&fresh).unwrap().glass_theme(),
+            crate::theme::Theme::Rose
+        );
+        // A file that does not parse is not rewritten.
+        assert_eq!(with_appearance_key("[appearance\n", "glass_theme", "fog"), None);
+        assert_eq!(with_appearance_key("appearance = 3\n", "glass_theme", "fog"), None);
     }
 
     #[test]

@@ -95,11 +95,16 @@ pub(crate) fn set_accent(color: Option<Color>) {
 // are Black Glass, the look Raven has always had; drawing code reads the
 // functions below, which answer for whichever theme is in use.
 //
-// Every theme keeps light text. The shell's drawing is full of white washes
-// and dark shadows chosen for light-on-glass, and a theme with dark text
-// would need each of those revisited; until then a light glass is a pale,
-// cool tint that white text still reads on, which is what frosted glass
-// over a landscape looks like anyway.
+// Every theme comes in two modes, chosen in `desktop.toml` as
+// `appearance.theme_mode` (see [`Mode`]). Dark is the glass above: a
+// translucent tint that light text reads on. Light is the same tint frosted
+// pale — a lighter ground at a slightly lower opacity, dark text, and the
+// washes, wells and hairlines that were white on dark glass turned to a
+// whisper of the text colour, since white on white draws nothing. Drawing
+// code never asks which mode it is in for a colour the palette has; it asks
+// [`ink`] for the colour of a wash, and [`is_light`] only where a panel draws
+// something the palette cannot describe (the arc launcher's hand-shaded
+// glass, the icon tint).
 
 /// The glass the panels are made of. Chosen in `desktop.toml` as
 /// `appearance.glass_theme`, and stepped from quick settings.
@@ -170,7 +175,7 @@ impl Theme {
         Self::ALL[(at + delta).rem_euclid(n) as usize]
     }
 
-    /// The colours this glass is made of.
+    /// The colours this glass is made of, in dark mode.
     pub(crate) const fn palette(self) -> &'static Palette {
         match self {
             Self::Black => &BLACK_GLASS,
@@ -178,6 +183,45 @@ impl Theme {
             Self::Arctic => &ARCTIC_GLASS,
             Self::Midnight => &MIDNIGHT_GLASS,
             Self::Rose => &ROSE_GLASS,
+        }
+    }
+
+    /// The colours this glass is made of, in `mode`.
+    pub(crate) const fn palette_in(self, mode: Mode) -> &'static Palette {
+        match mode {
+            Mode::Dark => self.palette(),
+            Mode::Light => match self {
+                Self::Black => &BLACK_GLASS_LIGHT,
+                Self::Fog => &FOG_GLASS_LIGHT,
+                Self::Arctic => &ARCTIC_GLASS_LIGHT,
+                Self::Midnight => &MIDNIGHT_GLASS_LIGHT,
+                Self::Rose => &ROSE_GLASS_LIGHT,
+            },
+        }
+    }
+}
+
+/// Light or dark: `appearance.theme_mode` in `desktop.toml`.
+///
+/// The file says `"light"`, `"dark"` or `"auto"`, and auto is dark: there is
+/// no time-of-day or sunrise logic anywhere in Raven, and every Raven
+/// application reads auto the same way, so the compositor's panels and the
+/// windows inside them always agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Mode {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Mode {
+    /// Read what the file says. Anything but `"light"` — `"dark"`, `"auto"`,
+    /// empty, a value a later build added — is dark.
+    pub(crate) fn from_value(value: &str) -> Self {
+        if value.trim().eq_ignore_ascii_case("light") {
+            Self::Light
+        } else {
+            Self::Dark
         }
     }
 }
@@ -272,6 +316,84 @@ const ROSE_GLASS: Palette = Palette {
     backdrop: 0x48,
 };
 
+// The light glasses: each dark theme's tint, frosted pale. The ground is a
+// near-white carrying the theme's hue, a little more see-through than the
+// dark one because a pale ground over a busy wallpaper stays legible at a
+// lower opacity; the text is a deep shade of the same hue; and the edge,
+// wells and rules are that shade at a whisper rather than white, which a
+// pale ground would swallow. The catch-light stays white: it is the light
+// on the glass, not the glass.
+
+const BLACK_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFF3_F3F7),
+    text: Color::from_argb(0xFF1A_1A24),
+    text_dim: Color::from_argb(0xFF55_5568),
+    border: Color::from_argb(0xFFD2_D2DC),
+    hairline: Color::from_argb(0x2414_141F),
+    catch_light: Color::from_argb(0xB3FF_FFFF),
+    well: Color::from_argb(0x0F14_141F),
+    well_raised: Color::from_argb(0x1C14_141F),
+    rule: Color::from_argb(0x1A14_141F),
+    panel_alpha: 0xD0,
+    backdrop: 0x30,
+};
+
+const FOG_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFE5_EAF1),
+    text: Color::from_argb(0xFF1C_2433),
+    text_dim: Color::from_argb(0xFF4E_5A70),
+    border: Color::from_argb(0xFFC3_CDDB),
+    hairline: Color::from_argb(0x2A20_3048),
+    catch_light: Color::from_argb(0xC0FF_FFFF),
+    well: Color::from_argb(0x1220_3048),
+    well_raised: Color::from_argb(0x2020_3048),
+    rule: Color::from_argb(0x1C20_3048),
+    panel_alpha: 0xC0,
+    backdrop: 0x28,
+};
+
+const ARCTIC_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFDD_EEF8),
+    text: Color::from_argb(0xFF0E_2A3C),
+    text_dim: Color::from_argb(0xFF3C_6278),
+    border: Color::from_argb(0xFFB2_D4E6),
+    hairline: Color::from_argb(0x300E_4A6A),
+    catch_light: Color::from_argb(0xCCFF_FFFF),
+    well: Color::from_argb(0x140E_4A6A),
+    well_raised: Color::from_argb(0x240E_4A6A),
+    rule: Color::from_argb(0x1E0E_4A6A),
+    panel_alpha: 0xB8,
+    backdrop: 0x24,
+};
+
+const MIDNIGHT_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFE3_E7F6),
+    text: Color::from_argb(0xFF10_1A3A),
+    text_dim: Color::from_argb(0xFF46_527C),
+    border: Color::from_argb(0xFFBF_C7E4),
+    hairline: Color::from_argb(0x2A24_3160),
+    catch_light: Color::from_argb(0xB3FF_FFFF),
+    well: Color::from_argb(0x1224_3160),
+    well_raised: Color::from_argb(0x2024_3160),
+    rule: Color::from_argb(0x1A24_3160),
+    panel_alpha: 0xD0,
+    backdrop: 0x38,
+};
+
+const ROSE_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFF6_E7EE),
+    text: Color::from_argb(0xFF3A_1E2C),
+    text_dim: Color::from_argb(0xFF74_5061),
+    border: Color::from_argb(0xFFE2_C4D2),
+    hairline: Color::from_argb(0x2A5A_3A4E),
+    catch_light: Color::from_argb(0xB8FF_FFFF),
+    well: Color::from_argb(0x125A_3A4E),
+    well_raised: Color::from_argb(0x205A_3A4E),
+    rule: Color::from_argb(0x1A5A_3A4E),
+    panel_alpha: 0xC8,
+    backdrop: 0x30,
+};
+
 /// The theme in use, as its index in [`Theme::ALL`]. An atomic for the
 /// reason [`ACCENT_IN_USE`] is one: every drawing site reads it, and none of
 /// them has the compositor state in hand.
@@ -289,8 +411,50 @@ pub(crate) fn set_theme(theme: Theme) -> bool {
     THEME_IN_USE.swap(at, std::sync::atomic::Ordering::Relaxed) != at
 }
 
+/// Whether the mode in use is light. See [`Mode`].
+static LIGHT_IN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn mode() -> Mode {
+    if LIGHT_IN_USE.load(std::sync::atomic::Ordering::Relaxed) {
+        Mode::Light
+    } else {
+        Mode::Dark
+    }
+}
+
+/// Switch modes. Returns whether that was a change, as [`set_theme`] does.
+pub(crate) fn set_mode(mode: Mode) -> bool {
+    let light = mode == Mode::Light;
+    LIGHT_IN_USE.swap(light, std::sync::atomic::Ordering::Relaxed) != light
+}
+
+/// Whether the panels are light glass with dark text.
+pub(crate) fn is_light() -> bool {
+    mode() == Mode::Light
+}
+
 fn palette() -> &'static Palette {
-    theme().palette()
+    theme().palette_in(mode())
+}
+
+/// The colour of a wash, an edge or a divider drawn over glass: white on
+/// dark glass, the text colour on light. Drawing code fades it to the
+/// strength it wants, where it once faded white.
+pub(crate) fn ink() -> Color {
+    match mode() {
+        Mode::Dark => Color::from_argb(0xFFFF_FFFF),
+        Mode::Light => text(),
+    }
+}
+
+/// What the overview lays over the desktop behind the spaces: black, half
+/// strength, on dark glass; the ground itself on light, so the dark labels
+/// on top of it still read.
+pub(crate) fn veil() -> Color {
+    match mode() {
+        Mode::Dark => Color::from_argb(0x8000_0000),
+        Mode::Light => background().with_alpha(0x80),
+    }
 }
 
 /// Panel, dock and overlay background, in the theme in use.
@@ -409,6 +573,13 @@ pub(crate) const CARD_RADIUS: f32 = 14.0;
 /// [`RECORDING`], whose red only ever means the screen is being captured.
 pub(crate) const CRITICAL: Color = Color::from_argb(0xFFFB_7185);
 
+/// Text set on a solid slab of accent — a badge, a primary button. Dark in
+/// both modes: the accents on offer are mid-bright, and dark type on them
+/// reads where the light ground of light glass would not.
+pub(crate) fn on_accent() -> Color {
+    BACKGROUND
+}
+
 /// The selection wash: the accent at the strength a selected row or tile is
 /// tinted with. The accent's one job inside a panel, apart from the caret.
 pub(crate) fn selection() -> Color {
@@ -449,7 +620,9 @@ pub(crate) const GAP: i32 = 8;
 /// `hicolor` and 1 under `breeze-dark`. Whatever RavenLinux ships belongs here.
 ///
 /// RavenLinux ships `breeze-icons`, so this names `breeze-dark`: the light
-/// variant is drawn for dark panels, which is what [`BACKGROUND`] is. Naming
+/// variant is drawn for dark panels, which is what [`BACKGROUND`] is; light
+/// glass wants `breeze`, and [`icon_theme`] answers for the mode in use. This
+/// constant is the dark answer, which is also what the tests resolve. Naming
 /// `hicolor` here was not a smaller choice but an empty one — the image
 /// carried three files under that theme, all of them installed by CMake, so
 /// every icon in the dock and the launcher resolved to nothing and drew blank.
@@ -458,6 +631,18 @@ pub(crate) const GAP: i32 = 8;
 /// regardless, so a name this theme happens to lack still resolves the way it
 /// did before. Nothing is lost by preferring a theme that has icons in it.
 pub(crate) const ICON_THEME: &str = "breeze-dark";
+/// [`ICON_THEME`]'s twin for light glass: dark strokes on a pale ground.
+pub(crate) const ICON_THEME_LIGHT: &str = "breeze";
+
+/// The icon theme for the mode in use. `Icons::find` falls back through
+/// what the theme inherits and then hicolor, so a machine without `breeze`
+/// still resolves every icon it did.
+pub(crate) fn icon_theme() -> &'static str {
+    match mode() {
+        Mode::Dark => ICON_THEME,
+        Mode::Light => ICON_THEME_LIGHT,
+    }
+}
 
 /// How many panes the carousel shows at once.
 ///
@@ -533,12 +718,36 @@ mod tests {
             });
             0.2126 * r + 0.7152 * g + 0.0722 * b
         }
-        for theme in Theme::ALL {
-            let p = theme.palette();
-            let (hi, lo) = (luminance(p.text), luminance(p.background));
-            let ratio = (hi.max(lo) + 0.05) / (hi.min(lo) + 0.05);
-            assert!(ratio >= 4.0, "{} text contrast {ratio}", theme.label());
+        let contrast = |a: Color, b: Color| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        for mode in [Mode::Dark, Mode::Light] {
+            for theme in Theme::ALL {
+                let p = theme.palette_in(mode);
+                let ratio = contrast(p.text, p.background);
+                assert!(ratio >= 4.0, "{} {mode:?} text contrast {ratio}", theme.label());
+                let dim = contrast(p.text_dim, p.background);
+                assert!(dim >= 3.0, "{} {mode:?} dim text contrast {dim}", theme.label());
+                // Light glass carries dark text and dark glass light text:
+                // the mode is not just a paler tint of the same scheme.
+                let dark_text = luminance(p.text) < luminance(p.background);
+                assert_eq!(dark_text, mode == Mode::Light, "{} {mode:?}", theme.label());
+            }
         }
+    }
+
+    #[test]
+    fn the_mode_reads_back_from_what_the_file_says() {
+        assert_eq!(Mode::from_value("light"), Mode::Light);
+        assert_eq!(Mode::from_value(" Light "), Mode::Light);
+        assert_eq!(Mode::from_value("dark"), Mode::Dark);
+        // Auto is dark everywhere in Raven, and so is anything unknown.
+        assert_eq!(Mode::from_value("auto"), Mode::Dark);
+        assert_eq!(Mode::from_value(""), Mode::Dark);
+        assert_eq!(Mode::from_value("sepia"), Mode::Dark);
+        assert_eq!(Theme::Fog.palette_in(Mode::Dark), Theme::Fog.palette());
+        assert_ne!(Theme::Fog.palette_in(Mode::Light), Theme::Fog.palette());
     }
 
     #[test]

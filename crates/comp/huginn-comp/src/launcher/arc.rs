@@ -51,8 +51,77 @@ const ZOOM: f32 = 1.4;
 const CANVAS_W: f32 = 2.0 * (OUTER + CARD_GAP + CARD_W) + 8.0;
 const CANVAS_H: f32 = 540.0;
 
-const SIDE_GROUND: Color = Color::from_argb(0xA30E_111E);
-const CARD_GROUND: Color = Color::from_argb(0xBD16_1826);
+/// The arc's own shading, in the mode in use.
+///
+/// The arc is not a panel of the glass the themes describe but a hand-shaded
+/// centrepiece — a navy band, a lit hub, discs under the icons — so its
+/// colours cannot come from the palette. They come from here instead, once
+/// for dark glass and once for light, so that the same drawing reads on
+/// either: on light glass the grounds are pale, the washes and rims that were
+/// white are the text colour at a whisper, and the type that was white on
+/// the dark hub is the theme's text.
+struct Shades {
+    /// The sidebar's and the card's glass.
+    side_ground: Color,
+    card_ground: Color,
+    /// The band's ground, the wash at its top, and the fog at its foot.
+    band: Color,
+    band_wash: Color,
+    band_fog: Color,
+    /// The hub's ground where it is lit and where it is deep, and its fog
+    /// near and far.
+    hub_lit: Color,
+    hub_deep: Color,
+    fog_near: Color,
+    fog_far: Color,
+    /// A slot's disc, lit and deep.
+    slot_lit: Color,
+    slot_deep: Color,
+    /// The ground of a key hint chip.
+    keys: Color,
+    /// Washes, rims and dividers: white on dark, the text colour on light.
+    ink: Color,
+    /// The strongest type: the query, a chosen label, the card's title.
+    bright: Color,
+}
+
+fn shades() -> Shades {
+    if crate::theme::is_light() {
+        Shades {
+            side_ground: rgba(244, 246, 251, 0.78),
+            card_ground: rgba(248, 249, 253, 0.84),
+            band: rgba(236, 240, 248, 0.70),
+            band_wash: rgba(255, 255, 255, 1.0),
+            band_fog: rgba(120, 140, 190, 1.0),
+            hub_lit: rgba(252, 253, 255, 0.95),
+            hub_deep: rgba(222, 228, 242, 0.97),
+            fog_near: rgba(130, 150, 205, 0.30),
+            fog_far: rgba(150, 168, 215, 0.12),
+            slot_lit: rgba(255, 255, 255, 0.86),
+            slot_deep: rgba(224, 229, 242, 0.90),
+            keys: rgba(250, 251, 255, 0.70),
+            ink: crate::theme::ink(),
+            bright: crate::theme::text(),
+        }
+    } else {
+        Shades {
+            side_ground: Color::from_argb(0xA30E_111E),
+            card_ground: Color::from_argb(0xBD16_1826),
+            band: rgba(14, 17, 30, 0.64),
+            band_wash: rgba(255, 255, 255, 1.0),
+            band_fog: rgba(150, 172, 222, 1.0),
+            hub_lit: rgba(24, 32, 56, 0.95),
+            hub_deep: rgba(8, 10, 20, 0.97),
+            fog_near: rgba(160, 182, 230, 0.38),
+            fog_far: rgba(115, 140, 195, 0.14),
+            slot_lit: rgba(40, 46, 70, 0.78),
+            slot_deep: rgba(12, 14, 26, 0.88),
+            keys: rgba(14, 16, 26, 0.55),
+            ink: crate::theme::ink(),
+            bright: WHITE,
+        }
+    }
+}
 
 /// Lay out and paint the arc. See [`super::compose`].
 pub(super) fn compose(
@@ -151,7 +220,7 @@ pub(super) fn compose(
             label_size,
             sx + nudge,
             sy + px(SLOT) + px(2.0),
-            if chosen { WHITE } else { crate::theme::text() },
+            if chosen { shades().bright } else { crate::theme::text() },
             Weight::NORMAL,
         );
         layout.hits.push((
@@ -220,8 +289,8 @@ pub(super) fn compose(
         cy + px(OUTER * 0.86 + 30.0),
         px(11.5),
         s,
-        rgba(14, 16, 26, 0.55),
-        Some(rgba(255, 255, 255, 0.24)),
+        shades().keys,
+        Some(faded(shades().ink, 0.24)),
     );
     layout.surfaces.push(keys);
     layout.surfaces.push(rect(
@@ -282,7 +351,8 @@ fn draw_band(
 ) {
     let top = cy - radius;
     let span = radius * 2.0;
-    let ground = rgba(14, 17, 30, 0.64);
+    let shades = shades();
+    let ground = shades.band;
     let reach = radius + 2.0;
     canvas.paint(
         (cx - reach) as i32,
@@ -298,13 +368,13 @@ fn draw_band(
             }
             let t = (y - top) / span;
             let mut color = if t < 0.38 {
-                over(ground, rgba(255, 255, 255, 0.07 * (1.0 - t / 0.38)))
+                over(ground, faded(shades.band_wash, 0.07 * (1.0 - t / 0.38)))
             } else {
-                over(ground, rgba(150, 172, 222, 0.16 * (t - 0.38) / 0.62))
+                over(ground, faded(shades.band_fog, 0.16 * (t - 0.38) / 0.62))
             };
             let rim = (1.0 - (distance - (radius - 0.5)).abs()).clamp(0.0, 1.0);
             if rim > 0.0 {
-                color = over(color, rgba(255, 255, 255, 0.26 * rim));
+                color = over(color, faded(shades.ink, 0.26 * rim));
             }
             if let Some(at) = highlight {
                 let width = 2.5 * s;
@@ -341,6 +411,7 @@ fn draw_hub(canvas: &mut Canvas, (cx, cy): (f32, f32), radius: f32, s: f32, acce
     let reach = radius + glow;
     let top = cy - radius;
     let (inner_glow, rim_w) = (28.0 * s, 2.5 * s);
+    let shades = shades();
     canvas.paint(
         (cx - reach) as i32,
         (cy - reach) as i32,
@@ -360,18 +431,14 @@ fn draw_hub(canvas: &mut Canvas, (cx, cy): (f32, f32), radius: f32, s: f32, acce
             }
             // A darker ground lit from above centre.
             let lit = dx.hypot(y - (top + radius * 0.64)) / (radius * 1.44);
-            let mut color = mix(rgba(24, 32, 56, 0.95), rgba(8, 10, 20, 0.97), lit);
+            let mut color = mix(shades.hub_lit, shades.hub_deep, lit);
             // Fog: an ellipse centred below the hub, wider than tall.
             let fog_y = top + radius * 2.24;
             let e = ((dx / (radius * 2.6)).powi(2) + ((y - fog_y) / (radius * 1.5)).powi(2)).sqrt();
             let fog = if e < 0.45 {
-                mix(
-                    rgba(160, 182, 230, 0.38),
-                    rgba(115, 140, 195, 0.14),
-                    e / 0.45,
-                )
+                mix(shades.fog_near, shades.fog_far, e / 0.45)
             } else if e < 0.72 {
-                rgba(115, 140, 195, 0.14 * (1.0 - (e - 0.45) / 0.27))
+                faded(shades.fog_far, 1.0 - (e - 0.45) / 0.27)
             } else {
                 rgba(0, 0, 0, 0.0)
             };
@@ -437,6 +504,7 @@ fn draw_slot(
     let glow = 24.0 * s;
     let reach = radius + glow;
     let border = if chosen { 1.5 * s } else { 1.0 };
+    let shades = shades();
     canvas.paint(
         (x - reach) as i32,
         (y - reach) as i32,
@@ -457,14 +525,14 @@ fn draw_slot(
             let body = edge(distance - radius);
             if body > 0.0 {
                 let lit = dx.hypot(dy + radius * 0.4) / (radius * 1.4);
-                let mut disc = mix(rgba(40, 46, 70, 0.78), rgba(12, 14, 26, 0.88), lit);
+                let mut disc = mix(shades.slot_lit, shades.slot_deep, lit);
                 let ring = edge((distance - (radius - border / 2.0)).abs() - border / 2.0);
                 disc = over(
                     disc,
                     if chosen {
                         faded(accent, 0.95 * ring)
                     } else {
-                        rgba(255, 255, 255, 0.15 * ring)
+                        faded(shades.ink, 0.15 * ring)
                     },
                 );
                 if chosen {
@@ -499,7 +567,7 @@ fn draw_search(
     y += px(22.0) + px(6.0);
     if typing {
         let shown = fit_tail(text, launcher.query(), input_size, px(170.0));
-        draw_centred(text, canvas, &shown, input_size, cx, y, WHITE, EMPHASIS);
+        draw_centred(text, canvas, &shown, input_size, cx, y, shades().bright, EMPHASIS);
         let width = text.measure_weighted(&shown, input_size, EMPHASIS).0;
         canvas.fill(
             (cx + width / 2.0 + px(2.0)) as usize,
@@ -509,7 +577,7 @@ fn draw_search(
             accent.to_rgba_bytes(),
         );
     } else {
-        draw_centred(text, canvas, "Search", input_size, cx, y, WHITE, EMPHASIS);
+        draw_centred(text, canvas, "Search", input_size, cx, y, shades().bright, EMPHASIS);
     }
     y += input_size * 1.35 + px(6.0);
     let found = launcher.results().len() + launcher.file_hits().len();
@@ -539,7 +607,7 @@ fn draw_search(
         px(22.0) as usize,
         1,
         0.0,
-        rgba(255, 255, 255, 0.55),
+        faded(shades().ink, 0.55),
     );
 }
 
@@ -642,8 +710,8 @@ fn draw_sidebar(
         width,
         height,
         px(22.0),
-        SIDE_GROUND,
-        rgba(255, 255, 255, 0.16),
+        shades().side_ground,
+        faded(shades().ink, 0.16),
     );
     let (row_x, row_w) = (left + pad, width - pad * 2.0);
     let label_size = px(13.5);
@@ -652,7 +720,7 @@ fn draw_sidebar(
         if on {
             let (xu, yu, wu, hu) = (row_x as usize, y as usize, row_w as usize, row_h as usize);
             canvas.fill_rounded(xu, yu, wu, hu, row_h / 2.0, faded(accent, 0.2));
-            canvas.stroke_rounded(xu, yu, wu, hu, row_h / 2.0, 1.0, rgba(255, 255, 255, 0.24));
+            canvas.stroke_rounded(xu, yu, wu, hu, row_h / 2.0, 1.0, faded(shades().ink, 0.24));
             glow_dot(
                 canvas,
                 row_x + px(2.0),
@@ -680,7 +748,7 @@ fn draw_sidebar(
             label_size,
             label_x as i32,
             (y + (row_h - label_size * 1.35) / 2.0) as i32,
-            if on { WHITE } else { crate::theme::text() },
+            if on { shades().bright } else { crate::theme::text() },
         );
         if let Some(count) = count {
             let count = count.to_string();
@@ -848,8 +916,8 @@ fn draw_card(
         width,
         height,
         px(16.0),
-        CARD_GROUND,
-        rgba(255, 255, 255, 0.12),
+        shades().card_ground,
+        faded(shades().ink, 0.12),
     );
 
     let x = left + pad_x;
@@ -868,7 +936,7 @@ fn draw_card(
         title_size,
         text_x as i32,
         heading_y as i32,
-        WHITE,
+        shades().bright,
         EMPHASIS,
     );
     let kind = fit(text, &kind, kind_size, heading_room);
@@ -887,7 +955,7 @@ fn draw_card(
         px(26.0) as usize,
         1,
         0.0,
-        rgba(255, 255, 255, 0.25),
+        faded(shades().ink, 0.25),
     );
     y += 1.0 + px(14.0);
     for line in &about {
@@ -935,7 +1003,7 @@ fn draw_card(
             primary_h as usize,
             px(9.0),
             px(2.0),
-            rgba(255, 255, 255, 0.85),
+            faded(shades().ink, 0.85),
         );
     }
     let primary_size = px(13.0);
@@ -946,7 +1014,7 @@ fn draw_card(
         primary_size,
         x + inner / 2.0,
         y + (primary_h - primary_size * 1.35) / 2.0,
-        Color::from_argb(0xFF05_262C),
+        crate::theme::on_accent(),
         EMPHASIS,
     );
     layout.menu_hits.push((rect(x, y, inner, primary_h), 0));

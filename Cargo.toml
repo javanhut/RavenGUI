@@ -67,6 +67,10 @@ serde = { version = "1", features = ["derive"] }
 # The one file the desktop reads about itself: ~/.config/raven/desktop.toml,
 # written by raven-settings. See huginn-comp/src/desktop_config.rs.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# Writing one key of that file back — the glass stepped in quick settings —
+# without disturbing the rest of it: comments, order, keys this build does
+# not know. The same toml_edit `toml` already parses with.
+toml_edit = { version = "0.22", default-features = false, features = ["parse", "display"] }
 # BlueZ, for the quick settings Bluetooth row. Blocking API only: the
 # connection runs its executor on a thread of its own, and the compositor
 # talks to it from a thread of its own too, so no async runtime enters the

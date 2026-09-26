@@ -3942,8 +3942,12 @@ fn glyph_row(
 /// one set rather than twelve logos. The lightness sits where a pastel is
 /// legible on the panel's dark ground; the bottom of the gradient is a
 /// little deeper, which is enough for the glyph to feel lit from above.
+/// Light glass wants the opposite end: a deep shade that reads on a pale
+/// ground, see [`TINT_LIGHTNESS_LIGHT`].
 const TINT_SATURATION: f32 = 0.78;
 const TINT_LIGHTNESS: (f32, f32) = (0.74, 0.62);
+/// [`TINT_LIGHTNESS`] on light glass.
+const TINT_LIGHTNESS_LIGHT: (f32, f32) = (0.44, 0.34);
 
 /// The file the launcher draws for `name`: the symbolic variant if the
 /// theme has one, otherwise the ordinary icon.
@@ -3971,9 +3975,14 @@ pub(crate) fn launcher_icon(
 /// is still one of the family rather than the one grey thing in the grid.
 pub(crate) fn tinted(icon: &raven_desktop::Pixmap) -> raven_desktop::Pixmap {
     let hue = icon.hue().unwrap_or_else(accent_hue);
+    let lightness = if crate::theme::is_light() {
+        TINT_LIGHTNESS_LIGHT
+    } else {
+        TINT_LIGHTNESS
+    };
     icon.tinted(
-        hsl(hue, TINT_SATURATION, TINT_LIGHTNESS.0),
-        hsl(hue, TINT_SATURATION, TINT_LIGHTNESS.1),
+        hsl(hue, TINT_SATURATION, lightness.0),
+        hsl(hue, TINT_SATURATION, lightness.1),
     )
 }
 
@@ -4817,6 +4826,10 @@ mod render_tests {
         if let Ok(theme) = std::env::var("LAUNCHER_THEME") {
             crate::theme::set_theme(crate::theme::Theme::from_value(&theme).unwrap_or_default());
         }
+        // `LAUNCHER_MODE=light`: draw it on light glass.
+        if let Ok(mode) = std::env::var("LAUNCHER_MODE") {
+            crate::theme::set_mode(crate::theme::Mode::from_value(&mode));
+        }
         let mut launcher = Launcher::default();
         // `LAUNCHER_STYLE=arc`: the arc rather than the list.
         if std::env::var("LAUNCHER_STYLE").is_ok_and(|s| s.eq_ignore_ascii_case("arc")) {
@@ -4865,7 +4878,7 @@ mod render_tests {
 
         let output = Rect::from_xywh(0, 0, 1920, 1080);
         let icons = Icons::discover(
-            &std::env::var("RAVEN_ICON_THEME").unwrap_or_else(|_| crate::theme::ICON_THEME.into()),
+            &std::env::var("RAVEN_ICON_THEME").unwrap_or_else(|_| crate::theme::icon_theme().into()),
         );
         let mut pixmaps = Pixmaps::new();
         let (canvas, layout) =
