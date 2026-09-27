@@ -23,9 +23,10 @@
 //! - `appearance.launcher_layout` — `"list"` or `"arc"`,
 //!   [`crate::launcher::Style`]; also stepped from quick settings.
 //! - `appearance.glass_theme` — `"black"`, `"fog"`, `"arctic"`,
-//!   `"midnight"` or `"rose"`, [`crate::theme::Theme`]: the tint of every
-//!   panel the compositor draws; also stepped from quick settings, which
-//!   writes it back ([`save_glass_theme`]).
+//!   `"midnight"`, `"rose"`, `"tokyo-neon"`, `"clear"`, `"ember"` or
+//!   `"nebula"`, [`crate::theme::Theme`]: the tint of every panel the
+//!   compositor draws; also stepped from quick settings, which writes it
+//!   back ([`save_glass_theme`]).
 //! - `appearance.theme_mode` — `"light"`, `"dark"` or `"auto"`,
 //!   [`crate::theme::Mode`]: whether that glass is frosted pale with dark
 //!   text or tinted dark with light text, and which icon theme the panels
@@ -75,7 +76,8 @@ pub(crate) struct Appearance {
     /// `"list"` or `"arc"`; see [`crate::launcher::Style`]. Empty, or a
     /// value this build does not know, is the list.
     pub launcher_layout: String,
-    /// `"black"`, `"fog"`, `"arctic"`, `"midnight"` or `"rose"`; see
+    /// `"black"`, `"fog"`, `"arctic"`, `"midnight"`, `"rose"`,
+    /// `"tokyo-neon"`, `"clear"`, `"ember"` or `"nebula"`; see
     /// [`crate::theme::Theme`]. Empty, or unknown, is Black Glass.
     pub glass_theme: String,
     /// `"light"`, `"dark"` or `"auto"`; see [`crate::theme::Mode`]. Empty,

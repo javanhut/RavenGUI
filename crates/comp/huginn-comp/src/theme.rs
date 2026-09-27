@@ -121,15 +121,27 @@ pub(crate) enum Theme {
     Midnight,
     /// Dusky rose-tinted glass.
     Rose,
+    /// Green-black glass with a neon-green edge: Tokyo after dark.
+    TokyoNeon,
+    /// Barely tinted, barely there: the most see-through glass.
+    Clear,
+    /// Warm, smoky amber glass.
+    Ember,
+    /// Deep violet glass.
+    Nebula,
 }
 
 impl Theme {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Black,
         Self::Fog,
         Self::Arctic,
         Self::Midnight,
         Self::Rose,
+        Self::TokyoNeon,
+        Self::Clear,
+        Self::Ember,
+        Self::Nebula,
     ];
 
     /// What quick settings shows.
@@ -140,6 +152,10 @@ impl Theme {
             Self::Arctic => "Arctic Glass",
             Self::Midnight => "Midnight Glass",
             Self::Rose => "Rose Glass",
+            Self::TokyoNeon => "Tokyo Neon Glass",
+            Self::Clear => "Clear Glass",
+            Self::Ember => "Ember Glass",
+            Self::Nebula => "Nebula Glass",
         }
     }
 
@@ -151,6 +167,10 @@ impl Theme {
             Self::Arctic => "arctic",
             Self::Midnight => "midnight",
             Self::Rose => "rose",
+            Self::TokyoNeon => "tokyo-neon",
+            Self::Clear => "clear",
+            Self::Ember => "ember",
+            Self::Nebula => "nebula",
         }
     }
 
@@ -183,6 +203,10 @@ impl Theme {
             Self::Arctic => &ARCTIC_GLASS,
             Self::Midnight => &MIDNIGHT_GLASS,
             Self::Rose => &ROSE_GLASS,
+            Self::TokyoNeon => &TOKYO_NEON_GLASS,
+            Self::Clear => &CLEAR_GLASS,
+            Self::Ember => &EMBER_GLASS,
+            Self::Nebula => &NEBULA_GLASS,
         }
     }
 
@@ -196,6 +220,10 @@ impl Theme {
                 Self::Arctic => &ARCTIC_GLASS_LIGHT,
                 Self::Midnight => &MIDNIGHT_GLASS_LIGHT,
                 Self::Rose => &ROSE_GLASS_LIGHT,
+                Self::TokyoNeon => &TOKYO_NEON_GLASS_LIGHT,
+                Self::Clear => &CLEAR_GLASS_LIGHT,
+                Self::Ember => &EMBER_GLASS_LIGHT,
+                Self::Nebula => &NEBULA_GLASS_LIGHT,
             },
         }
     }
@@ -316,6 +344,67 @@ const ROSE_GLASS: Palette = Palette {
     backdrop: 0x48,
 };
 
+/// The one theme whose edge is not white: the hairline, catch-light and
+/// wells are neon green, so every panel glows faintly at its rim.
+const TOKYO_NEON_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF0A_1A14),
+    text: Color::from_argb(0xFFE6_FFF1),
+    text_dim: Color::from_argb(0xFF8F_D1AE),
+    border: Color::from_argb(0xFF1A_4A34),
+    hairline: Color::from_argb(0x4039_FF9A),
+    catch_light: Color::from_argb(0x7039_FF9A),
+    well: Color::from_argb(0x1A39_FF9A),
+    well_raised: Color::from_argb(0x2E39_FF9A),
+    rule: Color::from_argb(0x2239_FF9A),
+    panel_alpha: 0xD0,
+    backdrop: 0x60,
+};
+
+/// Glass at its thinnest: a neutral ground at low opacity, so the blurred
+/// desktop does most of the work, and a brighter edge and catch-light so
+/// the panel still reads as a sheet rather than as floating text.
+const CLEAR_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF1C_1F26),
+    text: Color::from_argb(0xFFFF_FFFF),
+    text_dim: Color::from_argb(0xFFD2_D6DE),
+    border: Color::from_argb(0xFF3A_3F4A),
+    hairline: Color::from_argb(0x4DFF_FFFF),
+    catch_light: Color::from_argb(0x99FF_FFFF),
+    well: Color::from_argb(0x1FFF_FFFF),
+    well_raised: Color::from_argb(0x33FF_FFFF),
+    rule: Color::from_argb(0x29FF_FFFF),
+    panel_alpha: 0x60,
+    backdrop: 0x18,
+};
+
+const EMBER_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF3A_2418),
+    text: Color::from_argb(0xFFFF_F3E8),
+    text_dim: Color::from_argb(0xFFE6_C7AE),
+    border: Color::from_argb(0xFF5E_3C28),
+    hairline: Color::from_argb(0x40FF_D9B8),
+    catch_light: Color::from_argb(0x70FF_E2C8),
+    well: Color::from_argb(0x22FF_D9B8),
+    well_raised: Color::from_argb(0x38FF_D9B8),
+    rule: Color::from_argb(0x2CFF_D9B8),
+    panel_alpha: 0xB8,
+    backdrop: 0x48,
+};
+
+const NEBULA_GLASS: Palette = Palette {
+    background: Color::from_argb(0xFF24_163A),
+    text: Color::from_argb(0xFFF3_EAFF),
+    text_dim: Color::from_argb(0xFFC4_B2E0),
+    border: Color::from_argb(0xFF3E_2A60),
+    hairline: Color::from_argb(0x33D6_B8FF),
+    catch_light: Color::from_argb(0x60E0_C8FF),
+    well: Color::from_argb(0x1CD6_B8FF),
+    well_raised: Color::from_argb(0x30D6_B8FF),
+    rule: Color::from_argb(0x22D6_B8FF),
+    panel_alpha: 0xC4,
+    backdrop: 0x58,
+};
+
 // The light glasses: each dark theme's tint, frosted pale. The ground is a
 // near-white carrying the theme's hue, a little more see-through than the
 // dark one because a pale ground over a busy wallpaper stays legible at a
@@ -390,6 +479,62 @@ const ROSE_GLASS_LIGHT: Palette = Palette {
     well: Color::from_argb(0x125A_3A4E),
     well_raised: Color::from_argb(0x205A_3A4E),
     rule: Color::from_argb(0x1A5A_3A4E),
+    panel_alpha: 0xC8,
+    backdrop: 0x30,
+};
+
+const TOKYO_NEON_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFE2_F6EA),
+    text: Color::from_argb(0xFF06_291A),
+    text_dim: Color::from_argb(0xFF2F_6A4C),
+    border: Color::from_argb(0xFFB8_E2C9),
+    hairline: Color::from_argb(0x300A_6A40),
+    catch_light: Color::from_argb(0xC0FF_FFFF),
+    well: Color::from_argb(0x140A_6A40),
+    well_raised: Color::from_argb(0x240A_6A40),
+    rule: Color::from_argb(0x1E0A_6A40),
+    panel_alpha: 0xC4,
+    backdrop: 0x2C,
+};
+
+const CLEAR_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFF7_F9FC),
+    text: Color::from_argb(0xFF0F_1218),
+    text_dim: Color::from_argb(0xFF47_4F5C),
+    border: Color::from_argb(0xFFD8_DEE8),
+    hairline: Color::from_argb(0x260F_1218),
+    catch_light: Color::from_argb(0xE0FF_FFFF),
+    well: Color::from_argb(0x100F_1218),
+    well_raised: Color::from_argb(0x1C0F_1218),
+    rule: Color::from_argb(0x180F_1218),
+    panel_alpha: 0x80,
+    backdrop: 0x10,
+};
+
+const EMBER_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFF8_EBDF),
+    text: Color::from_argb(0xFF3A_1F10),
+    text_dim: Color::from_argb(0xFF7A_5238),
+    border: Color::from_argb(0xFFE6_CDB6),
+    hairline: Color::from_argb(0x2A5E_3C28),
+    catch_light: Color::from_argb(0xB8FF_FFFF),
+    well: Color::from_argb(0x125E_3C28),
+    well_raised: Color::from_argb(0x205E_3C28),
+    rule: Color::from_argb(0x1A5E_3C28),
+    panel_alpha: 0xC8,
+    backdrop: 0x30,
+};
+
+const NEBULA_GLASS_LIGHT: Palette = Palette {
+    background: Color::from_argb(0xFFEE_E6FA),
+    text: Color::from_argb(0xFF22_123C),
+    text_dim: Color::from_argb(0xFF5E_4A80),
+    border: Color::from_argb(0xFFD4_C6EC),
+    hairline: Color::from_argb(0x2A3E_2A60),
+    catch_light: Color::from_argb(0xB8FF_FFFF),
+    well: Color::from_argb(0x123E_2A60),
+    well_raised: Color::from_argb(0x203E_2A60),
+    rule: Color::from_argb(0x1A3E_2A60),
     panel_alpha: 0xC8,
     backdrop: 0x30,
 };
@@ -699,9 +844,11 @@ mod tests {
             assert_eq!(Theme::from_value(theme.label()), Some(theme));
         }
         assert_eq!(Theme::from_value("fog-glass"), Some(Theme::Fog));
+        assert_eq!(Theme::from_value("Tokyo Neon"), Some(Theme::TokyoNeon));
+        assert_eq!(Theme::from_value("tokyoneon"), Some(Theme::TokyoNeon));
         assert_eq!(Theme::from_value("sepia"), None);
         assert_eq!(Theme::Black.palette().background, BACKGROUND);
-        assert_eq!(Theme::Rose.stepped(1), Theme::Black);
+        assert_eq!(Theme::Nebula.stepped(1), Theme::Black);
     }
 
     #[test]
