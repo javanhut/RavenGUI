@@ -1,0 +1,15 @@
+[package]
+name = "raven-glass"
+description = "Raven Glass, the one look every Raven app wears: the shared stylesheets, read from the system at run time, and the glass-theme tints that match the compositor. No toolkit dependency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Deliberately no dependencies. Every GTK app on the image links this, each on
+# its own gtk-rs generation, and RoostBar is not GTK at all: the crate hands
+# out CSS text and the app loads it into whatever it draws with.
+[dependencies]
+
+[lints]
+workspace = true

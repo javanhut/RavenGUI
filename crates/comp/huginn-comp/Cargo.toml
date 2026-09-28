@@ -58,6 +58,10 @@ enumflags2.workspace = true
 # Already in the tree via winit; used to load the system cursor theme.
 xcursor = "0.3"
 
+[dev-dependencies]
+# The apps' copy of the glass grounds; a test in theme.rs holds it to ours.
+raven-glass = { path = "../../raven-glass" }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Peer-to-peer connections, so the notifications server is tested over a real
 # socket without a session bus. Tests only: the resolver keeps this feature out

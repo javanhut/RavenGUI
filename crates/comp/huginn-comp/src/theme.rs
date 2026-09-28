@@ -823,6 +823,32 @@ pub(crate) const LOCK_SCREEN: &str = "raven-lock";
 mod tests {
     use super::*;
 
+    /// Every app tints its windows from `raven_glass::tint`, which carries
+    /// its own copy of each glass's ground and text so it needs none of this
+    /// crate. This is what keeps the windows and the panels the same glass.
+    #[test]
+    fn apps_tint_their_windows_with_the_same_glass() {
+        let hex = |c: Color| {
+            let [r, g, b, _] = c.to_rgba_bytes();
+            format!("#{r:02X}{g:02X}{b:02X}")
+        };
+        for theme in Theme::ALL {
+            let apps = raven_glass::tint::grounds(theme.value());
+            if theme == Theme::Black {
+                assert_eq!(apps, None, "Black Glass is Raven Glass untinted");
+                continue;
+            }
+            let apps = apps.unwrap_or_else(|| panic!("raven-glass has no {}", theme.value()));
+            let dark = theme.palette_in(Mode::Dark);
+            let light = theme.palette_in(Mode::Light);
+            let v = theme.value();
+            assert_eq!(apps.dark_bg.to_ascii_uppercase(), hex(dark.background), "{v} dark ground");
+            assert_eq!(apps.dark_fg.to_ascii_uppercase(), hex(dark.text), "{v} dark text");
+            assert_eq!(apps.light_bg.to_ascii_uppercase(), hex(light.background), "{v} light ground");
+            assert_eq!(apps.light_fg.to_ascii_uppercase(), hex(light.text), "{v} light text");
+        }
+    }
+
     #[test]
     fn the_three_encodings_all_describe_the_same_colour() {
         // The drift this type exists to prevent: the accent was once #7AA2F7

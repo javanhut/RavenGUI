@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/raven-protocol",
     "crates/raven-desktop",
+    "crates/raven-glass",
     "crates/raven-fprint",
     "crates/raven-rec",
     "crates/raven-h264",
