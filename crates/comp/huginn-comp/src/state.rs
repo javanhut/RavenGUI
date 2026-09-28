@@ -7754,7 +7754,25 @@ impl Huginn {
         let chrome_alpha = card.alpha * reveal as f32;
         let mut out = Vec::new();
         for ((id, surface, placed), cell) in windows.into_iter().zip(cells) {
-            let drawn = blend(placed, shrink_into(placed, cell), reveal);
+            // A minimized window has no place on the desktop to go back to —
+            // its rect is only where it was before it left — so it stays in
+            // its patch and fades with the reveal instead. Blended like the
+            // rest, it would grow out to a full-size ghost of itself just
+            // before the desktop, which never draws it, took over.
+            let minimized = self
+                .space
+                .window(id)
+                .is_some_and(huginn_core::window::Window::is_minimized);
+            let drawn = if minimized {
+                shrink_into(placed, cell)
+            } else {
+                blend(placed, shrink_into(placed, cell), reveal)
+            };
+            let alpha = if minimized {
+                card.alpha * reveal.clamp(0.0, 1.0) as f32
+            } else {
+                card.alpha
+            };
             let pane = crate::motion::fit(placed, drawn, 1.0);
             // The renderer scales about the origin and shifts once, so the
             // pane's transform and the stage's compose into a single one:
@@ -7764,7 +7782,7 @@ impl Huginn {
                 scale_y: card.scale_y * pane.scale_y,
                 offset_x: card.scale_x * pane.offset_x + card.offset_x,
                 offset_y: card.scale_y * pane.offset_y + card.offset_y,
-                alpha: card.alpha,
+                alpha,
             };
             let frame = drawn_frame(&surface, pane, drawn);
             let thumb = self
