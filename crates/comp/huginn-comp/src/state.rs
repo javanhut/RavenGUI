@@ -6259,6 +6259,23 @@ impl Huginn {
             Some(_) => self.queue_redraw(),
             None => {}
         }
+        // Nothing but fingers may hold the row between stages or past either
+        // end. A swipe dropped without its lift — the session locked
+        // mid-drag, an end that never arrived — leaves the row wherever the
+        // rubber band had it, and nothing else would ever pull it home: the
+        // front stage sat stretched part-way off the screen, the veil and
+        // the window sliding with it.
+        let driven = self.swipe.as_ref().is_some_and(|swipe| swipe.position().is_some());
+        let last = self.space.workspaces().len().saturating_sub(1) as f32;
+        let instant = self.reduced_motion();
+        if !driven && let Some(carousel) = &mut self.workspace_carousel {
+            let target = carousel.position.target();
+            let home = target.round().clamp(0.0, last);
+            if (target - home).abs() > WorkspaceCarousel::TOLERANCE {
+                carousel.position.set_damping(1.0, now);
+                carousel.position.go_to(home, now, instant);
+            }
+        }
         let mut finish_workspace_carousel = false;
         if let Some(carousel) = &self.workspace_carousel {
             let moving = !carousel.position.is_settled(now) || !carousel.reveal.is_settled(now);
