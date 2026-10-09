@@ -745,7 +745,6 @@ pub(crate) const FOCUS_RING_WIDTH: i32 = 2;
 /// screen the way every other panel's does.
 pub(crate) const TITLE_BAR_HEIGHT: i32 = 30;
 
-
 /// The title's size at 1080p, in logical pixels; scaled with the screen.
 pub(crate) const TITLE_TEXT_SIZE: f32 = 13.0;
 
@@ -842,10 +841,26 @@ mod tests {
             let dark = theme.palette_in(Mode::Dark);
             let light = theme.palette_in(Mode::Light);
             let v = theme.value();
-            assert_eq!(apps.dark_bg.to_ascii_uppercase(), hex(dark.background), "{v} dark ground");
-            assert_eq!(apps.dark_fg.to_ascii_uppercase(), hex(dark.text), "{v} dark text");
-            assert_eq!(apps.light_bg.to_ascii_uppercase(), hex(light.background), "{v} light ground");
-            assert_eq!(apps.light_fg.to_ascii_uppercase(), hex(light.text), "{v} light text");
+            assert_eq!(
+                apps.dark_bg.to_ascii_uppercase(),
+                hex(dark.background),
+                "{v} dark ground"
+            );
+            assert_eq!(
+                apps.dark_fg.to_ascii_uppercase(),
+                hex(dark.text),
+                "{v} dark text"
+            );
+            assert_eq!(
+                apps.light_bg.to_ascii_uppercase(),
+                hex(light.background),
+                "{v} light ground"
+            );
+            assert_eq!(
+                apps.light_fg.to_ascii_uppercase(),
+                hex(light.text),
+                "{v} light text"
+            );
         }
     }
 
@@ -899,9 +914,17 @@ mod tests {
             for theme in Theme::ALL {
                 let p = theme.palette_in(mode);
                 let ratio = contrast(p.text, p.background);
-                assert!(ratio >= 4.0, "{} {mode:?} text contrast {ratio}", theme.label());
+                assert!(
+                    ratio >= 4.0,
+                    "{} {mode:?} text contrast {ratio}",
+                    theme.label()
+                );
                 let dim = contrast(p.text_dim, p.background);
-                assert!(dim >= 3.0, "{} {mode:?} dim text contrast {dim}", theme.label());
+                assert!(
+                    dim >= 3.0,
+                    "{} {mode:?} dim text contrast {dim}",
+                    theme.label()
+                );
                 // Light glass carries dark text and dark glass light text:
                 // the mode is not just a paler tint of the same scheme.
                 let dark_text = luminance(p.text) < luminance(p.background);

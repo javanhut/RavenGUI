@@ -31,8 +31,19 @@ pub(super) fn compose(
 
     // The design's measurements, in logical pixels at 1080p. On a screen too
     // short for them the whole sheet is drawn smaller rather than cut off.
-    let natural = 26.0 * 2.0 + 56.0 + 20.0 + 34.0 + 20.0 + 3.0 * 124.0 + 2.0 * 6.0
-        + 30.0 + 16.0 + 1.0 + 16.0 + 28.0 + 58.0;
+    let natural = 26.0 * 2.0
+        + 56.0
+        + 20.0
+        + 34.0
+        + 20.0
+        + 3.0 * 124.0
+        + 2.0 * 6.0
+        + 30.0
+        + 16.0
+        + 1.0
+        + 16.0
+        + 28.0
+        + 58.0;
     let room = output.h() as f32 * m.density as f32 * 0.92;
     let squeeze = (room / (natural * m.scale)).min(1.0);
     let scale = m.scale * squeeze;
@@ -376,9 +387,7 @@ pub(super) fn compose(
                 text_dim,
             );
         }
-        layout
-            .buttons
-            .push((rect(cx, y, chip_w, chips_h), *button));
+        layout.buttons.push((rect(cx, y, chip_w, chips_h), *button));
         cx += chip_w + px(8.0);
     }
     let sort_y = y + (chips_h - sort_size * 1.35) / 2.0;
@@ -601,7 +610,11 @@ pub(super) fn compose(
                 px(4.0),
                 px(1.6),
                 direction < 0,
-                if can { text_color } else { faded(text_dim, 0.4) },
+                if can {
+                    text_color
+                } else {
+                    faded(text_dim, 0.4)
+                },
             );
             layout.buttons.push((
                 rect(ax, cy - arrow / 2.0, arrow, arrow),
@@ -841,10 +854,24 @@ fn draw_strip(
             head_size,
             link_x - px(12.0) - name_x,
         );
-        text.draw(canvas, &name, head_size, name_x as i32, y as i32, crate::theme::text_dim());
+        text.draw(
+            canvas,
+            &name,
+            head_size,
+            name_x as i32,
+            y as i32,
+            crate::theme::text_dim(),
+        );
     }
     if !pins.is_empty() {
-        text.draw(canvas, link, link_size, link_x as i32, y as i32, crate::theme::text_dim());
+        text.draw(
+            canvas,
+            link,
+            link_size,
+            link_x as i32,
+            y as i32,
+            crate::theme::text_dim(),
+        );
         layout.buttons.push((
             rect(link_x - px(6.0), y - px(4.0), link_w + px(12.0), px(22.0)),
             Button::PinnedPanel,
@@ -921,7 +948,14 @@ fn draw_strip(
             name_size,
             sx + card_w - px(8.0) - label_x,
         );
-        text.draw(canvas, &name, name_size, label_x as i32, top as i32, crate::theme::text());
+        text.draw(
+            canvas,
+            &name,
+            name_size,
+            label_x as i32,
+            top as i32,
+            crate::theme::text(),
+        );
         let when = ago(launcher.now().saturating_sub(*at));
         text.draw(
             canvas,

@@ -393,6 +393,11 @@ fn button<B: InputBackend>(state: &mut Huginn, event: &B::PointerButtonEvent) {
         if shell_press(state, event.button_code(), source) == Taken::Shell {
             return;
         }
+        // A click on a window or the desktop is working on this screen. One
+        // the shell took -- the dock, a card, the strip -- is reaching for
+        // something from wherever the person was; see
+        // `Huginn::working_output`.
+        state.note_working_here();
     }
 
     let pointer = state.pointer();

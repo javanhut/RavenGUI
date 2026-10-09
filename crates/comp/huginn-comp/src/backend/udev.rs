@@ -50,7 +50,7 @@ use smithay::{
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
         egl::EGLDevice,
-        input::{Event as _, InputEvent, KeyboardKeyEvent},
+        input::{Event as _, InputEvent, KeyboardKeyEvent, Switch, SwitchState, SwitchToggleEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer,
@@ -142,6 +142,10 @@ struct Screen {
     /// rescan reports connectors, so both directions have to be answerable.
     connector: connector::Handle,
     name: String,
+    /// The monitor on the connector, from its EDID: what the saved layout is
+    /// kept by, since the connector name is not. See
+    /// `huginn_core::layout::rebind`.
+    id: Option<String>,
     /// The mode the CRTC is driving. Compared against the connector's preferred
     /// mode on every rescan; a difference means the panel behind the connector
     /// is not the one this screen was brought up for.
@@ -234,6 +238,15 @@ struct Udev {
     /// Init has been told we are ready and the machine is going down. The
     /// screens stay off whatever happens until the resume.
     asleep: bool,
+    /// The lid is shut. With another screen connected the built-in panel is
+    /// not driven at all: it is not a screen anybody can see, and a desktop
+    /// that kept it would put windows, the pointer and the dock behind the
+    /// lid. With nothing else connected it stays, so the session always has a
+    /// screen. See [`Udev::hides_builtin`].
+    lid_closed: bool,
+    /// The built-in panel is connected but left dark for the lid, so opening
+    /// it, or the last other screen going, has something to bring back.
+    builtin_hidden: bool,
 }
 
 /// How long a withdrawn `wl_output` global stays bindable before it is
@@ -584,6 +597,8 @@ pub(crate) fn run() -> Result<()> {
         screen_off_timer: None,
         sleep_token: None,
         asleep: false,
+        lid_closed: lid_closed_now(),
+        builtin_hidden: false,
     };
 
     // Every other DRM device on the seat: the discrete GPU on a hybrid
@@ -877,6 +892,46 @@ fn draw(
 /// repeats every line.
 /// The output transform for a saved rotation. The numbering is the same,
 /// counter-clockwise quarter turns, so this is a relabelling.
+/// A connector's name as DRM spells it and the saved layout writes it:
+/// `eDP-1`, `HDMI-A-1`, `DVI-I-2`.
+fn connector_name(connector: &connector::Info) -> String {
+    format!(
+        "{}-{}",
+        connector.interface().as_str(),
+        connector.interface_id()
+    )
+}
+
+/// The monitor on `connector`, from the EDID the kernel read when it probed
+/// it. See `huginn_core::layout::identity`. `None` with no EDID, which a
+/// virtual connector or a broken cable can mean.
+fn monitor_identity(device: &DrmDevice, connector: connector::Handle) -> Option<String> {
+    let properties = device.get_properties(connector).ok()?;
+    let (handles, values) = properties.as_props_and_values();
+    let blob = handles.iter().zip(values).find_map(|(handle, value)| {
+        let info = device.get_property(*handle).ok()?;
+        (info.name().to_bytes() == b"EDID").then_some(*value)
+    })?;
+    if blob == 0 {
+        return None;
+    }
+    let edid = device.get_property_blob(blob).ok()?;
+    huginn_core::layout::identity(&edid)
+}
+
+/// Whether the lid is shut as the compositor starts. libinput reports the
+/// lid only when it moves, and a laptop booted shut in a dock must not light
+/// its panel until somebody opens it. ACPI's word for it, where there is one;
+/// open otherwise.
+fn lid_closed_now() -> bool {
+    std::fs::read_dir("/proc/acpi/button/lid")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|lid| std::fs::read_to_string(lid.path().join("state")).ok())
+        .any(|state| state.contains("closed"))
+}
+
 const fn transform_of(rotation: Rotation) -> Transform {
     match rotation {
         Rotation::Normal => Transform::Normal,
@@ -1172,7 +1227,7 @@ impl Udev {
                     device = device_id,
                     "device reported a change; rescanning connectors"
                 );
-                if self.sync_device(device_id) {
+                if self.sync_device(device_id) | self.settle_lid() {
                     self.relayout();
                     self.state.queue_redraw();
                 }
@@ -1244,7 +1299,7 @@ impl Udev {
             }
         }
         self.secondaries.insert(dev, secondary);
-        if self.sync_device(dev) {
+        if self.sync_device(dev) | self.settle_lid() {
             self.relayout();
             self.state.queue_redraw();
         }
@@ -1272,6 +1327,8 @@ impl Udev {
             }
             tracing::info!(path = ?secondary.path, "DRM device removed");
         }
+        // The dock that went may have been the only other screen.
+        changed |= self.settle_lid();
         if changed {
             self.relayout();
             self.state.queue_redraw();
@@ -1294,6 +1351,7 @@ impl Udev {
         for dev in devices {
             changed |= self.sync_device(dev);
         }
+        changed |= self.settle_lid();
         if changed {
             self.relayout();
             self.state.queue_redraw();
@@ -1322,6 +1380,24 @@ impl Udev {
             .iter()
             .filter_map(|handle| device.get_connector(*handle, true).ok())
             .filter(|connector| connector.state() == connector::State::Connected)
+            .collect();
+        // A panel behind a shut lid is left dark, and is not a screen,
+        // whenever something else can be.
+        let builtin = |c: &connector::Info| crate::state::is_builtin_panel(&connector_name(c));
+        let hide = self.hides_builtin(dev, connected.iter().any(|c| !builtin(c)));
+        if connected.iter().any(builtin) {
+            if hide != self.builtin_hidden {
+                tracing::info!(
+                    lid_closed = self.lid_closed,
+                    "built-in panel {}",
+                    if hide { "off" } else { "back" }
+                );
+            }
+            self.builtin_hidden = hide;
+        }
+        let connected: Vec<connector::Info> = connected
+            .into_iter()
+            .filter(|c| !(hide && builtin(c)))
             .collect();
         let live: HashSet<connector::Handle> =
             connected.iter().map(connector::Info::handle).collect();
@@ -1372,11 +1448,10 @@ impl Udev {
         resources: &ResourceHandles,
         connector: &connector::Info,
     ) -> Result<()> {
-        let name = format!(
-            "{}-{}",
-            connector.interface().as_str(),
-            connector.interface_id()
-        );
+        let name = connector_name(connector);
+        let id = self
+            .device(dev)
+            .and_then(|device| monitor_identity(device, connector.handle()));
 
         let Some(mode) = preferred_mode(connector) else {
             anyhow::bail!("{name} reports no modes");
@@ -1472,6 +1547,7 @@ impl Udev {
             width = wl_mode.size.w,
             height = wl_mode.size.h,
             refresh_mhz = wl_mode.refresh,
+            monitor = id.as_deref().unwrap_or("unknown"),
             kind = match scanout {
                 ScreenScanout::Primary(_) => "primary",
                 ScreenScanout::Gpu { .. } => "secondary gpu",
@@ -1488,6 +1564,7 @@ impl Udev {
                 global,
                 connector: connector.handle(),
                 name,
+                id,
                 mode,
                 scale,
                 physical: scale.physical,
@@ -1519,6 +1596,9 @@ impl Udev {
         };
         let (wl_mode, scale) = describe(connector, &mode);
         let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
+        let id = self
+            .device(dev)
+            .and_then(|device| monitor_identity(device, connector.handle()));
 
         let Udev {
             screens,
@@ -1529,8 +1609,15 @@ impl Udev {
         let screen = screens
             .get_mut(&key)
             .expect("looked up by connector just above");
+        // Another monitor on the same cable -- a KVM, a swap -- is another
+        // entry in the saved layout, even at the same mode.
+        let swapped = id != screen.id;
+        if swapped {
+            tracing::info!(name = %screen.name, monitor = id.as_deref().unwrap_or("unknown"), "a different monitor on this connector");
+            screen.id = id;
+        }
         if mode == screen.mode && scale == screen.scale {
-            return false;
+            return swapped;
         }
 
         if mode != screen.mode {
@@ -1612,7 +1699,66 @@ impl Udev {
             .find(|crtc| !self.screens.contains_key(&(dev, *crtc)))
     }
 
+    /// Whether a built-in panel on `dev` should be left dark: the lid is shut
+    /// and some other screen is connected, on this device
+    /// (`external_here`) or up on another.
+    fn hides_builtin(&self, dev: libc::dev_t, external_here: bool) -> bool {
+        self.lid_closed
+            && (external_here
+                || self.screens.iter().any(|(key, screen)| {
+                    key.0 != dev && !crate::state::is_builtin_panel(&screen.name)
+                }))
+    }
+
+    /// Bring the built-in panel into line with the lid, after the lid moved or
+    /// the screens on some other device changed: a dock's monitors arriving
+    /// after the laptop's own connectors were read is what makes a panel
+    /// behind a shut lid one to turn off, and the last of them going is what
+    /// brings it back. Returns whether any screen changed.
+    fn settle_lid(&mut self) -> bool {
+        let builtin = |screen: &Screen| crate::state::is_builtin_panel(&screen.name);
+        let builtin_up = self.screens.values().any(builtin);
+        let external_up = self.screens.values().any(|screen| !builtin(screen));
+        let resync = if self.lid_closed && external_up {
+            builtin_up
+        } else {
+            self.builtin_hidden
+        };
+        if !resync {
+            return false;
+        }
+        let mut devices: Vec<libc::dev_t> = self.secondaries.keys().copied().collect();
+        devices.insert(0, self.device_id);
+        let mut changed = false;
+        for dev in devices {
+            changed |= self.sync_device(dev);
+        }
+        changed
+    }
+
+    /// The lid opened or closed.
+    fn set_lid(&mut self, closed: bool) {
+        if closed == self.lid_closed {
+            return;
+        }
+        tracing::info!(closed, "lid");
+        self.lid_closed = closed;
+        if self.settle_lid() {
+            self.relayout();
+            self.state.queue_redraw();
+        }
+    }
+
     fn relayout(&mut self) {
+        // The saved entries follow the monitors, not the connectors: a
+        // monitor that came up on another connector this time takes its own
+        // entry with it. Before anything reads them.
+        let connected: Vec<(String, Option<String>)> = self
+            .screens
+            .values()
+            .map(|screen| (screen.name.clone(), screen.id.clone()))
+            .collect();
+        self.state.rebind_output_layout(&connected);
         let saved = self.state.output_layout().to_vec();
         let builtin = crate::state::is_builtin_panel;
 
@@ -2007,6 +2153,14 @@ impl Udev {
         if self.screens_off && !self.asleep && self.sleep_token.is_none() && !switch {
             self.set_screens_powered(true);
         }
+        if let InputEvent::SwitchToggle { event } = &event {
+            // Through the trait: libinput's own event has a `switch` of its
+            // own, in its own types.
+            if SwitchToggleEvent::switch(event) == Some(Switch::Lid) {
+                self.set_lid(SwitchToggleEvent::state(event) == SwitchState::On);
+            }
+            return;
+        }
 
         let InputEvent::Keyboard { event } = event else {
             // Motion, buttons and scroll all go to the shared handler, so the
@@ -2022,6 +2176,10 @@ impl Udev {
         let serial = SERIAL_COUNTER.next_serial();
         let time = event.time_msec();
         let key_state = event.state();
+        // Typing is working on the focused screen; see `Huginn::working_output`.
+        if key_state == smithay::backend::input::KeyState::Pressed {
+            self.state.note_working_here();
+        }
         // Read before the filter runs: the closure is handed the compositor
         // state, but working out whose layer this is needs the focus as it
         // stands now, not as the keystroke may leave it.
@@ -2038,49 +2196,53 @@ impl Udev {
         let help_up = self.state.help_open();
         let dock_menu_open = self.state.dock_menu_is_open();
         let code = event.key_code();
-        let (resolved, mods_changed) = self
-            .keyboard
-            .input_intercept::<_, _>(
-                &mut self.state,
-                code,
-                key_state,
-                |_state, modifiers, handle| {
-                    {
-                        let sym = handle.modified_sym();
-                        // The character the layout produces, so the
-                        // launcher types what the user pressed rather
-                        // than what a US keyboard would have.
-                        let character = sym.key_char();
-                        let launcher = launcher_open.then_some(character);
-                        let help = help_up.then_some(character);
-                        resolve(
-                            key_state,
-                            modifiers,
-                            sym.raw(),
-                            Modes {
-                                focus_owns_super: owns_super,
-                                launcher,
-                                settings_open,
-                                pinned_open,
-                                resizing,
-                                overview,
-                                locked,
-                                switcher_open,
-                                selecting_region,
-                                help,
-                                dock_menu_open,
-                            },
-                        )
-                    }
-                },
-            );
+        let (resolved, mods_changed) = self.keyboard.input_intercept::<_, _>(
+            &mut self.state,
+            code,
+            key_state,
+            |_state, modifiers, handle| {
+                {
+                    let sym = handle.modified_sym();
+                    // The character the layout produces, so the
+                    // launcher types what the user pressed rather
+                    // than what a US keyboard would have.
+                    let character = sym.key_char();
+                    let launcher = launcher_open.then_some(character);
+                    let help = help_up.then_some(character);
+                    resolve(
+                        key_state,
+                        modifiers,
+                        sym.raw(),
+                        Modes {
+                            focus_owns_super: owns_super,
+                            launcher,
+                            settings_open,
+                            pinned_open,
+                            resizing,
+                            overview,
+                            locked,
+                            switcher_open,
+                            selecting_region,
+                            help,
+                            dock_menu_open,
+                        },
+                    )
+                }
+            },
+        );
         let (forward, action) = self
             .state
             .swallowed_keys
             .settle(code.raw(), key_state, resolved);
         if forward {
-            self.keyboard
-                .input_forward(&mut self.state, code, key_state, serial, time, mods_changed);
+            self.keyboard.input_forward(
+                &mut self.state,
+                code,
+                key_state,
+                serial,
+                time,
+                mods_changed,
+            );
         }
         if resizing
             && key_state == smithay::backend::input::KeyState::Pressed

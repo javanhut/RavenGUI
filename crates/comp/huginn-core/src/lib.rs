@@ -916,7 +916,7 @@ impl Space {
         let (a, b) = (self.workspaces[from].output(), self.workspaces[to].output());
         if let (Some(old), Some(new)) = (self.outputs.get(a), self.outputs.get(b))
             && let Some(win) = self.windows.get_mut(&id)
-            && win.mode == WindowMode::Floating
+            && win.keeps_own_geometry()
         {
             let g = win.geometry;
             win.geometry = Rect::from_xywh(
@@ -945,7 +945,7 @@ impl Space {
             let (dx, dy) = (new.area.x() - old.area.x(), new.area.y() - old.area.y());
             for id in self.workspaces[index].windows() {
                 if let Some(win) = self.windows.get_mut(id)
-                    && win.mode == WindowMode::Floating
+                    && win.keeps_own_geometry()
                 {
                     let g = win.geometry;
                     win.geometry = Rect::from_xywh(g.x() + dx, g.y() + dy, g.w(), g.h());
@@ -1170,9 +1170,18 @@ impl Space {
     }
 
     /// Move an existing window into the active workspace and focus it.
+    ///
+    /// A floating window is carried by the offset between the two screens,
+    /// so it lands where it was relative to the screen rather than pressed
+    /// against the edge of this one nearest where it used to be.
     pub fn bring_to_active_workspace(&mut self, id: WindowId) -> bool {
         if !self.windows.contains_key(&id) {
             return false;
+        }
+        if let Some(from) = self.workspace_of(id)
+            && from != self.active
+        {
+            self.carry_window(id, from, self.active);
         }
         for (index, workspace) in self.workspaces.iter_mut().enumerate() {
             if index != self.active {
@@ -2586,6 +2595,28 @@ mod tests {
         assert!(s.focus_window(there));
         assert_eq!(s.focused(), Some(there));
         assert_eq!(s.focused_output(), 1);
+    }
+
+    #[test]
+    fn a_floating_window_restored_onto_the_other_screen_keeps_its_place_on_it() {
+        let mut s = two_screens();
+        let float = s.open_window();
+        let win = s.window_mut(float).unwrap();
+        win.mode = WindowMode::Floating;
+        win.geometry = Rect::from_xywh(200, 100, 800, 600);
+        s.arrange();
+        assert!(s.minimize(float));
+
+        assert!(s.focus_output(1));
+        assert!(s.bring_to_active_workspace(float));
+        assert!(s.unminimize(float));
+        s.arrange();
+        assert_eq!(
+            s.window(float).unwrap().geometry,
+            Rect::from_xywh(1920 + 200, 100, 800, 600),
+            "where it was on the left screen, on the right one -- not at its edge"
+        );
+        assert_eq!(s.focused(), Some(float));
     }
 
     #[test]

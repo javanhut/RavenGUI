@@ -137,6 +137,15 @@ impl Window {
         matches!(self.mode, WindowMode::Floating)
     }
 
+    /// Whether [`Self::geometry`] is the window's own rather than the
+    /// layout's: a floating window, or one put away that will come back
+    /// floating. Moving one between screens has to carry the rect with it.
+    pub fn keeps_own_geometry(&self) -> bool {
+        self.mode == WindowMode::Floating
+            || (self.mode == WindowMode::Minimized
+                && self.minimized_from == Some(WindowMode::Floating))
+    }
+
     /// Whether this window currently participates in the workspace layout.
     pub const fn is_minimized(&self) -> bool {
         matches!(self.mode, WindowMode::Minimized)

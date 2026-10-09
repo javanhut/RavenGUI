@@ -89,7 +89,15 @@ impl Rotation {
 /// What was asked for one screen, by name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Saved {
+    /// The connector it was last seen on: `eDP-1`, `HDMI-A-1`. For an entry
+    /// whose monitor is not connected and whose connector has since been
+    /// taken by another, its [`Self::id`] instead -- see [`rebind`].
     pub name: String,
+    /// The monitor itself, from its EDID (see [`identity`]), once it has been
+    /// seen. Connector names are not the monitor: two DisplayLink adapters
+    /// number their `DVI-I-n` connectors in whichever order they come up, and
+    /// a dock renumbers its `DP-n` from one boot to the next.
+    pub id: Option<String>,
     /// Where its top-left corner goes, in logical pixels.
     pub position: Option<Point>,
     /// The effective scale to run it at instead of the one its size implies.
@@ -106,6 +114,7 @@ impl Saved {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            id: None,
             position: None,
             scale: None,
             rotation: Rotation::Normal,
@@ -187,10 +196,10 @@ fn right_of(taken: &[Rect], size: Size, y: i32) -> Rect {
 ///
 /// One screen per line: `name x,y` or `name x,y scale` or `name - scale`,
 /// where `-` is no position, optionally followed by `rotate=90` (or 180,
-/// 270; counter-clockwise) and `primary`. Only the first `primary` in the
-/// file counts. Lines that do not parse are dropped rather than
-/// failing the file: a typo in one entry should cost that entry, not every
-/// screen's place. Comments start with `#`.
+/// 270; counter-clockwise), `primary` and `id=` the monitor's identity.
+/// Only the first `primary` in the file counts. Lines that do not parse are
+/// dropped rather than failing the file: a typo in one entry should cost that
+/// entry, not every screen's place. Comments start with `#`.
 pub fn parse(text: &str) -> Vec<Saved> {
     text.lines()
         .map(str::trim)
@@ -208,9 +217,14 @@ pub fn parse(text: &str) -> Vec<Saved> {
             let mut scale = None;
             let mut rotation = Rotation::Normal;
             let mut primary = false;
+            let mut id = None;
             for part in parts {
                 if part == "primary" {
                     primary = true;
+                    continue;
+                }
+                if let Some(value) = part.strip_prefix("id=") {
+                    id = Some(value.to_owned()).filter(|v| !v.is_empty());
                     continue;
                 }
                 match part.strip_prefix("rotate=") {
@@ -223,6 +237,7 @@ pub fn parse(text: &str) -> Vec<Saved> {
             }
             Some(Saved {
                 name: name.to_owned(),
+                id,
                 position,
                 scale,
                 rotation,
@@ -241,7 +256,7 @@ pub fn parse(text: &str) -> Vec<Saved> {
 /// Write the saved layout, in the format [`parse`] reads.
 pub fn to_text(saved: &[Saved]) -> String {
     let mut out = String::from(
-        "# raven outputs: name x,y [scale] [rotate=90] [primary]  -- see huginn docs/outputs.md\n",
+        "# raven outputs: name x,y [scale] [rotate=90] [primary] [id=monitor]  -- see huginn docs/outputs.md\n",
     );
     for entry in saved {
         out.push_str(&entry.name);
@@ -258,6 +273,9 @@ pub fn to_text(saved: &[Saved]) -> String {
         }
         if entry.primary {
             out.push_str(" primary");
+        }
+        if let Some(id) = &entry.id {
+            out.push_str(&format!(" id={id}"));
         }
         out.push('\n');
     }
@@ -292,6 +310,151 @@ pub fn primary(saved: &[Saved]) -> Option<&str> {
 /// Record which way up `name` is.
 pub fn set_rotation(saved: &mut Vec<Saved>, name: &str, rotation: Rotation) {
     entry(saved, name).rotation = rotation;
+}
+
+/// Which monitor an EDID describes: `HPN.36da.1CR1211QZ8`, manufacturer,
+/// product code and serial number.
+///
+/// The serial is the one the monitor prints in its serial descriptor where
+/// it has one, since the numeric field is a placeholder on plenty of them --
+/// HP fill it with `0x01010101` on every unit. Without either the identity is
+/// the model alone, which still tells a laptop panel from a monitor, and two
+/// of the same model apart only by [`rebind`]'s fallback to the connector.
+/// `None` for anything that is not an EDID.
+pub fn identity(edid: &[u8]) -> Option<String> {
+    const HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+    if edid.len() < 128 || edid[..8] != HEADER {
+        return None;
+    }
+    // Three five-bit letters, 'A' as 1.
+    let packed = u16::from_be_bytes([edid[8], edid[9]]);
+    let maker: String = [10, 5, 0]
+        .iter()
+        .map(|shift| char::from(b'@' + ((packed >> shift) & 0x1f) as u8))
+        .collect();
+    let product = u16::from_le_bytes([edid[10], edid[11]]);
+    let numeric = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
+
+    // The four 18-byte descriptors; 0xff is the serial number as text.
+    let printed = edid[54..126]
+        .as_chunks::<18>()
+        .0
+        .iter()
+        .find(|d| d[..3] == [0, 0, 0] && d[3] == 0xff)
+        .map(|d| {
+            d[5..]
+                .iter()
+                .take_while(|b| **b != b'\n')
+                .map(|b| char::from(*b))
+                .collect::<String>()
+                .trim()
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty());
+    let serial = printed.or_else(|| (numeric != 0).then(|| numeric.to_string()));
+
+    let mut id = format!("{maker}.{product:04x}");
+    if let Some(serial) = serial {
+        id.push('.');
+        id.push_str(&serial);
+    }
+    Some(id)
+}
+
+/// Tie the saved entries to the monitors connected now, by identity, and
+/// rename each to the connector its monitor is on. Returns whether anything
+/// changed, so the caller knows to save.
+///
+/// `connected` is every screen up right now, by connector name, with its
+/// [`identity`] where its EDID gave one. After this, looking an entry up by
+/// connector name -- as [`arrange`], [`primary`] and the setters all do --
+/// finds the monitor's own entry whichever connector it came up on:
+///
+/// - An entry is found by its monitor's identity first, so two identical
+///   monitors that swapped connectors overnight keep their own places.
+/// - An entry with no identity yet -- one written before identities were, or
+///   just set by name from Settings -- is claimed by the screen on its
+///   connector, which gives it that screen's identity from then on.
+/// - An entry left holding a connector name that is now some other
+///   monitor's is renamed to its identity, where it waits for its monitor;
+///   one with no identity is stale and dropped.
+///
+/// An identity two connected screens share says nothing about which is which,
+/// and those two are matched by connector name as though they had none.
+pub fn rebind(saved: &mut Vec<Saved>, connected: &[(String, Option<String>)]) -> bool {
+    let before = saved.clone();
+    let shared = |id: &str| {
+        connected
+            .iter()
+            .filter(|(_, other)| other.as_deref() == Some(id))
+            .count()
+            > 1
+    };
+    let connected: Vec<(&str, Option<&str>)> = connected
+        .iter()
+        .map(|(name, id)| (name.as_str(), id.as_deref().filter(|id| !shared(id))))
+        .collect();
+    let present = |id: &str| connected.iter().any(|(_, other)| *other == Some(id));
+
+    // Which connected screen each entry belongs to.
+    let mut owner: Vec<Option<usize>> = vec![None; saved.len()];
+    for (screen, (_, id)) in connected.iter().enumerate() {
+        if let Some(id) = id
+            && let Some(entry) = saved.iter().position(|s| s.id.as_deref() == Some(*id))
+        {
+            owner[entry] = Some(screen);
+        }
+    }
+    for (screen, (name, id)) in connected.iter().enumerate() {
+        if owner.contains(&Some(screen)) {
+            continue;
+        }
+        // A screen with an identity claims only an entry that has none: one
+        // with an identity of its own is some other monitor's. A screen whose
+        // EDID said nothing takes its connector's entry unless that entry's
+        // monitor is connected elsewhere.
+        let claimable = |s: &Saved| match (id, s.id.as_deref()) {
+            (_, None) => true,
+            (None, Some(other)) => !present(other),
+            (Some(_), Some(_)) => false,
+        };
+        if let Some(entry) = saved
+            .iter()
+            .enumerate()
+            .position(|(i, s)| owner[i].is_none() && s.name == *name && claimable(s))
+        {
+            owner[entry] = Some(screen);
+        }
+    }
+
+    let mut keep = vec![true; saved.len()];
+    for (index, entry) in saved.iter_mut().enumerate() {
+        match owner[index] {
+            Some(screen) => {
+                let (name, id) = connected[screen];
+                name.clone_into(&mut entry.name);
+                if let Some(id) = id {
+                    entry.id = Some(id.to_owned());
+                }
+            }
+            None if connected.iter().any(|(name, _)| *name == entry.name) => match &entry.id {
+                Some(id) => entry.name = id.clone(),
+                None => keep[index] = false,
+            },
+            None => {}
+        }
+    }
+    let mut keep = keep.into_iter();
+    saved.retain(|_| keep.next().unwrap_or(true));
+    *saved != before
 }
 
 fn entry<'a>(saved: &'a mut Vec<Saved>, name: &str) -> &'a mut Saved {
@@ -502,6 +665,164 @@ mod tests {
             &[],
         );
         assert_eq!(placed[1], Rect::from_xywh(1920, 0, 1440, 2560));
+    }
+
+    fn bound(name: &str, id: &str, x: i32, y: i32) -> Saved {
+        Saved {
+            id: Some(id.into()),
+            ..at(name, x, y)
+        }
+    }
+
+    fn up(screens: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        screens
+            .iter()
+            .map(|(name, id)| ((*name).to_owned(), id.map(str::to_owned)))
+            .collect()
+    }
+
+    #[test]
+    fn two_identical_monitors_that_swap_connectors_keep_their_own_places() {
+        // Two DisplayLink adapters came up the other way round this boot.
+        let mut saved = vec![
+            Saved {
+                rotation: Rotation::Deg90,
+                ..bound("DVI-I-1", "HPN.36da.QZ8", 0, 0)
+            },
+            Saved {
+                primary: true,
+                ..bound("DVI-I-2", "HPN.36da.QZB", 1080, 0)
+            },
+        ];
+        let changed = rebind(
+            &mut saved,
+            &up(&[
+                ("DVI-I-1", Some("HPN.36da.QZB")),
+                ("DVI-I-2", Some("HPN.36da.QZ8")),
+            ]),
+        );
+        assert!(changed);
+        let qz8 = saved.iter().find(|s| s.name == "DVI-I-2").unwrap();
+        assert_eq!(qz8.id.as_deref(), Some("HPN.36da.QZ8"));
+        assert_eq!(
+            qz8.rotation,
+            Rotation::Deg90,
+            "the turned one is still turned"
+        );
+        assert_eq!(qz8.position, Some(Point::new(0, 0)));
+        assert_eq!(primary(&saved), Some("DVI-I-1"), "main follows the monitor");
+    }
+
+    #[test]
+    fn an_entry_from_before_identities_is_claimed_by_its_connector() {
+        let mut saved = vec![at("HDMI-A-1", 1920, 0)];
+        assert!(rebind(
+            &mut saved,
+            &up(&[("HDMI-A-1", Some("HPN.366c.3CM"))])
+        ));
+        assert_eq!(saved[0].id.as_deref(), Some("HPN.366c.3CM"));
+        assert!(
+            !rebind(&mut saved, &up(&[("HDMI-A-1", Some("HPN.366c.3CM"))])),
+            "settled: nothing to save the second time"
+        );
+    }
+
+    #[test]
+    fn an_absent_monitor_gives_up_its_connector_name_and_waits() {
+        let mut saved = vec![bound("DP-1", "DEL.a0b1.X", -1920, 0)];
+        // Another monitor on the same port.
+        rebind(&mut saved, &up(&[("DP-1", Some("GSM.5b7f.Y"))]));
+        assert_eq!(saved.len(), 1, "a new monitor makes no entry of its own");
+        assert_eq!(saved[0].name, "DEL.a0b1.X");
+        assert!(
+            arrange(&[screen("DP-1", 1920, 1080, false)], &saved)[0].x() == 0,
+            "the stranger is not put where the absent one was"
+        );
+        // And it comes back.
+        rebind(&mut saved, &up(&[("DP-3", Some("DEL.a0b1.X"))]));
+        assert_eq!(saved[0].name, "DP-3");
+        assert_eq!(saved[0].position, Some(Point::new(-1920, 0)));
+    }
+
+    #[test]
+    fn a_stale_entry_with_no_identity_is_dropped_when_its_connector_is_taken() {
+        let mut saved = vec![at("DVI-I-1", 0, 0), bound("DVI-I-2", "A", 1920, 0)];
+        // A's monitor moved to DVI-I-1; the old unnamed DVI-I-1 entry is
+        // nobody's now.
+        rebind(&mut saved, &up(&[("DVI-I-1", Some("A"))]));
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "DVI-I-1");
+        assert_eq!(saved[0].position, Some(Point::new(1920, 0)));
+    }
+
+    #[test]
+    fn a_shared_identity_falls_back_to_connector_names() {
+        let mut saved = vec![
+            bound("DP-1", "X.0001", 0, 0),
+            bound("DP-2", "X.0001", 1920, 0),
+        ];
+        rebind(
+            &mut saved,
+            &up(&[("DP-1", Some("X.0001")), ("DP-2", Some("X.0001"))]),
+        );
+        assert_eq!(saved[0].name, "DP-1");
+        assert_eq!(saved[1].name, "DP-2");
+    }
+
+    #[test]
+    fn the_identity_round_trips() {
+        let saved = vec![Saved {
+            primary: true,
+            ..bound("DVI-I-1", "HPN.36da.1CR1211QZ8", 1, 0)
+        }];
+        let text = to_text(&saved);
+        assert!(text.contains("DVI-I-1 1,0 primary id=HPN.36da.1CR1211QZ8\n"));
+        assert_eq!(parse(&text), saved);
+    }
+
+    fn edid(maker: &str, product: u16, numeric: u32, printed: Option<&str>) -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+        let m: Vec<u16> = maker.bytes().map(|b| u16::from(b - b'@')).collect();
+        e[8..10].copy_from_slice(&((m[0] << 10) | (m[1] << 5) | m[2]).to_be_bytes());
+        e[10..12].copy_from_slice(&product.to_le_bytes());
+        e[12..16].copy_from_slice(&numeric.to_le_bytes());
+        if let Some(printed) = printed {
+            let d = &mut e[72..90];
+            d[3] = 0xff;
+            // Thirteen bytes: a newline ends a shorter one, and one that
+            // fills the field has none.
+            let mut text = printed.as_bytes().to_vec();
+            text.push(b'\n');
+            text.truncate(13);
+            d[5..5 + text.len()].copy_from_slice(&text);
+        }
+        e
+    }
+
+    #[test]
+    fn an_edid_names_its_monitor() {
+        assert_eq!(
+            identity(&edid("HPN", 14042, 0x0101_0101, Some("1CR1211QZ8"))).as_deref(),
+            Some("HPN.36da.1CR1211QZ8"),
+            "the printed serial wins over the placeholder"
+        );
+        assert_eq!(
+            identity(&edid("HPN", 13932, 0x0101_0101, Some("3CM2120B3F   "))).as_deref(),
+            Some("HPN.366c.3CM2120B3F"),
+            "padding trimmed"
+        );
+        assert_eq!(
+            identity(&edid("CMN", 5046, 0, None)).as_deref(),
+            Some("CMN.13b6"),
+            "a laptop panel with no serial is its model"
+        );
+        assert_eq!(
+            identity(&edid("DEL", 1, 42, None)).as_deref(),
+            Some("DEL.0001.42")
+        );
+        assert_eq!(identity(&[0; 128]), None);
+        assert_eq!(identity(&[]), None);
     }
 
     #[test]

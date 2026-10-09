@@ -2303,7 +2303,10 @@ mod tests {
         apps[1].categories = vec!["Development".to_owned()];
         let frecency = Frecency::new();
         let mut launcher = expanded(&apps, &frecency);
-        assert_eq!(launcher.categories(), &[Category::All, Category::Development]);
+        assert_eq!(
+            launcher.categories(),
+            &[Category::All, Category::Development]
+        );
         assert_eq!(
             launcher.press(Key::NextGroup, &apps, &frecency, NOW, CLOCK, STILL),
             Outcome::Redraw
@@ -2927,7 +2930,6 @@ mod tests {
             Outcome::Dismissed
         );
     }
-
 
     #[test]
     fn pinned_applications_are_on_the_foot() {
@@ -4878,7 +4880,8 @@ mod render_tests {
 
         let output = Rect::from_xywh(0, 0, 1920, 1080);
         let icons = Icons::discover(
-            &std::env::var("RAVEN_ICON_THEME").unwrap_or_else(|_| crate::theme::icon_theme().into()),
+            &std::env::var("RAVEN_ICON_THEME")
+                .unwrap_or_else(|_| crate::theme::icon_theme().into()),
         );
         let mut pixmaps = Pixmaps::new();
         let (canvas, layout) =
@@ -5046,4 +5049,3 @@ mod render_tests {
         }
     }
 }
-

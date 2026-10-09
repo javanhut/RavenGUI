@@ -508,6 +508,10 @@ impl Nested {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
                 let key_state = event.state();
+                // Typing is working on the focused screen; see `Huginn::working_output`.
+                if key_state == smithay::backend::input::KeyState::Pressed {
+                    self.state.note_working_here();
+                }
                 // Read before the filter runs: the closure is handed the compositor
                 // state, but working out whose layer this is needs the focus as it
                 // stands now, not as the keystroke may leave it.
@@ -524,49 +528,53 @@ impl Nested {
                 let help_up = self.state.help_open();
                 let dock_menu_open = self.state.dock_menu_is_open();
                 let code = event.key_code();
-                let (resolved, mods_changed) = self
-                    .keyboard
-                    .input_intercept::<_, _>(
+                let (resolved, mods_changed) = self.keyboard.input_intercept::<_, _>(
+                    &mut self.state,
+                    code,
+                    key_state,
+                    |_state, modifiers, handle| {
+                        {
+                            let sym = handle.modified_sym();
+                            // The character the layout produces, so the
+                            // launcher types what the user pressed rather
+                            // than what a US keyboard would have.
+                            let character = sym.key_char();
+                            let launcher = launcher_open.then_some(character);
+                            let help = help_up.then_some(character);
+                            resolve(
+                                key_state,
+                                modifiers,
+                                sym.raw(),
+                                Modes {
+                                    focus_owns_super: owns_super,
+                                    launcher,
+                                    settings_open,
+                                    pinned_open,
+                                    resizing,
+                                    overview,
+                                    locked,
+                                    switcher_open,
+                                    selecting_region,
+                                    help,
+                                    dock_menu_open,
+                                },
+                            )
+                        }
+                    },
+                );
+                let (forward, action) =
+                    self.state
+                        .swallowed_keys
+                        .settle(code.raw(), key_state, resolved);
+                if forward {
+                    self.keyboard.input_forward(
                         &mut self.state,
                         code,
                         key_state,
-                        |_state, modifiers, handle| {
-                            {
-                                let sym = handle.modified_sym();
-                                // The character the layout produces, so the
-                                // launcher types what the user pressed rather
-                                // than what a US keyboard would have.
-                                let character = sym.key_char();
-                                let launcher = launcher_open.then_some(character);
-                                let help = help_up.then_some(character);
-                                resolve(
-                                    key_state,
-                                    modifiers,
-                                    sym.raw(),
-                                    Modes {
-                                        focus_owns_super: owns_super,
-                                        launcher,
-                                        settings_open,
-                                        pinned_open,
-                                        resizing,
-                                        overview,
-                                        locked,
-                                        switcher_open,
-                                        selecting_region,
-                                        help,
-                                        dock_menu_open,
-                                    },
-                                )
-                            }
-                        },
+                        serial,
+                        time,
+                        mods_changed,
                     );
-                let (forward, action) = self
-                    .state
-                    .swallowed_keys
-                    .settle(code.raw(), key_state, resolved);
-                if forward {
-                    self.keyboard
-                        .input_forward(&mut self.state, code, key_state, serial, time, mods_changed);
                 }
                 // Any press that is not an arrow leaves resize mode — the
                 // keymap forwarded it, so this is the only place that knows it

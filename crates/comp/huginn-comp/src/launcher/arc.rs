@@ -220,7 +220,11 @@ pub(super) fn compose(
             label_size,
             sx + nudge,
             sy + px(SLOT) + px(2.0),
-            if chosen { shades().bright } else { crate::theme::text() },
+            if chosen {
+                shades().bright
+            } else {
+                crate::theme::text()
+            },
             Weight::NORMAL,
         );
         layout.hits.push((
@@ -563,11 +567,27 @@ fn draw_search(
     let stack =
         px(22.0) + px(6.0) + input_size * 1.35 + px(6.0) + hint_size * 1.35 + px(14.0) + 1.0;
     let mut y = cy - stack / 2.0 - px(15.0);
-    draw_search_glyph(canvas, cx - px(1.5), y + px(9.0), px(7.5), px(1.6), crate::theme::text());
+    draw_search_glyph(
+        canvas,
+        cx - px(1.5),
+        y + px(9.0),
+        px(7.5),
+        px(1.6),
+        crate::theme::text(),
+    );
     y += px(22.0) + px(6.0);
     if typing {
         let shown = fit_tail(text, launcher.query(), input_size, px(170.0));
-        draw_centred(text, canvas, &shown, input_size, cx, y, shades().bright, EMPHASIS);
+        draw_centred(
+            text,
+            canvas,
+            &shown,
+            input_size,
+            cx,
+            y,
+            shades().bright,
+            EMPHASIS,
+        );
         let width = text.measure_weighted(&shown, input_size, EMPHASIS).0;
         canvas.fill(
             (cx + width / 2.0 + px(2.0)) as usize,
@@ -577,7 +597,16 @@ fn draw_search(
             accent.to_rgba_bytes(),
         );
     } else {
-        draw_centred(text, canvas, "Search", input_size, cx, y, shades().bright, EMPHASIS);
+        draw_centred(
+            text,
+            canvas,
+            "Search",
+            input_size,
+            cx,
+            y,
+            shades().bright,
+            EMPHASIS,
+        );
     }
     y += input_size * 1.35 + px(6.0);
     let found = launcher.results().len() + launcher.file_hits().len();
@@ -748,7 +777,11 @@ fn draw_sidebar(
             label_size,
             label_x as i32,
             (y + (row_h - label_size * 1.35) / 2.0) as i32,
-            if on { shades().bright } else { crate::theme::text() },
+            if on {
+                shades().bright
+            } else {
+                crate::theme::text()
+            },
         );
         if let Some(count) = count {
             let count = count.to_string();
@@ -959,7 +992,14 @@ fn draw_card(
     );
     y += 1.0 + px(14.0);
     for line in &about {
-        text.draw(canvas, line, about_size, x as i32, y as i32, crate::theme::text());
+        text.draw(
+            canvas,
+            line,
+            about_size,
+            x as i32,
+            y as i32,
+            crate::theme::text(),
+        );
         y += about_size * 1.5;
     }
     if !about.is_empty() {
@@ -1044,7 +1084,14 @@ fn draw_card(
             &["window-new-symbolic", "list-add-symbolic"]
         };
         let glyph = px(16.0);
-        if let Some(icon) = symbol(icons, pixmaps, symbols, glyph as u32, density, crate::theme::text()) {
+        if let Some(icon) = symbol(
+            icons,
+            pixmaps,
+            symbols,
+            glyph as u32,
+            density,
+            crate::theme::text(),
+        ) {
             blit_centred(canvas, &icon, x + glyph / 2.0, y + action_h / 2.0);
         }
         let size = px(12.5);

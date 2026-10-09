@@ -413,6 +413,11 @@ struct AppSwitcher {
 
 const APP_SWITCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// How long into the session the arrival of the main screen still moves
+/// focus to it. Long enough for a DisplayLink adapter, whose screens come up
+/// after its manager has started and found them.
+const HOME_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long the wheel is ignored after a notch up takes a window out of the
 /// strip. Longer than the run of events a free-spinning wheel reports for one
 /// flick, and shorter than the gap before anyone deliberately turns it again.
@@ -816,8 +821,15 @@ pub(crate) struct Huginn {
     /// `apply` happened; the backend owes a re-arrange.
     layout_changed: bool,
     /// Focus has been put on the main screen for this session. Done once,
-    /// when the first real screens arrive, and again at every unlock.
+    /// when the main screen arrives -- which on a dock is seconds after the
+    /// laptop's own, DisplayLink's adapters coming up last -- and again at
+    /// every unlock. Set without homing when the person picks a main screen
+    /// mid-session, which is not a request to be moved to it.
     homed: bool,
+    /// The screen the person was working on when the pointer carried focus
+    /// off it, by name, until they click or type where it went. See
+    /// [`Self::working_output`].
+    crossed_from: Option<String>,
 
     /// The keybinding overlay, painted when summoned. `None` when closed.
     help: Option<crate::overlay::Overlay>,
@@ -1286,6 +1298,7 @@ impl Huginn {
             staged_primary: None,
             layout_changed: false,
             homed: false,
+            crossed_from: None,
             focus_ring: std::array::from_fn(|_| {
                 SolidColorBuffer::new((0, 0), crate::theme::accent().to_rgba_f32())
             }),
@@ -2048,9 +2061,17 @@ impl Huginn {
         // just unplugged is invisible and can reach nothing.
         self.pointer_location = self.clamp_pointer(self.pointer_location);
         self.apply_output_geometry();
-        if !self.homed && self.outputs.iter().any(|output| output.output.is_some()) {
+        // Only while the session is starting: a main screen plugged in an hour
+        // later is a dock arriving under somebody already at work, and the
+        // pointer is theirs by then.
+        if !self.homed
+            && self.primary_output().is_some()
+            && self.outputs.iter().any(|output| output.output.is_some())
+        {
             self.homed = true;
-            self.home_to_primary();
+            if self.uptime() < HOME_WINDOW {
+                self.home_to_primary();
+            }
         }
         self.broadcast_outputs();
         // A screen gone is a capture of it stopped; a new mode is a new
@@ -2098,8 +2119,17 @@ impl Huginn {
         if on == self.space.focused_output() {
             return;
         }
+        let left = self.space.focused_output();
         if self.space.focus_output(on) {
             tracing::debug!(output = %self.outputs[on].name, "focus followed the pointer");
+            // Passing through is not working there: the first screen left is
+            // remembered until the person acts somewhere, and coming back to
+            // it is simply being there again.
+            match &self.crossed_from {
+                None => self.crossed_from = self.outputs.get(left).map(|o| o.name.clone()),
+                Some(from) if *from == self.outputs[on].name => self.crossed_from = None,
+                Some(_) => {}
+            }
             // Panels follow focus, so a launcher open on the old screen is
             // about to be drawn on this one — recompose it for this screen's
             // area and density rather than stretching the stale pixels.
@@ -2108,6 +2138,62 @@ impl Huginn {
             self.broadcast_workspaces();
             self.queue_redraw();
         }
+    }
+
+    /// The person clicked or typed on the focused screen: that is where they
+    /// are working now. Not while the strip of windows or the dock's menu is
+    /// up, whose keys and clicks are choosing something to bring back to the
+    /// screen they came from.
+    pub(crate) fn note_working_here(&mut self) {
+        if self.app_switcher.is_none() && !self.dock_menu_is_open() {
+            self.crossed_from = None;
+        }
+    }
+
+    /// The screen the person is working on, which is where an application
+    /// brought back from the dock goes.
+    ///
+    /// Usually the focused screen. Not when the pointer has just carried focus
+    /// across to reach something on another screen: the dock, the cards and
+    /// the strip of put-away windows all live on the main screen, and going
+    /// down to the dock from a monitor beside it is reaching for an
+    /// application to work with there, not deciding to work on the main
+    /// screen. That lasts until the person clicks or types somewhere.
+    pub(crate) fn working_output(&self) -> usize {
+        self.crossed_from
+            .as_deref()
+            .and_then(|name| self.output_index(name))
+            .unwrap_or_else(|| self.space.focused_output())
+    }
+
+    /// Focus the screen the person is working on, for something about to be
+    /// brought to it.
+    fn focus_working_output(&mut self) {
+        let target = self.working_output();
+        self.crossed_from = None;
+        if target != self.space.focused_output() && self.space.focus_output(target) {
+            self.refresh_output_panels();
+            self.broadcast_workspaces();
+        }
+    }
+
+    /// Put the pointer on `id` if it is on another screen than the focused
+    /// one -- as it is after a click on the dock brought a window back beside
+    /// it. Focus follows the pointer between screens, so a pointer left
+    /// behind would take focus straight back to the dock's screen on the
+    /// first nudge, and what is typed next would go there.
+    fn bring_pointer_to(&mut self, id: WindowId) {
+        let focused = self.space.focused_output();
+        if self.space.output_at(self.pointer_point()) == Some(focused) {
+            return;
+        }
+        let Some(rect) = self.space.window(id).map(|window| window.geometry) else {
+            return;
+        };
+        let centre = rect.center();
+        self.pointer_location =
+            self.clamp_pointer((f64::from(centre.x), f64::from(centre.y)).into());
+        self.queue_redraw();
     }
 
     /// Tell every surface which screens it is on.
@@ -2161,12 +2247,15 @@ impl Huginn {
         // An empty list is the correct answer while the lock is still a blank:
         // the backend clears the framebuffer every frame, so no elements means
         // a cleared screen rather than a stale one.
-        if let Some(lock) = &self.lock {
+        //
+        // The lock screen itself is drawn on the main screen alone; the others
+        // stay cleared. One password field is where to type it, and the same
+        // clock and prompt on three monitors is three places to look for it.
+        if self.lock.is_some() {
             let mut out = Vec::new();
-            for (name, surface) in lock.surfaces() {
-                let Some(rect) = self.output_index(name).map(|i| self.outputs[i].rect) else {
-                    continue;
-                };
+            if let Some((name, surface)) = self.lock_shown()
+                && let Some(rect) = self.output_index(name).map(|i| self.outputs[i].rect)
+            {
                 out.push(SceneItem::Surface(surface.wl_surface().clone(), rect));
             }
             return out;
@@ -2722,16 +2811,29 @@ impl Huginn {
     /// worth leaving on a panel that is about to go dark, or about to be
     /// frozen by a suspend.
     pub(crate) fn lock_ready(&self) -> bool {
-        let Some(lock) = self.lock.as_ref() else {
-            return false;
-        };
-        let surfaces = lock.surfaces();
-        lock.client.is_some()
-            && !surfaces.is_empty()
-            && surfaces.len() >= self.outputs.len()
-            && surfaces
-                .iter()
-                .all(|(_, surface)| has_buffer(surface.wl_surface()))
+        self.lock.as_ref().is_some_and(|lock| lock.client.is_some())
+            && self
+                .lock_shown()
+                .is_some_and(|(_, surface)| has_buffer(surface.wl_surface()))
+    }
+
+    /// The lock surface that is drawn, with the name of its screen: the one
+    /// on the main screen, or with none set the screen the panels are on.
+    /// Failing that, any -- a lock screen that has not covered the main
+    /// screen yet is still better shown somewhere than nowhere, since it is
+    /// the only way back in.
+    pub(crate) fn lock_shown(&self) -> Option<(&String, &LockSurface)> {
+        let surfaces = self.lock.as_ref()?.surfaces();
+        let main = self.outputs.get(self.panel_output()).map(|o| &o.name);
+        surfaces
+            .iter()
+            .find(|(name, _)| Some(name) == main)
+            .or_else(|| {
+                surfaces
+                    .iter()
+                    .find(|(name, _)| self.output_index(name).is_some())
+            })
+            .map(|(name, surface)| (name, surface))
     }
 
     /// How long until the screens should go off, while locked; `None` when
@@ -2959,6 +3061,15 @@ impl Huginn {
         &self.layout
     }
 
+    /// Tie the saved layout to the monitors connected now, by their EDID,
+    /// and save it if that changed anything. The backend calls this before
+    /// every arrangement; see `huginn_core::layout::rebind`.
+    pub(crate) fn rebind_output_layout(&mut self, connected: &[(String, Option<String>)]) {
+        if huginn_core::layout::rebind(&mut self.layout, connected) {
+            self.save_layout();
+        }
+    }
+
     /// Start a staged entry for `name` from what is saved for it, so staging
     /// one thing keeps the rest: a scale change keeps the position, and a
     /// position change keeps the scale and the rotation.
@@ -3018,6 +3129,7 @@ impl Huginn {
             huginn_core::layout::set_rotation(&mut self.layout, &entry.name, entry.rotation);
         }
         if let Some(primary) = self.staged_primary.take() {
+            self.homed = true;
             huginn_core::layout::set_primary(&mut self.layout, primary.as_deref());
             self.space.set_primary(self.primary_output());
             // The panels move to it now, not at the next pointer crossing.
@@ -4546,7 +4658,11 @@ impl Huginn {
     /// Bring a minimized window back onto the active workspace as an ordinary
     /// tile, and focus it. See [`Self::accept_app_switcher`] for why not
     /// fullscreen.
+    ///
+    /// Onto the screen the person is working on (see
+    /// [`Self::working_output`]), not the one the dock is on.
     fn restore_window(&mut self, id: huginn_core::window::WindowId) {
+        self.focus_working_output();
         self.space.bring_to_active_workspace(id);
         self.space.unminimize(id);
         if let Some(surface) = self.windows.get(&id) {
@@ -4561,14 +4677,27 @@ impl Huginn {
             surface.send_configure();
         }
         self.restore_motion(id);
+        self.bring_pointer_to(id);
         self.refresh_focus();
     }
 
-    /// Go to a window wherever it is: show its workspace on the focused
-    /// screen, bring it out of the dock if it was put away, and focus it.
-    /// "Go to", not "bring": the window keeps its workspace, which is where
-    /// the person who put it there expects to find it next time.
+    /// Go to a window wherever it is: show its workspace on the screen the
+    /// person is working on, or go to the screen already showing it, and
+    /// focus it. "Go to", not "bring": the window keeps its workspace, which
+    /// is where the person who put it there expects to find it next time.
+    ///
+    /// A window put away is the exception, and is brought back like one from
+    /// the dock, to the screen the person is working on: its workspace may be
+    /// on any screen, and the one place they are looking is their own.
     pub(crate) fn go_to_window(&mut self, id: WindowId) {
+        if self
+            .space
+            .window(id)
+            .is_some_and(|window| window.is_minimized())
+        {
+            self.restore_window(id);
+            return;
+        }
         let Some(index) = self
             .space
             .workspaces()
@@ -4577,20 +4706,14 @@ impl Huginn {
         else {
             return;
         };
+        // A workspace another screen is showing moves focus there; one in the
+        // wings is shown on the screen the person is working on.
+        self.focus_working_output();
         self.space.activate_workspace(index);
-        let was_minimized = self.space.unminimize(id);
-        if was_minimized && let Some(surface) = self.windows.get(&id) {
-            surface.set_fullscreen(false);
-        }
         self.space.active_workspace_mut().focus(id);
         self.share_screen_with(id);
         self.arrange();
-        if was_minimized {
-            if let Some(surface) = self.windows.get(&id) {
-                surface.send_configure();
-            }
-            self.restore_motion(id);
-        }
+        self.bring_pointer_to(id);
         self.refresh_focus();
     }
 
@@ -8498,9 +8621,10 @@ impl Huginn {
         // candidate. Returning `None` while the lock has no surface yet is
         // deliberate -- for those few milliseconds the keystrokes go nowhere at
         // all, which is the only safe place for them to go.
-        if let Some(lock) = &self.lock {
+        if self.lock.is_some() {
             return (
-                lock.surface().map(|s| s.wl_surface().clone().into()),
+                self.lock_shown()
+                    .map(|(_, s)| s.wl_surface().clone().into()),
                 KeyboardOn::Lock,
             );
         }
@@ -9742,12 +9866,6 @@ pub(crate) struct Lock {
 }
 
 impl Lock {
-    /// The surface that takes the keyboard while locked: the first one the
-    /// client made, if it has made any.
-    pub(crate) fn surface(&self) -> Option<&LockSurface> {
-        self.client.as_ref()?.surfaces.first().map(|(_, s)| s)
-    }
-
     /// Every lock surface with the name of the output it covers.
     pub(crate) fn surfaces(&self) -> &[(String, LockSurface)] {
         self.client

@@ -403,9 +403,23 @@ pub(super) fn draw_hints(
                 rim,
             );
         }
-        text.draw(canvas, key, size, (x + pad) as i32, text_y, crate::theme::text());
+        text.draw(
+            canvas,
+            key,
+            size,
+            (x + pad) as i32,
+            text_y,
+            crate::theme::text(),
+        );
         x += key_w + pad;
-        text.draw(canvas, verb, size, x as i32, text_y, crate::theme::text_dim());
+        text.draw(
+            canvas,
+            verb,
+            size,
+            x as i32,
+            text_y,
+            crate::theme::text_dim(),
+        );
         x += verb_w + between;
     }
     Rect::from_xywh(left as i32, y as i32, total as i32, chip_h as i32)

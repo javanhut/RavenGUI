@@ -130,7 +130,14 @@ pub(crate) fn spaces_bar(
     for (index, (name, width)) in names.iter().zip(&widths).enumerate() {
         let (_, text_h) = text.measure(name, size);
         let colour = if index == front {
-            canvas.fill_rounded(x as usize, 0, width.ceil() as usize, h, height * 0.5, pill());
+            canvas.fill_rounded(
+                x as usize,
+                0,
+                width.ceil() as usize,
+                h,
+                height * 0.5,
+                pill(),
+            );
             crate::theme::text()
         } else {
             crate::theme::text_dim()

@@ -62,6 +62,20 @@ reports the result in one step. A saved entry for a screen that is not
 connected waits for it: the monitor placed above the laptop a week ago comes
 back above the laptop.
 
+Each line also carries the monitor's identity from its EDID once it has been
+seen -- manufacturer, product code and serial, as in
+`DVI-I-1 0,0 rotate=90 id=HPN.36da.1CR1211QZ8` -- and that, not the connector
+name, is what the entry belongs to (`huginn_core::layout::rebind`). Connector
+names are not stable: the kernel numbers connectors of one type across every
+DRM device in the order they register, so two DisplayLink adapters come up as
+`DVI-I-1` and `DVI-I-2` in whichever order they finished probing, and a dock's
+`DP-n` move between boots. Before every arrangement each entry is renamed to
+the connector its monitor is on now; an entry whose connector has been taken
+by another monitor is renamed to its identity and waits. An entry with no
+identity -- written before identities were, or just set by name -- is claimed
+by the monitor on its connector. Two connected monitors with the same identity
+(the same model with no serial) are told apart by connector name, as before.
+
 A saved scale overrides the one the panel's size implies, through the same
 integer-advertised, fractional-laid-out policy as the automatic one.
 
@@ -78,8 +92,12 @@ like the rest of the layout, and found again whenever the screens change.
   follow the focused screen, as before.
 - New windows open on the workspace it is showing, and focus goes with them
   (`Space::set_primary`).
-- Focus and the pointer are put on it when the session's first screens
-  arrive and at every unlock.
+- Focus and the pointer are put on it when it arrives at the start of the
+  session -- which with DisplayLink is a few seconds after the laptop's own
+  screens -- and at every unlock.
+- The lock screen is drawn on it alone; the other screens stay black while
+  the session is locked. Without a main display it is drawn on the screen the
+  panels are on.
 - It is numbered 1; the rest follow left to right.
 
 ## Workspaces across screens
@@ -156,6 +174,29 @@ every device, and its output manager cannot drive dumb buffers; both paths
 here share the primary's render path unchanged. Devices come and go with
 udev like connectors do: a dock plugged in brings its screens up, unplugged
 takes them down and the workspaces on them come home.
+
+## The lid
+
+With the lid shut and any other screen connected, the built-in panel is not
+driven: its CRTC is turned off and it leaves the layout, so nothing -- a
+window, the pointer, the dock -- can end up behind the lid. Opening the lid
+brings it back where its saved entry puts it. With nothing else connected it
+stays on, so there is always a screen. The lid is read from libinput's switch
+events, and at start-up from `/proc/acpi/button/lid`, since a laptop booted
+shut in a dock reports nothing until the lid moves.
+
+## Bringing a window back
+
+A window brought back from the dock, the strip of put-away windows, Alt-Tab or
+a notification goes to the screen the person is working on, which is not
+always the focused one. Focus follows the pointer between screens, and the
+dock, the cards and the strip are on the main display: going down to the dock
+from the monitor beside it carries focus across with it. The screen the
+pointer left is remembered until a click on a window or the desktop, or a key
+press, says the person is working where the pointer is now
+(`Huginn::working_output`). The pointer is put on the window it brought back,
+so the next nudge of the mouse does not take focus back to the dock's screen.
+A floating window keeps its place relative to the screen it moves to.
 
 ## Hotplug
 

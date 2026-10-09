@@ -329,7 +329,11 @@ fn compose(
             close as usize,
             close as usize,
             close / 2.0,
-            if on { theme::well_raised() } else { theme::well() },
+            if on {
+                theme::well_raised()
+            } else {
+                theme::well()
+            },
         );
         let glyph_size = CLOSE_GLYPH * scale;
         let (glyph_w, glyph_h) = text.measure("×", glyph_size);

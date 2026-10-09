@@ -416,7 +416,10 @@ pub(crate) fn save_glass_theme(theme: crate::theme::Theme) {
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("desktop.toml");
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("desktop.toml");
             let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
             let result =
                 std::fs::write(&temp, &updated).and_then(|()| std::fs::rename(&temp, &path));
@@ -534,7 +537,10 @@ mod tests {
     #[test]
     fn the_glass_is_black_unless_the_file_names_another() {
         use crate::theme::Theme;
-        assert_eq!(DesktopConfig::parse("").unwrap().glass_theme(), Theme::Black);
+        assert_eq!(
+            DesktopConfig::parse("").unwrap().glass_theme(),
+            Theme::Black
+        );
         let fog = DesktopConfig::parse("[appearance]\nglass_theme = \"fog\"\n").unwrap();
         assert_eq!(fog.glass_theme(), Theme::Fog);
         let odd = DesktopConfig::parse("[appearance]\nglass_theme = \"sepia\"\n").unwrap();
@@ -548,12 +554,15 @@ mod tests {
         let light = DesktopConfig::parse("[appearance]\ntheme_mode = \"light\"\n").unwrap();
         assert_eq!(light.theme_mode(), Mode::Light);
         let auto = DesktopConfig::parse("[appearance]\ntheme_mode = \"auto\"\n").unwrap();
-        assert_eq!(auto.theme_mode(), Mode::Dark, "auto is dark in every Raven app");
+        assert_eq!(
+            auto.theme_mode(),
+            Mode::Dark,
+            "auto is dark in every Raven app"
+        );
         // The mode sits beside the glass rather than replacing it.
-        let both = DesktopConfig::parse(
-            "[appearance]\ntheme_mode = \"light\"\nglass_theme = \"rose\"\n",
-        )
-        .unwrap();
+        let both =
+            DesktopConfig::parse("[appearance]\ntheme_mode = \"light\"\nglass_theme = \"rose\"\n")
+                .unwrap();
         assert_eq!(both.theme_mode(), Mode::Light);
         assert_eq!(both.glass_theme(), crate::theme::Theme::Rose);
     }
@@ -642,8 +651,14 @@ mod tests {
             crate::theme::Theme::Rose
         );
         // A file that does not parse is not rewritten.
-        assert_eq!(with_appearance_key("[appearance\n", "glass_theme", "fog"), None);
-        assert_eq!(with_appearance_key("appearance = 3\n", "glass_theme", "fog"), None);
+        assert_eq!(
+            with_appearance_key("[appearance\n", "glass_theme", "fog"),
+            None
+        );
+        assert_eq!(
+            with_appearance_key("appearance = 3\n", "glass_theme", "fog"),
+            None
+        );
     }
 
     #[test]
