@@ -225,15 +225,23 @@ mod linux {
             "primary" => {
                 let [name] = rest else { usage() };
                 if layout.version() < 7 {
-                    eprintln!("raven-output: this huginn is too old to set a main screen; update RavenGUI and log in again");
+                    eprintln!(
+                        "raven-output: this huginn is too old to set a main screen; update RavenGUI and log in again"
+                    );
                     std::process::exit(1);
                 }
-                let name = if name == "none" { String::new() } else { name.clone() };
+                let name = if name == "none" {
+                    String::new()
+                } else {
+                    name.clone()
+                };
                 layout.set_primary(name);
             }
             "identify" => {
                 if layout.version() < 6 {
-                    eprintln!("raven-output: this huginn is too old to identify screens; update RavenGUI and log in again");
+                    eprintln!(
+                        "raven-output: this huginn is too old to identify screens; update RavenGUI and log in again"
+                    );
                     std::process::exit(1);
                 }
                 layout.identify();
@@ -251,7 +259,9 @@ mod linux {
                     _ => usage(),
                 };
                 if layout.version() < 5 {
-                    eprintln!("raven-output: this huginn is too old to rotate screens; update RavenGUI and log in again");
+                    eprintln!(
+                        "raven-output: this huginn is too old to rotate screens; update RavenGUI and log in again"
+                    );
                     std::process::exit(1);
                 }
                 layout.set_rotation(name.clone(), rotation);

@@ -6388,7 +6388,10 @@ impl Huginn {
         // rubber band had it, and nothing else would ever pull it home: the
         // front stage sat stretched part-way off the screen, the veil and
         // the window sliding with it.
-        let driven = self.swipe.as_ref().is_some_and(|swipe| swipe.position().is_some());
+        let driven = self
+            .swipe
+            .as_ref()
+            .is_some_and(|swipe| swipe.position().is_some());
         let last = self.space.workspaces().len().saturating_sub(1) as f32;
         let instant = self.reduced_motion();
         if !driven && let Some(carousel) = &mut self.workspace_carousel {
@@ -6751,7 +6754,8 @@ impl Huginn {
                 .with_alpha(WORKSPACE_CARD_ALPHA)
                 .to_rgba_f32(),
         );
-        self.overview_veil.set_color(crate::theme::veil().to_rgba_f32());
+        self.overview_veil
+            .set_color(crate::theme::veil().to_rgba_f32());
     }
 
     /// Re-read the installed applications and rebuild what shows them.
