@@ -2122,6 +2122,12 @@ impl Huginn {
         let left = self.space.focused_output();
         if self.space.focus_output(on) {
             tracing::debug!(output = %self.outputs[on].name, "focus followed the pointer");
+            // The dock is the pointer's screen's. One that was up on the
+            // screen just left goes at once, rather than sliding away across
+            // this one; this screen's own comes up from its own bottom edge.
+            if self.app_switcher.is_none() {
+                self.dock.hide_now();
+            }
             // Passing through is not working there: the first screen left is
             // remembered until the person acts somewhere, and coming back to
             // it is simply being there again.
@@ -2150,15 +2156,23 @@ impl Huginn {
         }
     }
 
+    /// A click on the dock, which is on the screen the pointer is on: an
+    /// application brought back from it is meant for this screen, wherever
+    /// the pointer came from.
+    pub(crate) fn note_dock_click(&mut self) {
+        self.crossed_from = None;
+    }
+
     /// The screen the person is working on, which is where an application
     /// brought back from the dock goes.
     ///
     /// Usually the focused screen. Not when the pointer has just carried focus
-    /// across to reach something on another screen: the dock, the cards and
-    /// the strip of put-away windows all live on the main screen, and going
-    /// down to the dock from a monitor beside it is reaching for an
-    /// application to work with there, not deciding to work on the main
-    /// screen. That lasts until the person clicks or types somewhere.
+    /// across to reach something on another screen: the notification cards
+    /// live on the main screen, and going over to one from a monitor beside
+    /// it is reaching for an application to work with there, not deciding to
+    /// work on the main screen. That lasts until the person clicks or types
+    /// somewhere -- the dock included, which is on every screen and belongs
+    /// to the one it was clicked on (see [`Self::dock_output`]).
     pub(crate) fn working_output(&self) -> usize {
         self.crossed_from
             .as_deref()
@@ -3199,6 +3213,26 @@ impl Huginn {
             .collect()
     }
 
+    /// The screen the dock is on: the one the pointer is on, since focus
+    /// follows it between screens. Unlike the other panels it does not stay
+    /// on the main screen. Every screen has a bottom edge to bring it up
+    /// from, and what is clicked on it -- an application brought back, the
+    /// strip of put-away windows -- belongs to the screen it was clicked on.
+    fn dock_output(&self) -> usize {
+        self.space.focused_output().min(self.outputs.len() - 1)
+    }
+
+    /// The dock's screen's rectangle. See [`Self::dock_output`].
+    pub(crate) fn dock_area(&self) -> Rect {
+        self.outputs[self.dock_output()].rect
+    }
+
+    /// The dock's screen's scale: what the dock and its previews are
+    /// composed at.
+    fn dock_scale(&self) -> OutputScale {
+        self.outputs[self.dock_output()].scale
+    }
+
     pub(crate) fn app_switcher_open(&self) -> bool {
         self.app_switcher.is_some()
     }
@@ -3221,7 +3255,7 @@ impl Huginn {
     pub(crate) fn dock_rect(&self) -> Option<Rect> {
         if self.app_switcher.is_some() {
             return Some(crate::dock::centred_placement(
-                self.output_area(),
+                self.dock_area(),
                 self.dock_items.len().max(1),
                 self.dock.prefs(),
             ));
@@ -3231,7 +3265,7 @@ impl Huginn {
             return None;
         }
         Some(crate::dock::placement(
-            self.output_area(),
+            self.dock_area(),
             self.dock_items.len().max(1),
             self.dock.reveal(now),
             self.dock.prefs(),
@@ -3365,7 +3399,7 @@ impl Huginn {
             .position(|act| !matches!(act, DockAct::Action(_)))
             .unwrap_or(rows.len());
         let (offered, desktop) = rows.split_at(split);
-        let (area, density) = (self.output_area(), self.scale().advertised);
+        let (area, density) = (self.dock_area(), self.dock_scale().advertised);
         let bar = self.dock_rect()?;
         let (panel, layout) = crate::dock::menu(
             &mut self.text,
@@ -3552,7 +3586,7 @@ impl Huginn {
             return Some(bar);
         }
         Some(crate::dock::panel_placement(
-            self.output_area(),
+            self.dock_area(),
             self.dock_items.len().max(1),
             self.dock.reveal(self.uptime()),
             self.dock.prefs(),
@@ -3604,7 +3638,7 @@ impl Huginn {
             },
         };
         self.rebuild_dock_previews();
-        let (area, advertised) = (self.output_area(), self.scale().advertised);
+        let (area, advertised) = (self.dock_area(), self.dock_scale().advertised);
         self.dock_panel = (self.app_switcher.is_some() || self.dock.is_visible(self.uptime()))
             .then(|| {
                 crate::dock::render(
@@ -3690,8 +3724,8 @@ impl Huginn {
         // Laid out twice: the captions need the frames' widths to fit under,
         // and the frames need the captions' height to stand above. The second
         // pass changes only where the row sits, not how wide anything is.
-        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area(), 0);
-        let (area, advertised) = (self.output_area(), self.scale().advertised);
+        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.dock_area(), 0);
+        let (area, advertised) = (self.dock_area(), self.dock_scale().advertised);
         let captions: Vec<Option<crate::canvas::Panel>> = sized
             .iter()
             .zip(&frames)
@@ -3704,10 +3738,10 @@ impl Huginn {
         let reserve = captions
             .iter()
             .flatten()
-            .map(|caption| crate::dock::caption_room(caption, self.output_area()))
+            .map(|caption| crate::dock::caption_room(caption, self.dock_area()))
             .max()
             .unwrap_or(0);
-        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.output_area(), reserve);
+        let frames = crate::dock::preview_row(&sizes, anchor, dock, self.dock_area(), reserve);
         self.dock_previews = sized
             .into_iter()
             .zip(frames)
@@ -3717,8 +3751,8 @@ impl Huginn {
                 frame,
                 panel: crate::dock::preview_frame(
                     frame,
-                    self.output_area(),
-                    self.scale().advertised,
+                    self.dock_area(),
+                    self.dock_scale().advertised,
                 ),
                 caption,
             })
@@ -3758,7 +3792,7 @@ impl Huginn {
             Some(crate::dock::item_rect(dock, index, self.dock.prefs()))
         });
         tile.unwrap_or_else(|| {
-            let area = self.output_area();
+            let area = self.dock_area();
             let side = crate::dock::placement(area, 1, 1.0, self.dock.prefs()).h();
             Rect::from_xywh(
                 area.x() + (area.w() - side) / 2,
@@ -4002,11 +4036,11 @@ impl Huginn {
                 offset_y: y - f64::from(placed.y()) * scale,
                 alpha: 1.0,
             };
-            let backing = crate::dock::preview_backing(frame, self.output_area());
+            let backing = crate::dock::preview_backing(frame, self.dock_area());
             out.push(SceneItem::Preview(surface, placed, transform));
             out.push(SceneItem::Overlay(preview.panel.buffer(), backing, 1.0));
             if let Some(caption) = &preview.caption {
-                let below = crate::dock::caption_placement(caption, backing, self.output_area());
+                let below = crate::dock::caption_placement(caption, backing, self.dock_area());
                 out.push(SceneItem::Overlay(caption.buffer(), below, 1.0));
             }
         }
@@ -4027,7 +4061,7 @@ impl Huginn {
         let approaching_dock = self.app_switcher.is_none()
             && self.dock.is_animating(now)
             && crate::dock::placement(
-                self.output_area(),
+                self.dock_area(),
                 self.dock_items.len().max(1),
                 1.0,
                 self.dock.prefs(),
@@ -4037,7 +4071,7 @@ impl Huginn {
         let y = self.pointer_location.y.round() as i32;
         if self.dock.pointer_moved(
             y,
-            self.output_area(),
+            self.dock_area(),
             over_dock || approaching_dock || self.dock_menu.is_some(),
             now,
             motion,

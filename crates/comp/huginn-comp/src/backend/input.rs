@@ -534,6 +534,7 @@ fn shell_press(state: &mut Huginn, button: u32, source: Source) -> Taken {
     // any client is concerned. It has to be asked first, or a click on it
     // falls through to whatever window is behind it.
     if let Some(item) = state.dock_click() {
+        state.note_dock_click();
         // A middle click, or `Ctrl`+click, on an icon opens another window
         // of that application; any other press is the ordinary click that
         // starts or raises it. A touchpad's three-finger tap arrives as a

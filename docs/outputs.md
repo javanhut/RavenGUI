@@ -86,10 +86,14 @@ layout, set from Settings or `raven-output primary DP-1` through
 `raven_output_layout_v1.set_primary` (since version 7). It is kept by name,
 like the rest of the layout, and found again whenever the screens change.
 
-- The dock, launcher, quick settings, notifications and the other
+- The launcher, quick settings, notifications and the other
   compositor-drawn panels stay on it (`Huginn::panel_output`), as does a
   layer-shell bar that did not choose a screen. Without a main display they
   follow the focused screen, as before.
+- The dock does not. It is on whichever screen the pointer is on
+  (`Huginn::dock_output`), comes up from that screen's bottom edge, and the
+  strip of put-away windows opens there too. One that is up when the pointer
+  crosses to another screen goes at once.
 - New windows open on the workspace it is showing, and focus goes with them
   (`Space::set_primary`).
 - Focus and the pointer are put on it when it arrives at the start of the
@@ -187,16 +191,17 @@ shut in a dock reports nothing until the lid moves.
 
 ## Bringing a window back
 
-A window brought back from the dock, the strip of put-away windows, Alt-Tab or
-a notification goes to the screen the person is working on, which is not
-always the focused one. Focus follows the pointer between screens, and the
-dock, the cards and the strip are on the main display: going down to the dock
-from the monitor beside it carries focus across with it. The screen the
-pointer left is remembered until a click on a window or the desktop, or a key
-press, says the person is working where the pointer is now
-(`Huginn::working_output`). The pointer is put on the window it brought back,
-so the next nudge of the mouse does not take focus back to the dock's screen.
-A floating window keeps its place relative to the screen it moves to.
+A window brought back from the dock or the strip of put-away windows opens on
+the screen whose dock was clicked, since the dock is on the screen the pointer
+is on. One brought back from Alt-Tab or a notification goes to the screen the
+person is working on, which is not always the focused one: the cards are on
+the main display, and going over to one from the monitor beside it carries
+focus across with it. The screen the pointer left is remembered until a click
+-- on a window, the desktop or the dock -- or a key press says the person is
+working where the pointer is now (`Huginn::working_output`). The pointer is
+put on a window brought back to another screen, so the next nudge of the mouse
+does not take focus straight back. A floating window keeps its place relative
+to the screen it moves to.
 
 ## Hotplug
 
