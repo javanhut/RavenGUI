@@ -170,6 +170,9 @@ struct Screen {
     submitted_at: Option<Instant>,
     /// This screen's frame-time samples since the last report.
     stats: crate::frametime::FrameStats,
+    /// When the connector first reported nothing connected, while the screen
+    /// is still being driven. See [`UNPLUG_GRACE`].
+    unplugged_at: Option<Instant>,
 }
 
 struct Udev {
@@ -247,6 +250,28 @@ struct Udev {
     /// The built-in panel is connected but left dark for the lid, so opening
     /// it, or the last other screen going, has something to bring back.
     builtin_hidden: bool,
+    /// A rescan is due for a screen whose connector went quiet. See
+    /// [`UNPLUG_GRACE`].
+    unplug_recheck: bool,
+}
+
+/// How long a connector may report nothing connected before its screen is
+/// taken down.
+///
+/// A monitor coming out of standby drops hot-plug detect while it starts up
+/// and raises it again a few hundred milliseconds later. Taken at its word
+/// that is an unplug and a plug: the screen's workspaces go to another screen
+/// and come back, its `wl_output` is withdrawn and a new one made, and a lock
+/// screen that was on it -- the main screen, as a rule -- is drawn on some
+/// other one in between. So the screen is driven on through the gap, and only
+/// a connector still empty when this runs out has been unplugged. A cable
+/// really pulled costs this much longer before its windows come home.
+const UNPLUG_GRACE: Duration = Duration::from_secs(2);
+
+/// Whether a screen whose connector went quiet at `since` is still within
+/// [`UNPLUG_GRACE`] at `now`. One that only just went quiet is.
+fn lingers(since: Option<Instant>, now: Instant) -> bool {
+    since.is_none_or(|since| now.saturating_duration_since(since) < UNPLUG_GRACE)
 }
 
 /// How long a withdrawn `wl_output` global stays bindable before it is
@@ -599,6 +624,7 @@ pub(crate) fn run() -> Result<()> {
         asleep: false,
         lid_closed: lid_closed_now(),
         builtin_hidden: false,
+        unplug_recheck: false,
     };
 
     // Every other DRM device on the seat: the discrete GPU on a hybrid
@@ -1344,6 +1370,35 @@ impl Udev {
         }
     }
 
+    /// Look again once [`UNPLUG_GRACE`] has run out, for the screens being
+    /// driven through a connector that went quiet: whichever are still quiet
+    /// then have been unplugged. One timer however many screens are waiting;
+    /// a screen that went quiet after it was armed is not yet due when it
+    /// fires, and arms the next.
+    fn arm_unplug_recheck(&mut self) {
+        if self.unplug_recheck {
+            return;
+        }
+        let timer = Timer::from_duration(UNPLUG_GRACE);
+        match self.handle.insert_source(timer, |_, _, data: &mut Udev| {
+            data.unplug_recheck = false;
+            if data
+                .screens
+                .values()
+                .any(|screen| screen.unplugged_at.is_some())
+            {
+                data.sync_connectors();
+            }
+            TimeoutAction::Drop
+        }) {
+            Ok(_) => self.unplug_recheck = true,
+            // Nothing would ever look again, and a screen that is not there
+            // would be driven for good. The next rescan finds the mark already
+            // set and, past the grace, takes it down.
+            Err(e) => tracing::warn!(error = %e, "cannot arm the unplug recheck"),
+        }
+    }
+
     fn sync_connectors(&mut self) {
         let mut devices: Vec<libc::dev_t> = self.secondaries.keys().copied().collect();
         devices.insert(0, self.device_id);
@@ -1381,10 +1436,23 @@ impl Udev {
             .filter_map(|handle| device.get_connector(*handle, true).ok())
             .filter(|connector| connector.state() == connector::State::Connected)
             .collect();
+        // Every connector with a monitor on it, before the lid has its say:
+        // a screen missing from this has gone quiet, where one missing only
+        // from `live` below was turned off on purpose.
+        let present: HashSet<connector::Handle> =
+            connected.iter().map(connector::Info::handle).collect();
+        let now = Instant::now();
         // A panel behind a shut lid is left dark, and is not a screen,
-        // whenever something else can be.
+        // whenever something else can be. A screen being driven through a
+        // quiet connector is still something else.
         let builtin = |c: &connector::Info| crate::state::is_builtin_panel(&connector_name(c));
-        let hide = self.hides_builtin(dev, connected.iter().any(|c| !builtin(c)));
+        let lingering = self.screens.iter().any(|(key, screen)| {
+            key.0 == dev
+                && !present.contains(&screen.connector)
+                && !crate::state::is_builtin_panel(&screen.name)
+                && lingers(screen.unplugged_at, now)
+        });
+        let hide = self.hides_builtin(dev, lingering || connected.iter().any(|c| !builtin(c)));
         if connected.iter().any(builtin) {
             if hide != self.builtin_hidden {
                 tracing::info!(
@@ -1407,8 +1475,26 @@ impl Udev {
         // releases the CRTC for the next connector to claim.
         let mut retired = Vec::new();
         let mut changed = false;
+        let mut waiting = false;
         self.screens.retain(|key, screen| {
-            if key.0 != dev || live.contains(&screen.connector) {
+            if key.0 != dev {
+                return true;
+            }
+            if live.contains(&screen.connector) {
+                if screen.unplugged_at.take().is_some() {
+                    tracing::info!(name = %screen.name, "output connected again; it was never taken down");
+                    screen.dirty = true;
+                }
+                return true;
+            }
+            // Gone quiet, not turned off for the lid: driven on for a while
+            // in case it is only waking up. See [`UNPLUG_GRACE`].
+            if !present.contains(&screen.connector) && lingers(screen.unplugged_at, now) {
+                if screen.unplugged_at.is_none() {
+                    tracing::info!(name = %screen.name, "output reports nothing connected; waiting before taking it down");
+                    screen.unplugged_at = Some(now);
+                }
+                waiting = true;
                 return true;
             }
             tracing::info!(name = %screen.name, "output unplugged");
@@ -1418,6 +1504,9 @@ impl Udev {
         });
         for global in retired {
             self.retire_global(global);
+        }
+        if waiting {
+            self.arm_unplug_recheck();
         }
 
         // --- new, or still here but different ---
@@ -1574,6 +1663,7 @@ impl Udev {
                 dirty: true,
                 submitted_at: None,
                 stats: crate::frametime::FrameStats::default(),
+                unplugged_at: None,
             },
         );
         Ok(())
@@ -2584,3 +2674,22 @@ fn send_frames(surface: &WlSurface, time: u32) {
 }
 
 crate::impl_xwm_handler!(Udev);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quiet_connector_is_driven_on_until_the_grace_runs_out() {
+        let now = Instant::now();
+        assert!(lingers(None, now), "it only just went quiet");
+        assert!(lingers(Some(now), now));
+        let waking = now + UNPLUG_GRACE - Duration::from_millis(1);
+        assert!(lingers(Some(now), waking));
+        assert!(!lingers(Some(now), now + UNPLUG_GRACE), "unplugged");
+        assert!(
+            lingers(Some(now + UNPLUG_GRACE), now),
+            "a clock that went back"
+        );
+    }
+}

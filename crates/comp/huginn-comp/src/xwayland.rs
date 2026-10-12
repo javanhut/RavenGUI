@@ -320,6 +320,7 @@ impl Huginn {
         // it. See [`Huginn::share_screen_with`].
         self.share_screen_with(id);
         self.arrange();
+        self.bring_pointer_to(id);
         self.refresh_focus();
         self.queue_redraw();
     }

@@ -949,6 +949,9 @@ pub(crate) struct Huginn {
     pub(crate) pinned: crate::pinned::Pinned,
     pub(crate) pins: crate::pins::Pins,
     pinned_panel: Option<crate::canvas::Panel>,
+    /// The screen the pin bar came up on, by name. See
+    /// [`Self::pinned_output`].
+    pinned_on: Option<String>,
     /// Installed applications, scanned once at startup.
     pub(crate) apps: Vec<raven_desktop::Entry>,
     /// How often each application has been launched.
@@ -1366,6 +1369,7 @@ impl Huginn {
             pinned: crate::pinned::Pinned::default(),
             pins: load_pins(),
             pinned_panel: None,
+            pinned_on: None,
             apps: crate::launcher::scan_applications(),
             frecency: load_frecency(),
             icons: raven_desktop::Icons::discover(crate::theme::icon_theme()),
@@ -2054,9 +2058,6 @@ impl Huginn {
                 .collect(),
         );
         self.outputs = outputs;
-        // Indices move when a monitor comes or goes; the main screen is kept
-        // by name, so it is found again every time.
-        self.space.set_primary(self.primary_output());
         // Somewhere on a screen, always: a pointer left on a monitor that was
         // just unplugged is invisible and can reach nothing.
         self.pointer_location = self.clamp_pointer(self.pointer_location);
@@ -2113,6 +2114,13 @@ impl Huginn {
     /// between screens and only between screens: within one, clicking is
     /// what moves it, as it always has.
     pub(crate) fn pointer_crossed_outputs(&mut self) {
+        // Not under a lock. There is nothing to focus, and with no main
+        // screen the lock screen is drawn on the focused one (see
+        // [`Self::lock_shown`]): following the pointer would carry the
+        // password field from screen to screen behind it.
+        if self.lock.is_some() {
+            return;
+        }
         let Some(on) = self.space.output_at(self.pointer_point()) else {
             return;
         };
@@ -2149,9 +2157,14 @@ impl Huginn {
     /// The person clicked or typed on the focused screen: that is where they
     /// are working now. Not while the strip of windows or the dock's menu is
     /// up, whose keys and clicks are choosing something to bring back to the
-    /// screen they came from.
+    /// screen they came from -- nor the launcher or the pin bar, which are
+    /// choosing something to open there.
     pub(crate) fn note_working_here(&mut self) {
-        if self.app_switcher.is_none() && !self.dock_menu_is_open() {
+        if self.app_switcher.is_none()
+            && !self.dock_menu_is_open()
+            && !self.launcher.is_open()
+            && !self.pinned.is_open()
+        {
             self.crossed_from = None;
         }
     }
@@ -2163,8 +2176,9 @@ impl Huginn {
         self.crossed_from = None;
     }
 
-    /// The screen the person is working on, which is where an application
-    /// brought back from the dock goes.
+    /// The screen the person is working on, which is where a new window
+    /// opens, where the pin bar comes up, and where an application brought
+    /// back from the dock goes.
     ///
     /// Usually the focused screen. Not when the pointer has just carried focus
     /// across to reach something on another screen: the notification cards
@@ -2196,7 +2210,7 @@ impl Huginn {
     /// it. Focus follows the pointer between screens, so a pointer left
     /// behind would take focus straight back to the dock's screen on the
     /// first nudge, and what is typed next would go there.
-    fn bring_pointer_to(&mut self, id: WindowId) {
+    pub(crate) fn bring_pointer_to(&mut self, id: WindowId) {
         let focused = self.space.focused_output();
         if self.space.output_at(self.pointer_point()) == Some(focused) {
             return;
@@ -2366,7 +2380,7 @@ impl Huginn {
             out.push(SceneItem::Overlay(
                 panel.buffer(),
                 crate::pinned::placement(
-                    self.output_area(),
+                    self.pinned_area(),
                     panel.size(),
                     self.pinned.position(),
                     reveal,
@@ -3145,7 +3159,6 @@ impl Huginn {
         if let Some(primary) = self.staged_primary.take() {
             self.homed = true;
             huginn_core::layout::set_primary(&mut self.layout, primary.as_deref());
-            self.space.set_primary(self.primary_output());
             // The panels move to it now, not at the next pointer crossing.
             self.refresh_output_panels();
             self.broadcast_outputs();
@@ -5980,11 +5993,35 @@ impl Huginn {
         }
     }
 
-    /// Open the pin bar where quick settings put it.
+    /// Open the pin bar where quick settings put it, on the screen the
+    /// person is working on.
     pub(crate) fn open_pinned(&mut self) {
         let (clock, motion) = (self.uptime(), self.settings.motion());
+        self.pinned_on = self
+            .outputs
+            .get(self.working_output())
+            .map(|output| output.name.clone());
         self.pinned.open(&self.apps, &self.pins, clock, motion);
         self.refresh_pinned();
+    }
+
+    /// The screen the pin bar is on: the one the person was working on when
+    /// it was opened (see [`Self::working_output`]), and it stays there until
+    /// it is closed. Like the dock and unlike the other panels it is not
+    /// kept on the main screen -- what is opened from it opens where it was
+    /// asked for. Kept by name, since indices move when a monitor comes or
+    /// goes; a bar whose screen went is drawn on the focused one.
+    fn pinned_output(&self) -> usize {
+        self.pinned_on
+            .as_deref()
+            .and_then(|name| self.output_index(name))
+            .unwrap_or_else(|| self.space.focused_output())
+            .min(self.outputs.len() - 1)
+    }
+
+    /// The pin bar's screen's rectangle. See [`Self::pinned_output`].
+    fn pinned_area(&self) -> Rect {
+        self.outputs[self.pinned_output()].rect
     }
 
     /// Apply a keystroke to the pin bar, and act on what it asks for.
@@ -6004,7 +6041,7 @@ impl Huginn {
         }
         let panel = self.pinned_panel.as_ref()?;
         let placed = crate::pinned::placement(
-            self.output_area(),
+            self.pinned_area(),
             panel.size(),
             self.pinned.position(),
             self.pinned.reveal(self.uptime()),
@@ -6065,7 +6102,8 @@ impl Huginn {
 
     /// Redraw the pin bar, or drop it when it is closed.
     pub(crate) fn refresh_pinned(&mut self) {
-        let (area, advertised) = (self.output_area(), self.scale().advertised);
+        let screen = &self.outputs[self.pinned_output()];
+        let (area, advertised) = (screen.rect, screen.scale.advertised);
         // A pinned application that is running says so, with the mark the
         // dock uses for the same fact — and from the same list.
         let running = self.running_app_ids();
@@ -6375,7 +6413,7 @@ impl Huginn {
         // [`crate::pinned::Pinned::blur_region`].
         if let Some(panel) = self.pinned_panel.as_ref() {
             return self.pinned.blur_region(crate::pinned::placement(
-                self.output_area(),
+                self.pinned_area(),
                 panel.size(),
                 self.pinned.position(),
                 self.pinned.reveal(clock),
@@ -7739,9 +7777,18 @@ impl Huginn {
     /// handler and this is not; both take a `WindowId` from the core and record
     /// the surface against it.
     pub(crate) fn open_x11_window(&mut self, window: WindowSurface) -> WindowId {
-        let id = self.space.open_window();
+        let id = self.open_window_here();
         self.windows.insert(id, window);
         id
+    }
+
+    /// Take a place in the layout for a window a client just made: on the
+    /// screen the person is working on (see [`Self::working_output`]), not
+    /// the main one. Whoever calls this owes [`Self::bring_pointer_to`] once
+    /// the window has been laid out.
+    fn open_window_here(&mut self) -> WindowId {
+        self.focus_working_output();
+        self.space.open_window()
     }
 
     /// Drop an X11 window out of the layout and re-run the passes that depend
@@ -9163,7 +9210,7 @@ impl XdgShellHandler for Huginn {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let id = self.space.open_window();
+        let id = self.open_window_here();
         // Before the surface is recorded against the id, not after: giving the
         // screen back refreshes focus, and a window already in `self.windows`
         // would be configured there — an extra configure, carrying no size,
@@ -9212,6 +9259,7 @@ impl XdgShellHandler for Huginn {
         // commit, so a window that never gets one simply never appears.
         surface.send_configure();
 
+        self.bring_pointer_to(id);
         self.refresh_focus();
     }
 

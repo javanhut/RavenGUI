@@ -94,14 +94,17 @@ like the rest of the layout, and found again whenever the screens change.
   (`Huginn::dock_output`), comes up from that screen's bottom edge, and the
   strip of put-away windows opens there too. One that is up when the pointer
   crosses to another screen goes at once.
-- New windows open on the workspace it is showing, and focus goes with them
-  (`Space::set_primary`).
+- Nor does the pin bar. It comes up on the screen the person is working on
+  (`Huginn::pinned_output`) and stays there until it is closed.
+- New windows do not open on it either, but on the screen the person is
+  working on: see [Where a window opens](#where-a-window-opens).
 - Focus and the pointer are put on it when it arrives at the start of the
   session -- which with DisplayLink is a few seconds after the laptop's own
   screens -- and at every unlock.
 - The lock screen is drawn on it alone; the other screens stay black while
-  the session is locked. Without a main display it is drawn on the screen the
-  panels are on.
+  the session is locked. Without a main display it is drawn on the screen
+  that was focused when the session was locked: focus does not follow the
+  pointer under a lock, so it stays there.
 - It is numbered 1; the rest follow left to right.
 
 ## Workspaces across screens
@@ -189,6 +192,19 @@ stays on, so there is always a screen. The lid is read from libinput's switch
 events, and at start-up from `/proc/acpi/button/lid`, since a laptop booted
 shut in a dock reports nothing until the lid moves.
 
+## Where a window opens
+
+On the screen the person is working on (`Huginn::working_output`), whichever
+one is main: a terminal asked for on the third monitor opens on the third
+monitor. That is the focused screen, with the one exception described under
+[Bringing a window back](#bringing-a-window-back) -- the launcher is on the
+main display, and going over to it from the monitor beside it to click an
+application is asking for that application back where the person came from.
+Keys and clicks in the launcher and the pin bar are choosing something to
+open, not working on the screen they happen to be drawn on, so neither
+changes which screen that is. The pointer is put on a window that opened on
+another screen than the one it was on, for the reason given there.
+
 ## Bringing a window back
 
 A window brought back from the dock or the strip of put-away windows opens on
@@ -208,7 +224,15 @@ to the screen it moves to.
 A monitor plugged in gets a workspace of its own — the first one nobody is
 looking at — and comes up as a desktop, not a blank. A monitor unplugged sends
 its workspaces to the screen that remains with their windows and focus intact;
-the pointer, if it was there, is moved to the nearest screen. A monitor
+the pointer, if it was there, is moved to the nearest screen.
+
+Unplugged means still unplugged two seconds later (`UNPLUG_GRACE` in
+`backend/udev.rs`). A monitor coming out of standby drops hot-plug detect
+while it starts up and raises it again a few hundred milliseconds later, and
+taken at its word that is its workspaces sent away and brought back, its
+`wl_output` replaced, and a lock screen that was on it drawn on some other
+screen in between. Its screen is driven on through the gap instead. A device
+that goes -- a dock pulled out -- takes its screens with it at once. A monitor
 swapped on a live cable (a KVM, a different display on the same port) keeps
 its `wl_output` and gets a mode event. With no screens at all the last layout
 is kept so nothing is resized to zero and back.

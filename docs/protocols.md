@@ -139,7 +139,7 @@ Exactly one of the two events is sent. The result is shaped for
 | `set_position(name, x, y)` | request. Stage where a screen's top-left corner goes, in logical pixels. |
 | `set_scale(name, scale)` | request. Stage an effective scale for a screen; 0 returns it to the one derived from its size. |
 | `set_rotation(name, rotation)` | request, since 5. Stage which way up a screen is: 0–3, quarter turns counter-clockwise, as `wl_output.transform` numbers them. |
-| `set_primary(name)` | request, since 7. Stage the main screen — panels stay on it, new windows open there, focus starts there, and it is numbered 1. An empty name stages none. |
+| `set_primary(name)` | request, since 7. Stage the main screen — panels and the lock screen stay on it, focus starts there, and it is numbered 1. An empty name stages none. |
 | `identify()` | request, since 6. Every screen shows its number (left to right, then top to bottom, from 1) in a badge in its corner for a few seconds. Changes and saves nothing. |
 | `apply()` | request. Apply every staged change at once, save the result, and report the new geometry. A name that matches no connected screen is saved for when it connects. |
 | `output(name, x, y, width, height, scale, physical_width, physical_height, mm_width, mm_height, focused)` | event. One per screen, followed by `done`. Sent on creation and again whenever the set of screens or their geometry changes. |
