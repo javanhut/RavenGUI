@@ -13,7 +13,7 @@ the pointer is one point in it and crosses between screens where they touch.
 Workspaces belong to screens. Each screen shows one of them, no workspace
 shows on two screens, and the *focused* screen is the one whose workspace is
 active — where new windows open, where `Super+Ctrl` bindings act, where the
-shell's own panels (dock, launcher, quick settings, volume) sit. Focus follows
+dock, the launcher and the pin bar come up. Focus follows
 the pointer between screens and only between screens; within one, clicking
 moves it as it always has.
 
@@ -86,16 +86,18 @@ layout, set from Settings or `raven-output primary DP-1` through
 `raven_output_layout_v1.set_primary` (since version 7). It is kept by name,
 like the rest of the layout, and found again whenever the screens change.
 
-- The launcher, quick settings, notifications and the other
-  compositor-drawn panels stay on it (`Huginn::panel_output`), as does a
-  layer-shell bar that did not choose a screen. Without a main display they
-  follow the focused screen, as before.
+- Quick settings, notifications, the volume and brightness readouts and the
+  other fixed compositor-drawn panels stay on it (`Huginn::panel_output`), as
+  does a layer-shell bar that did not choose a screen. Without a main display
+  they follow the focused screen, as before.
 - The dock does not. It is on whichever screen the pointer is on
   (`Huginn::dock_output`), comes up from that screen's bottom edge, and the
   strip of put-away windows opens there too. One that is up when the pointer
   crosses to another screen goes at once.
-- Nor does the pin bar. It comes up on the screen the person is working on
-  (`Huginn::pinned_output`) and stays there until it is closed.
+- Nor do the launcher and the pin bar. Each comes up on the screen the
+  person is working on (`Huginn::launcher_output`, `Huginn::pinned_output`)
+  and stays there until it is closed: they are asked for from wherever the
+  person is, and behave the same on every screen.
 - New windows do not open on it either, but on the screen the person is
   working on: see [Where a window opens](#where-a-window-opens).
 - Focus and the pointer are put on it when it arrives at the start of the
@@ -197,13 +199,12 @@ shut in a dock reports nothing until the lid moves.
 On the screen the person is working on (`Huginn::working_output`), whichever
 one is main: a terminal asked for on the third monitor opens on the third
 monitor. That is the focused screen, with the one exception described under
-[Bringing a window back](#bringing-a-window-back) -- the launcher is on the
-main display, and going over to it from the monitor beside it to click an
-application is asking for that application back where the person came from.
-Keys and clicks in the launcher and the pin bar are choosing something to
-open, not working on the screen they happen to be drawn on, so neither
-changes which screen that is. The pointer is put on a window that opened on
-another screen than the one it was on, for the reason given there.
+[Bringing a window back](#bringing-a-window-back). The launcher and the pin
+bar come up on that screen too and stay on it, and keys and clicks in them
+are choosing something to open, not working on whichever screen the pointer
+has wandered to since, so neither changes which screen that is. The pointer
+is put on a window that opened on another screen than the one it was on, for
+the reason given there.
 
 ## Bringing a window back
 

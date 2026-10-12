@@ -943,6 +943,9 @@ pub(crate) struct Huginn {
     /// frame — a search field repainted at the refresh rate is how one ends up
     /// feeling slower than the typing that drives it.
     launcher_panel: Option<crate::canvas::Panel>,
+    /// The screen the launcher came up on, by name. See
+    /// [`Self::launcher_output`].
+    launcher_on: Option<String>,
     /// The pin bar, the pins it shows, and its pixels. The pins are
     /// held here rather than in the panel because three things write them:
     /// the panel, the launcher's menu, and quick settings.
@@ -1366,6 +1369,7 @@ impl Huginn {
             file_index_requests: None,
             file_index_built: None,
             launcher_panel: None,
+            launcher_on: None,
             pinned: crate::pinned::Pinned::default(),
             pins: load_pins(),
             pinned_panel: None,
@@ -1679,9 +1683,7 @@ impl Huginn {
             // as a global rect when the launcher opened. The dock has moved
             // with the focused output, so re-aim before re-placing — the old
             // rect can point at another screen entirely.
-            let origin = self
-                .dock_rect()
-                .map(|dock| crate::dock::item_rect(dock, 0, self.dock.prefs()));
+            let origin = self.launcher_origin();
             self.launcher.set_origin(origin);
             self.refresh_launcher();
         }
@@ -1955,10 +1957,13 @@ impl Huginn {
 
     /// The panel screen's rectangle, before panels reserve any of it.
     ///
-    /// The panel screen is the one the shell's own panels sit on -- the dock,
-    /// the launcher, quick settings, notifications. With a main screen set it
-    /// is that one, and they stay there; without, it is the focused screen
-    /// and they follow the pointer between screens.
+    /// The panel screen is the one the shell's own fixed panels sit on --
+    /// quick settings, notifications, the volume and brightness readouts.
+    /// With a main screen set it is that one, and they stay there; without,
+    /// it is the focused screen and they follow the pointer between screens.
+    /// The dock, the launcher and the pin bar are not among them: see
+    /// [`Self::dock_output`], [`Self::launcher_output`] and
+    /// [`Self::pinned_output`].
     pub(crate) fn output_area(&self) -> Rect {
         self.outputs[self.panel_output()].rect
     }
@@ -2144,9 +2149,10 @@ impl Huginn {
                 Some(from) if *from == self.outputs[on].name => self.crossed_from = None,
                 Some(_) => {}
             }
-            // Panels follow focus, so a launcher open on the old screen is
-            // about to be drawn on this one — recompose it for this screen's
-            // area and density rather than stretching the stale pixels.
+            // Without a main screen the panels follow focus, so quick
+            // settings open on the old screen is about to be drawn on this
+            // one — recompose it for this screen's area and density rather
+            // than stretching the stale pixels.
             self.refresh_output_panels();
             self.refresh_focus();
             self.broadcast_workspaces();
@@ -2177,8 +2183,8 @@ impl Huginn {
     }
 
     /// The screen the person is working on, which is where a new window
-    /// opens, where the pin bar comes up, and where an application brought
-    /// back from the dock goes.
+    /// opens, where the launcher and the pin bar come up, and where an
+    /// application brought back from the dock goes.
     ///
     /// Usually the focused screen. Not when the pointer has just carried focus
     /// across to reach something on another screen: the notification cards
@@ -2357,7 +2363,7 @@ impl Huginn {
             out.push(SceneItem::Overlay(
                 panel.buffer(),
                 crate::launcher::placement(
-                    self.output_area(),
+                    self.launcher_area(),
                     panel.size(),
                     self.launcher.origin(),
                     reveal,
@@ -2371,7 +2377,7 @@ impl Huginn {
             let shade = f32::from(crate::theme::backdrop()) / 255.0;
             out.push(SceneItem::Ring(
                 &self.launcher_backdrop,
-                self.output_area(),
+                self.launcher_area(),
                 reveal.clamp(0.0, 1.0) * shade,
             ));
         }
@@ -5772,7 +5778,8 @@ impl Huginn {
         }
     }
 
-    /// Open the launcher, growing it out of the dock's launcher icon.
+    /// Open the launcher on the screen the person is working on, growing it
+    /// out of the dock's launcher icon.
     ///
     /// The origin is only taken when the dock is actually on screen — §4 asks
     /// for the motion to start at the icon, and starting it off the bottom of
@@ -5780,9 +5787,11 @@ impl Huginn {
     /// cannot follow. Without one it grows in place from the centre.
     pub(crate) fn open_launcher(&mut self) {
         self.request_file_index_if_stale();
-        let origin = self
-            .dock_rect()
-            .map(|dock| crate::dock::item_rect(dock, 0, self.dock.prefs()));
+        self.launcher_on = self
+            .outputs
+            .get(self.working_output())
+            .map(|output| output.name.clone());
+        let origin = self.launcher_origin();
         let (now, clock, motion) = (self.now(), self.uptime(), self.settings.motion());
         self.launcher.set_pinned(self.pins.paths().to_vec());
         self.launcher.set_style(self.settings.launcher_style());
@@ -5792,6 +5801,37 @@ impl Huginn {
         // choice; the highlight starts on the best match all the same.
         self.launcher_pointer_at = Some(self.pointer_location);
         self.refresh_launcher();
+    }
+
+    /// The screen the launcher is on: the one the person was working on when
+    /// it was opened (see [`Self::working_output`]), and it stays there until
+    /// it is closed. Like the pin bar and unlike quick settings it is not
+    /// kept on the main screen -- it is asked for from wherever the person
+    /// is, and what it opens opens there. Kept by name, since indices move
+    /// when a monitor comes or goes; one whose screen went is drawn on the
+    /// focused one.
+    fn launcher_output(&self) -> usize {
+        self.launcher_on
+            .as_deref()
+            .and_then(|name| self.output_index(name))
+            .unwrap_or_else(|| self.space.focused_output())
+            .min(self.outputs.len() - 1)
+    }
+
+    /// The launcher's screen's rectangle. See [`Self::launcher_output`].
+    fn launcher_area(&self) -> Rect {
+        self.outputs[self.launcher_output()].rect
+    }
+
+    /// The dock's launcher icon, for the launcher to grow out of -- when the
+    /// dock is up, and on the launcher's screen. The dock goes with the
+    /// pointer, and an icon on another screen is no place to grow from.
+    fn launcher_origin(&self) -> Option<Rect> {
+        if self.dock_output() != self.launcher_output() {
+            return None;
+        }
+        self.dock_rect()
+            .map(|dock| crate::dock::item_rect(dock, 0, self.dock.prefs()))
     }
 
     /// Apply a keystroke to the launcher, and act on what it asks for.
@@ -5817,7 +5857,7 @@ impl Huginn {
         }
         let panel = self.launcher_panel.as_ref()?;
         let placed = crate::launcher::placement(
-            self.output_area(),
+            self.launcher_area(),
             panel.size(),
             self.launcher.origin(),
             self.launcher.reveal(self.uptime()),
@@ -6406,7 +6446,7 @@ impl Huginn {
         // reveal (see [`Self::blur_radius`]), so it eases in and out with
         // the panel.
         if self.launcher_panel.is_some() {
-            return Some(self.output_area());
+            return Some(self.launcher_area());
         }
         // The pin bar blurs its rail rather than its canvas: the canvas is
         // rail, menu and the transparent air between them. See
@@ -7152,7 +7192,8 @@ impl Huginn {
     /// frame: composing it walks the result list and shapes a string per row,
     /// which is cheap once per keystroke and wasteful sixty times a second.
     pub(crate) fn refresh_launcher(&mut self) {
-        let (area, advertised) = (self.output_area(), self.scale().advertised);
+        let screen = &self.outputs[self.launcher_output()];
+        let (area, advertised) = (screen.rect, screen.scale.advertised);
         // A no-op when the size is unchanged.
         self.launcher_backdrop.resize((area.w(), area.h()));
         self.launcher
