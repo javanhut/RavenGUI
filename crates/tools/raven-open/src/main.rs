@@ -5,6 +5,7 @@
 //! raven-open ~/Downloads/report.pdf  # the default PDF viewer
 //! raven-open .                       # the file manager
 //! raven-open --dry-run notes.md      # say what would run, run nothing
+//! raven-open --terminal ~/src        # Raven's terminal, in that folder
 //! ```
 //!
 //! One binary, installed under the names other programs call: `xdg-open`,
@@ -33,9 +34,11 @@ mod status {
 
 const OPEN_USAGE: &str = "\
 usage: raven-open [--dry-run] <file | URL>
+       raven-open [--dry-run] --terminal [folder]
 
 Opens a file, folder or URL with the application chosen for it.
 
+  -t, --terminal  open Raven's terminal in the folder (default: here)
   -n, --dry-run   print what would be run, and run nothing
   -h, --help      this text
       --version   the version
@@ -83,6 +86,7 @@ fn open(
     err: &mut dyn Write,
 ) -> u8 {
     let mut dry_run = false;
+    let mut terminal = false;
     let mut targets = Vec::new();
     let mut options_done = false;
     for arg in args {
@@ -95,12 +99,16 @@ fn open(
             }
             "--version" => return version(name, out),
             "-n" | "--dry-run" => dry_run = true,
+            "-t" | "--terminal" => terminal = true,
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 let _ = writeln!(err, "{name}: unknown option {flag}\n\n{OPEN_USAGE}");
                 return status::USAGE;
             }
             _ => targets.push(arg),
         }
+    }
+    if terminal {
+        return open_terminal(name, &targets, env, cwd, dry_run, out, err);
     }
     // One thing at a time, as xdg-open takes: several would each need a
     // choice, and a partial failure has no exit status that means anything.
@@ -148,6 +156,54 @@ fn open(
             err,
             "{name}: opened, but could not remember {id} for {mime}: {e}"
         );
+    }
+    status::OK
+}
+
+/// `--terminal [folder]`: the desktop's terminal with a shell in `folder`,
+/// or in the current directory when none is given. A file stands for the
+/// folder it is in, so "a terminal here" works on whatever was selected.
+fn open_terminal(
+    name: &str,
+    targets: &[&String],
+    env: &Env,
+    cwd: &Path,
+    dry_run: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let dir = match targets {
+        [] => cwd.to_path_buf(),
+        [one] => cwd.join(one),
+        _ => {
+            let _ = writeln!(err, "{OPEN_USAGE}");
+            return status::USAGE;
+        }
+    };
+    let dir = match std::fs::metadata(&dir) {
+        Ok(meta) if meta.is_dir() => dir,
+        Ok(_) => match dir.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => dir,
+        },
+        Err(e) => {
+            let _ = writeln!(err, "{name}: {}: {e}", dir.display());
+            return status::MISSING;
+        }
+    };
+    let terminal = raven_open::launch::chosen_terminal(env);
+    let Some(argv) = raven_open::launch::terminal_argv(&terminal, &dir) else {
+        let _ = writeln!(err, "{name}: {}: path is not valid UTF-8", dir.display());
+        return status::FAILED;
+    };
+    if dry_run {
+        let _ = writeln!(out, "run:   {}", argv.join(" "));
+        let _ = writeln!(out, "in:    {}", dir.display());
+        return status::OK;
+    }
+    if let Err(e) = raven_open::launch::spawn_in(&argv, &dir) {
+        let _ = writeln!(err, "{name}: could not start {}: {e}", argv[0]);
+        return status::FAILED;
     }
     status::OK
 }
@@ -237,5 +293,38 @@ mod tests {
         assert_eq!(code(&["--bogus", "x"]), status::USAGE);
         assert_eq!(code(&["missing.txt"]), status::MISSING);
         assert_eq!(code(&["gopher://x"]), status::NO_TOOL);
+    }
+
+    #[test]
+    fn terminal_opens_in_the_named_folder_or_the_one_holding_a_file() {
+        let (root, env) = system("terminal");
+        let dir = root.join("My Project");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "x").unwrap();
+        let run = |a: &[&str]| capture(|o, e| open("raven-open", &args(a), &env, &root, o, e));
+
+        let (code, out, _) = run(&["-n", "--terminal", "My Project"]);
+        assert_eq!(code, status::OK);
+        let expected = format!("run:   raven-terminal --working-directory {}", dir.display());
+        assert_eq!(out.lines().next(), Some(expected.as_str()));
+
+        let (_, out, _) = run(&["-n", "-t", "My Project/notes.md"]);
+        assert_eq!(out.lines().next(), Some(expected.as_str()));
+
+        let (_, out, _) = run(&["-n", "-t"]);
+        assert!(out.contains(&root.display().to_string()), "{out}");
+
+        assert_eq!(run(&["-n", "-t", "nowhere"]).0, status::MISSING);
+        assert_eq!(run(&["-t", "a", "b"]).0, status::USAGE);
+
+        // The terminal chosen in the desktop settings is started in the folder.
+        std::fs::create_dir_all(env.config_home.join("raven")).unwrap();
+        std::fs::write(
+            env.config_home.join("raven/desktop.toml"),
+            "[general]\nterminal = \"kitty\"\n",
+        )
+        .unwrap();
+        let (_, out, _) = run(&["-n", "-t", "My Project"]);
+        assert_eq!(out, format!("run:   kitty\nin:    {}\n", dir.display()));
     }
 }

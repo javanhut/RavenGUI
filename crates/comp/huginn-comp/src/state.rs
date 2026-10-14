@@ -53,7 +53,10 @@ use smithay::{
         wayland_server::{
             Client, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
-            protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
+            protocol::{
+                wl_buffer, wl_data_device_manager::DndAction, wl_data_source::WlDataSource,
+                wl_output::WlOutput, wl_seat, wl_surface::WlSurface,
+            },
         },
     },
     utils::Serial,
@@ -83,7 +86,7 @@ use smithay::{
             SelectionHandler,
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-                set_data_device_focus,
+                default_action_chooser, set_data_device_focus,
             },
         },
         session_lock::{LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker},
@@ -637,6 +640,9 @@ pub(crate) struct Huginn {
     greeter: bool,
     /// What the focused client last asked the cursor to look like.
     pub cursor_status: CursorImageStatus,
+    /// The icon a client's drag carries under the pointer, from
+    /// `start_drag` until the drop. See [`crate::dnd`].
+    pub(crate) dnd_icon: Option<crate::dnd::DndIcon>,
     /// Keyboards whose LEDs the compositor drives, and what they should show.
     ///
     /// In a session the kernel stops driving caps lock — the VT is in raw
@@ -1259,6 +1265,7 @@ impl Huginn {
             greeter: hosting_greeter(),
             // Default until a client sets its own on pointer enter.
             cursor_status: CursorImageStatus::default_named(),
+            dnd_icon: None,
             keyboard_led_devices: Vec::new(),
             keyboard_led_state: LedState::default(),
             space: {
@@ -2606,6 +2613,19 @@ impl Huginn {
         // where anybody can see it.
         if self.lock.is_some() {
             return out;
+        }
+
+        // A drag icon is on screen but not in the scene, which must not hold
+        // it: the scene is also what the pointer hits, and the icon is always
+        // right under the pointer.
+        if let Some(icon) = self.dnd_icon.as_ref().filter(|icon| icon.alive()) {
+            let origin = icon.origin(self.pointer_location);
+            let bbox = smithay::desktop::utils::bbox_from_surface_tree(&icon.surface, origin);
+            let rect = Rect::new(
+                huginn_core::geometry::Point::new(bbox.loc.x, bbox.loc.y),
+                Size::new(bbox.size.w, bbox.size.h),
+            );
+            out.push((icon.surface.clone(), rect));
         }
 
         out.extend(
@@ -8916,6 +8936,22 @@ impl CompositorHandler for Huginn {
             self.begin_close_ghost(id);
         }
 
+        // A drag icon moves by the offset attached with each of its buffers,
+        // which nothing else reads: smithay leaves it to the compositor.
+        if let Some(icon) = self.dnd_icon.as_mut().filter(|icon| &icon.surface == surface) {
+            let delta = with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .buffer_delta
+                    .take()
+            });
+            if let Some(delta) = delta {
+                icon.offset += delta;
+            }
+        }
+
         on_commit_buffer_handler::<Self>(surface);
         self.queue_redraw();
         // A window being captured has something new to capture, whether or
@@ -9516,9 +9552,33 @@ impl DataDeviceHandler for Huginn {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
     }
+
+    /// Ctrl copies and Shift moves, whichever window the drop lands on: the
+    /// target may not be focused, and then it cannot see the modifiers to
+    /// choose by itself. See [`crate::dnd`].
+    fn action_choice(&mut self, available: DndAction, preferred: DndAction) -> DndAction {
+        let held = self
+            .seat
+            .get_keyboard()
+            .map(|keyboard| keyboard.modifier_state())
+            .and_then(|mods| crate::dnd::modifier_action(mods.ctrl, mods.shift, available));
+        held.unwrap_or_else(|| default_action_chooser(available, preferred))
+    }
 }
 
-impl ClientDndGrabHandler for Huginn {}
+impl ClientDndGrabHandler for Huginn {
+    fn started(&mut self, _source: Option<WlDataSource>, icon: Option<WlSurface>, _seat: Seat<Self>) {
+        self.dnd_icon = icon.map(crate::dnd::DndIcon::new);
+        self.queue_redraw();
+    }
+
+    /// Every drag ends here, dropped or cancelled, so this is where the
+    /// icon goes.
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.dnd_icon = None;
+        self.queue_redraw();
+    }
+}
 impl ServerDndGrabHandler for Huginn {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
 }

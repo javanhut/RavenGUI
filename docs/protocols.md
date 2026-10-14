@@ -23,7 +23,7 @@ For how to actually use these, see `docs/integration.md`.
 | `wl_seat` | keyboard and pointer |
 | `wp_cursor_shape_manager_v1` | a client names its cursor and the compositor draws it from the system theme, at the screen's density |
 | `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1` | pointer confinement and lock with unbounded relative motion; used by games, XWayland and 3D applications to capture the mouse |
-| `wl_data_device_manager` | clipboard and drag-and-drop |
+| `wl_data_device_manager` | clipboard and drag-and-drop. The drag icon is drawn under the pointer and gets frame callbacks; Ctrl held at the drop copies and Shift moves, whichever window is under the pointer, since an unfocused target cannot see the modifiers |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
 | `ext_session_lock_manager_v1` | locking the session. See below |
 | `ext_foreign_toplevel_list_v1` | the window list: every window that has drawn, with its title and app id, kept current as they change and withdrawn when it closes. Read-only — the protocol has no requests that act on a window. Advertised to every client, unfiltered, with the same caveat as `raven_shell_v1` |

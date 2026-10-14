@@ -30,6 +30,8 @@ mod decor;
 mod desktop_config;
 mod dmabuf;
 #[cfg(target_os = "linux")]
+mod dnd;
+#[cfg(target_os = "linux")]
 mod dock;
 mod fileindex;
 mod focus;

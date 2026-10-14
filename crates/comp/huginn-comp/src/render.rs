@@ -185,6 +185,12 @@ fn elements_with_boundary(
     if include_cursor {
         push_cursor(renderer, state, fallback_cursor, view, scale, &mut out);
     }
+    // The drag icon rides just behind the pointer. Unlike the arrow it stays
+    // while a finger drags, since then it is the only sign of the drag; a
+    // recording shows it and a screenshot does not.
+    if pass != Pass::Screenshot {
+        push_dnd_icon(renderer, state, view, scale, &mut out);
+    }
 
     let boundary = push_items(
         renderer,
@@ -293,6 +299,31 @@ fn push_cursor(
         // A client asked for no cursor at all, e.g. while typing or in a game.
         CursorImageStatus::Hidden => {}
     }
+}
+
+/// The icon a client's drag carries, as seen from `view`, appended to `out`.
+/// See [`crate::dnd`].
+fn push_dnd_icon(
+    renderer: &mut GlesRenderer,
+    state: &Huginn,
+    view: Rect,
+    scale: f64,
+    out: &mut Vec<HuginnElement>,
+) {
+    let Some(icon) = state.dnd_icon.as_ref().filter(|icon| icon.alive()) else {
+        return;
+    };
+    let origin = icon.origin(state.pointer_location);
+    let position: Point<i32, Logical> = (origin.x - view.x(), origin.y - view.y()).into();
+    let elements = render_elements_from_surface_tree(
+        renderer,
+        &icon.surface,
+        position.to_physical_precise_round::<f64, i32>(scale),
+        scale,
+        1.0,
+        Kind::Unspecified,
+    );
+    out.extend(elements.into_iter().map(HuginnElement::Surface));
 }
 
 /// `items` — scene items, front to back, in the desktop's coordinates —
