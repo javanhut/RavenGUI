@@ -10,9 +10,16 @@ use smithay::reexports::wayland_server::{
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, event_created_child,
-    protocol::{wl_compositor, wl_registry, wl_seat, wl_surface},
+    protocol::{
+        wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_registry, wl_seat,
+        wl_surface,
+    },
 };
 use wayland_protocols::{
+    wp::presentation_time::client::{
+        wp_presentation::{self, WpPresentation},
+        wp_presentation_feedback::{self, WpPresentationFeedback},
+    },
     wp::primary_selection::zv1::client::{
         zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
         zwp_primary_selection_device_v1::{self, ZwpPrimarySelectionDeviceV1},
@@ -33,9 +40,20 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_v2::{self, ZwpInputMethodV2},
 };
 
+use std::time::Duration;
+
+use smithay::{
+    backend::renderer::element::Id as ElementId,
+    output::{Output, PhysicalProperties, Subpixel},
+    reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind,
+    wayland::selection::SelectionTarget,
+};
+
 use crate::activation::Origin;
 use crate::focus::FocusTarget;
+use crate::presentation::Shown;
 use crate::state::{ClientState, Huginn};
+use crate::xselection::Owner;
 
 #[derive(Default)]
 struct Probe {
@@ -46,6 +64,12 @@ struct Probe {
     text_input_entered: bool,
     ime_activated: bool,
     ime_done: bool,
+    primary_cleared: bool,
+    clipboard_offered: Vec<String>,
+    clipboard_selections: usize,
+    /// `(tv_sec_lo, tv_nsec, refresh, seq_lo, flags)` of each `presented`.
+    presented: Vec<(u32, u32, u32, u32, u32)>,
+    discarded: usize,
 }
 
 struct Peer {
@@ -145,6 +169,7 @@ const ADVERTISED: &[&str] = &[
     "zwp_text_input_manager_v3",
     "zwp_input_method_manager_v2",
     "xdg_activation_v1",
+    "wp_presentation",
 ];
 
 #[test]
@@ -321,6 +346,261 @@ fn a_launch_token_is_trusted() {
     assert_eq!(origin_of(&h.state, &token), Some(Origin::Launch));
 }
 
+/// Two clients with a keyboard, the first focused: the one an X11 selection
+/// should reach, and one it should not.
+fn focused_client_with_devices(h: &mut Harness) -> Peer {
+    h.state
+        .seat
+        .add_keyboard(Default::default(), 200, 25)
+        .expect("keyboard");
+    let (server, client) = UnixStream::pair().expect("pair");
+    let id = h
+        .display
+        .handle()
+        .insert_client(server, Arc::new(ClientState::default()))
+        .expect("client");
+    let mut peer = peer_on(h, client);
+    let qh = peer.queue.handle();
+    let surface = peer
+        .bind::<wl_compositor::WlCompositor>(4)
+        .create_surface(&qh, ());
+    let seat = peer.bind::<wl_seat::WlSeat>(7);
+    peer.bind::<ZwpPrimarySelectionDeviceManagerV1>(1)
+        .get_device(&seat, &qh, ());
+    peer.bind::<wl_data_device_manager::WlDataDeviceManager>(3)
+        .get_data_device(&seat, &qh, ());
+    h.roundtrip(&mut peer);
+    let server_surface = id
+        .object_from_protocol_id::<SWlSurface>(&h.display.handle(), surface.id().protocol_id())
+        .expect("surface");
+    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+    h.state
+        .set_keyboard_focus(Some(FocusTarget::Surface(server_surface)), serial);
+    h.roundtrip(&mut peer);
+    peer
+}
+
+#[test]
+fn an_x11_primary_selection_reaches_the_focused_wayland_client() {
+    let mut h = Harness::new();
+    let mut peer = focused_client_with_devices(&mut h);
+    let before = peer.probe.selections;
+
+    h.state.x11_new_selection(
+        SelectionTarget::Primary,
+        vec!["text/plain;charset=utf-8".into()],
+    );
+    h.roundtrip(&mut peer);
+
+    assert!(
+        peer.probe.selections > before,
+        "the X11 primary selection never reached the focused client"
+    );
+    assert!(
+        peer.probe
+            .offered
+            .iter()
+            .any(|mime| mime == "text/plain;charset=utf-8"),
+        "offered without its types: {:?}",
+        peer.probe.offered
+    );
+
+    h.state.x11_cleared_selection(SelectionTarget::Primary);
+    h.roundtrip(&mut peer);
+    assert!(
+        peer.probe.primary_cleared,
+        "the X11 client let go of the primary selection and Wayland still offers it"
+    );
+}
+
+#[test]
+fn an_x11_clipboard_reaches_the_focused_wayland_client() {
+    let mut h = Harness::new();
+    let mut peer = focused_client_with_devices(&mut h);
+    let before = peer.probe.clipboard_selections;
+
+    h.state
+        .x11_new_selection(SelectionTarget::Clipboard, vec!["image/png".into()]);
+    h.roundtrip(&mut peer);
+
+    assert!(
+        peer.probe.clipboard_selections > before,
+        "the X11 clipboard never reached the focused client"
+    );
+    assert!(
+        peer.probe
+            .clipboard_offered
+            .iter()
+            .any(|m| m == "image/png"),
+        "offered without its types: {:?}",
+        peer.probe.clipboard_offered
+    );
+}
+
+#[test]
+fn a_wayland_selection_is_recorded_for_x11() {
+    let mut h = Harness::new();
+    h.state
+        .seat
+        .add_keyboard(Default::default(), 200, 25)
+        .expect("keyboard");
+    let (server, client) = UnixStream::pair().expect("pair");
+    let id = h
+        .display
+        .handle()
+        .insert_client(server, Arc::new(ClientState::default()))
+        .expect("client");
+    let mut peer = peer_on(&mut h, client);
+    let qh = peer.queue.handle();
+    let surface = peer
+        .bind::<wl_compositor::WlCompositor>(4)
+        .create_surface(&qh, ());
+    let seat = peer.bind::<wl_seat::WlSeat>(7);
+    let primary = peer.bind::<ZwpPrimarySelectionDeviceManagerV1>(1);
+    let primary_device = primary.get_device(&seat, &qh, ());
+    let data = peer.bind::<wl_data_device_manager::WlDataDeviceManager>(3);
+    let data_device = data.get_data_device(&seat, &qh, ());
+    h.roundtrip(&mut peer);
+    let server_surface = id
+        .object_from_protocol_id::<SWlSurface>(&h.display.handle(), surface.id().protocol_id())
+        .expect("surface");
+    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+    h.state
+        .set_keyboard_focus(Some(FocusTarget::Surface(server_surface)), serial);
+    h.roundtrip(&mut peer);
+
+    let source = primary.create_source(&qh, ());
+    source.offer("text/plain;charset=utf-8".into());
+    primary_device.set_selection(Some(&source), serial.into());
+    let clip = data.create_data_source(&qh, ());
+    clip.offer("text/uri-list".into());
+    data_device.set_selection(Some(&clip), serial.into());
+    h.roundtrip(&mut peer);
+
+    assert_eq!(
+        h.state.selection_bridge.owner(SelectionTarget::Primary),
+        &Owner::Wayland(vec!["text/plain;charset=utf-8".into()])
+    );
+    assert_eq!(
+        h.state.selection_bridge.owner(SelectionTarget::Clipboard),
+        &Owner::Wayland(vec!["text/uri-list".into()])
+    );
+}
+
+fn test_output() -> Output {
+    Output::new(
+        "test".into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Huginn".into(),
+            model: "Test".into(),
+        },
+    )
+}
+
+/// A client asking for feedback on one commit, and the server's side of the
+/// surface it asked about.
+fn surface_with_feedback(
+    h: &mut Harness,
+) -> (Peer, wl_surface::WlSurface, WpPresentation, SWlSurface) {
+    let (server, client) = UnixStream::pair().expect("pair");
+    let id = h
+        .display
+        .handle()
+        .insert_client(server, Arc::new(ClientState::default()))
+        .expect("client");
+    let mut peer = peer_on(h, client);
+    let qh = peer.queue.handle();
+    let surface = peer
+        .bind::<wl_compositor::WlCompositor>(4)
+        .create_surface(&qh, ());
+    let presentation = peer.bind::<WpPresentation>(2);
+    presentation.feedback(&surface, &qh, ());
+    surface.commit();
+    h.roundtrip(&mut peer);
+    let server_surface = id
+        .object_from_protocol_id::<SWlSurface>(&h.display.handle(), surface.id().protocol_id())
+        .expect("surface");
+    (peer, surface, presentation, server_surface)
+}
+
+#[test]
+fn a_shown_surface_is_told_when_its_frame_was_presented() {
+    let mut h = Harness::new();
+    let (mut peer, _surface, _presentation, server) = surface_with_feedback(&mut h);
+    let output = test_output();
+
+    let shown = Shown::from([(ElementId::from(&server), Kind::empty())]);
+    let mut feedback = crate::presentation::collect(&output, [server], &shown);
+    crate::presentation::presented(
+        &mut feedback,
+        Duration::new(5, 250),
+        crate::presentation::refresh(60_000),
+        9,
+        Kind::Vsync | Kind::HwClock | Kind::HwCompletion,
+    );
+    h.roundtrip(&mut peer);
+
+    let flags = (Kind::Vsync | Kind::HwClock | Kind::HwCompletion).bits();
+    assert_eq!(peer.probe.presented, vec![(5, 250, 16_666_666, 9, flags)]);
+    assert_eq!(peer.probe.discarded, 0);
+}
+
+#[test]
+fn an_unshown_surface_keeps_its_feedback_until_superseded() {
+    let mut h = Harness::new();
+    let (mut peer, surface, presentation, server) = surface_with_feedback(&mut h);
+    let output = test_output();
+
+    let mut feedback = crate::presentation::collect(&output, [server.clone()], &Shown::new());
+    crate::presentation::presented(
+        &mut feedback,
+        Duration::from_secs(5),
+        crate::presentation::refresh(60_000),
+        1,
+        Kind::Vsync,
+    );
+    h.roundtrip(&mut peer);
+    assert!(
+        peer.probe.presented.is_empty(),
+        "presented a surface the frame did not show"
+    );
+    assert_eq!(peer.probe.discarded, 0);
+
+    // A new commit supersedes the content nobody saw.
+    presentation.feedback(&surface, &peer.queue.handle(), ());
+    surface.commit();
+    h.roundtrip(&mut peer);
+    assert_eq!(peer.probe.discarded, 1);
+
+    let shown = Shown::from([(ElementId::from(&server), Kind::empty())]);
+    let mut feedback = crate::presentation::collect(&output, [server], &shown);
+    crate::presentation::presented(
+        &mut feedback,
+        Duration::from_secs(6),
+        crate::presentation::refresh(60_000),
+        2,
+        Kind::Vsync,
+    );
+    h.roundtrip(&mut peer);
+    assert_eq!(peer.probe.presented.len(), 1);
+}
+
+#[test]
+fn a_frame_that_never_lands_discards_its_feedback() {
+    let mut h = Harness::new();
+    let (mut peer, _surface, _presentation, server) = surface_with_feedback(&mut h);
+    let output = test_output();
+
+    let shown = Shown::from([(ElementId::from(&server), Kind::empty())]);
+    drop(crate::presentation::collect(&output, [server], &shown));
+    h.roundtrip(&mut peer);
+
+    assert!(peer.probe.presented.is_empty());
+    assert_eq!(peer.probe.discarded, 1);
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for Probe {
     fn event(
         probe: &mut Self,
@@ -350,8 +630,9 @@ impl Dispatch<ZwpPrimarySelectionDeviceV1, ()> for Probe {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zwp_primary_selection_device_v1::Event::Selection { .. } = event {
+        if let zwp_primary_selection_device_v1::Event::Selection { id } = event {
             probe.selections += 1;
+            probe.primary_cleared = id.is_none();
         }
     }
 
@@ -423,6 +704,84 @@ impl Dispatch<ZwpInputMethodV2, ()> for Probe {
     }
 }
 
+impl Dispatch<wl_data_device::WlDataDevice, ()> for Probe {
+    fn event(
+        probe: &mut Self,
+        _: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_device::Event::Selection { .. } = event {
+            probe.clipboard_selections += 1;
+        }
+    }
+
+    event_created_child!(Probe, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<wl_data_offer::WlDataOffer, ()> for Probe {
+    fn event(
+        probe: &mut Self,
+        _: &wl_data_offer::WlDataOffer,
+        event: wl_data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            probe.clipboard_offered.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<WpPresentation, ()> for Probe {
+    fn event(
+        _: &mut Self,
+        _: &WpPresentation,
+        _: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpPresentationFeedback, ()> for Probe {
+    fn event(
+        probe: &mut Self,
+        _: &WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_lo,
+                tv_nsec,
+                refresh,
+                seq_lo,
+                flags,
+                ..
+            } => {
+                let flags = match flags {
+                    wayland_client::WEnum::Value(flags) => flags.bits(),
+                    wayland_client::WEnum::Unknown(bits) => bits,
+                };
+                probe
+                    .presented
+                    .push((tv_sec_lo, tv_nsec, refresh, seq_lo, flags));
+            }
+            wp_presentation_feedback::Event::Discarded => probe.discarded += 1,
+            _ => {}
+        }
+    }
+}
+
 macro_rules! ignore_events {
     ($($ty:ty),*) => {$(
         impl Dispatch<$ty, ()> for Probe {
@@ -437,6 +796,8 @@ ignore_events!(
     wl_seat::WlSeat,
     ZwpPrimarySelectionDeviceManagerV1,
     ZwpPrimarySelectionSourceV1,
+    wl_data_device_manager::WlDataDeviceManager,
+    wayland_client::protocol::wl_data_source::WlDataSource,
     ZwpTextInputManagerV3,
     ZwpInputMethodManagerV2,
     XdgActivationV1

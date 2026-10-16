@@ -855,7 +855,12 @@ pub(crate) fn options(options: WEnum<Options>) -> Options {
 /// to frame; it only grows when the frame does.
 fn to_bgra(rgba: &[u8], out: &mut Vec<u8>) {
     out.resize(rgba.len(), 0);
-    for (from, to) in rgba.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+    for (from, to) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0)
+    {
         to[0] = from[2];
         to[1] = from[1];
         to[2] = from[0];

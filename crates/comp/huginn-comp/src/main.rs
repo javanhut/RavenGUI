@@ -63,6 +63,8 @@ mod pins;
 mod pointer;
 #[cfg(target_os = "linux")]
 mod popup;
+#[cfg(target_os = "linux")]
+mod presentation;
 #[cfg(all(test, target_os = "linux"))]
 mod protocol_tests;
 #[cfg(target_os = "linux")]
@@ -99,6 +101,8 @@ mod wallpaper;
 mod wheel;
 #[cfg(target_os = "linux")]
 mod window;
+#[cfg(target_os = "linux")]
+mod xselection;
 #[cfg(target_os = "linux")]
 mod xwayland;
 

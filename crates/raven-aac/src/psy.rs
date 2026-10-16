@@ -373,7 +373,7 @@ impl Detector {
     pub(crate) fn attack(&mut self, before: f32, region: &[f32]) -> bool {
         let mut prev = before;
         let mut found = false;
-        for segment in region.chunks_exact(128) {
+        for segment in region.as_chunks::<128>().0 {
             let mut energy = 0.0f32;
             for &x in segment {
                 let d = x - prev;

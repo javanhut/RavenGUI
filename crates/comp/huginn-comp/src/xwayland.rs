@@ -42,9 +42,11 @@ use smithay::{
     xwayland::{X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler, xwm::Reorder},
 };
 
-use smithay::wayland::xwayland_shell::XWaylandShellHandler;
+use smithay::wayland::{selection::SelectionTarget, xwayland_shell::XWaylandShellHandler};
 
-use crate::{state::Huginn, window::WindowSurface};
+use std::os::unix::io::OwnedFd;
+
+use crate::{focus::FocusTarget, state::Huginn, window::WindowSurface};
 
 /// What [`start`] needs from whichever type owns the event loop.
 ///
@@ -138,6 +140,11 @@ where
             };
             let huginn = data.as_huginn();
             huginn.xwm = Some(wm);
+            let transfers = lh.clone();
+            huginn.x11_selection_sender = Some(Box::new(move |wm, target, mime_type, fd| {
+                wm.send_selection(target, mime_type, fd, transfers.clone())
+            }));
+            huginn.x11_selections_ready();
             // Recorded rather than exported. `std::env::set_var` is unsafe in
             // edition 2024 and process-global for a value only child processes
             // need, so the display travels the same route WAYLAND_DISPLAY
@@ -157,6 +164,8 @@ where
             tracing::warn!("XWayland failed to start; X11 clients will not run");
             let huginn = data.as_huginn();
             huginn.xwm = None;
+            huginn.x11_selection_sender = None;
+            huginn.x11_selections_gone();
             huginn.x11_display = None;
         }
     });
@@ -264,6 +273,49 @@ impl XwmHandler for Huginn {
         property: smithay::xwayland::xwm::WmWindowProperty,
     ) {
         self.x11_property_notify(&w, property);
+    }
+
+    fn allow_selection_access(
+        &mut self,
+        xwm: smithay::xwayland::xwm::XwmId,
+        _selection: SelectionTarget,
+    ) -> bool {
+        let focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|target| match target {
+                FocusTarget::X11 { window, .. } => window.xwm_id(),
+                FocusTarget::Surface(_) => None,
+            });
+        crate::xselection::x11_may_read(focused, xwm)
+    }
+
+    fn send_selection(
+        &mut self,
+        _xwm: smithay::xwayland::xwm::XwmId,
+        selection: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        self.x11_read_selection(selection, mime_type, fd);
+    }
+
+    fn new_selection(
+        &mut self,
+        _xwm: smithay::xwayland::xwm::XwmId,
+        selection: SelectionTarget,
+        mime_types: Vec<String>,
+    ) {
+        self.x11_new_selection(selection, mime_types);
+    }
+
+    fn cleared_selection(
+        &mut self,
+        _xwm: smithay::xwayland::xwm::XwmId,
+        selection: SelectionTarget,
+    ) {
+        self.x11_cleared_selection(selection);
     }
 }
 
@@ -596,6 +648,56 @@ macro_rules! impl_xwm_handler {
                 button: u32,
             ) {
                 smithay::xwayland::XwmHandler::move_request(&mut self.state, xwm, w, button);
+            }
+
+            fn allow_selection_access(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+            ) -> bool {
+                smithay::xwayland::XwmHandler::allow_selection_access(
+                    &mut self.state,
+                    xwm,
+                    selection,
+                )
+            }
+
+            fn send_selection(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+                mime_type: String,
+                fd: std::os::unix::io::OwnedFd,
+            ) {
+                smithay::xwayland::XwmHandler::send_selection(
+                    &mut self.state,
+                    xwm,
+                    selection,
+                    mime_type,
+                    fd,
+                );
+            }
+
+            fn new_selection(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+                mime_types: Vec<String>,
+            ) {
+                smithay::xwayland::XwmHandler::new_selection(
+                    &mut self.state,
+                    xwm,
+                    selection,
+                    mime_types,
+                );
+            }
+
+            fn cleared_selection(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+            ) {
+                smithay::xwayland::XwmHandler::cleared_selection(&mut self.state, xwm, selection);
             }
         }
     };

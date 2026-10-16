@@ -46,6 +46,7 @@ use smithay::{
     utils::{Rectangle, SERIAL_COUNTER, Transform},
     wayland::{
         compositor::{SurfaceAttributes, TraversalAction, with_surface_tree_downward},
+        presentation::Refresh,
         socket::ListeningSocketSource,
     },
 };
@@ -429,7 +430,7 @@ impl Nested {
             _ => None,
         };
 
-        {
+        let mut feedback = {
             let (renderer, mut framebuffer) = self
                 .backend
                 .bind()
@@ -465,10 +466,21 @@ impl Nested {
             // Layer surfaces need frame callbacks too. A panel that never gets
             // one renders its first frame and then freezes forever.
             let now = self.start.elapsed().as_millis() as u32;
-            for (surface, _) in self.state.frame_surfaces() {
-                send_frames(&surface, now);
+            let surfaces: Vec<WlSurface> = self
+                .state
+                .frame_surfaces()
+                .into_iter()
+                .map(|(surface, _)| surface)
+                .collect();
+            for surface in &surfaces {
+                send_frames(surface, now);
             }
-        }
+
+            // The whole window is drawn every frame, so whatever falls on it
+            // was shown.
+            let shown = crate::presentation::shown_from_elements(&elements, scale.into(), size);
+            crate::presentation::collect(&self.output, surfaces, &shown)
+        };
 
         // Must happen after the framebuffer borrow ends, and after clients are
         // flushed: submit may block, and a client waiting on an unflushed event
@@ -477,6 +489,15 @@ impl Nested {
         self.backend
             .submit(Some(&[damage]))
             .map_err(|e| anyhow::anyhow!("submitting frame: {e}"))?;
+
+        // The host shows no page flip, so the frame is reported as presented
+        // when the swap returns. A failed swap returned above, and dropping
+        // the feedback discarded it.
+        let (time, flags) = crate::presentation::timing(None, crate::presentation::now());
+        let refresh = self.output.current_mode().map_or(Refresh::Unknown, |mode| {
+            crate::presentation::refresh(mode.refresh)
+        });
+        crate::presentation::presented(&mut feedback, time, refresh, 0, flags);
         Ok(())
     }
 

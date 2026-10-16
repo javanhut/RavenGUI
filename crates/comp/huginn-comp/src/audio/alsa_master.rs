@@ -78,10 +78,10 @@ pub(super) fn make_audible() {
         });
         match target {
             Ok(raw) if raw > 0 => {
-                if value.set_integer(0, raw as i32).is_some() {
-                    if let Err(error) = ctl.elem_write(&value) {
-                        tracing::warn!(card, %error, "could not restore ALSA Master volume");
-                    }
+                if value.set_integer(0, raw as i32).is_some()
+                    && let Err(error) = ctl.elem_write(&value)
+                {
+                    tracing::warn!(card, %error, "could not restore ALSA Master volume");
                 }
             }
             Ok(_) => tracing::warn!(card, "ALSA Master recovery level was zero"),
@@ -93,12 +93,10 @@ pub(super) fn make_audible() {
 
     if let Some((_, mut value)) = control(&ctl, SWITCH, ElemType::Boolean)
         && value.get_boolean(0) == Some(false)
+        && value.set_boolean(0, true).is_some()
+        && let Err(error) = ctl.elem_write(&value)
     {
-        if value.set_boolean(0, true).is_some() {
-            if let Err(error) = ctl.elem_write(&value) {
-                tracing::warn!(card, %error, "could not unmute ALSA Master");
-            }
-        }
+        tracing::warn!(card, %error, "could not unmute ALSA Master");
     }
 }
 

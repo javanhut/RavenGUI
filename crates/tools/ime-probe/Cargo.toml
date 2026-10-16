@@ -1,0 +1,19 @@
+[package]
+name = "ime-probe"
+description = "An input-method-v2 client for driving text-input-v3 clients under Huginn by hand or from a test harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ime-probe"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client.workspace = true
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+
+[lints]
+workspace = true

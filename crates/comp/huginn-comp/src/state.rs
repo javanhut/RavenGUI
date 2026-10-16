@@ -38,9 +38,10 @@ use smithay::{
     delegate_compositor, delegate_cursor_shape, delegate_data_device,
     delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_inhibit,
     delegate_input_method_manager, delegate_layer_shell, delegate_output,
-    delegate_pointer_constraints, delegate_primary_selection, delegate_relative_pointer,
-    delegate_seat, delegate_session_lock, delegate_shm, delegate_text_input_manager,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_pointer_constraints, delegate_presentation, delegate_primary_selection,
+    delegate_relative_pointer, delegate_seat, delegate_session_lock, delegate_shm,
+    delegate_text_input_manager, delegate_viewporter, delegate_xdg_activation,
+    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -83,15 +84,19 @@ use smithay::{
             PointerConstraint, PointerConstraintsHandler, PointerConstraintsState,
             with_pointer_constraint,
         },
+        presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
         selection::{
-            SelectionHandler,
+            SelectionHandler, SelectionSource, SelectionTarget,
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-                default_action_chooser, set_data_device_focus,
+                clear_data_device_selection, default_action_chooser,
+                request_data_device_client_selection, set_data_device_focus,
+                set_data_device_selection,
             },
             primary_selection::{
-                PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+                PrimarySelectionHandler, PrimarySelectionState, clear_primary_selection,
+                request_primary_client_selection, set_primary_focus, set_primary_selection,
             },
         },
         session_lock::{LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker},
@@ -604,6 +609,10 @@ pub(crate) struct Huginn {
     pub data_device_state: DataDeviceState,
     /// Middle-click paste. Follows the keyboard like the clipboard does.
     pub(crate) primary_selection_state: PrimarySelectionState,
+    /// `wp_presentation`. Held, not read: dropping it withdraws the global.
+    /// The feedback is answered by the backends; see [`crate::presentation`].
+    #[allow(dead_code)]
+    pub(crate) presentation_state: PresentationState,
     /// zwp_text_input_v3 and zwp_input_method_v2: an input method (IBus,
     /// fcitx5) composing into the focused client. smithay moves the
     /// text-input focus with the keyboard's. Held, not read.
@@ -699,6 +708,13 @@ pub(crate) struct Huginn {
     /// which are states the compositor runs in perfectly well, just without
     /// X11 clients.
     pub(crate) xwm: Option<X11Wm>,
+    /// Who owns the clipboard and the primary selection, Wayland or X11.
+    /// See [`crate::xselection`].
+    pub(crate) selection_bridge: crate::xselection::Bridge,
+    /// Asks XWayland to write its selection into a pipe for a Wayland
+    /// client. Set with the window manager: the transfer runs on the event
+    /// loop, whose data type only the backend knows.
+    pub(crate) x11_selection_sender: Option<crate::xselection::Sender>,
     /// `xwayland_shell_v1`, the protocol XWayland uses to associate an X11
     /// window with the Wayland surface it created for it. Held, not read:
     /// dropping it withdraws the global and XWayland can no longer associate
@@ -1279,6 +1295,7 @@ impl Huginn {
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
             primary_selection_state: PrimarySelectionState::new::<Self>(dh),
+            presentation_state: PresentationState::new::<Self>(dh, crate::presentation::CLOCK_ID),
             text_input_state: TextInputManagerState::new::<Self>(dh),
             // Any client may be the input method, for the reason given for
             // the session lock above.
@@ -1306,6 +1323,8 @@ impl Huginn {
             },
             windows: HashMap::new(),
             xwm: None,
+            selection_bridge: Default::default(),
+            x11_selection_sender: None,
             xwayland_shell_state: XWaylandShellState::new::<Self>(dh),
             x11_unmanaged: Vec::new(),
             x11_display: None,
@@ -9611,6 +9630,119 @@ impl Huginn {
 
 impl SelectionHandler for Huginn {
     type SelectionUserData = ();
+
+    /// A Wayland client set the clipboard or the primary selection.
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        let action = self
+            .selection_bridge
+            .wayland_selection(ty, source.map(|source| source.mime_types()));
+        self.apply_selection(ty, action);
+    }
+
+    /// A Wayland client is pasting the stand-in for an X11 client's
+    /// selection: XWayland writes it.
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        let (Some(xwm), Some(send)) = (self.xwm.as_mut(), self.x11_selection_sender.as_ref())
+        else {
+            return;
+        };
+        if let Err(e) = send(xwm, ty, mime_type, fd) {
+            tracing::warn!(?ty, error = %e, "reading an X11 selection for a Wayland client");
+        }
+    }
+}
+
+impl Huginn {
+    /// An X11 client took a selection.
+    pub(crate) fn x11_new_selection(&mut self, target: SelectionTarget, mime_types: Vec<String>) {
+        let action = self.selection_bridge.x11_selection(target, mime_types);
+        self.apply_selection(target, action);
+    }
+
+    /// The X11 client owning a selection let it go.
+    pub(crate) fn x11_cleared_selection(&mut self, target: SelectionTarget) {
+        let action = self.selection_bridge.x11_cleared(target);
+        self.apply_selection(target, action);
+    }
+
+    /// An X11 client is pasting a Wayland client's selection: the Wayland
+    /// source writes it.
+    pub(crate) fn x11_read_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        let result = match target {
+            SelectionTarget::Clipboard => {
+                request_data_device_client_selection(&self.seat, mime_type, fd)
+                    .map_err(|e| e.to_string())
+            }
+            SelectionTarget::Primary => request_primary_client_selection(&self.seat, mime_type, fd)
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = result {
+            tracing::debug!(?target, error = %e, "reading a Wayland selection for an X11 client");
+        }
+    }
+
+    /// XWayland's window manager just started: it is told the selections
+    /// Wayland clients already hold.
+    pub(crate) fn x11_selections_ready(&mut self) {
+        for (target, mime_types) in self.selection_bridge.replay() {
+            self.apply_selection(
+                target,
+                crate::xselection::Action::OfferToX11(Some(mime_types)),
+            );
+        }
+    }
+
+    /// XWayland went away, and with it every X11 selection.
+    pub(crate) fn x11_selections_gone(&mut self) {
+        for target in self.selection_bridge.x11_gone() {
+            self.apply_selection(target, crate::xselection::Action::ClearWayland);
+        }
+    }
+
+    fn apply_selection(&mut self, target: SelectionTarget, action: crate::xselection::Action) {
+        use crate::xselection::Action;
+        match action {
+            Action::Nothing => {}
+            Action::OfferToX11(mime_types) => {
+                if let Some(xwm) = self.xwm.as_mut()
+                    && let Err(e) = xwm.new_selection(target, mime_types)
+                {
+                    tracing::warn!(?target, error = %e, "offering a Wayland selection to X11");
+                }
+            }
+            Action::SetWayland(mime_types) => match target {
+                SelectionTarget::Clipboard => {
+                    set_data_device_selection(&self.display, &self.seat, mime_types, ())
+                }
+                SelectionTarget::Primary => {
+                    set_primary_selection(&self.display, &self.seat, mime_types, ())
+                }
+            },
+            Action::ClearWayland => match target {
+                SelectionTarget::Clipboard => {
+                    clear_data_device_selection(&self.display, &self.seat)
+                }
+                SelectionTarget::Primary => clear_primary_selection(&self.display, &self.seat),
+            },
+        }
+    }
 }
 
 impl PrimarySelectionHandler for Huginn {
@@ -9854,6 +9986,7 @@ delegate_pointer_constraints!(Huginn);
 delegate_relative_pointer!(Huginn);
 delegate_data_device!(Huginn);
 delegate_primary_selection!(Huginn);
+delegate_presentation!(Huginn);
 delegate_text_input_manager!(Huginn);
 delegate_input_method_manager!(Huginn);
 delegate_xdg_activation!(Huginn);

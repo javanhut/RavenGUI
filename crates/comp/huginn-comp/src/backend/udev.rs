@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::{
     backend::{
         allocator::{
@@ -101,6 +102,7 @@ use crate::backend::gpu_class;
 use crate::backend::input;
 use crate::backend::keymap::{Action, Modes, help_line, resolve};
 use crate::pointer::Cursor;
+use crate::presentation::Shown;
 use crate::render;
 use crate::render::HuginnElement;
 use crate::state::{ClientState, Huginn};
@@ -170,6 +172,9 @@ struct Screen {
     submitted_at: Option<Instant>,
     /// This screen's frame-time samples since the last report.
     stats: crate::frametime::FrameStats,
+    /// The `wp_presentation` feedback of the frame in flight, answered when
+    /// its flip lands. Dropping it discards it.
+    feedback: Option<OutputPresentationFeedback>,
     /// When the connector first reported nothing connected, while the screen
     /// is still being driven. See [`UNPLUG_GRACE`].
     unplugged_at: Option<Instant>,
@@ -457,7 +462,7 @@ pub(crate) fn run() -> Result<()> {
         .insert_source(
             drm_notifier,
             move |event, meta, data: &mut Udev| match event {
-                DrmEvent::VBlank(crtc) => data.on_vblank(primary_id, crtc),
+                DrmEvent::VBlank(crtc) => data.on_vblank(primary_id, crtc, *meta),
                 DrmEvent::Error(e) => {
                     tracing::error!(error = %e, ?meta, "DRM error");
                 }
@@ -502,6 +507,7 @@ pub(crate) fn run() -> Result<()> {
                 }
                 for screen in data.screens.values_mut() {
                     screen.awaiting_flip = false;
+                    screen.feedback = None;
                 }
             }
             SessionEvent::ActivateSession => {
@@ -745,21 +751,24 @@ fn describe(connector: &connector::Info, mode: &DrmMode) -> (Mode, OutputScale) 
     (wl_mode, scale)
 }
 
-/// Put a frame on a screen of the primary GPU.
+/// Put a frame on a screen of the primary GPU. What it showed comes from
+/// the compositor's own account of each element: occluded ones are skipped,
+/// and some go straight to a plane.
 fn present_primary(
     renderer: &mut GlesRenderer,
     drm: &mut Surface,
     elements: &[HuginnElement],
-) -> Result<bool> {
+) -> Result<Option<Shown>> {
     let result = drm
         .render_frame(renderer, elements, CLEAR, FrameFlags::DEFAULT)
         .map_err(|e| anyhow::anyhow!("rendering: {e}"))?;
     if result.is_empty {
-        return Ok(false);
+        return Ok(None);
     }
+    let shown = crate::presentation::shown_from_states(&result.states);
     drm.queue_frame(())
         .map_err(|e| anyhow::anyhow!("queueing: {e}"))?;
-    Ok(true)
+    Ok(Some(shown))
 }
 
 /// Put a frame on a screen of another GPU: render on the primary into the
@@ -1121,6 +1130,7 @@ impl Udev {
         for screen in self.screens.values_mut() {
             screen.awaiting_flip = false;
             screen.submitted_at = None;
+            screen.feedback = None;
             if on {
                 screen.dirty = true;
                 continue;
@@ -1236,6 +1246,7 @@ impl Udev {
             // complete. Left set, it would make every future frame look like
             // one already in flight and nothing would ever be drawn again.
             screen.awaiting_flip = false;
+            screen.feedback = None;
             if let ScreenScanout::Dumb(dumb) = &mut screen.scanout {
                 dumb.reset();
             }
@@ -1313,7 +1324,7 @@ impl Udev {
         match self
             .handle
             .insert_source(notifier, move |event, meta, data: &mut Udev| match event {
-                DrmEvent::VBlank(crtc) => data.on_vblank(dev, crtc),
+                DrmEvent::VBlank(crtc) => data.on_vblank(dev, crtc, *meta),
                 DrmEvent::Error(e) => {
                     tracing::error!(device = dev, error = %e, ?meta, "DRM error");
                 }
@@ -1663,6 +1674,7 @@ impl Udev {
                 dirty: true,
                 submitted_at: None,
                 stats: crate::frametime::FrameStats::default(),
+                feedback: None,
                 unplugged_at: None,
             },
         );
@@ -2057,8 +2069,13 @@ impl Udev {
         };
 
         // Every kind renders the same elements with the primary; they differ
-        // only in where the pixels go afterwards. `Ok(true)` is a frame in
-        // flight, `Ok(false)` a frame with nothing new in it.
+        // only in where the pixels go afterwards. `Ok(Some(_))` is a frame in
+        // flight, with what it shows; `Ok(None)` a frame with nothing new in
+        // it. The secondary and dumb kinds draw the scene whole, so what they
+        // show is whatever falls on the screen.
+        let whole = |queued: bool| {
+            queued.then(|| crate::presentation::shown_from_elements(&elements, scale.into(), size))
+        };
         let presented = match &mut screen.scanout {
             ScreenScanout::Primary(drm) => present_primary(renderer, drm, &elements),
             ScreenScanout::Gpu { drm, bridge } => {
@@ -2068,7 +2085,8 @@ impl Udev {
                         ..
                     }) => present_gpu(
                         renderer, allocator, secondary, drm, bridge, &elements, size, scale,
-                    ),
+                    )
+                    .map(whole),
                     _ => Err(anyhow::anyhow!("its device is gone")),
                 }
             }
@@ -2078,10 +2096,19 @@ impl Udev {
                 &elements,
                 scale,
                 screen.output.current_transform(),
-            ),
+            )
+            .map(whole),
         };
         match presented {
-            Ok(true) => {
+            Ok(Some(shown)) => {
+                screen.feedback = Some(crate::presentation::collect(
+                    &screen.output,
+                    state
+                        .frame_surfaces()
+                        .into_iter()
+                        .map(|(surface, _)| surface),
+                    &shown,
+                ));
                 screen.awaiting_flip = true;
                 screen.dirty = false;
                 screen.submitted_at = Some(Instant::now());
@@ -2098,7 +2125,7 @@ impl Udev {
                 state.captures.note_damage(&screen.name);
             }
             // Nothing changed on screen; do not burn a page flip on it.
-            Ok(false) => {
+            Ok(None) => {
                 screen.dirty = false;
                 screen.stats.record_skipped();
             }
@@ -2173,7 +2200,12 @@ impl Udev {
         }
     }
 
-    fn on_vblank(&mut self, dev: libc::dev_t, crtc: crtc::Handle) {
+    fn on_vblank(
+        &mut self,
+        dev: libc::dev_t,
+        crtc: crtc::Handle,
+        meta: Option<smithay::backend::drm::DrmEventMetadata>,
+    ) {
         let key = (dev, crtc);
         if let Some(screen) = self.screens.get_mut(&key) {
             screen.awaiting_flip = false;
@@ -2188,6 +2220,19 @@ impl Udev {
             };
             if let Err(e) = submitted {
                 tracing::warn!(name = %screen.name, error = %e, "frame_submitted");
+            }
+            // The frame is on screen: its feedback is answered with the flip's
+            // own time when the kernel gave one on the monotonic clock.
+            if let Some(mut feedback) = screen.feedback.take() {
+                let (time, flags) = crate::presentation::timing(
+                    crate::presentation::flip_time(meta.as_ref()),
+                    crate::presentation::now(),
+                );
+                let refresh = crate::presentation::refresh(
+                    screen.output.current_mode().map_or(0, |mode| mode.refresh),
+                );
+                let seq = meta.map_or(0, |meta| u64::from(meta.sequence));
+                crate::presentation::presented(&mut feedback, time, refresh, seq, flags);
             }
         }
         // Only draw again if something actually changed. Rendering on every
