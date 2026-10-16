@@ -524,11 +524,9 @@ impl Default for Launcher {
 /// is honoured, and falling back to the bare binary name on `$PATH` when none
 /// is. Pure, so the shape of the command line is testable without spawning.
 ///
-/// The `-e` convention is assumed: RavenTerminal's source is not in this
-/// workspace, and `-e <command...>` is what xterm, gnome-terminal, alacritty,
-/// foot and kitty all accept, so it is the flag a terminal that wants to be a
-/// drop-in for any of them ends up taking. If RavenTerminal ever spells it
-/// differently, this is the one place to change.
+/// RavenTerminal (source in `RavenApps/RavenTerminal`) takes `-e <command...>`
+/// like xterm, foot and kitty: everything after `-e` is the program and its
+/// arguments.
 pub(crate) fn in_terminal(argv: Vec<String>, entries: &[Entry]) -> Vec<String> {
     let mut wrapped = terminal_argv(entries);
     wrapped.push("-e".to_owned());

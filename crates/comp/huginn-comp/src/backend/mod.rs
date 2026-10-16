@@ -87,7 +87,12 @@ pub(crate) fn advertise(scale: huginn_core::scale::OutputScale) -> smithay::outp
 /// not run is a message in the log and nothing more. The exception is the lock
 /// screen, where "did it start" decides whether the compositor is about to
 /// blank a screen that something can get past.
-pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) -> bool {
+pub(crate) fn spawn(
+    argv: &[String],
+    socket: &str,
+    x11_display: Option<u32>,
+    activation_token: Option<&str>,
+) -> bool {
     let Some((program, args)) = argv.split_first() else {
         return false;
     };
@@ -125,6 +130,18 @@ pub(crate) fn spawn(argv: &[String], socket: &str, x11_display: Option<u32>) -> 
     // server maps windows nobody will ever lay out.
     if let Some(display) = x11_display {
         command.env("DISPLAY", format!(":{display}"));
+    }
+    // xdg-activation: lets the new window take focus when it maps. The X11
+    // startup-notification name carries the same token for toolkits that
+    // still read only that.
+    if let Some(token) = activation_token {
+        command
+            .env("XDG_ACTIVATION_TOKEN", token)
+            .env("DESKTOP_STARTUP_ID", token);
+    } else {
+        command
+            .env_remove("XDG_ACTIVATION_TOKEN")
+            .env_remove("DESKTOP_STARTUP_ID");
     }
     match command.spawn() {
         Ok(child) => {
@@ -294,6 +311,30 @@ mod tests {
     fn the_backend_names_are_exactly_the_two_that_exist() {
         assert_eq!(Backend::named(Some("udev")), Backend::Udev);
         assert_eq!(Backend::named(Some("winit")), Backend::Winit);
+    }
+
+    #[test]
+    fn a_launched_child_is_handed_its_activation_token() {
+        let dir = std::env::temp_dir().join(format!("huginn-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let out = dir.join("env");
+        let script = format!(
+            "printf '%s|%s' \"$XDG_ACTIVATION_TOKEN\" \"$DESKTOP_STARTUP_ID\" > {}",
+            out.display()
+        );
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        assert!(spawn(&argv, "wayland-test", None, Some("tok-123")));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            seen = std::fs::read_to_string(&out).unwrap_or_default();
+            if !seen.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seen, "tok-123|tok-123");
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub(crate) struct Item {
     /// One particular window, when the strip is listing windows rather than
     /// applications — the switcher's tiles. `None` in the ordinary dock.
     pub window: Option<WindowId>,
+    /// Whether a window of it asked for attention (xdg-activation without
+    /// a token that could take focus).
+    pub urgent: bool,
 }
 
 impl Item {
@@ -64,6 +67,7 @@ impl Item {
             entry: None,
             running: false,
             window: None,
+            urgent: false,
         }
     }
 
@@ -149,6 +153,7 @@ pub(crate) fn items(apps: &[Entry], running: &[String]) -> Vec<Item> {
                 entry: Some(index),
                 running: is_running(&apps[index]),
                 window: None,
+                urgent: false,
             });
         }
     }
@@ -182,6 +187,7 @@ pub(crate) fn items(apps: &[Entry], running: &[String]) -> Vec<Item> {
             entry: Some(index),
             running: true,
             window: None,
+            urgent: false,
         });
     }
     items
@@ -210,6 +216,7 @@ pub(crate) fn window_items(apps: &[Entry], windows: &[(WindowId, String)]) -> Ve
                     entry: Some(index),
                     running: true,
                     window: Some(*id),
+                    urgent: false,
                 });
             }
         }
@@ -252,8 +259,20 @@ pub(crate) fn alt_tab_items(apps: &[Entry], windows: &[(WindowId, Option<String>
                 .and_then(|app_id| apps.iter().position(|entry| matches(entry, app_id))),
             running: true,
             window: Some(*id),
+            urgent: false,
         })
         .collect()
+}
+
+/// Mark the items whose application has a window in `urgent`, by `app_id`,
+/// and clear the rest.
+pub(crate) fn mark_urgent(items: &mut [Item], apps: &[Entry], urgent: &[String]) {
+    for item in items {
+        item.urgent = item
+            .entry
+            .and_then(|index| apps.get(index))
+            .is_some_and(|entry| urgent.iter().any(|id| matches(entry, id)));
+    }
 }
 
 /// The dock's visibility, and what the pointer is doing about it.
@@ -782,7 +801,7 @@ fn compose(
 
         // Running state: a small mark under the icon. §4 asks for "a subtle
         // indicator, not a separate region" — the same slot, annotated.
-        if item.running && prefs.dots {
+        if item.urgent || (item.running && prefs.dots) {
             let dot = (4.0 * scale).max(3.0);
             canvas.fill_rounded(
                 (x + icon / 2.0 - dot / 2.0) as usize,
@@ -790,7 +809,11 @@ fn compose(
                 dot as usize,
                 dot as usize,
                 dot / 2.0,
-                crate::theme::accent(),
+                if item.urgent {
+                    crate::theme::CRITICAL
+                } else {
+                    crate::theme::accent()
+                },
             );
         }
     }
@@ -1237,6 +1260,27 @@ mod tests {
     fn an_unrelated_app_id_does_not_match() {
         assert!(!matches(&apps()[0], "chromium"));
         assert!(!matches(&apps()[0], ""));
+    }
+
+    #[test]
+    fn an_application_whose_window_wants_attention_is_marked_urgent() {
+        let running = ["Navigator".to_string()];
+        let mut items = items(&apps(), &running);
+        mark_urgent(&mut items, &apps(), &["Navigator".to_string()]);
+        let firefox = items.iter().find(|i| i.entry == Some(2)).expect("firefox");
+        assert!(firefox.urgent);
+        assert!(
+            items
+                .iter()
+                .filter(|i| i.entry != Some(2))
+                .all(|i| !i.urgent)
+        );
+
+        mark_urgent(&mut items, &apps(), &[]);
+        assert!(
+            items.iter().all(|i| !i.urgent),
+            "urgency outlived its window"
+        );
     }
 
     #[test]

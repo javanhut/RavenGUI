@@ -24,6 +24,9 @@ For how to actually use these, see `docs/integration.md`.
 | `wp_cursor_shape_manager_v1` | a client names its cursor and the compositor draws it from the system theme, at the screen's density |
 | `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1` | pointer confinement and lock with unbounded relative motion; used by games, XWayland and 3D applications to capture the mouse |
 | `wl_data_device_manager` | clipboard and drag-and-drop. The drag icon is drawn under the pointer and gets frame callbacks; Ctrl held at the drop copies and Shift moves, whichever window is under the pointer, since an unfocused target cannot see the modifiers |
+| `zwp_primary_selection_device_manager_v1` | middle-click paste. The primary selection follows keyboard focus exactly as the clipboard does: only the focused client is offered it |
+| `zwp_text_input_manager_v3`, `zwp_input_method_manager_v2` | input methods (IBus, fcitx5) composing into the focused client: preedit, commit and the candidate popup, which is drawn beside the text cursor the client reports. Text-input focus follows keyboard focus. Any client may bind the input-method global, for the reason given for the session lock below |
+| `xdg_activation_v1` | a window asking to be focused. A token takes focus — switching to the window's workspace, or restoring it if minimized — when it was asked for by the client holding the keyboard, with a serial from this seat no older than that focus, and is used within 10 seconds; applications Huginn starts get one in `XDG_ACTIVATION_TOKEN` (and `DESKTOP_STARTUP_ID`) valid for 60 seconds. Any other request marks the window urgent instead: its dock icon gets a red dot, clicking it goes to the window, and the mark clears when the window is focused |
 | `xwayland_shell_v1` | XWayland only; associates an X11 window with its surface |
 | `ext_session_lock_manager_v1` | locking the session. See below |
 | `ext_foreign_toplevel_list_v1` | the window list: every window that has drawn, with its title and app id, kept current as they change and withdrawn when it closes. Read-only — the protocol has no requests that act on a window. Advertised to every client, unfiltered, with the same caveat as `raven_shell_v1` |
@@ -237,9 +240,7 @@ find them in the registry.
 |---|---|
 | `wlr-foreign-toplevel-management-v1` | No window *management* from outside: an external dock or switcher can list windows (see `ext_foreign_toplevel_list_v1` above) but cannot activate, close or minimize one. |
 | `wlr-screencopy`, `ext-image-copy-capture-v1` | No *standard* screen capture: no screen sharing through the portal or PipeWire, and third-party recorders (OBS, wf-recorder) find nothing to use. Client capture exists, but through `raven_capture_v1` above, which only Raven's own software speaks. |
-| `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. |
-| `zwp_primary_selection_v1` | No middle-click paste. The regular clipboard works. |
-| `text-input-v3`, `input-method-v2` | No input methods. CJK and other IME input will not work. |
+| `wp-presentation-time` | Clients cannot get precise presentation feedback. Media players fall back to their own timing. Advertising it needs feedback delivered from each backend's page flip, which neither backend collects yet. |
 | `wlr-virtual-pointer`, `virtual-keyboard-v1` | No input injection. Remote-desktop and automation tools cannot drive the session. |
 | `ext-idle-notify-v1` | A client cannot be told the session went idle. The compositor locks on its own timer, so auto-lock works — what is missing is any way for *other* software to react to idleness. |
 | `tablet-v2` | Graphics tablets are not routed. |

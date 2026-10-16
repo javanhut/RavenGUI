@@ -37,9 +37,10 @@ use smithay::{
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_device,
     delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_inhibit,
-    delegate_layer_shell, delegate_output, delegate_pointer_constraints, delegate_relative_pointer,
-    delegate_seat, delegate_session_lock, delegate_shm, delegate_viewporter,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_input_method_manager, delegate_layer_shell, delegate_output,
+    delegate_pointer_constraints, delegate_primary_selection, delegate_relative_pointer,
+    delegate_seat, delegate_session_lock, delegate_shm, delegate_text_input_manager,
+    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -76,6 +77,7 @@ use smithay::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
+        input_method::{InputMethodHandler, InputMethodManagerState, PopupSurface as ImePopup},
         output::{OutputHandler, OutputManagerState},
         pointer_constraints::{
             PointerConstraint, PointerConstraintsHandler, PointerConstraintsState,
@@ -87,6 +89,9 @@ use smithay::{
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 default_action_chooser, set_data_device_focus,
+            },
+            primary_selection::{
+                PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
             },
         },
         session_lock::{LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker},
@@ -101,7 +106,11 @@ use smithay::{
             },
         },
         shm::{ShmHandler, ShmState},
+        text_input::TextInputManagerState,
         viewporter::ViewporterState,
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 use smithay::{
@@ -593,6 +602,20 @@ pub(crate) struct Huginn {
     pub(crate) lock: Option<Lock>,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
+    /// Middle-click paste. Follows the keyboard like the clipboard does.
+    pub(crate) primary_selection_state: PrimarySelectionState,
+    /// zwp_text_input_v3 and zwp_input_method_v2: an input method (IBus,
+    /// fcitx5) composing into the focused client. smithay moves the
+    /// text-input focus with the keyboard's. Held, not read.
+    #[allow(dead_code)]
+    pub(crate) text_input_state: TextInputManagerState,
+    #[allow(dead_code)]
+    pub(crate) input_method_state: InputMethodManagerState,
+    /// xdg-activation tokens. See [`crate::activation`].
+    pub(crate) activation_state: XdgActivationState,
+    /// Windows that asked for activation without a token that could take
+    /// focus. Cleared when they get it; marked in the dock.
+    pub(crate) urgent: HashSet<WindowId>,
     pub seat: Seat<Self>,
     /// Pointer position in compositor-global logical coordinates.
     pub pointer_location: Point<f64, Logical>,
@@ -1255,6 +1278,13 @@ impl Huginn {
             lock: None,
             seat_state,
             data_device_state: DataDeviceState::new::<Self>(dh),
+            primary_selection_state: PrimarySelectionState::new::<Self>(dh),
+            text_input_state: TextInputManagerState::new::<Self>(dh),
+            // Any client may be the input method, for the reason given for
+            // the session lock above.
+            input_method_state: InputMethodManagerState::new::<Self, _>(dh, |_| true),
+            activation_state: XdgActivationState::new::<Self>(dh),
+            urgent: HashSet::new(),
             seat,
             pointer_location: (0.0, 0.0).into(),
             contacts: crate::touch::Contacts::default(),
@@ -2692,7 +2722,7 @@ impl Huginn {
         }
 
         let argv = [crate::theme::LOCK_SCREEN.to_string()];
-        if crate::backend::spawn(&argv, &self.socket, self.x11_display) {
+        if crate::backend::spawn(&argv, &self.socket, self.x11_display, None) {
             return true;
         }
 
@@ -3043,7 +3073,7 @@ impl Huginn {
             "the lock screen died while the session was locked; starting it again"
         );
         let argv = [crate::theme::LOCK_SCREEN.to_string()];
-        if crate::backend::spawn(&argv, &self.socket, self.x11_display) {
+        if crate::backend::spawn(&argv, &self.socket, self.x11_display, None) {
             return true;
         }
 
@@ -3654,8 +3684,18 @@ impl Huginn {
             Some(SwitcherKind::AltTab) => {
                 crate::dock::alt_tab_items(&self.apps, &self.alt_tab_windows())
             }
-            None => crate::dock::items(&self.apps, &self.running_app_ids()),
+            None => {
+                let mut running = self.running_app_ids();
+                for id in self.urgent_app_ids() {
+                    if !running.contains(&id) {
+                        running.push(id);
+                    }
+                }
+                crate::dock::items(&self.apps, &running)
+            }
         };
+        let urgent = self.urgent_app_ids();
+        crate::dock::mark_urgent(&mut self.dock_items, &self.apps, &urgent);
         // A window may close while a strip is up: keep the highlight inside
         // the strip, and drop the strip when nothing is left to show.
         let len = self.dock_items.len();
@@ -5734,7 +5774,8 @@ impl Huginn {
         }
         // The answer is not used here: a desktop entry that will not run is a
         // line in the log, not something the launcher can do anything about.
-        let _ = crate::backend::spawn(argv, &self.socket, self.x11_display);
+        let token = self.launch_token();
+        let _ = crate::backend::spawn(argv, &self.socket, self.x11_display, Some(&token));
     }
 
     /// Resize the focused window one step in `dir`.
@@ -6248,6 +6289,16 @@ impl Huginn {
         if let Some(id) = visible {
             self.space.active_workspace_mut().focus(id);
             self.refresh_focus();
+            return;
+        }
+        let wanting = self.urgent.iter().copied().find(|id| {
+            self.windows
+                .get(id)
+                .and_then(WindowSurface::app_id)
+                .is_some_and(|app_id| crate::dock::matches(entry, &app_id))
+        });
+        if let Some(id) = wanting {
+            self.go_to_window(id);
             return;
         }
         let minimized = self
@@ -7858,6 +7909,7 @@ impl Huginn {
         self.begin_close_ghost(id);
         self.withdraw_toplevel(id);
         self.windows.remove(&id);
+        self.urgent.remove(&id);
         self.mapped.remove(&id);
         self.decor.remove(&id);
         self.opening.remove(&id);
@@ -8875,7 +8927,8 @@ impl Huginn {
         };
         keyboard.set_focus(self, target.clone(), serial);
         let client = target.and_then(|target| self.display.get_client(target.surface().id()).ok());
-        set_data_device_focus(&self.display, &self.seat, client);
+        set_data_device_focus(&self.display, &self.seat, client.clone());
+        set_primary_focus(&self.display, &self.seat, client);
     }
 
     /// Attach an output so clients can discover scale, mode, and position.
@@ -8938,7 +8991,11 @@ impl CompositorHandler for Huginn {
 
         // A drag icon moves by the offset attached with each of its buffers,
         // which nothing else reads: smithay leaves it to the compositor.
-        if let Some(icon) = self.dnd_icon.as_mut().filter(|icon| &icon.surface == surface) {
+        if let Some(icon) = self
+            .dnd_icon
+            .as_mut()
+            .filter(|icon| &icon.surface == surface)
+        {
             let delta = with_states(surface, |states| {
                 states
                     .cached_state
@@ -9375,6 +9432,7 @@ impl XdgShellHandler for Huginn {
         self.begin_close_ghost(id);
         self.withdraw_toplevel(id);
         self.windows.remove(&id);
+        self.urgent.remove(&id);
         self.mapped.remove(&id);
         self.decor.remove(&id);
         self.opening.remove(&id);
@@ -9474,7 +9532,14 @@ impl SeatHandler for Huginn {
     /// silently does nothing.
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&FocusTarget>) {
         let client = focused.and_then(|target| self.display.get_client(target.surface().id()).ok());
-        set_data_device_focus(&self.display, seat, client);
+        set_data_device_focus(&self.display, seat, client.clone());
+        set_primary_focus(&self.display, seat, client);
+        if let Some(surface) = focused.map(FocusTarget::surface)
+            && let Some(id) = self.window_of_surface(surface)
+            && self.urgent.remove(&id)
+        {
+            self.refresh_dock();
+        }
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
@@ -9548,6 +9613,127 @@ impl SelectionHandler for Huginn {
     type SelectionUserData = ();
 }
 
+impl PrimarySelectionHandler for Huginn {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+impl InputMethodHandler for Huginn {
+    fn new_popup(&mut self, surface: ImePopup) {
+        if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
+            tracing::warn!("input method popup: {err}");
+        }
+    }
+
+    fn dismiss_popup(&mut self, surface: ImePopup) {
+        if let Some(parent) = surface.get_parent().map(|parent| parent.surface.clone()) {
+            let _ = PopupManager::dismiss_popup(&parent, &PopupKind::from(surface));
+        }
+        self.queue_redraw();
+    }
+
+    fn popup_repositioned(&mut self, _surface: ImePopup) {
+        self.queue_redraw();
+    }
+
+    fn parent_geometry(&self, parent: &WlSurface) -> smithay::utils::Rectangle<i32, Logical> {
+        crate::popup::window_geometry(parent)
+    }
+}
+
+impl XdgActivationHandler for Huginn {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.activation_state
+    }
+
+    fn token_created(&mut self, token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        let keyboard = self.seat.get_keyboard();
+        let (from_our_seat, since_enter) = match (&data.serial, &keyboard) {
+            (Some((serial, seat)), Some(keyboard)) => (
+                Seat::<Self>::from_resource(seat).is_some_and(|seat| seat == self.seat),
+                keyboard
+                    .last_enter()
+                    .is_some_and(|enter| serial.is_no_older_than(&enter)),
+            ),
+            _ => (false, false),
+        };
+        let focused_client = keyboard
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|target| self.display.get_client(target.surface().id()).ok())
+            .map(|client| client.id());
+        let requester_focused = data.client_id.is_some() && data.client_id == focused_client;
+        let origin = crate::activation::origin(from_our_seat, requester_focused, since_enter);
+        data.user_data.insert_if_missing(|| origin);
+        self.forget_stale_tokens();
+        let _ = token;
+        true
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        let Some(id) = self.window_of_surface(&surface) else {
+            return;
+        };
+        let origin = token_data
+            .user_data
+            .get::<crate::activation::Origin>()
+            .copied()
+            .unwrap_or(crate::activation::Origin::Untrusted);
+        match crate::activation::grant(origin, token_data.timestamp.elapsed()) {
+            crate::activation::Grant::Focus => {
+                self.activation_state.remove_token(&token);
+                self.urgent.remove(&id);
+                self.go_to_window(id);
+                self.refresh_dock();
+            }
+            crate::activation::Grant::Urgent => {
+                if self.space.focused() != Some(id) && self.urgent.insert(id) {
+                    self.refresh_dock();
+                }
+            }
+        }
+    }
+}
+
+impl Huginn {
+    /// A token for an application huginn is about to start, passed to it as
+    /// `XDG_ACTIVATION_TOKEN`.
+    pub(crate) fn launch_token(&mut self) -> String {
+        self.forget_stale_tokens();
+        let (token, data) = self.activation_state.create_external_token(None);
+        data.user_data
+            .insert_if_missing(|| crate::activation::Origin::Launch);
+        token.as_str().to_string()
+    }
+
+    fn forget_stale_tokens(&mut self) {
+        self.activation_state.retain_tokens(|_, data| {
+            data.timestamp.elapsed() <= crate::activation::LAUNCH_TOKEN_LIFETIME
+        });
+    }
+
+    /// The window whose toplevel surface is `surface`.
+    fn window_of_surface(&self, surface: &WlSurface) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find(|(_, window)| window.wl_surface().as_ref() == Some(surface))
+            .map(|(id, _)| *id)
+    }
+
+    /// The `app_id`s of the windows that want attention.
+    fn urgent_app_ids(&self) -> Vec<String> {
+        self.urgent
+            .iter()
+            .filter_map(|id| self.windows.get(id)?.app_id())
+            .collect()
+    }
+}
+
 impl DataDeviceHandler for Huginn {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
@@ -9567,7 +9753,12 @@ impl DataDeviceHandler for Huginn {
 }
 
 impl ClientDndGrabHandler for Huginn {
-    fn started(&mut self, _source: Option<WlDataSource>, icon: Option<WlSurface>, _seat: Seat<Self>) {
+    fn started(
+        &mut self,
+        _source: Option<WlDataSource>,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
         self.dnd_icon = icon.map(crate::dnd::DndIcon::new);
         self.queue_redraw();
     }
@@ -9662,6 +9853,10 @@ delegate_seat!(Huginn);
 delegate_pointer_constraints!(Huginn);
 delegate_relative_pointer!(Huginn);
 delegate_data_device!(Huginn);
+delegate_primary_selection!(Huginn);
+delegate_text_input_manager!(Huginn);
+delegate_input_method_manager!(Huginn);
+delegate_xdg_activation!(Huginn);
 delegate_output!(Huginn);
 delegate_viewporter!(Huginn);
 delegate_fractional_scale!(Huginn);

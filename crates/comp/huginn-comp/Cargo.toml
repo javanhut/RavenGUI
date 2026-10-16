@@ -67,6 +67,10 @@ raven-glass = { path = "../../raven-glass" }
 # socket without a session bus. Tests only: the resolver keeps this feature out
 # of the compositor itself.
 zbus = { workspace = true, features = ["p2p"] }
+# A real client for the protocol tests in `protocol_tests.rs`.
+wayland-client.workspace = true
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [lints]
 workspace = true

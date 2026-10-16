@@ -370,9 +370,8 @@ own to keep legible.
 `Terminal=true` entries — and their desktop actions — are launched inside
 `theme::TERMINAL` as `raven-terminal -e <command...>`, resolved through the
 terminal's own desktop entry when one is installed and the bare binary on
-`$PATH` when not. The `-e` flag is an assumption (`launcher::in_terminal`
-documents it); a terminal that spells it differently silently breaks every TUI
-entry.
+`$PATH` when not. RavenTerminal (source in `RavenApps/RavenTerminal`) takes
+`-e <command...>`, everything after the flag being the program to run.
 
 ## Building
 

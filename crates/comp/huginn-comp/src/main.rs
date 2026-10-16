@@ -9,6 +9,8 @@
 //! handlers, and rendering.
 
 #[cfg(target_os = "linux")]
+mod activation;
+#[cfg(target_os = "linux")]
 mod anim;
 #[cfg(target_os = "linux")]
 mod appwatch;
@@ -61,6 +63,8 @@ mod pins;
 mod pointer;
 #[cfg(target_os = "linux")]
 mod popup;
+#[cfg(all(test, target_os = "linux"))]
+mod protocol_tests;
 #[cfg(target_os = "linux")]
 mod record;
 #[cfg(target_os = "linux")]

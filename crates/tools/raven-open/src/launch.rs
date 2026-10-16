@@ -58,9 +58,10 @@ fn general_terminal(text: &str) -> Option<String> {
 /// terminal is started in it, which every terminal takes as where its shell
 /// begins. `None` when `dir` is not UTF-8 and so cannot be passed on.
 pub fn terminal_argv(terminal: &str, dir: &Path) -> Option<Vec<String>> {
+    // raven-terminal-launcher is the wrapper its desktop entry runs.
     let is_raven = Path::new(terminal)
         .file_name()
-        .is_some_and(|name| name == TERMINAL);
+        .is_some_and(|name| name == TERMINAL || name == "raven-terminal-launcher");
     let mut argv = vec![terminal.to_owned()];
     if is_raven {
         argv.push("--working-directory".to_owned());
@@ -182,6 +183,15 @@ mod tests {
         assert_eq!(
             terminal_argv("/usr/local/bin/raven-terminal", dir).unwrap()[1],
             "--working-directory"
+        );
+        // The installed desktop entry runs it through its launcher wrapper.
+        assert_eq!(
+            terminal_argv("/usr/local/bin/raven-terminal-launcher", dir).unwrap(),
+            [
+                "/usr/local/bin/raven-terminal-launcher",
+                "--working-directory",
+                "/home/me/My Files"
+            ]
         );
         // Another terminal is started in the folder instead (spawn_in).
         assert_eq!(terminal_argv("kitty", dir).unwrap(), ["kitty"]);
